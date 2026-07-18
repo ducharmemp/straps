@@ -1,0 +1,611 @@
+-- Provider tests: run the REAL fn.provider source against fake `curl`
+-- binaries placed first on PATH. Covers the full tool round-trip (the model
+-- requests bash, the tool runs, the follow-up turn completes), the custom
+-- base_url config, and the idle-stream watchdog (a server that keeps the
+-- connection open but silent must not hang the run forever).
+-- Run: nvim --headless -l tests/run_provider.lua
+
+local here = debug.getinfo(1, "S").source:sub(2)
+local root = vim.fn.fnamemodify(here, ":h:h")
+vim.opt.rtp:prepend(root)
+package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
+
+local failed = false
+local function case(name, fn)
+  local ok, err = pcall(fn)
+  if ok then
+    print("PASS  " .. name)
+  else
+    failed = true
+    print("FAIL  " .. name .. ": " .. tostring(err))
+  end
+end
+
+vim.env.ANTHROPIC_API_KEY = "test-key-not-real"
+local straps = require("straps").setup({})
+-- Hermetic: durable sessions write under a throwaway dir, never the real data dir.
+straps.config.session_dir = vim.fn.tempname()
+local registry = require("straps.registry")
+local state = require("straps.state")
+local loop = require("straps.loop")
+
+registry.define({ name = "hook.confirm", kind = "hook", doc = "test: allow all",
+  source = [[return function() return true end]] })
+
+local tmp = vim.fn.tempname()
+vim.fn.mkdir(tmp .. "/scripted", "p")
+vim.fn.mkdir(tmp .. "/stalling", "p")
+local real_path = vim.env.PATH
+
+local function write_exec(path, text)
+  local f = assert(io.open(path, "w"))
+  f:write(text)
+  f:close()
+  vim.fn.setfperm(path, "rwxr-xr-x")
+end
+
+-- Fake curl #1: scripted two-turn Anthropic SSE server. Turn 1 asks for a
+-- real bash tool call; turn 2 streams text. Logs argv and request bodies.
+write_exec(tmp .. "/scripted/curl", ([[#!/usr/bin/env bash
+D=%q
+N=$(cat "$D/n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/n"
+printf '%%s\n' "$*" >> "$D/argv"
+cat > "$D/body.$N"
+echo "STRAPS_HTTP_STATUS:200" >&2
+if [ "$N" = 1 ]; then
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":1200,"cache_read_input_tokens":1100,"cache_creation_input_tokens":100}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"bash"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"echo provider-e2e-output\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+EOF
+else
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start"}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"provider done"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+EOF
+fi
+]]):format(tmp))
+
+-- Fake curl #2: accepts the request then goes silent, holding the
+-- connection open. Only the watchdog can end this one.
+write_exec(tmp .. "/stalling/curl", [[#!/usr/bin/env bash
+cat > /dev/null
+sleep 60
+]])
+
+-- Fake curl #3: single-turn server that streams a thinking block before its
+-- text answer, exercising fn.provider's thinking/thinking_delta dispatch.
+vim.fn.mkdir(tmp .. "/thinking", "p")
+write_exec(tmp .. "/thinking/curl", ([[#!/usr/bin/env bash
+D=%q
+cat > "$D/thinking_body"
+echo "STRAPS_HTTP_STATUS:200" >&2
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start"}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering..."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"thinking test done"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+EOF
+]]):format(tmp))
+
+local function run_session(user_text)
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, user_text)
+  loop.start(bufnr)
+  vim.wait(15000, function() return not loop.running(bufnr) end, 50)
+  return bufnr, table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+end
+
+-- ---------------------------------------------------------------- scripted
+vim.env.PATH = tmp .. "/scripted:" .. real_path
+straps.config.base_url = "http://straps-fake.invalid"
+straps.config.log_file = tmp .. "/events.log"
+straps.config.cache_ttl = "1h"
+-- Alphabetically FIRST, registered LAST: proves build_tools uses
+-- registration order (append-only, cache-stable), not names() order.
+registry.define({ name = "tool.aaa_first_alphabetically", kind = "tool",
+  doc = "ordering canary", source = [[return function() return "ok" end]] })
+local bufnr, text = run_session("run echo via bash")
+
+case("full tool round-trip through the real provider source", function()
+  assert(text:find("provider-e2e-output", 1, true), "bash tool_result missing")
+  assert(text:find('"name":"bash"', 1, true) or text:find('"bash"', 1, true), "tool_use block missing")
+  assert(text:find("provider done", 1, true), "final streamed text missing")
+  assert(not loop.running(bufnr), "run still active")
+end)
+
+case("config.base_url reaches curl", function()
+  local argv = table.concat(vim.fn.readfile(tmp .. "/argv"), "\n")
+  assert(argv:find("http://straps-fake.invalid/v1/messages", 1, true), "custom base_url not in argv:\n" .. argv)
+end)
+
+case("second request contains the tool_result", function()
+  local body = table.concat(vim.fn.readfile(tmp .. "/body.2"), "\n")
+  local decoded = vim.json.decode(body)
+  local last = decoded.messages[#decoded.messages]
+  assert(last.role == "user", "last message should be the tool_result user message")
+  assert(last.content[1].type == "tool_result", "missing tool_result part")
+  assert(last.content[1].content:find("provider-e2e-output", 1, true), "tool output not sent back")
+end)
+
+case("fn.log captures request/response and loop events", function()
+  local lines = vim.fn.readfile(tmp .. "/events.log")
+  assert(#lines > 0, "log file is empty")
+  local seen, request, response = {}, nil, nil
+  for _, line in ipairs(lines) do
+    local ev = vim.json.decode(line) -- every line must be valid JSON
+    assert(type(ev) == "table" and type(ev.ev) == "string", "malformed log line: " .. line)
+    seen[ev.ev] = true
+    if ev.ev == "request" and not request then request = ev end
+    if ev.ev == "response" and ev.stop_reason == "end_turn" then response = ev end
+  end
+  for _, k in ipairs({ "run_start", "turn", "tool", "run_end" }) do
+    assert(seen[k], "missing loop event in log: " .. k)
+  end
+  assert(request, "no request event logged")
+  assert(type(request.bytes) == "number" and request.bytes > 0, "request event bytes not > 0")
+  assert(request.model, "request event missing model")
+  assert(response, "no response event with stop_reason end_turn")
+  assert(response.ok == true, "response event ok is not true")
+  assert(type(response.ms) == "number", "response event missing ms")
+end)
+
+case("cache breakpoints are in the request body", function()
+  local body = table.concat(vim.fn.readfile(tmp .. "/body.1"), "\n")
+  local decoded = vim.json.decode(body)
+  assert(type(decoded.system) == "table", "system should be the array form when cache is on")
+  assert(decoded.system[1] and type(decoded.system[1].cache_control) == "table"
+    and decoded.system[1].cache_control.type == "ephemeral",
+    "system[1] missing cache_control ephemeral")
+  local last = decoded.messages[#decoded.messages]
+  local lastblock = last.content[#last.content]
+  assert(type(lastblock.cache_control) == "table" and lastblock.cache_control.type == "ephemeral",
+    "last content block of last message missing cache_control")
+  assert(type(decoded.tools) == "table" and #decoded.tools > 0, "tools missing from body")
+  local lasttool = decoded.tools[#decoded.tools]
+  assert(type(lasttool.cache_control) == "table" and lasttool.cache_control.type == "ephemeral",
+    "last tool missing cache_control (tools-prefix breakpoint)")
+  for i = 1, #decoded.tools - 1 do
+    assert(decoded.tools[i].cache_control == nil, "cache_control leaked onto tool " .. i)
+  end
+end)
+
+case("tools are sent in registration order, new tools appended last", function()
+  local decoded = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/body.1"), "\n"))
+  local names = {}
+  for i, t in ipairs(decoded.tools) do names[i] = t.name end
+  assert(names[#names] == "aaa_first_alphabetically",
+    "late-registered tool should be LAST, got order: " .. table.concat(names, ","))
+  assert(names[1] ~= "aaa_first_alphabetically", "tool list looks alphabetical")
+end)
+
+case("config.cache_ttl = 1h reaches all three breakpoints", function()
+  local decoded = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/body.1"), "\n"))
+  assert(decoded.system[1].cache_control.ttl == "1h", "system breakpoint missing ttl")
+  assert(decoded.tools[#decoded.tools].cache_control.ttl == "1h", "tools breakpoint missing ttl")
+  local last = decoded.messages[#decoded.messages]
+  assert(last.content[#last.content].cache_control.ttl == "1h", "message breakpoint missing ttl")
+end)
+
+straps.config.cache_ttl = nil
+registry.remove("tool.aaa_first_alphabetically")
+
+case("response log event carries usage and cache counters", function()
+  local resp
+  for _, line in ipairs(vim.fn.readfile(tmp .. "/events.log")) do
+    local ev = vim.json.decode(line)
+    if ev.ev == "response" and ev.stop_reason == "tool_use" then resp = ev end
+  end
+  assert(resp, "no response event for the tool_use turn")
+  assert(resp.input_tokens == 1200,
+    "input_tokens is " .. tostring(resp.input_tokens) .. ", want 1200")
+  assert(resp.cache_read_input_tokens == 1100,
+    "cache_read_input_tokens is " .. tostring(resp.cache_read_input_tokens) .. ", want 1100")
+  assert(resp.cache_creation_input_tokens == 100,
+    "cache_creation_input_tokens is " .. tostring(resp.cache_creation_input_tokens) .. ", want 100")
+end)
+
+straps.config.log_file = nil
+
+-- ------------------------------------------------------------ cache = false
+-- Same scripted fake; reset its counter and body captures so the run replays
+-- turn 1 + turn 2 from scratch.
+vim.fn.delete(tmp .. "/n")
+vim.fn.delete(tmp .. "/body.1")
+vim.fn.delete(tmp .. "/body.2")
+straps.config.cache = false
+local _, text_nc = run_session("run echo via bash, no caching")
+
+case("config.cache = false keeps the plain request shapes", function()
+  assert(text_nc:find("provider done", 1, true), "cache=false run did not complete")
+  local body = table.concat(vim.fn.readfile(tmp .. "/body.1"), "\n")
+  local decoded = vim.json.decode(body)
+  assert(type(decoded.system) == "string", "system should be a plain string when cache is off")
+  assert(not body:find("cache_control", 1, true), "cache_control leaked into a cache=false request")
+end)
+
+straps.config.cache = true
+
+-- ----------------------------------------------------------------- effort
+-- Same scripted fake; reset counters/body captures again. config.model is
+-- still the default (claude-sonnet-5, tagged thinking="adaptive").
+vim.fn.delete(tmp .. "/n")
+vim.fn.delete(tmp .. "/body.1")
+vim.fn.delete(tmp .. "/body.2")
+straps.config.effort = "high"
+local _, text_effort = run_session("run echo via bash, high effort")
+
+case("config.effort maps to output_config.effort for an adaptive-thinking model", function()
+  assert(text_effort:find("provider done", 1, true), "high-effort run did not complete")
+  local body = table.concat(vim.fn.readfile(tmp .. "/body.1"), "\n")
+  local decoded = vim.json.decode(body)
+  assert(type(decoded.thinking) == "table", "thinking block missing from request body")
+  assert(decoded.thinking.type == "adaptive", "thinking.type is " .. tostring(decoded.thinking.type))
+  assert(decoded.thinking.budget_tokens == nil,
+    "adaptive thinking must not send budget_tokens, got " .. tostring(decoded.thinking.budget_tokens))
+  assert(type(decoded.output_config) == "table", "output_config missing from request body")
+  assert(decoded.output_config.effort == "high",
+    "output_config.effort is " .. tostring(decoded.output_config.effort) .. ", want high")
+end)
+
+vim.fn.delete(tmp .. "/n")
+vim.fn.delete(tmp .. "/body.1")
+vim.fn.delete(tmp .. "/body.2")
+straps.config.model = "claude-haiku-4-5-20251001" -- tagged thinking="budget"
+straps.config.effort = "high"
+local _, text_budget = run_session("run echo via bash, high effort, budget model")
+
+case("config.effort maps to thinking.budget_tokens for a budget-thinking model", function()
+  assert(text_budget:find("provider done", 1, true), "budget-model high-effort run did not complete")
+  local body = table.concat(vim.fn.readfile(tmp .. "/body.1"), "\n")
+  local decoded = vim.json.decode(body)
+  assert(type(decoded.thinking) == "table", "thinking block missing from request body")
+  assert(decoded.thinking.type == "enabled", "thinking.type is " .. tostring(decoded.thinking.type))
+  assert(decoded.thinking.budget_tokens == 24000,
+    "thinking.budget_tokens is " .. tostring(decoded.thinking.budget_tokens) .. ", want 24000")
+  assert(decoded.output_config == nil,
+    "budget-thinking model must not send output_config.effort")
+  assert(decoded.max_tokens > decoded.thinking.budget_tokens,
+    "max_tokens (" .. tostring(decoded.max_tokens) .. ") must exceed budget_tokens")
+end)
+
+straps.config.model = "claude-sonnet-5"
+
+vim.fn.delete(tmp .. "/n")
+vim.fn.delete(tmp .. "/body.1")
+vim.fn.delete(tmp .. "/body.2")
+straps.config.effort = "off"
+local _, text_off = run_session("run echo via bash, effort off")
+
+case("config.effort = off sends no thinking block", function()
+  assert(text_off:find("provider done", 1, true), "off-effort run did not complete")
+  local body = table.concat(vim.fn.readfile(tmp .. "/body.1"), "\n")
+  local decoded = vim.json.decode(body)
+  assert(decoded.thinking == nil, "thinking block should be absent when effort is off")
+  assert(decoded.output_config == nil, "output_config should be absent when effort is off")
+end)
+
+straps.config.effort = "off"
+
+-- --------------------------------------------------------------- thinking
+vim.env.PATH = tmp .. "/thinking:" .. real_path
+straps.config.effort = "medium"
+local _, text_think = run_session("think about it")
+
+case("thinking_delta text streams into the transcript and the turn completes", function()
+  assert(text_think:find("pondering%.%.%.", 1) or text_think:find("pondering..."),
+    "thinking_delta text missing from transcript:\n" .. text_think)
+  assert(text_think:find("thinking test done", 1, true), "final text after thinking missing")
+end)
+
+straps.config.effort = "off"
+vim.env.PATH = tmp .. "/scripted:" .. real_path
+
+-- ------------------------------------------------ 4th (intermediate) breakpoint
+-- A fresh single-turn fake that captures its request body, driven over a
+-- pre-seeded long, tool-heavy transcript so the provider places the trailing
+-- intermediate breakpoint that keeps busy turns inside the ~20-block lookback.
+vim.fn.mkdir(tmp .. "/bp", "p")
+write_exec(tmp .. "/bp/curl", ([[#!/usr/bin/env bash
+D=%q
+cat > "$D/bpbody"
+echo "STRAPS_HTTP_STATUS:200" >&2
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start","message":{"usage":{}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+EOF
+]]):format(tmp))
+
+vim.env.PATH = tmp .. "/bp:" .. real_path
+straps.config.cache = true
+straps.config.cache_ttl = nil
+straps.config.base_url = "http://straps-fake.invalid"
+
+local bp_buf = state.new_session()
+state.append(bp_buf, "user", nil, "kick off a long tool-heavy session")
+for i = 1, 22 do -- 22 alternating rounds -> ~46 content blocks across many messages
+  state.append(bp_buf, "tool_use", { id = "t" .. i, name = "noop" }, "{}")
+  state.append(bp_buf, "tool_result", { id = "t" .. i, is_error = false }, "result " .. i)
+end
+state.append(bp_buf, "user", nil, "now answer")
+loop.start(bp_buf)
+vim.wait(15000, function() return not loop.running(bp_buf) end, 50)
+
+case("long conversations get a 4th intermediate breakpoint within lookback", function()
+  local decoded = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/bpbody"), "\n"))
+  local marked, total = {}, 0
+  for mi, msg in ipairs(decoded.messages) do
+    if type(msg.content) == "table" then
+      for _, blk in ipairs(msg.content) do
+        total = total + 1
+        if type(blk.cache_control) == "table" then marked[#marked + 1] = mi end
+      end
+    end
+  end
+  assert(total > 20, "seed did not exceed 20 content blocks (" .. total .. ")")
+  assert(#marked == 2, "expected 2 message breakpoints (intermediate + tail), got " .. #marked)
+  assert(marked[1] < marked[2], "breakpoints out of order")
+  assert(marked[2] == #decoded.messages, "tail breakpoint not on the last message")
+  -- The intermediate must sit far enough back to bridge a >20-block turn:
+  -- the provider accumulates >= 15 blocks (messages marked[1]..tail-1) before
+  -- placing it.
+  local bridge = 0
+  for mi = marked[1], #decoded.messages - 1 do bridge = bridge + #decoded.messages[mi].content end
+  assert(bridge >= 15, "intermediate breakpoint too close to tail: bridges " .. bridge .. " blocks")
+end)
+
+vim.env.PATH = real_path
+straps.config.base_url = nil
+
+-- ---------------------------------------------------------------- watchdog
+vim.env.PATH = tmp .. "/stalling:" .. real_path
+straps.config.request_timeout_ms = 400
+local t0 = vim.uv.hrtime()
+local bufnr2, text2 = run_session("this endpoint hangs")
+local elapsed_ms = (vim.uv.hrtime() - t0) / 1e6
+
+case("idle watchdog kills a silent stream instead of hanging forever", function()
+  assert(not loop.running(bufnr2), "run never finished — watchdog did not fire")
+  assert(text2:find("stream stalled", 1, true), "missing stall explanation:\n" .. text2)
+  assert(text2:find("request_timeout_ms", 1, true), "error should mention the config knob")
+  assert(elapsed_ms < 10000, "took too long: " .. elapsed_ms .. "ms")
+end)
+
+vim.env.PATH = real_path
+straps.config.request_timeout_ms = nil
+straps.config.base_url = nil
+
+-- ------------------------------------------------------------- HTTP errors
+-- Fake curl #4: non-2xx with a JSON error body (the live tools.22 failure
+-- shape). The run must surface a READABLE error naming the status and the
+-- API's message, and end cleanly.
+vim.fn.mkdir(tmp .. "/err400", "p")
+write_exec(tmp .. "/err400/curl", [[#!/usr/bin/env bash
+cat > /dev/null
+echo "STRAPS_HTTP_STATUS:400" >&2
+printf '%s' '{"type":"error","error":{"type":"invalid_request_error","message":"tools.22.custom.input_schema.properties: Input should be an object"}}'
+]])
+
+vim.env.PATH = tmp .. "/err400:" .. real_path
+straps.config.base_url = "http://straps-fake.invalid"
+local buf400, text400 = run_session("this request will 400")
+
+case("HTTP 400 surfaces the API's error message and ends the run cleanly", function()
+  assert(not loop.running(buf400), "run still active after a 400")
+  assert(text400:find("request failed (HTTP 400)", 1, true),
+    "status missing from error:\n" .. text400:sub(-400))
+  assert(text400:find("Input should be an object", 1, true),
+    "API error message not surfaced:\n" .. text400:sub(-400))
+end)
+
+-- Fake curl #5: 429 once, then a normal 200 answer — the retry path.
+vim.fn.mkdir(tmp .. "/flaky", "p")
+write_exec(tmp .. "/flaky/curl", ([[#!/usr/bin/env bash
+D=%q
+N=$(cat "$D/flaky_n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/flaky_n"
+cat > /dev/null
+if [ "$N" = 1 ]; then
+  echo "STRAPS_HTTP_STATUS:429" >&2
+  printf '%%s' '{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
+  exit 0
+fi
+echo "STRAPS_HTTP_STATUS:200" >&2
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start"}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"survived the rate limit"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+EOF
+]]):format(tmp))
+
+vim.env.PATH = tmp .. "/flaky:" .. real_path
+local t429 = vim.uv.hrtime()
+local buf429, text429 = run_session("rate limit me once")
+local ms429 = (vim.uv.hrtime() - t429) / 1e6
+
+case("429 retries with backoff and the run completes", function()
+  assert(text429:find("survived the rate limit", 1, true),
+    "retry did not complete:\n" .. text429:sub(-400))
+  local n = tonumber(vim.fn.readfile(tmp .. "/flaky_n")[1])
+  assert(n == 2, "curl called " .. tostring(n) .. " times, want 2 (one retry)")
+  assert(ms429 >= 900, "backoff skipped: only " .. math.floor(ms429) .. "ms elapsed")
+  assert(not text429:find("request failed", 1, true), "retryable error leaked into the transcript")
+end)
+
+-- Fake curl #6: always 429 — exhaustion must surface, not loop forever.
+vim.fn.mkdir(tmp .. "/always429", "p")
+write_exec(tmp .. "/always429/curl", ([[#!/usr/bin/env bash
+D=%q
+N=$(cat "$D/a429_n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/a429_n"
+cat > /dev/null
+echo "STRAPS_HTTP_STATUS:429" >&2
+printf '%%s' '{"type":"error","error":{"type":"rate_limit_error","message":"still rate limited"}}'
+]]):format(tmp))
+
+vim.env.PATH = tmp .. "/always429:" .. real_path
+local bufx, textx = run_session("rate limit me forever")
+
+case("persistent 429 exhausts retries with a readable error", function()
+  assert(not loop.running(bufx), "run still active after exhausted retries")
+  local n = tonumber(vim.fn.readfile(tmp .. "/a429_n")[1])
+  assert(n == 3, "curl called " .. tostring(n) .. " times, want exactly 3 attempts")
+  assert(textx:find("request failed (HTTP 429)", 1, true),
+    "exhaustion error missing status:\n" .. textx:sub(-400))
+  assert(textx:find("still rate limited", 1, true), "API message not surfaced")
+end)
+
+-- ------------------------------------------------- chunked multi-tool stream
+-- Fake curl #7: one response carrying TWO tool_use blocks, streamed rudely —
+-- the data line for block 0 is split mid-JSON across writes (line_buf
+-- reassembly), and block 1's input arrives as two input_json_delta events.
+-- Turn 2 answers in text. This drives the real SSE dispatch through the
+-- batched-tools path end to end.
+registry.define({ name = "tool.echo_tag", kind = "tool", doc = "echo the tag",
+  source = [[return function(input) return "tag-" .. tostring(input.tag) end]] })
+vim.fn.mkdir(tmp .. "/chunky", "p")
+write_exec(tmp .. "/chunky/curl", ([[#!/usr/bin/env bash
+D=%q
+N=$(cat "$D/chunky_n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/chunky_n"
+cat > "$D/chunky_body.$N"
+echo "STRAPS_HTTP_STATUS:200" >&2
+if [ "$N" = 1 ]; then
+  printf 'event: message_start\ndata: {"type":"message_start"}\n\n'
+  printf 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":"echo_tag"}}\n\n'
+  # block 0 input: ONE data line split across two writes, mid-JSON
+  printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"tag\\":\\"o'
+  sleep 0.05
+  printf 'ne\\"}"}}\n\n'
+  printf 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+  printf 'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"c2","name":"echo_tag"}}\n\n'
+  # block 1 input: two separate delta EVENTS
+  printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"tag\\":\\"tw"}}\n\n'
+  sleep 0.05
+  printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"o\\"}"}}\n\n'
+  printf 'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n'
+  printf 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}\n\n'
+  printf 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+else
+  printf 'event: message_start\ndata: {"type":"message_start"}\n\n'
+  printf 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+  printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"chunked done"}}\n\n'
+  printf 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+  printf 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+  printf 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+fi
+]]):format(tmp))
+
+vim.env.PATH = tmp .. "/chunky:" .. real_path
+local bufc, textc = run_session("stream me two tools, rudely chunked")
+
+case("split SSE chunks reassemble; a two-tool stream batches end to end", function()
+  assert(textc:find("tag-one", 1, true), "block 0 (split data line) input lost:\n" .. textc:sub(-500))
+  assert(textc:find("tag-two", 1, true), "block 1 (split delta events) input lost")
+  assert(textc:find("chunked done", 1, true), "follow-up turn missing")
+  -- Batch shape survives the REAL SSE path: one assistant message carries
+  -- both tool_use blocks in the replayed request.
+  local body2 = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/chunky_body.2"), "\n"))
+  local batch
+  for _, m in ipairs(body2.messages) do
+    if m.role == "assistant" then
+      local uses = {}
+      for _, p in ipairs(m.content) do
+        if p.type == "tool_use" then uses[#uses + 1] = p end
+      end
+      if #uses > 0 then batch = uses end
+    end
+  end
+  assert(batch and #batch == 2, "expected one assistant message with 2 tool_use blocks")
+  assert(batch[1].id == "c1" and batch[2].id == "c2", "tool_use order lost")
+  assert(batch[1].input.tag == "one" and batch[2].input.tag == "two",
+    "reassembled inputs wrong: " .. vim.inspect({ batch[1].input, batch[2].input }))
+end)
+
+registry.remove("tool.echo_tag")
+vim.env.PATH = real_path
+straps.config.base_url = nil
+
+if failed then
+  print("FAILED")
+  os.exit(1)
+end
+print("ALL PASS")
+os.exit(0)

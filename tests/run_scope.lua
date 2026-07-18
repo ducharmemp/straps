@@ -1,0 +1,644 @@
+-- tests/run_scope.lua — registry scoping + subagents (tool.spawn).
+--   nvim --headless -l tests/run_scope.lua
+-- No network: fn.provider is scripted per case. Covers: session-scoped
+-- defines shadowing global without mutating it; seq stability under
+-- shadowing (cache order); parent-chain resolution; define_default staying
+-- global; BufWipeout dropping a scope; registry_define defaulting to session
+-- scope (and scope="global" opting out); build_tools honoring the child tool
+-- filter and hiding spawn at the depth limit; per-buffer max_turns; a full
+-- spawn round trip through the loop; the readonly child confirm; and the
+-- spawn depth guard.
+
+local script = debug.getinfo(1, "S").source:sub(2)
+local root = vim.fn.fnamemodify(vim.fn.fnamemodify(script, ":p"), ":h:h")
+vim.opt.runtimepath:prepend(root)
+package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
+
+local straps = require("straps").setup({})
+straps.config.session_dir = vim.fn.tempname()
+
+local registry = require("straps.registry")
+local state = require("straps.state")
+local loop = require("straps.loop")
+
+local failed = false
+local function case(name, fn)
+  local ok, err = pcall(fn)
+  if ok then
+    print("PASS  " .. name)
+  else
+    failed = true
+    print("FAIL  " .. name .. ": " .. tostring(err))
+  end
+end
+
+local function define(name, kind, doc, source)
+  registry.define({ name = name, kind = kind, doc = doc, source = source }, { scope = "global" })
+end
+
+local function buf_text(bufnr)
+  return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+end
+
+local function wait_done(bufnr, ms)
+  assert(vim.wait(ms or 15000, function() return not loop.running(bufnr) end, 10),
+    "run did not finish in time")
+end
+
+local function allow_all()
+  define("hook.confirm", "hook", "test: allow everything", "return function() return true end")
+end
+
+local unpack = unpack or table.unpack
+local function pack(...) return { n = select("#", ...), ... } end
+local function drive(thunk, timeout_ms)
+  local out, finished, co
+  local ctx
+  ctx = {
+    bufnr = 0,
+    await = function(start)
+      local resolved = false
+      start(function(...)
+        if resolved then return end
+        resolved = true
+        local a = pack(...)
+        vim.schedule(function()
+          if coroutine.status(co) == "suspended" then
+            local ok, e = coroutine.resume(co, unpack(a, 1, a.n))
+            if not ok then finished = true; error(e) end
+          end
+        end)
+      end)
+      return coroutine.yield()
+    end,
+  }
+  co = coroutine.create(function()
+    out = thunk(ctx)
+    finished = true
+  end)
+  local ok, err = coroutine.resume(co)
+  if not ok then error(err) end
+  vim.wait(timeout_ms or 20000, function() return finished end, 20)
+  assert(finished, "drive: thunk did not finish within timeout")
+  return out
+end
+
+-- ------------------------------------------------------------ scoped defines
+
+case("session define shadows for the scope chain; global stays untouched", function()
+  define("tool.shadow_me", "tool", "global v1", [[return function() return "global" end]])
+  local buf = vim.api.nvim_create_buf(true, false)
+
+  local prev = registry.set_active_scope(buf)
+  local ok, err = pcall(function()
+    registry.define({ name = "tool.shadow_me", kind = "tool", doc = "scoped v2",
+      source = [[return function() return "scoped" end]] })
+    assert(registry.call("tool.shadow_me") == "scoped", "scoped call should hit the shadow")
+    local e = registry.get("tool.shadow_me")
+    assert(e.scope == buf, "entry should record its owning scope")
+    assert(e.version == 2, "shadow should build on the shadowed version, got " .. e.version)
+  end)
+  registry.set_active_scope(prev)
+  assert(ok, err)
+
+  assert(registry.call("tool.shadow_me") == "global", "global entry was polluted")
+  assert(registry.get("tool.shadow_me").scope == nil, "global entry gained a scope")
+end)
+
+case("shadowing reuses the shadowed seq; new scoped entries append", function()
+  define("tool.order_a", "tool", "a", [[return function() return "a" end]])
+  define("tool.order_b", "tool", "b", [[return function() return "b" end]])
+  local buf = vim.api.nvim_create_buf(true, false)
+
+  local function positions()
+    local names = registry.names_by_seq("tool")
+    local pos = {}
+    for i, n in ipairs(names) do pos[n] = i end
+    return pos, names
+  end
+  local before = positions()
+
+  local prev = registry.set_active_scope(buf)
+  local ok, err = pcall(function()
+    registry.define({ name = "tool.order_a", kind = "tool", doc = "a shadowed",
+      source = [[return function() return "a2" end]] })
+    registry.define({ name = "tool.order_new", kind = "tool", doc = "new",
+      source = [[return function() return "new" end]] })
+    local after, names = positions()
+    assert(after["tool.order_a"] == before["tool.order_a"],
+      "shadowing moved tool.order_a in seq order")
+    assert(after["tool.order_b"] == before["tool.order_b"],
+      "shadowing moved an unrelated tool")
+    assert(names[#names] == "tool.order_new", "new scoped entry should append last")
+  end)
+  registry.set_active_scope(prev)
+  assert(ok, err)
+
+  local pos = positions()
+  assert(pos["tool.order_new"] == nil, "scoped entry visible without its scope")
+end)
+
+case("child scope resolves through its parent's scope", function()
+  local parent = vim.api.nvim_create_buf(true, false)
+  local child = vim.api.nvim_create_buf(true, false)
+  registry.ensure_scope(parent)
+  registry.ensure_scope(child, parent)
+
+  local prev = registry.set_active_scope(parent)
+  registry.define({ name = "tool.parent_tool", kind = "tool", doc = "parent's",
+    source = [[return function() return "from-parent" end]] })
+  registry.set_active_scope(child)
+  local ok, err = pcall(function()
+    assert(registry.call("tool.parent_tool") == "from-parent",
+      "child should see the parent's session tools")
+    registry.define({ name = "tool.child_tool", kind = "tool", doc = "child's",
+      source = [[return function() return "from-child" end]] })
+  end)
+  registry.set_active_scope(parent)
+  local parent_sees_child = registry.get("tool.child_tool")
+  registry.set_active_scope(prev)
+  assert(ok, err)
+  assert(parent_sees_child == nil, "child definitions must not leak up to the parent")
+  assert(registry.get("tool.parent_tool") == nil, "parent's session tool leaked to global")
+end)
+
+case("define_default stays global even while a scope is active", function()
+  local buf = vim.api.nvim_create_buf(true, false)
+  local prev = registry.set_active_scope(buf)
+  local ok, err = pcall(function()
+    registry.define_default({ name = "tool.default_probe", kind = "tool", doc = "d",
+      source = [[return function() return "d" end]] })
+  end)
+  registry.set_active_scope(prev)
+  assert(ok, err)
+  local e = registry.get("tool.default_probe")
+  assert(e and e.scope == nil, "define_default should land in the global scope")
+end)
+
+case("BufWipeout drops the buffer's scope", function()
+  local buf = vim.api.nvim_create_buf(true, false)
+  local prev = registry.set_active_scope(buf)
+  registry.define({ name = "tool.doomed", kind = "tool", doc = "d",
+    source = [[return function() return "d" end]] })
+  registry.set_active_scope(prev)
+  assert(registry.scopes[buf], "scope should exist after a scoped define")
+  vim.cmd("bwipeout! " .. buf)
+  assert(registry.scopes[buf] == nil, "scope should be dropped on BufWipeout")
+end)
+
+-- -------------------------------------------------- registry_define the tool
+
+case("tool.registry_define defaults to session scope; scope='global' opts out", function()
+  local buf = vim.api.nvim_create_buf(true, false)
+  local prev = registry.set_active_scope(buf)
+  local ok, err = pcall(function()
+    local out = registry.call("tool.registry_define", {
+      name = "tool.rd_session", kind = "tool",
+      source = [[return function() return "s" end]],
+    }, { bufnr = buf })
+    assert(out:find("session scope", 1, true), "result should say session scope: " .. out)
+    out = registry.call("tool.registry_define", {
+      name = "tool.rd_global", kind = "tool", scope = "global",
+      source = [[return function() return "g" end]],
+    }, { bufnr = buf })
+    assert(out:find("global scope", 1, true), "result should say global scope: " .. out)
+  end)
+  registry.set_active_scope(prev)
+  assert(ok, err)
+  assert(registry.get("tool.rd_session") == nil, "session-scoped tool visible globally")
+  assert(registry.get("tool.rd_global") ~= nil, "scope='global' tool missing globally")
+end)
+
+-- --------------------------------------------------------- build_tools shaping
+
+case("build_tools honors the child tool filter and hides spawn at depth limit", function()
+  local buf = vim.api.nvim_create_buf(true, false)
+  registry.ensure_scope(buf)
+  vim.b[buf].straps_tool_filter = { "read_file", "grep" }
+  local prev = registry.set_active_scope(buf)
+  local ok, err = pcall(function()
+    local tools = registry.call("fn.build_tools")
+    local names = {}
+    for _, t in ipairs(tools) do names[#names + 1] = t.name end
+    table.sort(names)
+    assert(table.concat(names, ",") == "grep,read_file",
+      "filter not applied: " .. table.concat(names, ","))
+
+    vim.b[buf].straps_tool_filter = nil
+    vim.b[buf].straps_spawn_depth = 1
+    tools = registry.call("fn.build_tools")
+    for _, t in ipairs(tools) do
+      assert(t.name ~= "spawn", "spawn should be hidden at the depth limit")
+    end
+    assert(#tools > 10, "hiding spawn should not drop other tools")
+  end)
+  registry.set_active_scope(prev)
+  assert(ok, err)
+end)
+
+-- ------------------------------------------------------- loop-integrated scope
+
+case("an agent's mid-run registry_define is session-scoped end to end", function()
+  allow_all()
+  _G.straps_scope_calls = 0
+  define("fn.provider", "fn", "test: define a tool then finish", [==[
+return function(req, ctx)
+  _G.straps_scope_calls = _G.straps_scope_calls + 1
+  local n = _G.straps_scope_calls
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  if n == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "d1", name = "registry_define",
+        input = { name = "tool.run_temp", kind = "tool",
+          source = 'return function() return "temp-ran" end' } },
+    } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "defined it" } } }
+end
+]==])
+
+  local bufnr = state.new_session()
+  state.append_text(bufnr, "make a temp tool")
+  loop.start(bufnr)
+  wait_done(bufnr)
+
+  assert(buf_text(bufnr):find("session scope", 1, true),
+    "registry_define result should say session scope")
+  assert(registry.get("tool.run_temp") == nil, "mid-run define leaked to global")
+  local prev = registry.set_active_scope(bufnr)
+  local e = registry.get("tool.run_temp")
+  registry.set_active_scope(prev)
+  assert(e and e.scope == bufnr, "tool.run_temp missing from the session scope")
+end)
+
+-- ------------------------------------------------------------------- spawning
+
+case("spawn round trip: child session runs and its answer returns to the parent", function()
+  allow_all()
+  define("fn.provider", "fn", "test: parent spawns, child answers", [==[
+return function(req, ctx)
+  local first_user
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" then first_user = p.text; break end
+      end
+      break
+    end
+  end
+  local is_child = first_user and first_user:find("CHILD-TASK", 1, true)
+  -- Final text must be STREAMED via ctx.emit (like the real SSE provider);
+  -- the loop never copies returned text blocks into the buffer.
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      if is_child then
+        ctx.emit({ type = "text_delta", text = "CHILD-ANSWER-XYZ" })
+      elseif #req.messages > 1 then
+        ctx.emit({ type = "text_delta", text = "PARENT-DONE" })
+      end
+      resolve()
+    end, 5)
+  end)
+  if is_child then
+    return { stop_reason = "end_turn",
+      content = { { type = "text", text = "CHILD-ANSWER-XYZ" } } }
+  end
+  if #req.messages == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "s1", name = "spawn",
+        input = { task = "CHILD-TASK: report the magic string." } },
+    } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "PARENT-DONE" } } }
+end
+]==])
+
+  local parent = state.new_session()
+  state.append_text(parent, "please use a subagent")
+  loop.start(parent)
+  wait_done(parent)
+
+  local text = buf_text(parent)
+  assert(text:find("subagent finished", 1, true), "spawn result header missing:\n" .. text:sub(-400))
+  assert(text:find("CHILD-ANSWER-XYZ", 1, true), "child's answer missing from parent transcript")
+  assert(text:find("PARENT-DONE", 1, true), "parent did not continue after the spawn")
+
+  -- The child is a real session buffer, chained under the parent.
+  local child
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if b ~= parent and vim.api.nvim_buf_is_loaded(b)
+      and buf_text(b):find("CHILD-TASK", 1, true) then
+      child = b
+    end
+  end
+  assert(child, "child session buffer not found")
+  assert(registry.scopes[child] and registry.scopes[child].parent == parent,
+    "child scope should chain under the parent")
+  assert(vim.b[child].straps_spawn_depth == 1, "child depth not stamped")
+end)
+
+case("readonly child: writes are denied by the child-scope confirm", function()
+  allow_all() -- parent-side confirm allows spawn; the CHILD scope must deny
+  define("fn.provider", "fn", "test: readonly child tries to write", [==[
+return function(req, ctx)
+  local first_user
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" then first_user = p.text; break end
+      end
+      break
+    end
+  end
+  if not (first_user and first_user:find("RCHILD-TASK", 1, true)) then
+    error("unexpected non-child request in readonly test")
+  end
+  local final = #req.messages > 1
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      if final then ctx.emit({ type = "text_delta", text = "rchild-done" }) end
+      resolve()
+    end, 5)
+  end)
+  if not final then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "w1", name = "write_file",
+        input = { path = "/tmp/should-not-exist.txt", content = "nope" } },
+    } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "rchild-done" } } }
+end
+]==])
+
+  local parent = vim.api.nvim_create_buf(true, false)
+  local out = drive(function(ctx)
+    ctx.bufnr = parent
+    return registry.call("tool.spawn",
+      { task = "RCHILD-TASK: write a file.", readonly = true }, ctx)
+  end)
+  assert(out:find("rchild-done", 1, true), "child did not finish: " .. out)
+
+  local child
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and buf_text(b):find("RCHILD-TASK", 1, true)
+      and vim.b[b].straps_session then
+      child = b
+    end
+  end
+  assert(child, "readonly child buffer not found")
+  local ctext = buf_text(child)
+  assert(ctext:find("readonly subagent: write_file is not allowed", 1, true),
+    "write should be denied by the child-scope confirm:\n" .. ctext:sub(-400))
+  assert(vim.fn.filereadable("/tmp/should-not-exist.txt") == 0, "denied write happened anyway")
+end)
+
+case("spawn depth guard refuses a child spawning a grandchild", function()
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.b[buf].straps_spawn_depth = 1
+  local out = drive(function(ctx)
+    ctx.bufnr = buf
+    return registry.call("tool.spawn", { task = "grandchild task" }, ctx)
+  end)
+  assert(out:find("refused", 1, true) and out:find("depth", 1, true),
+    "depth guard did not trip: " .. out)
+end)
+
+case("two concurrent runs keep their session scopes isolated", function()
+  allow_all()
+  define("fn.provider", "fn", "test: two interleaved sessions defining tools", [==[
+return function(req, ctx)
+  local first_user
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" then first_user = p.text; break end
+      end
+      break
+    end
+  end
+  local tag = first_user:match("SESS%-(%u)")
+  -- Different delays force the two runs' awaits to interleave.
+  local delay = tag == "A" and 40 or 15
+  local final = #req.messages > 1
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      if final then ctx.emit({ type = "text_delta", text = tag .. "-DONE" }) end
+      resolve()
+    end, delay)
+  end)
+  if not final then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "d" .. tag, name = "registry_define",
+        input = { name = "tool.conc_" .. tag:lower(), kind = "tool",
+          source = 'return function() return "conc" end' } },
+    } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = tag .. "-DONE" } } }
+end
+]==])
+
+  local a = state.new_session()
+  local b = state.new_session()
+  state.append_text(a, "SESS-A define your tool")
+  state.append_text(b, "SESS-B define your tool")
+  loop.start(a)
+  loop.start(b)
+  wait_done(a)
+  wait_done(b)
+
+  assert(buf_text(a):find("A-DONE", 1, true), "session A did not finish")
+  assert(buf_text(b):find("B-DONE", 1, true), "session B did not finish")
+  assert(registry.get("tool.conc_a") == nil and registry.get("tool.conc_b") == nil,
+    "concurrent runs leaked defines to global")
+
+  local prev = registry.set_active_scope(a)
+  local a_own, a_cross = registry.get("tool.conc_a"), registry.get("tool.conc_b")
+  registry.set_active_scope(b)
+  local b_own, b_cross = registry.get("tool.conc_b"), registry.get("tool.conc_a")
+  registry.set_active_scope(prev)
+  assert(a_own and a_own.scope == a, "session A missing its own tool")
+  assert(b_own and b_own.scope == b, "session B missing its own tool")
+  assert(a_cross == nil and b_cross == nil,
+    "interleaved resumes cross-contaminated the scopes")
+end)
+
+case("a crashing child's error comes back to the parent, no hang", function()
+  allow_all()
+  define("fn.provider", "fn", "test: child provider explodes", [==[
+return function(req, ctx)
+  local first_user
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" then first_user = p.text; break end
+      end
+      break
+    end
+  end
+  if first_user and first_user:find("CRASH-TASK", 1, true) then
+    error("child exploded spectacularly")
+  end
+  error("unexpected non-child request in crash test")
+end
+]==])
+  local parent = vim.api.nvim_create_buf(true, false)
+  local out = drive(function(ctx)
+    ctx.bufnr = parent
+    return registry.call("tool.spawn", { task = "CRASH-TASK: boom" }, ctx)
+  end)
+  assert(out:find("subagent finished", 1, true), "spawn should return, not hang: " .. out)
+  assert(out:find("child exploded spectacularly", 1, true),
+    "child's error should surface in the parent's result: " .. out)
+end)
+
+case("a hanging child hits the spawn timeout and is stopped", function()
+  allow_all()
+  define("fn.provider", "fn", "test: child hangs until cancelled", [==[
+return function(req, ctx)
+  ctx.await(function(resolve)
+    ctx.on_cancel(function() resolve() end)
+    -- never resolves on its own
+  end)
+  return { content = {}, stop_reason = "cancelled" }
+end
+]==])
+  local parent = vim.api.nvim_create_buf(true, false)
+  local t0 = vim.uv.hrtime()
+  local out = drive(function(ctx)
+    ctx.bufnr = parent
+    return registry.call("tool.spawn",
+      { task = "HANG-TASK: never answer", timeout_ms = 400 }, ctx)
+  end)
+  local ms = (vim.uv.hrtime() - t0) / 1e6
+  assert(out:find("subagent timed out (stopped)", 1, true), "timeout header missing: " .. out)
+  assert(ms < 5000, "spawn timeout too slow: " .. math.floor(ms) .. "ms")
+end)
+
+case("cancelling the parent stops a spawned child mid-flight", function()
+  allow_all()
+  _G.straps_hang_child = nil
+  define("fn.provider", "fn", "test: parent spawns a hanging child", [==[
+return function(req, ctx)
+  local first_user
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" then first_user = p.text; break end
+      end
+      break
+    end
+  end
+  if first_user and first_user:find("HANG2-TASK", 1, true) then
+    _G.straps_hang_child = ctx.bufnr
+    ctx.await(function(resolve)
+      ctx.on_cancel(function() resolve() end)
+    end)
+    return { content = {}, stop_reason = "cancelled" }
+  end
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  if #req.messages == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "s9", name = "spawn",
+        input = { task = "HANG2-TASK: hang forever" } },
+    } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "unreachable" } } }
+end
+]==])
+
+  local parent = state.new_session()
+  state.append_text(parent, "spawn something that hangs")
+  loop.start(parent)
+  assert(vim.wait(8000, function() return _G.straps_hang_child ~= nil end, 20),
+    "child never started")
+  local child = _G.straps_hang_child
+  assert(loop.running(child), "child should be mid-run")
+
+  loop.stop(parent)
+  wait_done(parent)
+  assert(vim.wait(4000, function() return not loop.running(child) end, 20),
+    "cancelling the parent did not stop the child")
+  assert(buf_text(parent):find("[straps: run cancelled]", 1, true),
+    "parent missing its cancellation note")
+end)
+
+case("a hand-mangled transcript (deleted tool_result) fails loudly, not forever", function()
+  allow_all()
+  -- Simulate the real API's rejection of an unpaired tool_use: the scripted
+  -- provider validates pairing like the server would and raises.
+  define("fn.provider", "fn", "test: rejects unpaired tool_use like the API", [==[
+return function(req, ctx)
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  for i, m in ipairs(req.messages) do
+    if m.role == "assistant" then
+      for _, p in ipairs(m.content) do
+        if p.type == "tool_use" then
+          local nxt = req.messages[i + 1]
+          local paired = false
+          if nxt and nxt.role == "user" then
+            for _, q in ipairs(nxt.content) do
+              if q.type == "tool_result" and q.tool_use_id == p.id then paired = true end
+            end
+          end
+          if not paired then
+            error("simulated API 400: unpaired tool_use " .. tostring(p.id))
+          end
+        end
+      end
+    end
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "clean" } } }
+end
+]==])
+
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "please run a tool")
+  state.append(bufnr, "assistant", nil, "running it")
+  state.append(bufnr, "tool_use", { id = "t9", name = "ping" }, "{}")
+  -- ...and the user hand-deleted the tool_result block. Send another message.
+  state.append(bufnr, "user", nil, "and now continue")
+
+  loop.start(bufnr)
+  wait_done(bufnr)
+
+  local text = buf_text(bufnr)
+  assert(text:find("run error", 1, true), "mangled transcript should end in a visible run error")
+  assert(text:find("unpaired tool_use t9", 1, true),
+    "the API-style explanation should reach the transcript")
+  assert(not loop.running(bufnr), "run must end, not spin")
+  -- The buffer stays usable: a trailing user marker is restored.
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local last_marker
+  for i = #lines, 1, -1 do
+    if lines[i]:find("%%[straps:", 1, true) == 1 then last_marker = lines[i]; break end
+  end
+  assert(last_marker and last_marker:find("user", 1, true),
+    "no trailing user block after the failure")
+end)
+
+case("per-buffer max_turns override bounds a run", function()
+  allow_all()
+  define("tool.ping", "tool", "ping", [[return function() return "pong" end]])
+  _G.straps_scope_calls = 0
+  define("fn.provider", "fn", "test: tools forever", [==[
+return function(req, ctx)
+  _G.straps_scope_calls = _G.straps_scope_calls + 1
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  return { stop_reason = "tool_use", content = {
+    { type = "tool_use", id = "p" .. _G.straps_scope_calls, name = "ping",
+      input = vim.empty_dict() },
+  } }
+end
+]==])
+  local bufnr = state.new_session()
+  vim.b[bufnr].straps_max_turns = 2
+  state.append_text(bufnr, "ping forever")
+  loop.start(bufnr)
+  wait_done(bufnr)
+  assert(_G.straps_scope_calls == 2,
+    "provider called " .. _G.straps_scope_calls .. " times, want 2 (vim.b override)")
+  assert(buf_text(bufnr):find("stopped after 2 turns", 1, true), "exhaustion note missing")
+end)
+
+print(failed and "FAILED" or "ALL PASS")
+os.exit(failed and 1 or 0)

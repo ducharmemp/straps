@@ -1,0 +1,331 @@
+-- Full-stack integration test: real setup() (provider, tools, hooks, ui),
+-- then fn.provider and hook.confirm are REDEFINED at runtime — which is
+-- itself the architecture under test — and a scripted 3-turn session runs
+-- the canonical self-extension scenario:
+--   turn 1: agent redefines hook.after_write (auto-lint) and defines a new
+--           tool ("shout") via registry_define
+--   turn 2: agent calls write_file (linter hook must fire) and shout
+--           (new tool must be callable one turn after its definition)
+--   turn 3: agent streams final text
+-- Run: nvim --headless -l tests/run_integration.lua
+
+local here = debug.getinfo(1, "S").source:sub(2)
+local root = vim.fn.fnamemodify(here, ":h:h")
+vim.opt.rtp:prepend(root)
+package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
+
+local failed = false
+local function case(name, fn)
+  local ok, err = pcall(fn)
+  if ok then
+    print("PASS  " .. name)
+  else
+    failed = true
+    print("FAIL  " .. name .. ": " .. tostring(err))
+  end
+end
+
+local straps = require("straps").setup({ max_turns = 8 })
+-- Hermetic: durable sessions write under a throwaway dir, never the real data dir.
+straps.config.session_dir = vim.fn.tempname()
+local registry = require("straps.registry")
+local state = require("straps.state")
+local loop = require("straps.loop")
+
+local tmp = vim.fn.tempname()
+vim.fn.mkdir(tmp, "p")
+local demo_path = tmp .. "/demo.txt"
+
+case("setup registers provider, tools, hooks", function()
+  for _, name in ipairs({
+    "fn.provider", "fn.build_tools", "fn.system_prompt", "fn.api_key",
+    "tool.write_file", "tool.registry_define", "hook.confirm", "hook.after_write",
+  }) do
+    assert(registry.get(name), "missing " .. name)
+  end
+end)
+
+-- Runtime redefinitions (no network, no confirm dialogs in headless).
+registry.define({
+  name = "hook.confirm",
+  kind = "hook",
+  doc = "test: allow everything",
+  source = [[return function() return true end]],
+})
+
+_G.__it = { turn = 0, tools_seen = {}, last_roles = {} }
+_G.__it_demo_path = demo_path
+
+registry.define({
+  name = "fn.provider",
+  kind = "fn",
+  doc = "test: scripted 3-turn provider",
+  source = [==[
+-- Async like the real provider: suspend in ctx.await, emit deltas from a
+-- callback context, resolve with the final response.
+return function(req, ctx)
+  local it = _G.__it
+  it.turn = it.turn + 1
+  it.tools_seen[it.turn] = vim.tbl_map(function(t) return t.name end, req.tools)
+  it.last_roles[it.turn] = #req.messages > 0 and req.messages[#req.messages].role or "?"
+  local function respond(resp)
+    return ctx.await(function(resolve)
+      vim.defer_fn(function()
+        if resp.content[1] and resp.content[1].type == "text" then
+          ctx.emit({ type = "text_delta", text = resp.content[1].text })
+        end
+        resolve(resp)
+      end, 5)
+    end)
+  end
+  if it.turn == 1 then
+    return respond({
+      stop_reason = "tool_use",
+      content = {
+        { type = "tool_use", id = "t1", name = "registry_define", input = {
+            name = "hook.after_write", kind = "hook",
+            doc = "auto-lint after every write",
+            source = 'return function(path, ctx) return "LINT " .. path .. ": ok" end',
+        } },
+        { type = "tool_use", id = "t2", name = "registry_define", input = {
+            name = "tool.shout", kind = "tool",
+            doc = "Uppercase some text.",
+            input_schema = '{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}',
+            source = 'return function(input) return string.upper(input.text) end',
+        } },
+      },
+    })
+  elseif it.turn == 2 then
+    return respond({
+      stop_reason = "tool_use",
+      content = {
+        { type = "tool_use", id = "t3", name = "write_file",
+          input = { path = _G.__it_demo_path, content = "hello from straps\n" } },
+        { type = "tool_use", id = "t4", name = "shout", input = { text = "it works" } },
+      },
+    })
+  end
+  return respond({ stop_reason = "end_turn", content = { { type = "text", text = "done: linting is now automatic" } } })
+end
+]==],
+})
+
+local bufnr = state.new_session()
+state.append(bufnr, "user", nil, "from now on, lint every file you write; then write demo.txt")
+
+loop.start(bufnr)
+vim.wait(10000, function()
+  return not loop.running(bufnr)
+end, 10)
+
+local text = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+
+case("run completed", function()
+  assert(not loop.running(bufnr), "loop still running")
+  assert(_G.__it.turn == 3, "expected 3 provider turns, got " .. _G.__it.turn)
+end)
+
+case("hook.after_write redefinition is SESSION-scoped: chain sees v2, global stays v1", function()
+  -- The agent's registry_define during the run lands in the session scope.
+  local g = assert(registry.get("hook.after_write"))
+  assert(g.version == 1, "global entry should be untouched, version = " .. tostring(g.version))
+  assert(g.scope == nil, "global entry should have no scope")
+  local prev = registry.set_active_scope(bufnr)
+  local ok, e = pcall(registry.get, "hook.after_write")
+  registry.set_active_scope(prev)
+  assert(ok and e, "session-scoped entry missing")
+  assert(e.version == 2, "session-scoped version = " .. tostring(e.version))
+  assert(e.doc:find("auto%-lint"), "doc not updated")
+  assert(e.scope == bufnr, "entry should record its owning scope")
+end)
+
+case("new tool is in the tool list on the following turn", function()
+  assert(not vim.tbl_contains(_G.__it.tools_seen[1], "shout"), "shout leaked into turn 1")
+  assert(vim.tbl_contains(_G.__it.tools_seen[2], "shout"), "shout missing in turn 2")
+end)
+
+case("write_file wrote the file and the linter hook fired into its result", function()
+  assert(vim.fn.filereadable(demo_path) == 1, "file not written")
+  assert(table.concat(vim.fn.readfile(demo_path), "\n") == "hello from straps")
+  assert(text:find("LINT " .. demo_path .. ": ok", 1, true), "linter output not in tool_result")
+end)
+
+case("agent-defined tool executed", function()
+  assert(text:find("IT WORKS", 1, true), "shout result missing")
+end)
+
+case("final assistant text streamed into the buffer", function()
+  assert(text:find("done: linting is now automatic", 1, true))
+end)
+
+case("transcript still parses; messages stay API-valid", function()
+  local parsed = state.parse(bufnr)
+  assert(parsed.system and #parsed.system > 0, "system prompt missing")
+  assert(#parsed.messages >= 5, "too few messages: " .. #parsed.messages)
+  for i = 2, #parsed.messages do
+    assert(parsed.messages[i].role ~= parsed.messages[i - 1].role, "roles not alternating at " .. i)
+  end
+  for t = 2, 3 do
+    assert(_G.__it.last_roles[t] == "user", "provider turn " .. t .. " did not end on a user message")
+  end
+  assert(state.last_user_text(bufnr) == nil or state.last_user_text(bufnr) == "",
+    "trailing user prompt block should be empty")
+end)
+
+case("session buffer is buffer-state", function()
+  assert(vim.b[bufnr].straps_session == true)
+  assert(vim.b[bufnr].straps_status == "idle")
+end)
+
+case("config merge applied", function()
+  assert(straps.config.max_turns == 8)
+  assert(straps.config.model == "claude-sonnet-5")
+end)
+
+-- Picker tests: stub ui.pick (the snacks/vim.ui.select seam) so these run
+-- headless and deterministically, rather than exercising the real backend.
+do
+  local ui = require("straps.ui")
+  local real_pick = ui.pick
+
+  local function with_stub(choice, fn)
+    ui.pick = function(items, opts, on_choice)
+      on_choice(choice)
+    end
+    local ok, err = pcall(fn)
+    ui.pick = real_pick
+    if not ok then
+      error(err, 0)
+    end
+  end
+
+  case("pick_model sets config.model from a picked entry", function()
+    with_stub({ id = "claude-opus-4-8", label = "Opus 4.8" }, function()
+      ui.pick_model()
+    end)
+    assert(straps.config.model == "claude-opus-4-8",
+      "config.model is " .. tostring(straps.config.model))
+  end)
+
+  case("pick_model cancel (nil choice) leaves config.model untouched", function()
+    straps.config.model = "claude-sonnet-5"
+    with_stub(nil, function()
+      ui.pick_model()
+    end)
+    assert(straps.config.model == "claude-sonnet-5",
+      "cancel should not change config.model, got " .. tostring(straps.config.model))
+  end)
+
+  case("pick_effort sets config.effort from a picked entry", function()
+    with_stub({ name = "high", level = "high", budget_tokens = 24000 }, function()
+      ui.pick_effort()
+    end)
+    assert(straps.config.effort == "high", "config.effort is " .. tostring(straps.config.effort))
+  end)
+
+  straps.config.model = "claude-sonnet-5"
+  straps.config.effort = "off"
+end
+
+case("default progress hook cleaned up its extmarks", function()
+  -- setup() registered the real hook.on_progress default, so the run above
+  -- exercised the ui mechanism; done must have torn the indicator down.
+  local ns = vim.api.nvim_create_namespace("straps_progress")
+  local marks = vim.api.nvim_buf_get_extmarks(bufnr, ns, 0, -1, {})
+  assert(#marks == 0, "leftover progress extmarks: " .. #marks)
+end)
+
+-- ui.open_session() is a single ordinary buffer now (no linked compose split):
+-- type directly under the trailing %%[straps:user]%% marker and press <CR>
+-- in normal mode. These cases drive the real keymap via nvim_feedkeys so the
+-- wiring under test is exactly what a person at the keyboard exercises.
+local ui = require("straps.ui")
+
+local function press_enter(bufnr)
+  local win = assert(vim.fn.win_findbuf(bufnr)[1], "session buffer has no window")
+  vim.api.nvim_set_current_win(win)
+  vim.api.nvim_win_set_cursor(win, { vim.api.nvim_buf_line_count(bufnr), 0 })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+end
+
+case("typing under the trailing user marker and <CR> starts a run", function()
+  local session = ui.open_session()
+  assert(vim.b[session].straps_session, "opened buffer isn't a session")
+
+  _G.__it.turn = 0 -- replay the scripted 3-turn provider
+  vim.api.nvim_buf_set_lines(session, -1, -1, false, { "line one of the ask", "line two of the ask" })
+  press_enter(session)
+
+  local t = table.concat(vim.api.nvim_buf_get_lines(session, 0, -1, false), "\n")
+  assert(t:find("%%[straps:user]%%\nline one of the ask\nline two of the ask", 1, true),
+    "typed text not present as a user block")
+
+  assert(vim.wait(10000, function() return not loop.running(session) end, 10),
+    "run did not finish")
+  assert(_G.__it.turn == 3, "expected 3 provider turns, got " .. _G.__it.turn)
+end)
+
+case("<CR> while a run is active prompts to steer instead of starting a second run", function()
+  _G.__steer = { calls = 0, mid_turn = false }
+  registry.define({
+    name = "fn.provider",
+    kind = "fn",
+    doc = "test: slow first turn so a mid-run <CR> lands as steering",
+    source = [==[
+return function(req, ctx)
+  local st = _G.__steer
+  st.calls = st.calls + 1
+  local n = st.calls
+  return ctx.await(function(resolve)
+    vim.defer_fn(function()
+      if n == 1 then
+        st.mid_turn = true -- the test presses <CR> again now
+        vim.defer_fn(function()
+          ctx.emit({ type = "text_delta", text = "slow first reply" })
+          resolve({ stop_reason = "end_turn",
+            content = { { type = "text", text = "slow first reply" } } })
+        end, 100)
+      else
+        ctx.emit({ type = "text_delta", text = "steered second reply" })
+        resolve({ stop_reason = "end_turn",
+          content = { { type = "text", text = "steered second reply" } } })
+      end
+    end, 5)
+  end)
+end
+]==],
+  })
+
+  local session = ui.open_session()
+  vim.api.nvim_buf_set_lines(session, -1, -1, false, { "first message" })
+  press_enter(session)
+  assert(loop.running(session), "run did not start from <CR>")
+
+  assert(vim.wait(2000, function() return _G.__steer.mid_turn end, 5),
+    "provider never reached mid-turn")
+  assert(loop.running(session), "run finished before the steering <CR>")
+
+  -- <CR> mid-run opens vim.ui.input({prompt="steer: "}); stub it.
+  local real_input = vim.ui.input
+  vim.ui.input = function(_, on_confirm) on_confirm("second message") end
+  press_enter(session)
+  vim.ui.input = real_input
+
+  assert(vim.wait(10000, function() return not loop.running(session) end, 10),
+    "run did not finish")
+  assert(_G.__steer.calls == 2,
+    "provider called " .. _G.__steer.calls .. " times, want 2 (steer at end_turn continues)")
+  local t = table.concat(vim.api.nvim_buf_get_lines(session, 0, -1, false), "\n")
+  local first = t:find("%%[straps:user]%%\nfirst message", 1, true)
+  local second = t:find("%%[straps:user]%%\nsecond message", 1, true)
+  assert(first, "first message missing as a user block")
+  assert(second and second > first, "steered message missing as a user block after the first")
+  assert(t:find("steered second reply", 1, true), "turn-2 output missing")
+end)
+
+if failed then
+  print("FAILED")
+  os.exit(1)
+end
+print("ALL PASS")
+os.exit(0)

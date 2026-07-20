@@ -266,6 +266,19 @@ local function run_turns(bufnr, ctx, run)
     if #parsed.messages == 0 then
       error("nothing to send — type your request under the trailing %%[straps:user]%% marker", 0)
     end
+    -- Newer models (including the default) reject a request that ends on an
+    -- assistant message — assistant prefill is unsupported — so fail here,
+    -- not with an opaque HTTP 400 after a round trip.
+    if parsed.messages[#parsed.messages].role ~= "user" then
+      if turn > 1 then
+        -- Mid-run an assistant-role tail means the finished turn appended no
+        -- user-role content for the model to answer.
+        error("the last turn added nothing to respond to — the model claimed"
+          .. ' stop_reason "tool_use" but requested no tools, or steering was blank', 0)
+      end
+      error("nothing to send — the transcript ends with an assistant message;"
+        .. " type your request under the trailing %%[straps:user]%% marker", 0)
+    end
     log(bufnr, { ev = "turn", turn = turn, messages = #parsed.messages })
     local tools = registry.call("fn.build_tools")
 

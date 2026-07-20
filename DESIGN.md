@@ -327,7 +327,9 @@ edit.
   queue; otherwise `loop.start(bufnr)`, which parses the buffer as-is — the
   trailing user block (or whatever the user left there) IS the message. An
   empty trailing block errors with a clear "nothing to send" message rather
-  than silently doing nothing.
+  than silently doing nothing — both when the conversation is empty and when
+  it would leave the transcript ending on an assistant message (newer models
+  reject a request ending on an assistant message — unsupported prefill).
 - Target resolution for `:StrapsSend`/`:StrapsSteer`/`:StrapsStop`: current
   buffer must be a session buffer (`vim.b.straps_session`); else polite error.
 

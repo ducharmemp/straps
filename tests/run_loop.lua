@@ -314,7 +314,10 @@ end
   assert(not text:find("should-not-appear", 1, true), "run continued past cancellation")
   assert(last_marker(bufnr):find("user", 1, true), "no trailing user block after cancel")
 
-  -- the buffer is reusable: a fresh run works after a cancelled one
+  -- the buffer is reusable: a fresh run works after a cancelled one. The
+  -- cancellation note is an assistant block, so the user must type a new
+  -- message first (a bare re-run fails the trailing-assistant guard).
+  state.append_text(bufnr, "try again")
   define("fn.provider", "fn", "test: immediate text", [==[
 return function(req, ctx)
   ctx.await(function(resolve)
@@ -343,6 +346,47 @@ return function() error("provider should not be reached for an empty conversatio
   local text = buf_text(bufnr)
   assert(text:find("nothing to send", 1, true), "missing friendly empty-conversation error")
   assert(not text:find("should not be reached", 1, true), "provider was called")
+end)
+
+case("trailing assistant message fails fast with a helpful message, no provider call", function()
+  define("fn.provider", "fn", "test: must not be called", [==[
+return function() error("provider should not be reached for a trailing assistant message") end
+]==])
+  local bufnr = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false,
+    { "%%[straps:system]%%", "sys", "", "%%[straps:user]%%", "hi", "",
+      "%%[straps:assistant]%%", "prior answer", "", "%%[straps:user]%%" })
+  loop.start(bufnr)
+  wait_done(bufnr)
+  local text = buf_text(bufnr)
+  assert(text:find("ends with an assistant message", 1, true),
+    "missing friendly trailing-assistant error")
+  assert(not text:find("should not be reached", 1, true), "provider was called")
+end)
+
+case("stop_reason tool_use with no tool blocks errors, not a resend or user-blaming message", function()
+  _G.straps_test_calls = 0
+  define("fn.provider", "fn", "test: claims tool_use but requests no tools", [==[
+return function(req, ctx)
+  _G.straps_test_calls = _G.straps_test_calls + 1
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      ctx.emit({ type = "text_delta", text = "let me look" })
+      resolve()
+    end, 5)
+  end)
+  return { stop_reason = "tool_use", content = { { type = "text", text = "let me look" } } }
+end
+]==])
+  local bufnr = new_session_with_prompt("go")
+  loop.start(bufnr)
+  wait_done(bufnr)
+  assert(_G.straps_test_calls == 1,
+    "provider called " .. _G.straps_test_calls .. " times, expected 1")
+  local text = buf_text(bufnr)
+  assert(text:find("requested no tools", 1, true), "missing malformed-turn error")
+  assert(not text:find("type your request", 1, true),
+    "mid-run failure misdiagnosed as an empty prompt")
 end)
 
 case("steering message is delivered on the next turn", function()

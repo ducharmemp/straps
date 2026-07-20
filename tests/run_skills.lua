@@ -34,8 +34,10 @@ local PROSE = "Release steps (found the hard way):\n"
 case("no skills: tool.skill lists nothing, prompt has no # Skills section", function()
   local out = registry.call("tool.skill", {}, {})
   assert(out == "no skills defined", "expected empty listing, got: " .. out)
+  -- The core prompt MENTIONS "# Skills" inline (self-extension section), so
+  -- assert on the section header at line start, not the bare substring.
   local prompt = registry.call("fn.system_prompt")
-  assert(not prompt:find("# Skills", 1, true), "prompt should omit # Skills when none exist")
+  assert(not prompt:find("\n# Skills\n", 1, true), "prompt should omit # Skills when none exist")
 end)
 
 case("registry_define accepts kind=skill with a prose (non-Lua) body", function()
@@ -67,7 +69,7 @@ end)
 
 case("skills appear in the # Skills prompt layer", function()
   local prompt = registry.call("fn.system_prompt")
-  assert(prompt:find("# Skills", 1, true), "prompt missing # Skills section")
+  assert(prompt:find("\n# Skills\n", 1, true), "prompt missing # Skills section")
   assert(prompt:find("- skill.release_process: Load before cutting a release.", 1, true),
     "prompt missing the skill line")
 end)

@@ -367,6 +367,33 @@ require("straps.registry").define{
 }
 ```
 
+## Skills — knowledge, not capability
+
+A fourth entry kind, `skill.NAME`, stores prose instead of code: `source`
+is the text itself (no Lua), `doc` is a one-line load trigger. An
+extension — a tool, hook or fn — is capability: the agent defines one when
+it needs to become more capable at doing something. A skill is knowledge:
+it defines one when it learned something worth knowing next time — a
+procedure discovered the hard way, an API whose real behavior contradicts
+its docs.
+
+Skills cost one listing line each in the system prompt (a `# Skills`
+section, present only when skills exist); the body loads on demand via the
+`skill` tool. They follow the same lifecycle as every other entry:
+session-scoped by default, persisted by appending their `registry_get`
+rendering to `.straps.lua`.
+
+```lua
+require("straps.registry").define{
+  name = "skill.release_process",
+  kind = "skill",
+  doc = "Load before cutting a release.",
+  source = [[1. bump the rockspec version FIRST (make dist reads it)
+2. run `make dist` — plain make skips the manifest
+3. tag only after CI is green: `git tag vX.Y.Z && git push --tags`]],
+}
+```
+
 ## Picking model and effort
 
 `:StrapsModel` and `:StrapsEffort` open a picker (uses `snacks.nvim`'s

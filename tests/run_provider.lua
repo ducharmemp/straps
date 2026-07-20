@@ -38,6 +38,9 @@ vim.fn.mkdir(tmp .. "/stalling", "p")
 local real_path = vim.env.PATH
 
 local function write_exec(path, text)
+  -- Sandboxed builds (nix flake check) have no /usr/bin/env; point the
+  -- shebang at the bash actually on PATH instead.
+  text = text:gsub("^#!/usr/bin/env bash", "#!" .. vim.fn.exepath("bash"), 1)
   local f = assert(io.open(path, "w"))
   f:write(text)
   f:close()

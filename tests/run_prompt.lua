@@ -160,13 +160,21 @@ case("core layer carries the self-extension triggers and .straps.lua persistence
 end)
 
 -- ----------------------------------------------------------------- env VCS
-case("env layer reports version control from the straps repo root", function()
-  cd(root)
+-- Runs in a freshly init'd repo, not the straps checkout: a flake/tarball
+-- copy of this source tree has no .git, so the checkout is not a reliable
+-- fixture.
+case("env layer reports version control from a git repo root", function()
+  if vim.fn.executable("git") == 0 then
+    return -- no git, nothing to detect
+  end
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  vim.fn.system({ "git", "init", "-q", dir })
+  cd(dir)
   local ok, err = pcall(function()
     local env = registry.call("fn.system_prompt_env")
     assert(env:find("vcs: ", 1, true), "vcs line missing:\n" .. env)
-    assert(env:find("jj", 1, true) or env:find("git", 1, true),
-      "vcs line should mention jj or git:\n" .. env)
+    assert(env:find("git", 1, true), "vcs line should mention git:\n" .. env)
   end)
   cd(orig_cwd)
   assert(ok, err)

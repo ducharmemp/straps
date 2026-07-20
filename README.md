@@ -23,7 +23,9 @@ Three invariants:
 
 - Neovim >= 0.11
 - `curl` on PATH
-- `ANTHROPIC_API_KEY` in the environment
+- An Anthropic API key: `ANTHROPIC_API_KEY` in the environment, or written to
+  `$XDG_CONFIG_HOME/straps/api_key` (`~/.config/straps/api_key` by default;
+  the file must not be accessible by group/other — `chmod 600` it)
 
 No other dependencies. No plenary.
 
@@ -547,8 +549,10 @@ local url = "https://my-proxy.internal/v1/messages"
 ```
 
 The next provider call — even the next turn of a run already in progress —
-uses the new definition. `fn.api_key` is likewise an entry; redefine it if
-your key comes from somewhere other than `$ANTHROPIC_API_KEY`.
+uses the new definition. `fn.api_key` is likewise an entry; the default tries
+`$ANTHROPIC_API_KEY`, then `$XDG_CONFIG_HOME/straps/api_key`
+(`~/.config/straps/api_key` by default, refused unless it is `chmod 600`) —
+redefine it if your key comes from somewhere else.
 
 ## Builtin tools
 

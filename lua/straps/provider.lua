@@ -10,11 +10,38 @@ local M = {}
 local API_KEY_SRC = [==[
 return function()
   local key = vim.env.ANTHROPIC_API_KEY
-  if not key or key == "" then
-    error("straps: ANTHROPIC_API_KEY is not set. Export it in your shell, "
-      .. "or redefine fn.api_key to fetch the key from somewhere else.")
+  if key and key ~= "" then
+    return key
   end
-  return key
+  local config_home = vim.env.XDG_CONFIG_HOME
+  if not config_home or config_home == "" then
+    local home = vim.env.HOME
+    config_home = (home and home ~= "") and (home .. "/.config") or nil
+  end
+  local path = config_home and (config_home .. "/straps/api_key")
+  local st = path and vim.uv.fs_stat(path)
+  if st and st.type == "file" then
+    -- Refuse a key file that group/other can access (the low six mode
+    -- bits), the way ssh treats private keys.
+    if st.mode % 64 ~= 0 then
+      error(("straps: %s is accessible by group/other (mode %03o); "
+        .. "run chmod 600 on it."):format(path, st.mode % 4096))
+    end
+    local f, open_err = io.open(path, "r")
+    if not f then
+      error("straps: " .. path .. " exists but could not be read ("
+        .. tostring(open_err) .. ").")
+    end
+    key = f:read("*l")
+    f:close()
+    key = key and vim.trim(key) or ""
+    if key ~= "" then
+      return key
+    end
+  end
+  error("straps: no API key found. Export ANTHROPIC_API_KEY in your shell, "
+    .. "write the key to " .. (path or "$XDG_CONFIG_HOME/straps/api_key")
+    .. ", or redefine fn.api_key to fetch the key from somewhere else.")
 end
 ]==]
 
@@ -1106,7 +1133,7 @@ function M.register()
   define({
     name = "fn.api_key",
     kind = "fn",
-    doc = "Return the Anthropic API key (default: $ANTHROPIC_API_KEY).",
+    doc = "Return the Anthropic API key (default: $ANTHROPIC_API_KEY, then $XDG_CONFIG_HOME/straps/api_key; the file must be chmod 600).",
     source = API_KEY_SRC,
   })
   define({

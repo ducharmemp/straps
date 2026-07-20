@@ -381,7 +381,11 @@ edit.
 
 - POST `https://api.anthropic.com/v1/messages` with headers `x-api-key`
   (from `registry.call("fn.api_key")`, default entry reads
-  `vim.env.ANTHROPIC_API_KEY`, error with clear message if unset),
+  `vim.env.ANTHROPIC_API_KEY`, falling back to the first line of
+  `$XDG_CONFIG_HOME/straps/api_key` — `~/.config/straps/api_key` when
+  `XDG_CONFIG_HOME` is unset — refusing a group/other-accessible key file,
+  distinct error for a present-but-unreadable file, error with clear message
+  if neither source yields a key),
   `anthropic-version: 2023-06-01`, `content-type: application/json`.
 - Body: `{ model=config.model, max_tokens=config.max_tokens, stream=true,
   system=req.system (omit if nil), messages=req.messages, tools=req.tools (omit if empty) }`.

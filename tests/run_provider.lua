@@ -606,6 +606,104 @@ registry.remove("tool.echo_tag")
 vim.env.PATH = real_path
 straps.config.base_url = nil
 
+-- --------------------------------------------------------------- fn.api_key
+-- Sourcing order: $ANTHROPIC_API_KEY first, then the first line of
+-- $XDG_CONFIG_HOME/straps/api_key, else a readable error naming both.
+local saved_key = vim.env.ANTHROPIC_API_KEY
+local saved_xdg = vim.env.XDG_CONFIG_HOME
+local keydir = vim.fn.tempname()
+vim.fn.mkdir(keydir .. "/straps", "p")
+vim.env.XDG_CONFIG_HOME = keydir
+
+-- The file fallback refuses group/other-accessible key files, and writefile's
+-- mode depends on the umask — pin every key file the tests expect to be read.
+local function write_key_file(kf, lines)
+  vim.fn.writefile(lines, kf)
+  vim.fn.setfperm(kf, "rw-------")
+end
+
+case("fn.api_key: env var wins over the config file", function()
+  write_key_file(keydir .. "/straps/api_key", { "file-key" })
+  vim.env.ANTHROPIC_API_KEY = "env-key"
+  assert(registry.call("fn.api_key") == "env-key", "env var should take precedence over the file")
+end)
+
+case("fn.api_key: falls back to $XDG_CONFIG_HOME/straps/api_key, trimmed", function()
+  write_key_file(keydir .. "/straps/api_key", { "  file-key  " })
+  vim.env.ANTHROPIC_API_KEY = nil
+  local got = registry.call("fn.api_key")
+  assert(got == "file-key", "file fallback wrong: " .. vim.inspect(got))
+end)
+
+case("fn.api_key: a group/other-accessible key file is refused", function()
+  local kf = keydir .. "/straps/api_key"
+  vim.fn.writefile({ "leaky-key" }, kf)
+  vim.fn.setfperm(kf, "rw-r--r--")
+  vim.env.ANTHROPIC_API_KEY = nil
+  local ok, err = pcall(registry.call, "fn.api_key")
+  assert(not ok, "expected an error for a group-readable key file")
+  assert(tostring(err):find("chmod 600", 1, true), "error should say how to fix it: " .. tostring(err))
+  assert(not tostring(err):find("leaky-key", 1, true), "the key itself must not appear in the error")
+end)
+
+case("fn.api_key: an unreadable key file gets its own error, not the generic one", function()
+  local kf = keydir .. "/straps/api_key"
+  vim.fn.writefile({ "unreachable-key" }, kf)
+  vim.fn.setfperm(kf, "---------")
+  vim.env.ANTHROPIC_API_KEY = nil
+  local ok, err = pcall(registry.call, "fn.api_key")
+  vim.fn.setfperm(kf, "rw-------") -- so later cases can delete/rewrite it
+  assert(not ok, "expected an error for an unreadable key file")
+  assert(tostring(err):find("could not be read", 1, true),
+    "unreadable file should not fall through to the generic error: " .. tostring(err))
+end)
+
+case("fn.api_key: a present-but-blank key file still errors", function()
+  write_key_file(keydir .. "/straps/api_key", { "   " })
+  vim.env.ANTHROPIC_API_KEY = nil
+  local ok, err = pcall(registry.call, "fn.api_key")
+  assert(not ok, "expected an error for a whitespace-only key file")
+  assert(tostring(err):find("no API key found", 1, true), "wrong error: " .. tostring(err))
+end)
+
+case("fn.api_key: no env var and no file errors naming the file path", function()
+  vim.fn.delete(keydir .. "/straps/api_key")
+  vim.env.ANTHROPIC_API_KEY = nil
+  local ok, err = pcall(registry.call, "fn.api_key")
+  assert(not ok, "expected an error when no key source is available")
+  assert(tostring(err):find(keydir .. "/straps/api_key", 1, true),
+    "error should name the fallback file path: " .. tostring(err))
+end)
+
+case("fn.api_key: falls back to $HOME/.config when XDG_CONFIG_HOME is unset", function()
+  vim.fn.mkdir(keydir .. "/.config/straps", "p")
+  write_key_file(keydir .. "/.config/straps/api_key", { "home-key" })
+  local saved_home = vim.env.HOME
+  vim.env.XDG_CONFIG_HOME = nil
+  vim.env.HOME = keydir
+  vim.env.ANTHROPIC_API_KEY = nil
+  local ok, got = pcall(registry.call, "fn.api_key")
+  vim.env.HOME = saved_home
+  vim.env.XDG_CONFIG_HOME = keydir
+  assert(ok and got == "home-key", "HOME fallback wrong: " .. vim.inspect(got))
+end)
+
+case("fn.api_key: XDG_CONFIG_HOME and HOME both unset errors with the generic path", function()
+  local saved_home = vim.env.HOME
+  vim.env.XDG_CONFIG_HOME = nil
+  vim.env.HOME = nil
+  vim.env.ANTHROPIC_API_KEY = nil
+  local ok, err = pcall(registry.call, "fn.api_key")
+  vim.env.HOME = saved_home
+  vim.env.XDG_CONFIG_HOME = keydir
+  assert(not ok, "expected an error with no key source at all")
+  assert(tostring(err):find("$XDG_CONFIG_HOME/straps/api_key", 1, true),
+    "error should show the generic path: " .. tostring(err))
+end)
+
+vim.env.ANTHROPIC_API_KEY = saved_key
+vim.env.XDG_CONFIG_HOME = saved_xdg
+
 if failed then
   print("FAILED")
   os.exit(1)

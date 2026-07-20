@@ -202,7 +202,7 @@ end)
 
 -- ------------------------------------------------------------- run_in_terminal
 
-case("run_in_terminal streams through a real terminal split and returns output", function()
+case("run_in_terminal streams output and closes the split on success", function()
   local wins_before = #vim.api.nvim_list_wins()
   local out = drive(function(ctx)
     return registry.call("tool.run_in_terminal",
@@ -210,21 +210,25 @@ case("run_in_terminal streams through a real terminal split and returns output",
   end, 15000)
   assert(out:find("exit code: 0", 1, true), "exit code missing:\n" .. out:sub(1, 200))
   assert(out:find("STRAPS-TERM-OK", 1, true), "output missing:\n" .. out:sub(1, 400))
-  assert(out:find("terminal split left open", 1, true), "left-open note missing")
-  assert(#vim.api.nvim_list_wins() == wins_before + 1,
-    "terminal split should still be open")
-  vim.cmd("only") -- normalize windows for later cases
+  assert(out:find("terminal split closed", 1, true), "closed note missing:\n" .. out:sub(1, 400))
+  assert(#vim.api.nvim_list_wins() == wins_before,
+    "terminal split should be closed after a successful command")
 end)
 
-case("run_in_terminal reports a nonzero exit code", function()
+case("run_in_terminal reports a nonzero exit code and leaves the split open", function()
+  local wins_before = #vim.api.nvim_list_wins()
   local out = drive(function(ctx)
     return registry.call("tool.run_in_terminal", { command = "exit 3" }, ctx)
   end, 15000)
   assert(out:find("exit code: 3", 1, true), "expected exit code 3:\n" .. out:sub(1, 200))
-  vim.cmd("only")
+  assert(out:find("terminal split left open", 1, true), "left-open note missing")
+  assert(#vim.api.nvim_list_wins() == wins_before + 1,
+    "terminal split should stay open after a failing command")
+  vim.cmd("only") -- normalize windows for later cases
 end)
 
 case("run_in_terminal stops a job that exceeds timeout_ms", function()
+  local wins_before = #vim.api.nvim_list_wins()
   local t0 = vim.uv.hrtime()
   local out = drive(function(ctx)
     return registry.call("tool.run_in_terminal",
@@ -234,6 +238,9 @@ case("run_in_terminal stops a job that exceeds timeout_ms", function()
   assert(out:find("stopped: exceeded timeout of 400 ms", 1, true),
     "timeout note missing:\n" .. out:sub(1, 200))
   assert(ms < 5000, "timeout did not stop the job promptly: " .. math.floor(ms) .. "ms")
+  assert(out:find("terminal split left open", 1, true), "left-open note missing")
+  assert(#vim.api.nvim_list_wins() == wins_before + 1,
+    "terminal split should stay open after a timeout")
   vim.cmd("only")
 end)
 
@@ -255,6 +262,32 @@ case("run_in_terminal is killed by cancellation", function()
   assert(out:find("exit code:", 1, true), "cancelled job should still report its exit")
   assert(ms < 5000, "cancel did not stop the job promptly: " .. math.floor(ms) .. "ms")
   vim.cmd("only")
+end)
+
+case("run_in_terminal cleans up the split when the job cannot start", function()
+  -- An extra window, with focus kept in it: with only two windows, closing
+  -- the terminal split would land focus back on the right window by accident,
+  -- so an explicit focus restore would be indistinguishable from luck.
+  vim.cmd("new")
+  local wins_before = #vim.api.nvim_list_wins()
+  local win_before = vim.api.nvim_get_current_win()
+  -- Force the start-failure path: both job starters report failure.
+  local real_jobstart, real_termopen = vim.fn.jobstart, vim.fn.termopen
+  vim.fn.jobstart = function() return -1 end
+  vim.fn.termopen = function() return -1 end
+  local dok, out = pcall(drive, function(ctx)
+    local ok, err = pcall(registry.call, "tool.run_in_terminal", { command = "echo hi" }, ctx)
+    return ok and "unexpectedly succeeded" or tostring(err)
+  end, 15000)
+  vim.fn.jobstart = real_jobstart
+  vim.fn.termopen = real_termopen
+  assert(dok, tostring(out))
+  assert(out:find("could not start the terminal job", 1, true), "start error missing: " .. out)
+  assert(#vim.api.nvim_list_wins() == wins_before,
+    "split should be cleaned up when the job never starts")
+  assert(vim.api.nvim_get_current_win() == win_before,
+    "focus should return to the previous window")
+  vim.cmd("only") -- normalize windows for later cases
 end)
 
 -- ---------------------------------------------------------------- hook.confirm

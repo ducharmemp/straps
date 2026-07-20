@@ -371,8 +371,12 @@ end
       .. " WATCH the output stream live — use it for test suites, builds, and"
       .. " anything long-running or interesting; use bash for quick, quiet"
       .. " commands. Focus stays where the user was; the split keeps streaming."
-      .. " The full terminal output is also returned, and the split is left"
-      .. " open afterwards for inspection (the user closes it with :q)."
+      .. " The full terminal output is also returned. When the command exits 0"
+      .. " the split is closed automatically (kept only if it cannot be closed,"
+      .. " e.g. it is the last window — the result note says which happened);"
+      .. " on failure or timeout it is left open for inspection (the user"
+      .. " closes it with :q). If the job cannot start at all, the empty split"
+      .. " is cleaned up and the tool errors."
       .. " Parameters: command (required) — shell command run via bash -lc;"
       .. " timeout_ms (optional, default 300000) — the job is stopped if it"
       .. " runs longer.",
@@ -429,6 +433,16 @@ return function(input, ctx)
     end
   end)
   if start_err then
+    -- The job never started, so the split holds nothing to inspect: close it,
+    -- wipe its buffer, and put the user back where they were (focus was never
+    -- restored on this path — the job had to start with the split current).
+    for _, win in ipairs(vim.fn.win_findbuf(term_buf)) do
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+    if vim.api.nvim_buf_is_valid(term_buf) then
+      pcall(vim.api.nvim_buf_delete, term_buf, { force = true })
+    end
+    pcall(vim.api.nvim_set_current_win, prev_win)
     error("run_in_terminal: " .. start_err)
   end
 
@@ -439,10 +453,27 @@ return function(input, ctx)
   while #out_lines > 0 and out_lines[#out_lines]:match("^%s*$") do
     table.remove(out_lines)
   end
+
+  -- On success there is nothing left to inspect: close the split and wipe the
+  -- terminal buffer. Failures and timeouts keep it open for the user. If a
+  -- window survives (e.g. the split became the last window, which cannot be
+  -- closed), keep the buffer too so what it shows stays inspectable.
+  local closed = false
+  if code == 0 and not timed_out then
+    for _, win in ipairs(vim.fn.win_findbuf(term_buf)) do
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+    closed = #vim.fn.win_findbuf(term_buf) == 0
+    if closed and vim.api.nvim_buf_is_valid(term_buf) then
+      pcall(vim.api.nvim_buf_delete, term_buf, { force = true })
+    end
+  end
+
   return "exit code: " .. tostring(code)
     .. (timed_out and (" (stopped: exceeded timeout of " .. timeout_ms .. " ms)") or "")
     .. "\noutput:\n" .. table.concat(out_lines, "\n")
-    .. "\n[terminal split left open — the user can close it with :q]"
+    .. (closed and "\n[terminal split closed]"
+      or "\n[terminal split left open — the user can close it with :q]")
 end
 ]==],
   })

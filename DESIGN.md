@@ -649,7 +649,8 @@ Written for agent-ability and ecosystem norms; concise, imperative:
   comparisons, filetype'd scratch buffers for generated content,
   extmarks/virtual text for line-pinned notes. `eval_lua` builds any view
   Neovim can express and presentation is a first-class use of it; views are
-  for hand-off (end of a task, not every intermediate search), supplement the
+  for hand-off (end of a task, not every intermediate search; a closing recap
+  referencing 4+ file:line locations builds the view first), supplement the
   reply text rather than replace it, and superseded ones get cleaned up while
   the final hand-off view stays open.
 - Self-extension (kept, tightened): every tool/hook/fn is a registry entry;

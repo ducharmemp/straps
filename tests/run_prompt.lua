@@ -42,6 +42,11 @@ end
 local tmp = vim.fn.tempname()
 local deep = tmp .. "/isolated/prompt-test"
 vim.fn.mkdir(deep, "p")
+-- Canonicalize: macOS tempname() returns /var/... but the project layer walks
+-- up from getcwd(), which resolves the /var -> /private/var symlink, and the
+-- path-header assertions compare strings.
+tmp = assert(vim.uv.fs_realpath(tmp))
+deep = assert(vim.uv.fs_realpath(deep))
 
 -- ------------------------------------------------------------- composition
 case("fn.system_prompt composes core + env; project stays out of a bare dir", function()

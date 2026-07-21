@@ -188,7 +188,9 @@ case("show_user moves the user's view to path:line and reports it", function()
   assert(out:find("showing", 1, true) and out:find(":3", 1, true),
     "unexpected result: " .. out)
   local cur = vim.api.nvim_get_current_buf()
-  assert(vim.api.nvim_buf_get_name(cur) == vim.fn.fnamemodify(path, ":p"),
+  -- realpath, not :p — buffer names come back canonicalized (macOS
+  -- /var -> /private/var) and :p does not resolve symlinks.
+  assert(vim.api.nvim_buf_get_name(cur) == assert(vim.uv.fs_realpath(path)),
     "current window does not show the file")
   local pos = vim.api.nvim_win_get_cursor(0)
   assert(pos[1] == 3, "cursor should be on line 3, got " .. pos[1])

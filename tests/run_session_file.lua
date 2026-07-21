@@ -60,7 +60,12 @@ end)
 -- --------------------------------------------------- list_sessions ordering
 case("list_sessions returns sessions, newest first", function()
   local saved = straps.config.session_dir
-  straps.config.session_dir = vim.fn.tempname() -- isolated so only A + B appear
+  -- Isolated so only A + B appear. Pre-create and canonicalize the dir:
+  -- buffer names come back canonicalized (macOS /var -> /private/var) and
+  -- the membership check below compares path strings.
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
   local a = state.new_session()
   local b = state.new_session()
   local pa, pb = vim.api.nvim_buf_get_name(a), vim.api.nvim_buf_get_name(b)
@@ -159,18 +164,24 @@ end)
 -- ------------------------------------------------------- ui.pick_session
 case("ui.pick_session offers list_sessions() items and resumes the picked one", function()
   local saved = straps.config.session_dir
-  straps.config.session_dir = vim.fn.tempname() -- isolated so only this session appears
+  -- Isolated so only this session appears. Pre-create and canonicalize the
+  -- dir (macOS /var -> /private/var, see the list_sessions case) so the
+  -- stub's path comparison can actually match and exercise the resume branch.
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
   local bufnr = state.new_session()
   state.append(bufnr, "user", nil, "pick-session-content-abc")
   local path = vim.api.nvim_buf_get_name(bufnr)
 
   local ui = require("straps.ui")
   local real_pick = ui.pick
-  local seen_items
+  local seen_items, picked
   ui.pick = function(items, opts, on_choice)
     seen_items = items
     for _, s in ipairs(items) do
       if s.path == path then
+        picked = s
         return on_choice(s)
       end
     end
@@ -184,7 +195,12 @@ case("ui.pick_session offers list_sessions() items and resumes the picked one", 
   end
 
   assert(seen_items and #seen_items >= 1, "pick_session did not offer list_sessions() items")
-  assert(vim.b[bufnr].straps_session == true, "picked session was not resumed (missing straps_session flag)")
+  assert(picked, "list_sessions never offered the created session")
+  local cur = vim.api.nvim_get_current_buf()
+  assert(vim.api.nvim_buf_get_name(cur) == path,
+    "current window does not show the resumed session")
+  local text = table.concat(vim.api.nvim_buf_get_lines(cur, 0, -1, false), "\n")
+  assert(text:find("pick-session-content-abc", 1, true), "resumed transcript missing its content")
 end)
 
 case("ui.pick_session falls back to open_session when there are no saved sessions", function()

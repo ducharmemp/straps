@@ -643,6 +643,15 @@ Written for agent-ability and ecosystem norms; concise, imperative:
 - Permissions: some tool calls prompt the user for approval; a denial comes
   back as a tool error — respect it, adjust the approach, do not retry the
   identical call.
+- Presentation norms (`# Showing the user`): the editor is the display
+  surface — match the medium to the data's shape: show_user for one location,
+  the quickfix list for many (grep already fills it), diff splits for
+  comparisons, filetype'd scratch buffers for generated content,
+  extmarks/virtual text for line-pinned notes. `eval_lua` builds any view
+  Neovim can express and presentation is a first-class use of it; views are
+  for hand-off (end of a task, not every intermediate search), supplement the
+  reply text rather than replace it, and superseded ones get cleaned up while
+  the final hand-off view stays open.
 - Self-extension (kept, tightened): every tool/hook/fn is a registry entry;
   registry_list/registry_get to inspect, registry_define to add or redefine;
   redefinitions are immediate, new tools callable next turn; sources are

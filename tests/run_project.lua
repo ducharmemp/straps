@@ -25,6 +25,10 @@ end
 
 local tmp = vim.fn.tempname()
 vim.fn.mkdir(tmp, "p")
+-- Canonicalize: macOS tempname() returns /var/... but load_project_registry
+-- finds .straps.lua upward from getcwd(), which resolves the /var ->
+-- /private/var symlink, so the trust store is keyed by canonical paths.
+tmp = assert(vim.uv.fs_realpath(tmp))
 
 -- Redirect the data dir so the ui case's DEFAULT trust store lands in the
 -- tempdir, never in the user's real stdpath("data").

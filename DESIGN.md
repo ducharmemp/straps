@@ -815,8 +815,19 @@ Existing suites must all still pass.
   sets nomodified. This works generically because render output is executable.
 - `:StrapsRegistry` — scratch listing, `<CR>` on a line opens `:StrapsEdit`.
 - `:StrapsEval` — execute current buffer as Lua (eval-buffer).
-- Statusline hint while running: set `vim.b[bufnr].straps_status` =
-  "running"|"idle" (+ redraw); document how to surface it.
+- `:StrapsAgents` — picker over running agents (`ui.pick_agents`). Rows show
+  the session, its parent (`◂ <parent>`, for subagents spawned via
+  `tool.spawn`), and the one-line task; picking one brings that transcript
+  on-screen with `ui.show_session` (the public form of the old
+  `open_session_buffer`), so a running subagent is navigable to watch/steer.
+  Backed by `ui.running_agents()` (a snapshot built from
+  `loop.running_sessions()` + the child's `straps_parent`/`straps_task`
+  buffer vars, which `tool.spawn` sets) and `ui.agents_status()` (the
+  statusline component, `""` when idle, `🤖 N` / `🤖 N+M` otherwise).
+- Statusline hints: `vim.b[bufnr].straps_status` = "running"|"idle" (+ redraw)
+  is the PER-buffer state; `ui.agents_status()` is the buffer-independent
+  cross-session count (loop does a `redrawstatus!` on run start/end so a
+  subagent starting in the background updates the parent's statusline).
 - Folding for the session buffer: foldexpr folding each `tool_use`/`tool_result`
   block (marker line = fold start, level 1), `foldlevel=0` so results start
   closed. Keep it ~20 lines.

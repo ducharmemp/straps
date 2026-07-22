@@ -433,7 +433,9 @@ end
 -- really: editing earlier history is a feature) and press <CR>.
 -- open_session and resume_session differ ONLY in how they obtain the
 -- transcript bufnr (new_session vs open_session_file).
-local function open_session_buffer(bufnr)
+--- Public so callers holding a live session bufnr (e.g. the running-agents
+--- picker) can bring it on-screen with the full session wiring.
+function M.show_session(bufnr)
   -- Project registry (trusted .straps.lua, if any), so project-defined tools
   -- exist for the session's first request and land after the builtins in seq
   -- order (append-only, cache-safe). pcall: opening a session must never fail
@@ -441,7 +443,11 @@ local function open_session_buffer(bufnr)
   pcall(require("straps").load_project_registry)
   vim.cmd("split")
   vim.api.nvim_win_set_buf(0, bufnr)
-  vim.b[bufnr].straps_status = "idle"
+  -- Don't stomp a live status: a running subagent brought on-screen by the
+  -- agents picker is still "running".
+  if vim.b[bufnr].straps_status == nil then
+    vim.b[bufnr].straps_status = "idle"
+  end
   -- filetype=straps was set on bufnr before it had a window (new_session /
   -- open_session_file), so the FileType autocmd's vim.opt_local never had a
   -- window to land on; apply the fold options now that one exists.
@@ -481,7 +487,7 @@ end
 --- throughout — including editing earlier history before sending.
 function M.open_session()
   local bufnr = require("straps.state").new_session()
-  return open_session_buffer(bufnr)
+  return M.show_session(bufnr)
 end
 
 --- Resume a durable session: same as open_session, but the transcript comes
@@ -499,7 +505,7 @@ function M.resume_session(path)
     path = sessions[1].path
   end
   local bufnr = state.open_session_file(path)
-  return open_session_buffer(bufnr)
+  return M.show_session(bufnr)
 end
 
 --- Open a picker over state.list_sessions() ({ path, name, mtime }, newest
@@ -524,6 +530,99 @@ function M.pick_session()
     end
     M.resume_session(choice.path)
   end)
+end
+
+-- A short label for a session buffer: its filename tail, or a synthetic name
+-- for ephemeral (nofile) sessions.
+local function session_label(bufnr)
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  if name == "" then
+    return "buffer " .. bufnr
+  end
+  return vim.fn.fnamemodify(name, ":t")
+end
+
+--- Snapshot of every currently-running agent, as
+--- { bufnr, label, parent (bufnr|nil), parent_label (string|nil), depth,
+---   task (string|nil) }, top-level agents first then by depth. "Agent" here
+--- means a session buffer with an active run; a subagent is one whose
+--- straps_parent points at another session buffer.
+function M.running_agents()
+  local bufs = require("straps.loop").running_sessions()
+  local agents = {}
+  for _, bufnr in ipairs(bufs) do
+    local parent = vim.b[bufnr].straps_parent
+    if type(parent) ~= "number" or not vim.api.nvim_buf_is_valid(parent) then
+      parent = nil
+    end
+    agents[#agents + 1] = {
+      bufnr = bufnr,
+      label = session_label(bufnr),
+      parent = parent,
+      parent_label = parent and session_label(parent) or nil,
+      depth = tonumber(vim.b[bufnr].straps_spawn_depth) or 0,
+      task = vim.b[bufnr].straps_task,
+    }
+  end
+  table.sort(agents, function(a, b)
+    if a.depth ~= b.depth then
+      return a.depth < b.depth
+    end
+    return a.bufnr < b.bufnr
+  end)
+  return agents
+end
+
+--- Picker over running agents; picking one brings its transcript on-screen
+--- (M.show_session), so a running subagent is navigable to watch its output
+--- live. Each row shows the session, its parent (for subagents), and the
+--- one-line task the parent gave it.
+function M.pick_agents()
+  local agents = M.running_agents()
+  if #agents == 0 then
+    vim.notify("straps: no agents are running")
+    return
+  end
+  M.pick(agents, {
+    prompt = "straps: running agents",
+    format_item = function(a)
+      local parts = { a.label }
+      if a.parent_label then
+        parts[#parts + 1] = "◂ " .. a.parent_label
+      end
+      if a.task and a.task ~= "" then
+        parts[#parts + 1] = a.task
+      end
+      local indent = string.rep("  ", a.depth)
+      return indent .. table.concat(parts, "  ·  ")
+    end,
+  }, function(choice)
+    if choice and vim.api.nvim_buf_is_valid(choice.bufnr) then
+      M.show_session(choice.bufnr)
+    end
+  end)
+end
+
+--- Statusline component: a compact count of running agents, "" when none.
+--- Format: "🤖 N" for N top-level runs, "🤖 N+M" when M subagents are also
+--- active (M = agents with a parent). Drop it into a statusline with
+--- %{v:lua.require'straps.ui'.agents_status()}.
+function M.agents_status()
+  local agents = M.running_agents()
+  if #agents == 0 then
+    return ""
+  end
+  local subs = 0
+  for _, a in ipairs(agents) do
+    if a.parent then
+      subs = subs + 1
+    end
+  end
+  local top = #agents - subs
+  if subs > 0 then
+    return ("🤖 %d+%d"):format(top, subs)
+  end
+  return ("🤖 %d"):format(top)
 end
 
 -- BufWriteCmd for straps://registry/<name>: execute the buffer as Lua.

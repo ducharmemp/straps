@@ -695,5 +695,102 @@ case("autocmd_bridge queues a hook's string onto the session buffer", function()
   vim.api.nvim_del_autocmd(id)
 end)
 
+-- --------------------------------------------------------------- running agents
+
+case("running_agents / agents_status reflect active runs and parentage", function()
+  local loop = require("straps.loop")
+  local ui = require("straps.ui")
+
+  -- No runs yet: empty list, empty statusline component.
+  assert(#ui.running_agents() == 0, "expected no agents at rest")
+  assert(ui.agents_status() == "", "statusline should be empty with no agents")
+
+  -- Two session buffers, tagged as a parent/child pair like tool.spawn does.
+  local parent = state.new_session()
+  local child = state.new_session()
+  vim.b[child].straps_parent = parent
+  vim.b[child].straps_spawn_depth = 1
+  vim.b[child].straps_task = "investigate the widget"
+
+  -- Fake the loop's run registry directly (no network): start real runs would
+  -- fire the provider. running_sessions reads the private `runs` table, so we
+  -- start and immediately stop-flag is not enough — inject via loop.start would
+  -- call the provider. Instead simulate by monkeypatching running_sessions.
+  local real = loop.running_sessions
+  loop.running_sessions = function() return { parent, child } end
+  local ok, err = pcall(function()
+    local agents = ui.running_agents()
+    assert(#agents == 2, "expected two agents, got " .. #agents)
+    -- Top-level first (depth 0), then the subagent.
+    assert(agents[1].bufnr == parent and agents[1].parent == nil,
+      "first agent should be the top-level parent")
+    assert(agents[2].bufnr == child, "second agent should be the child")
+    assert(agents[2].parent == parent, "child's parent bufnr wrong")
+    assert(agents[2].parent_label ~= nil, "child should carry a parent label")
+    assert(agents[2].task == "investigate the widget", "child task not surfaced")
+    assert(agents[2].depth == 1, "child depth wrong")
+
+    -- Statusline: one top-level + one subagent -> "🤖 1+1".
+    local status = ui.agents_status()
+    assert(status:find("1+1", 1, true), "unexpected statusline: " .. status)
+  end)
+  loop.running_sessions = real
+  assert(ok, err)
+end)
+
+case("agents_status drops a stale/invalid parent to a top-level count", function()
+  local loop = require("straps.loop")
+  local ui = require("straps.ui")
+  local child = state.new_session()
+  local dead = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_delete(dead, { force = true })
+  vim.b[child].straps_parent = dead -- points at a wiped buffer
+
+  local real = loop.running_sessions
+  loop.running_sessions = function() return { child } end
+  local ok, err = pcall(function()
+    local agents = ui.running_agents()
+    assert(agents[1].parent == nil, "invalid parent should be dropped")
+    assert(ui.agents_status() == "🤖 1", "one top-level agent expected: "
+      .. ui.agents_status())
+  end)
+  loop.running_sessions = real
+  assert(ok, err)
+end)
+
+case("tool.spawn tags the child buffer with parent and task", function()
+  -- Drive spawn far enough to create + tag the child, then stop it. The child
+  -- has no provider wired here; loop.start will attempt a request and error
+  -- inside the coroutine, but the tagging happens before loop.start.
+  local parent = state.new_session()
+  local before = {}
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do before[b] = true end
+
+  -- Stub loop.start so no network happens; spawn's await then times out fast.
+  local loop = require("straps.loop")
+  local real_start, real_running = loop.start, loop.running
+  loop.start = function() end
+  loop.running = function() return false end -- so spawn's poll resolves immediately
+  local ok, out = pcall(drive, function(ctx)
+    ctx.bufnr = parent
+    return registry.call("tool.spawn",
+      { task = "  do   the    thing  ", timeout_ms = 2000 }, ctx)
+  end, 8000)
+  loop.start, loop.running = real_start, real_running
+  assert(ok, "spawn errored: " .. tostring(out))
+
+  -- Find the newly-created session buffer.
+  local child
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if not before[b] and vim.b[b] and vim.b[b].straps_parent == parent then
+      child = b
+    end
+  end
+  assert(child, "spawn did not create a child tagged with straps_parent")
+  assert(vim.b[child].straps_parent == parent, "child parent bufnr wrong")
+  assert(vim.b[child].straps_task == "do the thing",
+    "task not normalized/stored: " .. tostring(vim.b[child].straps_task))
+end)
+
 print(failed and "FAILED" or "ALL PASS")
 os.exit(failed and 1 or 0)

@@ -130,6 +130,10 @@ vim.api.nvim_create_user_command("StrapsRegistry", function()
   require("straps.ui").registry_list()
 end, { desc = "straps: list registry entries" })
 
+vim.api.nvim_create_user_command("StrapsAgents", function()
+  require("straps.ui").pick_agents()
+end, { desc = "straps: pick a running agent/subagent and open its transcript" })
+
 vim.api.nvim_create_user_command("StrapsEval", function()
   require("straps.ui").eval_buffer()
 end, { desc = "straps: execute the current buffer as Lua" })

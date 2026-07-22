@@ -359,7 +359,7 @@ function M.start(bufnr)
   local run = { cancelled = false, cancel_fns = {}, await_seq = 0, done = false, turns = 0 }
   runs[bufnr] = run
   pcall(function() vim.b[bufnr].straps_status = "running" end)
-  vim.cmd("redrawstatus")
+  vim.cmd("redrawstatus!") -- all windows: a subagent run changes the parent's agent count
 
   local ctx = new_ctx(bufnr, run)
   run.ctx = ctx
@@ -378,7 +378,7 @@ function M.start(bufnr)
     pcall(state.ensure_trailing_user, bufnr)
     runs[bufnr] = nil
     pcall(function() vim.b[bufnr].straps_status = "idle" end)
-    vim.cmd("redrawstatus")
+    vim.cmd("redrawstatus!") -- all windows: subagent finishing updates the parent's count
   end)
 
   -- Initial resume under this buffer's registry scope (see ctx.await for
@@ -433,6 +433,20 @@ end
 function M.running(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   return runs[bufnr] ~= nil
+end
+
+--- Bufnrs of every session with an active run, newest-started first.
+--- The authoritative "who is working right now" list — the agents picker
+--- and statusline component read it. Stale/invalid buffers are skipped.
+function M.running_sessions()
+  local out = {}
+  for bufnr in pairs(runs) do
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      out[#out + 1] = bufnr
+    end
+  end
+  table.sort(out)
+  return out
 end
 
 return M

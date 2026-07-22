@@ -676,3 +676,29 @@ Or in lualine:
 ```lua
 { function() return vim.b.straps_status or "" end }
 ```
+
+### Running agents
+
+`vim.b.straps_status` is per-buffer — it says whether _this_ session is
+running. Subagents (`tool.spawn`) run in their own session buffers, hidden by
+default, so a global "how many agents are working right now, and for whom"
+readout is separate:
+
+- `require("straps.ui").agents_status()` returns a compact count of every
+  active run across all sessions — `"🤖 2"` for two top-level runs, `"🤖 1+3"`
+  when three subagents are also active — and `""` when nothing is running. It
+  is buffer-independent, so drop it into a global (not window-local)
+  statusline:
+
+  ```lua
+  vim.o.statusline = "%f %h%m%r %{v:lua.require'straps.ui'.agents_status()} %=%l,%c"
+  ```
+
+  The loop redraws all statuslines when a run starts or ends, so the count
+  updates even while you sit in an unrelated buffer.
+
+- `:StrapsAgents` opens a picker over the running agents, each row showing the
+  session, its parent (`◂ <parent>`, for subagents), and the one-line task it
+  was spawned with. Picking one opens that transcript in a split so you can
+  watch a subagent's output live and steer it. `require("straps.ui")` also
+  exposes `pick_agents()` and the underlying `running_agents()` snapshot.

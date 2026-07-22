@@ -531,6 +531,111 @@ end
     "done reason is " .. tostring(done_ev.reason) .. ", want max_turns")
 end)
 
+case("stall detector stops an all-errors loop before max_turns", function()
+  allow_all()
+  -- A tool that always errors; every turn calls it, so every turn is stalled.
+  define("tool.boom", "tool", "always errors",
+    [[return function() error("kaboom", 0) end]])
+  local straps = require("straps")
+  local saved_max, saved_stall = straps.config.max_turns, straps.config.stall_limit
+  straps.config.max_turns = 50
+  straps.config.stall_limit = 3
+  _G.straps_test_calls = 0
+  define("fn.provider", "fn", "test: always requests boom", [==[
+return function(req, ctx)
+  _G.straps_test_calls = _G.straps_test_calls + 1
+  local n = _G.straps_test_calls
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  return { stop_reason = "tool_use", content = {
+    { type = "tool_use", id = "b" .. n, name = "boom", input = { attempt = n } },
+  } }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("keep failing")
+  loop.start(bufnr)
+  wait_done(bufnr)
+  straps.config.max_turns, straps.config.stall_limit = saved_max, saved_stall
+
+  assert(_G.straps_test_calls == 3,
+    "provider called " .. _G.straps_test_calls .. " times, want stall_limit=3 (not max_turns=50)")
+  local text = buf_text(bufnr)
+  assert(text:find("no apparent progress", 1, true), "missing loud stall note")
+  assert(text:find("config.stall_limit=3", 1, true), "note does not name config.stall_limit")
+  assert(text:find("kaboom", 1, true), "note does not quote the last error")
+end)
+
+case("stall detector catches an exact-repeat loop", function()
+  allow_all()
+  define("tool.ping", "tool", "ping", [[return function() return "pong" end]])
+  local straps = require("straps")
+  local saved_max, saved_stall = straps.config.max_turns, straps.config.stall_limit
+  straps.config.max_turns = 50
+  straps.config.stall_limit = 3
+  _G.straps_test_calls = 0
+  -- Identical (tool,input) every turn: succeeds, but repeats -> stalled.
+  define("fn.provider", "fn", "test: same ping input forever", [==[
+return function(req, ctx)
+  _G.straps_test_calls = _G.straps_test_calls + 1
+  local n = _G.straps_test_calls
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  return { stop_reason = "tool_use", content = {
+    { type = "tool_use", id = "p" .. n, name = "ping", input = { q = "same" } },
+  } }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("ping the same thing")
+  loop.start(bufnr)
+  wait_done(bufnr)
+  straps.config.max_turns, straps.config.stall_limit = saved_max, saved_stall
+
+  -- Turn 1 is novel (resets/keeps stall 0), turns 2/3/4 repeat -> stall hits 3.
+  assert(_G.straps_test_calls == 4,
+    "provider called " .. _G.straps_test_calls .. " times, want 4 (1 novel + 3 repeats)")
+  local text = buf_text(bufnr)
+  assert(text:find("no apparent progress", 1, true), "missing loud stall note")
+  assert(text:find("repeated tool calls", 1, true), "repeat stall should note repetition, not an error")
+end)
+
+case("a productive turn resets the stall counter", function()
+  allow_all()
+  define("tool.ping", "tool", "ping", [[return function() return "pong" end]])
+  define("tool.boom", "tool", "always errors", [[return function() error("boom", 0) end]])
+  local straps = require("straps")
+  local saved_max, saved_stall = straps.config.max_turns, straps.config.stall_limit
+  straps.config.max_turns = 50
+  straps.config.stall_limit = 3
+  _G.straps_test_calls = 0
+  -- Pattern: err, err, ok, err, err, ok, ... never 3 errors in a row, so the
+  -- stall detector never trips; only max_turns/end_turn can stop it. End at 8.
+  define("fn.provider", "fn", "test: never 3 stalls in a row", [==[
+return function(req, ctx)
+  _G.straps_test_calls = _G.straps_test_calls + 1
+  local n = _G.straps_test_calls
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  if n >= 8 then
+    return { stop_reason = "end_turn", content = { { type = "text", text = "stop" } } }
+  end
+  local name = (n % 3 == 0) and "ping" or "boom" -- ok on every 3rd turn
+  return { stop_reason = "tool_use", content = {
+    { type = "tool_use", id = "x" .. n, name = name, input = { attempt = n } },
+  } }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("mixed progress")
+  loop.start(bufnr)
+  wait_done(bufnr)
+  straps.config.max_turns, straps.config.stall_limit = saved_max, saved_stall
+
+  assert(_G.straps_test_calls == 8,
+    "provider called " .. _G.straps_test_calls .. " times, want 8 (stall reset, ran to end_turn)")
+  local text = buf_text(bufnr)
+  assert(not text:find("no apparent progress", 1, true),
+    "stall note appeared even though errors never ran 3 in a row")
+end)
+
 case("fn.log writes structured events", function()
   allow_all()
   define("tool.ping", "tool", "ping", [[return function() return "pong" end]])

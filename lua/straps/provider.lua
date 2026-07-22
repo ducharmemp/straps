@@ -45,6 +45,77 @@ return function()
 end
 ]==]
 
+-- Live model discovery: GET /v1/models and map each model to a picker entry
+-- { id, label, thinking }. Synchronous curl (the picker is a one-off UI action,
+-- not the hot path). The `thinking` tag is inferred from the API's own
+-- capabilities.thinking.types — the single source of truth for which of the
+-- two mutually incompatible thinking mechanisms a model speaks (fn.provider
+-- reads the same tag): adaptive.supported -> "adaptive", else enabled.supported
+-- -> "budget", else nil (send no thinking block). Returns a list on success, or
+-- (nil, errmsg) on any failure so callers can fall back to the static list.
+local LIST_MODELS_SRC = [==[
+return function()
+  local registry = require("straps.registry")
+  local ok_straps, straps = pcall(require, "straps")
+  local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+  local base_url = config.base_url or "https://api.anthropic.com"
+
+  local ok_key, api_key = pcall(registry.call, "fn.api_key")
+  if not ok_key or type(api_key) ~= "string" or api_key == "" then
+    return nil, "no API key (" .. tostring(api_key) .. ")"
+  end
+
+  -- Synchronous: the picker blocks briefly on this, which is fine for a
+  -- deliberate UI action and avoids threading the loop's async ctx through.
+  local res = vim.system({
+    "curl", "-sS",
+    base_url .. "/v1/models?limit=1000",
+    "-H", "x-api-key: " .. api_key,
+    "-H", "anthropic-version: 2023-06-01",
+    "-w", "\nSTRAPS_HTTP_STATUS:%{http_code}\n",
+  }, { text = true }):wait(15000)
+
+  if not res then
+    return nil, "model list request timed out"
+  end
+  local out = res.stdout or ""
+  local status = tonumber(out:match("STRAPS_HTTP_STATUS:(%d+)"))
+  out = out:gsub("%s*STRAPS_HTTP_STATUS:%d+%s*$", "")
+  if res.code ~= 0 then
+    return nil, "curl exited " .. res.code .. ": " .. (res.stderr or "")
+  end
+  if status and status >= 400 then
+    return nil, "HTTP " .. status .. ": " .. out:sub(1, 300)
+  end
+  local ok_json, body = pcall(vim.json.decode, out)
+  if not ok_json or type(body) ~= "table" or type(body.data) ~= "table" then
+    return nil, "could not parse /v1/models response"
+  end
+
+  local models = {}
+  for _, m in ipairs(body.data) do
+    if type(m) == "table" and type(m.id) == "string" then
+      local types = (((m.capabilities or {}).thinking or {}).types) or {}
+      local thinking = nil
+      if ((types.adaptive or {}).supported) == true then
+        thinking = "adaptive"
+      elseif ((types.enabled or {}).supported) == true then
+        thinking = "budget"
+      end
+      models[#models + 1] = {
+        id = m.id,
+        label = m.display_name or m.id,
+        thinking = thinking,
+      }
+    end
+  end
+  if #models == 0 then
+    return nil, "/v1/models returned no usable models"
+  end
+  return models
+end
+]==]
+
 local BUILD_TOOLS_SRC = [==[
 -- REGISTRATION order, not alphabetical: tools lead the prompt-cache prefix,
 -- and seq order is append-only — a tool the agent defines lands at the END
@@ -149,8 +220,22 @@ return function(req, ctx)
   local api_key = registry.call("fn.api_key")
   local base_url = config.base_url or "https://api.anthropic.com"
 
+  -- Model and effort are per-buffer-overridable (vim.b straps_model /
+  -- straps_effort), falling back to the global config. This lets one session
+  -- run a different model/effort than another — e.g. a cheap subagent under an
+  -- Opus main session (tool.spawn sets these on the child buffer). The pcall
+  -- guards a nil/invalid bufnr (a provider call outside a real session buffer).
+  local b_model, b_effort
+  pcall(function()
+    local bufnr = ctx and ctx.bufnr
+    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+      b_model = vim.b[bufnr].straps_model
+      b_effort = vim.b[bufnr].straps_effort
+    end
+  end)
+
   local body = {
-    model = config.model or "claude-sonnet-5",
+    model = b_model or config.model or "claude-sonnet-5",
     max_tokens = config.max_tokens or 8192,
     stream = true,
     messages = req.messages,
@@ -165,7 +250,7 @@ return function(req, ctx)
   -- name. Unknown/untagged model or "off" effort: send no thinking block
   -- at all (the safe default — guessing wrong fails closed with a 400,
   -- silently guessing a shape open would fail worse).
-  local model_id = config.model or "claude-sonnet-5"
+  local model_id = b_model or config.model or "claude-sonnet-5"
   local models = type(config.models) == "table" and config.models or {}
   local thinking_style = nil
   for _, m in ipairs(models) do
@@ -175,7 +260,7 @@ return function(req, ctx)
     end
   end
   local efforts = type(config.efforts) == "table" and config.efforts or {}
-  local effort_name = config.effort or "off"
+  local effort_name = b_effort or config.effort or "off"
   local effort_entry = nil
   for _, e in ipairs(efforts) do
     if type(e) == "table" and e.name == effort_name then
@@ -1176,6 +1261,12 @@ function M.register()
     kind = "fn",
     doc = "Return the Anthropic API key (default: $ANTHROPIC_API_KEY, then $XDG_CONFIG_HOME/straps/api_key; the file must be chmod 600).",
     source = API_KEY_SRC,
+  })
+  define({
+    name = "fn.list_models",
+    kind = "fn",
+    doc = "GET /v1/models and return picker entries { id, label, thinking } (thinking tag inferred from the API's capabilities); (nil, err) on failure.",
+    source = LIST_MODELS_SRC,
   })
   define({
     name = "fn.build_tools",

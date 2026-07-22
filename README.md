@@ -41,7 +41,8 @@ With lazy.nvim:
       -- defaults shown; all optional
       model = "claude-sonnet-5",
       max_tokens = 8192,
-      max_turns = 64,
+      max_turns = 128,
+      stall_limit = 6,
       max_tool_result_bytes = 100000,
     })
   end,
@@ -400,9 +401,32 @@ require("straps.registry").define{
 
 `:StrapsModel` and `:StrapsEffort` open a picker (uses `snacks.nvim`'s
 `Snacks.picker.select` when installed, otherwise falls back to plain
-`vim.ui.select`) over `config.models` / `config.efforts` and set
-`config.model` / `config.effort` on selection — no restart or reconnect
+`vim.ui.select`) over the model / effort list — no restart or reconnect
 needed, since both are read fresh on every provider call.
+
+**Per-session model and effort.** Selection is scoped to the buffer you run
+it on: invoke `:StrapsModel` / `:StrapsEffort` **on a session buffer** and it
+sets that session's model/effort only (stored in `vim.b`, read by
+`fn.provider` in preference to the global config) — so you can run Opus in
+one session and a cheap model in another at the same time. Invoke it anywhere
+else and it sets the global `config.model` / `config.effort` default for new
+sessions. A subagent inherits its parent session's override by default, and
+`spawn` takes explicit `model` / `effort` args to override that (e.g. a Haiku
+research subagent under an Opus main session). The active model/effort shows
+in a window-local **winbar** on each session window (a trailing `*` marks a
+session that diverges from the global default); set `config.session_winbar =
+false` to hide it, or drop `%{%v:lua.require'straps.ui'.session_status()%}`
+into your own statusline.
+
+`:StrapsModel` performs **live model discovery**: it queries `GET
+/v1/models` (via `fn.list_models`) with your API key and merges the result
+over `config.models`, so the menu reflects what your account can actually
+use — new models appear without a config edit. Your hand-curated `label`s
+win; live-only models are appended with their API display name and the
+`thinking` tag inferred from the API's own capabilities (so extended
+thinking still works for them). If discovery fails (offline, bad key), it
+notifies and falls back to the static `config.models` — the picker never
+breaks. The merged list is written back to `config.models`.
 
 `:StrapsResume!` (bang) opens the same picker over
 `state.list_sessions()` (newest first) and resumes whichever `*.straps`
@@ -631,11 +655,12 @@ machinery.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `model` | `"claude-sonnet-5"` | Anthropic model id. |
-| `models` | see below | Picker choices for `:StrapsModel`: `{ id, label?, thinking? }`. `thinking` is `"adaptive"` or `"budget"` (see Effort below); an unlisted/custom `model` sends no thinking block at all. |
+| `models` | see below | Static picker choices for `:StrapsModel`: `{ id, label?, thinking? }`. `thinking` is `"adaptive"` or `"budget"` (see Effort below); an unlisted/custom `model` sends no thinking block at all. `:StrapsModel` also does live discovery (`GET /v1/models`) and merges the account's real catalog over this list — so this is a seed of curated labels/overrides, not an exhaustive whitelist. |
 | `effort` | `"off"` | Name of the active entry in `config.efforts`; controls extended thinking. |
 | `efforts` | see below | Picker choices for `:StrapsEffort`: `{ name, level?, budget_tokens? }`. For models tagged `thinking = "adaptive"` (e.g. `claude-sonnet-5`, `claude-opus-4-8`), `level` becomes `output_config.effort` (`"low"`/`"medium"`/`"high"`/`"max"`). For models tagged `thinking = "budget"` (e.g. `claude-haiku-4-5-20251001`, `claude-opus-4-5-20251101`), `budget_tokens` becomes `thinking.budget_tokens`. These two mechanisms are mutually exclusive per model generation — sending the wrong one is a 400 — so pick whichever field applies to your model. `effort = "off"` sends no thinking block. |
 | `max_tokens` | `8192` | `max_tokens` per provider call. |
-| `max_turns` | `64` | Maximum assistant turns per run. |
+| `max_turns` | `128` | Hard ceiling on assistant turns per run — the backstop, not the primary spinning-catcher (that's `stall_limit`), hence generous. |
+| `stall_limit` | `6` | Progress-aware soft stop: end the run after this many *consecutive* stalled turns — a turn is stalled when its every tool call errored, or it repeats a `(tool, input)` call already made this run. Catches an agent spinning without progress early and loudly (a distinct note, quoting the last error), instead of waiting for `max_turns`. Set `0` to disable and let `max_turns` alone bound runs. |
 | `max_tool_result_bytes` | `100000` | Tool results larger than this are truncated with a note. |
 | `base_url` | `"https://api.anthropic.com"` | Endpoint base for the default provider; point it at any Anthropic-compatible server or proxy. |
 | `request_timeout_ms` | `300000` | Idle watchdog: if the response stream goes this long without any data, the request is killed and the run ends with an explanatory error instead of hanging. Raise it for slow local models. |
@@ -648,6 +673,7 @@ machinery.
 | `auto_compact_bytes` | unset | Raw-size alternative to `auto_compact_tokens`: compact when the transcript exceeds this many bytes. Unset = off: automatic history rewriting is opt-in. |
 | `render` | `true` | Transcript rendering (`fn.render`): a display-only conceal + extmark + fold layer that gives each block a categorical colored mark and collapses tool calls to a one-line summary. Buffer text, `modified`, parse and persist are never touched. `false` skips the wiring (raw markers). See [Rendering](#rendering). |
 | `tools_expanded` | `false` | Fold `tool_use`/`tool_result` blocks open by default when `true` (closed otherwise). |
+| `session_winbar` | `true` | Show a window-local winbar on each session window with the active model/effort (per-buffer override else global) and run status. `false` hides it; `ui.session_status()` / `ui.session_winbar()` stay usable in a manual statusline either way. |
 
 ## Security
 

@@ -8,7 +8,12 @@ local M = {}
 M.config = {
   model = "claude-sonnet-5",
   max_tokens = 8192,
-  max_turns = 64,
+  max_turns = 128,
+  -- Soft stop: end a run after this many CONSECUTIVE stalled turns — a turn is
+  -- stalled when its every tool call errored, or it repeats a (tool,input)
+  -- call already made this run. This is the real spinning-catcher; max_turns
+  -- is only the hard backstop, hence generous. 0 disables the detector.
+  stall_limit = 6,
   max_tool_result_bytes = 100000,
   cache = true,
   compact_keep_turns = 2,
@@ -35,6 +40,13 @@ M.config = {
   render = true,
   tools_expanded = false,
 
+  -- Session-window winbar: a window-local status line on each session window
+  -- showing the active model (per-buffer override else config.model), effort,
+  -- and run status. false disables it (e.g. you reserve the winbar for
+  -- something else); the ui.session_status() / ui.session_winbar() components
+  -- stay available for a manual statusline either way.
+  session_winbar = true,
+
   -- :StrapsModel picker choices. Each entry is { id, label?, thinking? }.
   -- `thinking` tags which extended-thinking mechanism the model speaks
   -- (checked against Anthropic's /v1/models capabilities.effort.supported):
@@ -45,7 +57,9 @@ M.config = {
   -- fn.provider reads the entry matching config.model to pick the right
   -- shape; an unlisted/custom model sends no thinking block at all (safest
   -- default — guessing wrong 400s the whole request). Picking one here sets
-  -- config.model.
+  -- config.model. This is a SEED, not an exhaustive menu: :StrapsModel does
+  -- live discovery (fn.list_models -> GET /v1/models) and merges the account's
+  -- real catalog over this list, keeping these curated labels/tags on top.
   models = {
     { id = "claude-opus-4-8", label = "Opus 4.8 — most capable, slowest", thinking = "adaptive" },
     { id = "claude-sonnet-5", label = "Sonnet 5 — balanced (default)", thinking = "adaptive" },

@@ -199,9 +199,23 @@ do
     end
   end
 
+  -- Hermetic model discovery: stub fn.list_models so pick_model never touches
+  -- the network. A nil return exercises the graceful fallback to config.models.
+  local registry = require("straps.registry")
+  local function with_list_models(source, fn)
+    registry.define({ name = "fn.list_models", kind = "fn",
+      doc = "test stub", source = source })
+    local ok, err = pcall(fn)
+    if not ok then
+      error(err, 0)
+    end
+  end
+
   case("pick_model sets config.model from a picked entry", function()
-    with_stub({ id = "claude-opus-4-8", label = "Opus 4.8" }, function()
-      ui.pick_model()
+    with_list_models("return function() return nil, 'stubbed offline' end", function()
+      with_stub({ id = "claude-opus-4-8", label = "Opus 4.8" }, function()
+        ui.pick_model()
+      end)
     end)
     assert(straps.config.model == "claude-opus-4-8",
       "config.model is " .. tostring(straps.config.model))
@@ -209,11 +223,54 @@ do
 
   case("pick_model cancel (nil choice) leaves config.model untouched", function()
     straps.config.model = "claude-sonnet-5"
-    with_stub(nil, function()
-      ui.pick_model()
+    with_list_models("return function() return nil, 'stubbed offline' end", function()
+      with_stub(nil, function()
+        ui.pick_model()
+      end)
     end)
     assert(straps.config.model == "claude-sonnet-5",
       "cancel should not change config.model, got " .. tostring(straps.config.model))
+  end)
+
+  case("pick_model merges live-discovered models into the picker list", function()
+    -- A fresh discovery brings a model absent from config.models.
+    with_list_models([[
+return function()
+  return {
+    { id = "claude-sonnet-5", label = "API Sonnet 5", thinking = "adaptive" },
+    { id = "claude-fable-5", label = "Claude Fable 5", thinking = "adaptive" },
+  }
+end
+]], function()
+      local seen
+      local saved_pick = ui.pick
+      ui.pick = function(items) seen = items end
+      pcall(ui.pick_model)
+      ui.pick = saved_pick
+      assert(type(seen) == "table", "picker never received items")
+      local has_fable, sonnet_label
+      for _, m in ipairs(seen) do
+        if m.id == "claude-fable-5" then has_fable = true end
+        if m.id == "claude-sonnet-5" then sonnet_label = m.label end
+      end
+      assert(has_fable, "live-only model claude-fable-5 not merged into the picker")
+      -- Curated static label must win over the API display_name.
+      assert(sonnet_label == "Sonnet 5 — balanced (default)",
+        "curated label lost in merge, got " .. tostring(sonnet_label))
+      -- The merged list is persisted so fn.provider can read the thinking tag.
+      local persisted
+      for _, m in ipairs(straps.config.models) do
+        if m.id == "claude-fable-5" then persisted = m end
+      end
+      assert(persisted and persisted.thinking == "adaptive",
+        "discovered model not persisted with its thinking tag")
+    end)
+    straps.config.models = {
+      { id = "claude-opus-4-8", label = "Opus 4.8 — most capable, slowest", thinking = "adaptive" },
+      { id = "claude-sonnet-5", label = "Sonnet 5 — balanced (default)", thinking = "adaptive" },
+      { id = "claude-sonnet-4-6", label = "Sonnet 4.6", thinking = "adaptive" },
+      { id = "claude-haiku-4-5-20251001", label = "Haiku 4.5 — fastest, cheapest", thinking = "budget" },
+    }
   end)
 
   case("pick_effort sets config.effort from a picked entry", function()
@@ -223,9 +280,74 @@ do
     assert(straps.config.effort == "high", "config.effort is " .. tostring(straps.config.effort))
   end)
 
+  case("pick_model on a session buffer sets it PER-BUFFER, not global", function()
+    local sess = state.new_session()
+    local prev = vim.api.nvim_get_current_buf()
+    vim.api.nvim_set_current_buf(sess)
+    straps.config.model = "claude-sonnet-5"
+    with_list_models("return function() return nil end", function()
+      with_stub({ id = "claude-fable-5", label = "Fable 5" }, function()
+        ui.pick_model()
+      end)
+    end)
+    vim.api.nvim_set_current_buf(prev)
+    assert(vim.b[sess].straps_model == "claude-fable-5",
+      "per-buffer model not set: " .. tostring(vim.b[sess].straps_model))
+    assert(straps.config.model == "claude-sonnet-5",
+      "global config.model was mutated (" .. tostring(straps.config.model)
+        .. ") — should stay put when picking on a session buffer")
+  end)
+
+  case("pick_effort on a session buffer sets it PER-BUFFER, not global", function()
+    local sess = state.new_session()
+    local prev = vim.api.nvim_get_current_buf()
+    vim.api.nvim_set_current_buf(sess)
+    straps.config.effort = "off"
+    with_stub({ name = "high", level = "high" }, function()
+      ui.pick_effort()
+    end)
+    vim.api.nvim_set_current_buf(prev)
+    assert(vim.b[sess].straps_effort == "high",
+      "per-buffer effort not set: " .. tostring(vim.b[sess].straps_effort))
+    assert(straps.config.effort == "off",
+      "global config.effort was mutated — should stay put on a session buffer")
+  end)
+
   straps.config.model = "claude-sonnet-5"
   straps.config.effort = "off"
 end
+
+case("session_status reflects per-buffer override with a divergence marker", function()
+  local ui = require("straps.ui")
+  local sess = state.new_session()
+  local prev = vim.api.nvim_get_current_buf()
+  vim.api.nvim_set_current_buf(sess)
+  straps.config.model = "claude-sonnet-5"
+  straps.config.effort = "off"
+  -- No override: shows the global default, no marker.
+  local base = ui.session_status()
+  assert(base:find("claude-sonnet-5", 1, true) or base:find("Sonnet 5", 1, true),
+    "status should show the global model when no override: " .. base)
+  assert(not base:find("*", 1, true), "no override should have no divergence marker: " .. base)
+  -- With override: shows it, with a trailing marker.
+  vim.b[sess].straps_model = "claude-fable-5"
+  vim.b[sess].straps_effort = "high"
+  local over = ui.session_status()
+  vim.api.nvim_set_current_buf(prev)
+  assert(over:find("high", 1, true), "effort missing from status: " .. over)
+  assert(over:sub(-1) == "*", "override should end with the divergence marker: " .. over)
+end)
+
+case("session_status and session_winbar are empty on non-session buffers", function()
+  local ui = require("straps.ui")
+  local scratch = vim.api.nvim_create_buf(false, true)
+  local prev = vim.api.nvim_get_current_buf()
+  vim.api.nvim_set_current_buf(scratch)
+  local s, w = ui.session_status(), ui.session_winbar()
+  vim.api.nvim_set_current_buf(prev)
+  assert(s == "", "session_status should be empty off a session buffer: [" .. s .. "]")
+  assert(w == "", "session_winbar should be empty off a session buffer: [" .. w .. "]")
+end)
 
 case("default progress hook cleaned up its extmarks", function()
   -- setup() registered the real hook.on_progress default, so the run above

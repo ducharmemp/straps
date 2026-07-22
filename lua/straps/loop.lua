@@ -15,7 +15,13 @@ local function get_config()
   local ok, straps = pcall(require, "straps")
   local cfg = (ok and type(straps) == "table" and rawget(straps, "config")) or {}
   return {
-    max_turns = cfg.max_turns or 64,
+    max_turns = cfg.max_turns or 128,
+    -- Soft stop: end the run after this many CONSECUTIVE stalled turns (a turn
+    -- is stalled when every tool call in it errored, or it repeats a
+    -- (tool,input) call already made this run). This is the real
+    -- spinning-catcher; max_turns is only the hard backstop, so it can be
+    -- generous. 0 disables the detector (max_turns alone bounds the run).
+    stall_limit = cfg.stall_limit or 6,
     max_tool_result_bytes = cfg.max_tool_result_bytes or 100000,
     -- Auto-compaction thresholds (both nil = off). Prefer auto_compact_tokens:
     -- with prompt caching on, a stable transcript is already cheap (cache
@@ -194,7 +200,7 @@ local function run_tool(bufnr, ctx, block, cfg)
 
   result = registry.try_call("hook.after_tool", name, input, result, ok, ctx) or result
   state.append(bufnr, "tool_result", { id = id, is_error = not ok }, tostring(result))
-  return ok
+  return ok, tostring(result)
 end
 
 -- Drain the steering queue (vim.b straps_steering): append each queued string
@@ -213,7 +219,7 @@ local function drain_steering(bufnr)
   return true
 end
 
--- Returns the run's ending reason: "ok" | "cancelled" | "max_turns".
+-- Returns the run's ending reason: "ok" | "cancelled" | "max_turns" | "stalled".
 local function run_turns(bufnr, ctx, run)
   local registry = require("straps.registry")
   local state = require("straps.state")
@@ -233,6 +239,14 @@ local function run_turns(bufnr, ctx, run)
   pcall(function()
     max_turns = vim.b[bufnr].straps_max_turns or max_turns
   end)
+
+  -- Stall detection state: run.stall counts CONSECUTIVE stalled turns (reset
+  -- by any productive turn); seen_calls records (tool.name .. input) of every
+  -- tool call so far, so a repeat is a stall signal. A turn is stalled when it
+  -- issued tool calls AND every one errored, OR any was an exact repeat.
+  run.stall = 0
+  run.seen_calls = {}
+  local stall_limit = cfg.stall_limit or 0
 
   for turn = 1, max_turns do
     run.turns = turn
@@ -308,6 +322,8 @@ local function run_turns(bufnr, ctx, run)
           { id = block.id, name = block.name }, pretty_json(block.input or {}))
       end
     end
+    -- Per-turn stall signals, folded in as each tool runs.
+    local n_calls, n_errors, any_repeat, last_error = 0, 0, false, nil
     for i, block in ipairs(tool_blocks) do
       if run.cancelled then
         -- Every appended tool_use must get a result, or the next parse
@@ -320,11 +336,42 @@ local function run_turns(bufnr, ctx, run)
         return cancelled_note()
       end
       progress(bufnr, ctx, { type = "tool", name = block.name }, "tool: " .. tostring(block.name))
+      -- (tool.name .. canonical input) identifies a call for repeat detection;
+      -- pretty_json sorts object keys, so equivalent inputs hash identically.
+      local key = tostring(block.name) .. "\0" .. pretty_json(block.input or {})
+      if run.seen_calls[key] then
+        any_repeat = true
+      end
+      run.seen_calls[key] = true
       local t0 = vim.uv.hrtime()
-      local ok = run_tool(bufnr, ctx, block, cfg)
+      local ok, result = run_tool(bufnr, ctx, block, cfg)
+      n_calls = n_calls + 1
+      if not ok then
+        n_errors = n_errors + 1
+        last_error = result
+      end
       log(bufnr, { ev = "tool", name = block.name,
         ms = math.floor((vim.uv.hrtime() - t0) / 1e6), is_error = not ok })
       progress(bufnr, ctx, { type = "tool_done", name = block.name, is_error = not ok })
+    end
+
+    -- Classify the turn for the stall detector. A turn with no tool calls is
+    -- never a stall (it is either the final answer or steering). A turn that
+    -- did work is stalled when every call errored, or any call repeated an
+    -- earlier one. Consecutive stalls accumulate; a productive turn resets.
+    if stall_limit > 0 and n_calls > 0 then
+      local stalled = (n_errors == n_calls) or any_repeat
+      run.stall = stalled and (run.stall + 1) or 0
+      if run.stall >= stall_limit then
+        local why = last_error and (" Last error: " .. last_error:gsub("%s+", " "):sub(1, 200))
+          or " (repeated tool calls with no new progress)"
+        state.append(bufnr, "assistant", nil,
+          ("[straps: stopped after %d consecutive turns with no apparent progress"
+            .. " (config.stall_limit=%d).%s — send a message to steer, or raise"
+            .. " config.stall_limit]"):format(run.stall, stall_limit, why))
+        log(bufnr, { ev = "stall", turn = turn, consecutive = run.stall })
+        return "stalled"
+      end
     end
 
     if resp.stop_reason ~= "tool_use" then
@@ -370,7 +417,7 @@ function M.start(bufnr)
       pcall(state.append, bufnr, "assistant", nil, "straps: run error: " .. tostring(ret))
     end
     -- done fires on every exit; run_turns names its own ending
-    -- ("ok" | "cancelled" | "max_turns"), a crash is "error".
+    -- ("ok" | "cancelled" | "max_turns" | "stalled"), a crash is "error".
     local reason = ok and (ret or "ok") or "error"
     log(bufnr, { ev = "run_end", reason = reason, turns = run.turns })
     progress(bufnr, ctx, { type = "done", reason = reason }, "")

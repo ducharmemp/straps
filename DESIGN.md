@@ -280,7 +280,15 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
         (default 100_000) with a note.
       - `result = registry.try_call("hook.after_tool", name, input, result, ok, ctx) or result`
       - `state.append(bufnr, "tool_result", {id=, is_error=not ok}, tostring(result))`
-   e. `resp.stop_reason == "tool_use"` → continue loop; else break.
+   e. Stall check (progress-aware soft stop): classify the turn — stalled when
+      it issued tool calls AND either every call errored or any call repeats a
+      `(tool, input)` already made this run (inputs canonicalized via
+      `pretty_json`, so key order doesn't matter). `run.stall` counts
+      CONSECUTIVE stalled turns; a productive turn resets it to 0. When it
+      reaches `config.stall_limit` (default 6, 0 disables), end the run with
+      reason `"stalled"` and a loud, distinct note (below). This measures the
+      spinning `max_turns` was only ever a proxy for.
+   f. `resp.stop_reason == "tool_use"` → continue loop; else break.
 3. `registry.try_call("hook.on_run_end", ctx)`; `state.ensure_trailing_user(bufnr)`;
    clear the running flag (also on error — wrap the whole run body, append an
    `assistant` block with the error message on failure so the user sees it).
@@ -358,11 +366,18 @@ edit.
 
 ### Run endings must be loud; long runs must be legible
 
-- `run_turns` returns a reason: "ok" | "cancelled" | "max_turns". Exhausting
-  `config.max_turns` appends a visible assistant note —
-  `[straps: stopped after N turns (config.max_turns) — send a message to
-  continue]` — never a silent end. The cleanup wrapper feeds the reason
-  (or "error") into the `done` progress event.
+- `run_turns` returns a reason: "ok" | "cancelled" | "max_turns" | "stalled".
+  Exhausting `config.max_turns` (the hard backstop, default 128) appends a
+  visible assistant note — `[straps: stopped after N turns (config.max_turns)
+  — send a message to continue]` — never a silent end. The `"stalled"` ending
+  is the progress-aware soft stop: after `config.stall_limit` consecutive
+  turns that made no apparent progress (all calls errored, or repeated an
+  earlier call), it appends a DISTINCT note naming `config.stall_limit` and
+  quoting the last error (or noting the repetition), so a stuck agent is
+  caught early and legibly rather than burning the whole `max_turns` budget.
+  `max_turns` is deliberately generous because the stall detector, not the
+  ceiling, is now the thing that catches spinning. The cleanup wrapper feeds
+  the reason (or "error") into the `done` progress event.
 - The `thinking` progress event carries `max = cfg.max_turns`; the default
   virt text shows `turn 12/64` so turn burn is visible during long runs.
 - `fn.log` (define_default in provider.register()): structured single-line
@@ -377,7 +392,7 @@ edit.
 - README documents `config.log_file` and a "Long sessions" note: context is
   the transcript, so pruning old tool results is just deleting buffer lines.
 
-## provider.lua — registers `fn.provider` (+ `fn.api_key`, `fn.build_tools`, `fn.system_prompt`)
+## provider.lua — registers `fn.provider` (+ `fn.api_key`, `fn.list_models`, `fn.build_tools`, `fn.system_prompt`)
 
 `fn.provider` source: `function(req, ctx) -> { content = blocks, stop_reason = s }`
 
@@ -418,6 +433,27 @@ edit.
   what prevents an open-but-silent stream from hanging a run forever.
 
 `fn.system_prompt` default source returns the default system prompt (below).
+
+### Live model discovery (`fn.list_models`)
+
+`fn.list_models() -> models | (nil, err)` — a synchronous `curl GET
+{base_url}/v1/models?limit=1000` (same `x-api-key`/`anthropic-version` headers
+as `fn.provider`, key from `fn.api_key`). Maps each returned model to a picker
+entry `{ id, label = display_name, thinking }`. The `thinking` tag is inferred
+from the API's own `capabilities.thinking.types`:
+`adaptive.supported` → `"adaptive"`, else `enabled.supported` → `"budget"`,
+else `nil` (no thinking block). This is the SAME tag `fn.provider` reads to
+choose between the two incompatible thinking mechanisms, so a discovered model
+gets extended thinking correctly without a hand-written config entry. It never
+throws — any failure (no key, curl error, non-2xx, unparseable body) returns
+`(nil, errmsg)` so the picker can fall back to the static `config.models`.
+
+`ui.pick_model` calls it and MERGES the result over `config.models`: configured
+entries keep their curated `label` and lead the list in configured order; any
+live-only model (e.g. a newly released one) is appended with its API
+display_name. The merged list is written back to `config.models` so
+`fn.provider`'s thinking-tag lookup finds discovered models and repeat pickers
+are instant. Fetch failure → notify + the static list; the picker never breaks.
 
 ### Prompt caching (cache_control breakpoints)
 
@@ -828,6 +864,18 @@ Existing suites must all still pass.
   is the PER-buffer state; `ui.agents_status()` is the buffer-independent
   cross-session count (loop does a `redrawstatus!` on run start/end so a
   subagent starting in the background updates the parent's statusline).
+- Per-buffer model / effort: `fn.provider` reads `vim.b[bufnr].straps_model`
+  and `vim.b[bufnr].straps_effort` in preference to `config.model` /
+  `config.effort`, so two sessions can run different models at once (and a
+  subagent can differ from its parent — `tool.spawn` accepts `model`/`effort`
+  args and otherwise inherits the parent's override). `ui.pick_model` /
+  `ui.pick_effort` write `vim.b` when invoked ON a session buffer, else the
+  global config default. `ui.session_status()` renders the effective
+  model/effort for the current session buffer (`""` elsewhere), with a trailing
+  `*` when a per-buffer override diverges from the global default;
+  `ui.session_winbar()` wraps it with a running/idle indicator and is
+  auto-installed as a window-local `winbar` on session windows
+  (`config.session_winbar = false` opts out).
 - Folding for the session buffer: foldexpr folding each `tool_use`/`tool_result`
   block (marker line = fold start, level 1), `foldlevel=0` so results start
   closed. Keep it ~20 lines.

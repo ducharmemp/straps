@@ -27,6 +27,7 @@ local HL_LINKS = {
   StrapsToolError = "DiagnosticError", -- ✗ on is_error
   StrapsRule = "Comment",          -- the turn rules
   StrapsCardBorder = "Comment",    -- the expanded-tool box art
+  StrapsWinbar = "StatusLine",     -- session-window winbar (model/effort/status)
 }
 
 --- (Re)establish the straps highlight groups as default links. Called from
@@ -452,6 +453,17 @@ function M.show_session(bufnr)
   -- open_session_file), so the FileType autocmd's vim.opt_local never had a
   -- window to land on; apply the fold options now that one exists.
   M.apply_fold_opts(bufnr)
+  -- Window-local winbar: show the session's active model/effort (and run
+  -- phase) right on its own window, so "what am I talking to" is always
+  -- visible without touching the user's global statusline. config.session_winbar
+  -- = false opts out (some users reserve the winbar or dislike it).
+  do
+    local ok_s, s = pcall(require, "straps")
+    local want = not (ok_s and type(s) == "table" and s.config and s.config.session_winbar == false)
+    if want then
+      vim.wo[0].winbar = "%{%v:lua.require'straps.ui'.session_winbar()%}"
+    end
+  end
   -- Transcript rendering: window-local conceal so the marker overlays show,
   -- one render now, and a debounced renderer for future appends/edits. The
   -- whole presentation is fn.render — config.render = false skips the wiring
@@ -623,6 +635,73 @@ function M.agents_status()
     return ("🤖 %d+%d"):format(top, subs)
   end
   return ("🤖 %d"):format(top)
+end
+
+--- Statusline component for a SESSION buffer: the model and effort that will
+--- be used for its next run — the per-buffer override (vim.b straps_model /
+--- straps_effort) if set, else the global config default. "" for non-session
+--- buffers (so it disappears everywhere else). Format: " model" or
+--- " model · effort" (effort omitted when "off"); a per-buffer override is
+--- marked with a trailing "*" so a session diverging from the global default
+--- is visible at a glance. Drop it into a statusline with
+--- %{v:lua.require'straps.ui'.session_status()}.
+function M.session_status()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local is_session = false
+  pcall(function() is_session = vim.b[bufnr].straps_session == true end)
+  if not is_session then
+    return ""
+  end
+  local ok, straps = pcall(require, "straps")
+  if not ok or type(straps) ~= "table" then
+    return ""
+  end
+  local cfg = straps.config or {}
+
+  local b_model, b_effort
+  pcall(function()
+    b_model = vim.b[bufnr].straps_model
+    b_effort = vim.b[bufnr].straps_effort
+  end)
+  local model = (b_model and b_model ~= "" and b_model) or cfg.model or "?"
+  local effort = (b_effort and b_effort ~= "" and b_effort) or cfg.effort or "off"
+  local overridden = (b_model and b_model ~= "") or (b_effort and b_effort ~= "")
+
+  -- Prefer a short label from config.models over the raw id when one exists.
+  local label = model
+  if type(cfg.models) == "table" then
+    for _, m in ipairs(cfg.models) do
+      if type(m) == "table" and m.id == model and m.label and m.label ~= "" then
+        label = m.label
+        break
+      end
+    end
+  end
+
+  local out = " " .. label
+  if effort and effort ~= "off" then
+    out = out .. " · " .. effort
+  end
+  if overridden then
+    out = out .. "*"
+  end
+  return out
+end
+
+--- Winbar for a session window: the active model/effort (session_status) plus
+--- a right-aligned run status (running/idle). Auto-installed on session windows
+--- unless config.session_winbar = false; also usable manually via
+--- %{%v:lua.require'straps.ui'.session_winbar()%}. "" for non-session buffers.
+function M.session_winbar()
+  local status = M.session_status()
+  if status == "" then
+    return ""
+  end
+  local run = "idle"
+  pcall(function() run = vim.b[vim.api.nvim_get_current_buf()].straps_status or "idle" end)
+  local left = "straps" .. status
+  local right = (run == "running") and "● running" or "○ idle"
+  return "%#StrapsWinbar#" .. left .. "%=" .. right .. " "
 end
 
 -- BufWriteCmd for straps://registry/<name>: execute the buffer as Lua.
@@ -864,24 +943,120 @@ function M.pick(items, opts, on_choice)
   end)
 end
 
---- Open a picker over config.models ({ id, label? } or plain strings);
---- picking one sets straps.config.model. No-op (with a notify) if the
---- straps config isn't loaded or config.models is empty.
+--- Merge live-discovered models over the static config.models list. The static
+--- list wins on hand-curated labels (the user picked those wording); live
+--- discovery is authoritative for which models EXIST and their thinking tag
+--- (fetched from the API's own capabilities). Order: configured entries first,
+--- in their configured order, then any live-only models appended. A live entry
+--- with no static counterpart brings its API display_name as the label.
+local function merge_models(static_list, live_list)
+  static_list = type(static_list) == "table" and static_list or {}
+  local by_id, order = {}, {}
+  local function norm(m)
+    return type(m) == "table" and m or { id = m }
+  end
+  for _, m in ipairs(static_list) do
+    m = norm(m)
+    if type(m.id) == "string" and not by_id[m.id] then
+      by_id[m.id] = { id = m.id, label = m.label, thinking = m.thinking }
+      order[#order + 1] = m.id
+    end
+  end
+  for _, m in ipairs(live_list or {}) do
+    if type(m) == "table" and type(m.id) == "string" then
+      local existing = by_id[m.id]
+      if existing then
+        -- Keep a hand-set label; fill gaps from the live entry.
+        existing.label = existing.label or m.label
+        if existing.thinking == nil then existing.thinking = m.thinking end
+      else
+        by_id[m.id] = { id = m.id, label = m.label, thinking = m.thinking }
+        order[#order + 1] = m.id
+      end
+    end
+  end
+  local out = {}
+  for _, id in ipairs(order) do
+    out[#out + 1] = by_id[id]
+  end
+  return out
+end
+M._merge_models = merge_models -- exposed for tests
+
+--- Model / effort selection is per-buffer when invoked ON a session buffer
+--- (written to vim.b straps_model / straps_effort, which fn.provider reads in
+--- preference to the global config), and sets the global config default
+--- otherwise. These helpers centralize the "session buffer? scope it; else
+--- global" decision and report the effective value for the picker's current-*
+--- marker. Returns the target bufnr or nil (global).
+local function session_target_buf()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local ok = pcall(function() return vim.b[bufnr].straps_session end)
+  if ok and vim.b[bufnr].straps_session then
+    return bufnr
+  end
+  return nil
+end
+
+--- Effective model for a target (per-buffer override else global config).
+local function effective_model(straps, bufnr)
+  if bufnr then
+    local m = vim.b[bufnr].straps_model
+    if m and m ~= "" then return m end
+  end
+  return straps.config.model
+end
+
+--- Effective effort for a target (per-buffer override else global config).
+local function effective_effort(straps, bufnr)
+  if bufnr then
+    local e = vim.b[bufnr].straps_effort
+    if e and e ~= "" then return e end
+  end
+  return straps.config.effort
+end
+
+--- Open a picker over the available models; picking one sets the model
+--- PER-BUFFER (vim.b straps_model) when run on a session buffer, else the
+--- global straps.config.model. The list is config.models (the curated static
+--- list) MERGED with a live GET /v1/models via fn.list_models, so the menu
+--- reflects what the account can actually use (new models appear without a
+--- config edit). A merged entry inherits the API's thinking tag so extended
+--- thinking still works. On fetch failure the static list is used with a
+--- notify — the picker never breaks. No-op if the straps config isn't loaded.
 function M.pick_model()
   local ok, straps = pcall(require, "straps")
   if not ok or type(straps) ~= "table" then
     return notify_err("straps: config not available (call require('straps').setup() first)")
   end
-  local models = straps.config.models
-  if type(models) ~= "table" or #models == 0 then
-    return notify_err("straps: config.models is empty")
+  local static_list = type(straps.config.models) == "table" and straps.config.models or {}
+
+  local live, err = require("straps.registry").try_call("fn.list_models")
+  if type(live) ~= "table" then
+    if err then
+      vim.notify("straps: live model discovery failed (" .. tostring(err)
+        .. "); showing config.models", vim.log.levels.WARN)
+    end
+    live = nil
   end
+  local models = merge_models(static_list, live)
+  if #models == 0 then
+    return notify_err("straps: no models available (config.models empty and discovery failed)")
+  end
+
+  -- Persist the merged list so fn.provider can look up the thinking tag of a
+  -- newly discovered model (it reads config.models), and repeat pickers are
+  -- instant even offline.
+  straps.config.models = models
+
+  local target = session_target_buf()
+  local current_model = effective_model(straps, target)
   M.pick(models, {
-    prompt = "straps: select model",
+    prompt = target and "straps: select model (this session)" or "straps: select model (global)",
     format_item = function(m)
       local id = type(m) == "table" and m.id or m
       local label = type(m) == "table" and m.label or nil
-      local current = id == straps.config.model
+      local current = id == current_model
       return (current and "* " or "  ") .. (label or id)
     end,
   }, function(choice)
@@ -889,13 +1064,20 @@ function M.pick_model()
       return
     end
     local id = type(choice) == "table" and choice.id or choice
-    straps.config.model = id
-    vim.notify("straps: model = " .. tostring(id))
+    if target and vim.api.nvim_buf_is_valid(target) then
+      vim.b[target].straps_model = id
+      vim.notify("straps: model = " .. tostring(id) .. " (this session)")
+    else
+      straps.config.model = id
+      vim.notify("straps: model = " .. tostring(id))
+    end
+    pcall(vim.cmd, "redrawstatus!")
   end)
 end
 
 --- Open a picker over config.efforts ({ name, budget_tokens? }); picking one
---- sets straps.config.effort to that entry's name. Effort controls extended
+--- sets the effort PER-BUFFER (vim.b straps_effort) when run on a session
+--- buffer, else the global straps.config.effort. Effort controls extended
 --- thinking (fn.provider): budget_tokens absent/0 means thinking is off.
 function M.pick_effort()
   local ok, straps = pcall(require, "straps")
@@ -906,10 +1088,12 @@ function M.pick_effort()
   if type(efforts) ~= "table" or #efforts == 0 then
     return notify_err("straps: config.efforts is empty")
   end
+  local target = session_target_buf()
+  local current_effort = effective_effort(straps, target)
   M.pick(efforts, {
-    prompt = "straps: select effort",
+    prompt = target and "straps: select effort (this session)" or "straps: select effort (global)",
     format_item = function(e)
-      local current = e.name == straps.config.effort
+      local current = e.name == current_effort
       local bits = {}
       if e.level then
         bits[#bits + 1] = "level=" .. e.level
@@ -924,8 +1108,14 @@ function M.pick_effort()
     if not choice then
       return
     end
-    straps.config.effort = choice.name
-    vim.notify("straps: effort = " .. tostring(choice.name))
+    if target and vim.api.nvim_buf_is_valid(target) then
+      vim.b[target].straps_effort = choice.name
+      vim.notify("straps: effort = " .. tostring(choice.name) .. " (this session)")
+    else
+      straps.config.effort = choice.name
+      vim.notify("straps: effort = " .. tostring(choice.name))
+    end
+    pcall(vim.cmd, "redrawstatus!")
   end)
 end
 

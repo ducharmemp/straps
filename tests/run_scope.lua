@@ -337,6 +337,123 @@ end
   assert(vim.b[child].straps_spawn_depth == 1, "child depth not stamped")
 end)
 
+-- Helper: run a parent whose only move is to spawn with the given extra input,
+-- then return the child buffer. Identifying the child by scanning transcripts
+-- is unreliable (the parent transcript also holds the spawn tool_use input, and
+-- the child buffer may unload after its run), so record the child bufnr
+-- deterministically: the child is the run whose buffer has a straps_parent set.
+local function run_spawn_with(extra_input_lua)
+  allow_all()
+  _G.__spawn_child = nil
+  define("hook.on_run_start", "hook", "test: capture the child bufnr", [[
+return function(ctx)
+  local ok, parent = pcall(function() return vim.b[ctx.bufnr].straps_parent end)
+  if ok and parent then _G.__spawn_child = ctx.bufnr end
+end
+]])
+  define("fn.provider", "fn", "test: parent spawns with extra input", ([==[
+return function(req, ctx)
+  local first_user
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" then first_user = p.text; break end
+      end
+      break
+    end
+  end
+  local is_child = first_user and first_user:find("KID-TASK", 1, true)
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  if is_child then
+    return { stop_reason = "end_turn", content = { { type = "text", text = "kid-done" } } }
+  end
+  if #req.messages == 1 then
+    local input = { task = "KID-TASK: do a thing." }
+    %s
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "s1", name = "spawn", input = input },
+    } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "parent-done" } } }
+end
+]==]):format(extra_input_lua))
+
+  local parent = state.new_session()
+  state.append_text(parent, "spawn please")
+  loop.start(parent)
+  wait_done(parent)
+  define("hook.on_run_start", "hook", "test: noop", "return function() end")
+  return _G.__spawn_child, parent
+end
+
+case("spawn propagates explicit model/effort to the child buffer", function()
+  local child = run_spawn_with([[
+    input.model = "claude-fable-5"
+    input.effort = "high"
+  ]])
+  assert(child, "child buffer not captured")
+  assert(vim.b[child].straps_model == "claude-fable-5",
+    "child model not set from spawn arg: " .. tostring(vim.b[child].straps_model))
+  assert(vim.b[child].straps_effort == "high",
+    "child effort not set from spawn arg: " .. tostring(vim.b[child].straps_effort))
+end)
+
+case("spawn inherits the parent's per-buffer model/effort when the arg is unset", function()
+  -- The parent's per-buffer override is read inside tool.spawn; a spawn with no
+  -- model/effort arg should copy it onto the child. Stamp the parent via a
+  -- one-shot hook.on_run_start layered over the capture hook.
+  allow_all()
+  _G.__spawn_child = nil
+  define("hook.on_run_start", "hook", "test: stamp parent + capture child", [[
+return function(ctx)
+  local parent = vim.b[ctx.bufnr].straps_parent
+  if parent then
+    _G.__spawn_child = ctx.bufnr
+  else
+    -- top-level (parent) run: give it a per-buffer override to inherit
+    vim.b[ctx.bufnr].straps_model = "claude-opus-4-8"
+    vim.b[ctx.bufnr].straps_effort = "medium"
+  end
+end
+]])
+  define("fn.provider", "fn", "test: parent spawns (no model arg)", [==[
+return function(req, ctx)
+  local first_user
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" then first_user = p.text; break end
+      end
+      break
+    end
+  end
+  local is_child = first_user and first_user:find("KID-TASK", 1, true)
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  if is_child then
+    return { stop_reason = "end_turn", content = { { type = "text", text = "kid-done" } } }
+  end
+  if #req.messages == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "s1", name = "spawn", input = { task = "KID-TASK: inherit." } },
+    } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "parent-done" } } }
+end
+]==])
+  local parent = state.new_session()
+  state.append_text(parent, "spawn please")
+  loop.start(parent)
+  wait_done(parent)
+  define("hook.on_run_start", "hook", "test: noop", "return function() end")
+
+  local child = _G.__spawn_child
+  assert(child, "child buffer not captured")
+  assert(vim.b[child].straps_model == "claude-opus-4-8",
+    "child did not inherit parent model: " .. tostring(vim.b[child].straps_model))
+  assert(vim.b[child].straps_effort == "medium",
+    "child did not inherit parent effort: " .. tostring(vim.b[child].straps_effort))
+end)
+
 case("readonly child: writes are denied by the child-scope confirm", function()
   allow_all() -- parent-side confirm allows spawn; the CHILD scope must deny
   define("fn.provider", "fn", "test: readonly child tries to write", [==[

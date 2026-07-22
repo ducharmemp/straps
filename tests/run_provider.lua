@@ -426,6 +426,55 @@ end)
 vim.env.PATH = real_path
 straps.config.base_url = nil
 
+-- --------------------------------------------- per-buffer model / effort
+-- fn.provider must read vim.b straps_model / straps_effort in preference to
+-- the global config, so two sessions can run different models. Reuse the bp
+-- fake (captures its request body to bpbody).
+vim.env.PATH = tmp .. "/bp:" .. real_path
+straps.config.base_url = "http://straps-fake.invalid"
+do
+  -- Global points at Sonnet 5 / off; the buffer overrides to Fable 5 / medium.
+  local saved_model, saved_effort, saved_models, saved_efforts =
+    straps.config.model, straps.config.effort, straps.config.models, straps.config.efforts
+  straps.config.model = "claude-sonnet-5"
+  straps.config.effort = "off"
+  -- Both tagged adaptive so the per-buffer effort produces a thinking block.
+  straps.config.models = {
+    { id = "claude-sonnet-5", label = "Sonnet 5", thinking = "adaptive" },
+    { id = "claude-fable-5", label = "Fable 5", thinking = "adaptive" },
+  }
+  straps.config.efforts = { { name = "medium", level = "medium" } }
+
+  local pb = state.new_session()
+  vim.b[pb].straps_model = "claude-fable-5"
+  vim.b[pb].straps_effort = "medium"
+  state.append(pb, "user", nil, "use my per-buffer model")
+  loop.start(pb)
+  vim.wait(15000, function() return not loop.running(pb) end, 50)
+
+  local body = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/bpbody"), "\n"))
+
+  case("fn.provider uses vim.b straps_model over config.model", function()
+    assert(body.model == "claude-fable-5",
+      "request model is " .. tostring(body.model) .. ", want the per-buffer claude-fable-5")
+  end)
+
+  case("fn.provider uses vim.b straps_effort (adaptive thinking from the buffer)", function()
+    -- config.effort is "off" (no thinking); the per-buffer "medium" must win
+    -- and, because fable-5 is tagged adaptive, produce the adaptive block.
+    assert(type(body.thinking) == "table" and body.thinking.type == "adaptive",
+      "expected an adaptive thinking block from the per-buffer effort, got "
+        .. vim.inspect(body.thinking))
+    assert(body.output_config and body.output_config.effort == "medium",
+      "expected output_config.effort=medium, got " .. vim.inspect(body.output_config))
+  end)
+
+  straps.config.model, straps.config.effort, straps.config.models, straps.config.efforts =
+    saved_model, saved_effort, saved_models, saved_efforts
+end
+vim.env.PATH = real_path
+straps.config.base_url = nil
+
 -- ---------------------------------------------------------------- watchdog
 vim.env.PATH = tmp .. "/stalling:" .. real_path
 straps.config.request_timeout_ms = 400
@@ -703,6 +752,79 @@ end)
 
 vim.env.ANTHROPIC_API_KEY = saved_key
 vim.env.XDG_CONFIG_HOME = saved_xdg
+
+-- ---------------------------------------------------------------- list_models
+-- Fake curl serving a /v1/models catalog, so fn.list_models runs end-to-end
+-- (real source, faked HTTP) and the thinking-tag inference is exercised.
+vim.fn.mkdir(tmp .. "/models", "p")
+write_exec(tmp .. "/models/curl", ([[#!/usr/bin/env bash
+D=%q
+printf '%%s\n' "$*" >> "$D/models_argv"
+cat <<'EOF'
+{"data":[
+  {"type":"model","id":"claude-sonnet-5","display_name":"Claude Sonnet 5",
+   "capabilities":{"thinking":{"supported":true,"types":{"enabled":{"supported":false},"adaptive":{"supported":true}}}}},
+  {"type":"model","id":"claude-fable-5","display_name":"Claude Fable 5",
+   "capabilities":{"thinking":{"supported":true,"types":{"enabled":{"supported":false},"adaptive":{"supported":true}}}}},
+  {"type":"model","id":"claude-haiku-4-5-20251001","display_name":"Claude Haiku 4.5",
+   "capabilities":{"thinking":{"supported":true,"types":{"enabled":{"supported":true},"adaptive":{"supported":false}}}}},
+  {"type":"model","id":"claude-legacy-0","display_name":"Legacy",
+   "capabilities":{"thinking":{"supported":false}}}
+], "has_more": false}
+EOF
+printf '\nSTRAPS_HTTP_STATUS:200\n'
+]]):format(tmp))
+
+do
+  local saved_path = vim.env.PATH
+  local saved_base = straps.config.base_url
+  vim.env.PATH = tmp .. "/models:" .. real_path
+  vim.env.ANTHROPIC_API_KEY = "test-key-not-real"
+  straps.config.base_url = "http://straps-models.invalid"
+
+  local models, err = registry.call("fn.list_models")
+
+  case("fn.list_models hits base_url/v1/models", function()
+    local argv = table.concat(vim.fn.readfile(tmp .. "/models_argv"), "\n")
+    assert(argv:find("http://straps-models.invalid/v1/models", 1, true),
+      "custom base_url /v1/models not in argv:\n" .. argv)
+  end)
+
+  case("fn.list_models parses the catalog", function()
+    assert(type(models) == "table", "expected a model list, got err: " .. tostring(err))
+    assert(#models == 4, "expected 4 models, got " .. #models)
+    assert(models[1].id == "claude-sonnet-5", "first id wrong: " .. tostring(models[1].id))
+    assert(models[1].label == "Claude Sonnet 5", "label should be display_name")
+  end)
+
+  case("fn.list_models infers the thinking tag from capabilities", function()
+    local by = {}
+    for _, m in ipairs(models) do by[m.id] = m end
+    assert(by["claude-sonnet-5"].thinking == "adaptive", "adaptive not inferred")
+    assert(by["claude-fable-5"].thinking == "adaptive", "fable adaptive not inferred")
+    assert(by["claude-haiku-4-5-20251001"].thinking == "budget", "enabled->budget not inferred")
+    assert(by["claude-legacy-0"].thinking == nil, "no-thinking model should get nil tag")
+  end)
+
+  vim.env.PATH = saved_path
+  straps.config.base_url = saved_base
+end
+
+case("fn.list_models returns (nil, err) on HTTP failure, never throws", function()
+  vim.fn.mkdir(tmp .. "/models_500", "p")
+  write_exec(tmp .. "/models_500/curl", [[#!/usr/bin/env bash
+printf '%s\nSTRAPS_HTTP_STATUS:401\n' '{"error":{"message":"bad key"}}'
+]])
+  local saved_path = vim.env.PATH
+  vim.env.PATH = tmp .. "/models_500:" .. real_path
+  vim.env.ANTHROPIC_API_KEY = "test-key-not-real"
+  local models, err = registry.call("fn.list_models")
+  vim.env.PATH = saved_path
+  assert(models == nil, "HTTP 401 should yield nil, got a list")
+  assert(type(err) == "string" and err:find("401", 1, true), "err should mention the status: " .. tostring(err))
+end)
+
+vim.env.ANTHROPIC_API_KEY = saved_key
 
 if failed then
   print("FAILED")

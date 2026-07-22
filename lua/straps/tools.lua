@@ -498,7 +498,9 @@ end
       .. " boolean) — the child may use only auto-allowed read-only tools,"
       .. " every write is denied without prompting; show (optional boolean) —"
       .. " open the child's transcript in a split; max_turns (optional,"
-      .. " default 24); timeout_ms (optional, default 600000).",
+      .. " default 24); model (optional) — run the child on this model id"
+      .. " instead of the session's; effort (optional) — extended-thinking"
+      .. " effort name for the child; timeout_ms (optional, default 600000).",
     input_schema = {
       type = "object",
       properties = {
@@ -512,6 +514,8 @@ end
         readonly = { type = "boolean", description = "Read-only child: every write tool is denied." },
         show = { type = "boolean", description = "Open the child's transcript buffer in a split." },
         max_turns = { type = "integer", description = "Child turn budget (default 24)." },
+        model = { type = "string", description = "Model id for the child (default: this session's model)." },
+        effort = { type = "string", description = "Extended-thinking effort name for the child (default: this session's effort)." },
         timeout_ms = { type = "integer", description = "Wall-clock cap in milliseconds (default 600000)." },
       },
       required = { "task" },
@@ -542,6 +546,17 @@ return function(input, ctx)
   local child = state.new_session()
   vim.b[child].straps_spawn_depth = depth + 1
   vim.b[child].straps_max_turns = math.floor(tonumber(input.max_turns) or 24)
+  -- Model / effort: an explicit spawn arg wins; else inherit the PARENT's
+  -- per-buffer override if it has one (so a subagent matches its session by
+  -- default), else leave unset so fn.provider falls back to the global config.
+  do
+    local pm, pe
+    pcall(function() pm, pe = vim.b[ctx.bufnr].straps_model, vim.b[ctx.bufnr].straps_effort end)
+    local model = input.model or pm
+    local effort = input.effort or pe
+    if type(model) == "string" and model ~= "" then vim.b[child].straps_model = model end
+    if type(effort) == "string" and effort ~= "" then vim.b[child].straps_effort = effort end
+  end
   -- Parentage lets ui.pick_agents / the statusline show the spawn tree: who
   -- launched this subagent, and a one-line description of its task.
   vim.b[child].straps_parent = ctx.bufnr

@@ -814,6 +814,523 @@ end
 ]==]),
   })
 
+  -- ------------------------------------------------------------- move_file
+
+  define({
+    name = "tool.move_file",
+    kind = "tool",
+    doc = "Move/rename a file on disk. If a language server is attached to"
+      .. " it and supports workspace/willRenameFiles, the server is asked"
+      .. " FIRST for a WorkspaceEdit fixing up references elsewhere (e.g."
+      .. " import paths) — applied through each touched buffer (native undo)"
+      .. " before the file itself moves. The move/rename then goes through"
+      .. " vim.lsp.util.rename (renames any open buffer in place, keeping its"
+      .. " undo history, and moves its undofile) so open buffers never go"
+      .. " stale, and workspace/didRenameFiles notifies the server afterward."
+      .. " No attached/capable server: a plain filesystem move — never an"
+      .. " error, since not every filetype has one. This is a WRITE tool and"
+      .. " prompts for confirmation. Parameters: from (required, existing"
+      .. " path); to (required, destination path; parent dirs are created)."
+      .. " For renaming a SYMBOL rather than a file, use rename_symbol.",
+    input_schema = {
+      type = "object",
+      properties = {
+        from = { type = "string", description = "Existing file path to move." },
+        to = { type = "string", description = "Destination path (parent dirs created)." },
+      },
+      required = { "from", "to" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local from, to = input.from, input.to
+  if type(from) ~= "string" or from == "" then return "move_file: from is required" end
+  if type(to) ~= "string" or to == "" then return "move_file: to is required" end
+
+  local from_full = vim.fn.fnamemodify(from, ":p")
+  if vim.fn.filereadable(from_full) ~= 1 then
+    return "move_file: no such file: " .. relname(from_full)
+  end
+  local to_full = vim.fn.fnamemodify(to, ":p")
+  if vim.fn.filereadable(to_full) == 1 then
+    return "move_file: destination already exists: " .. relname(to_full)
+  end
+
+  local buf = load_buf(from_full) -- load first: LSP needs an attached buffer to ask
+  local clients = wait_clients(ctx, buf)
+  local mover -- the one client (if any) that supports will/didRenameFiles
+  for _, c in ipairs(clients or {}) do
+    local ok_s, supports = pcall(function()
+      return c:supports_method("workspace/willRenameFiles")
+    end)
+    if ok_s and supports then mover = c; break end
+  end
+
+  local edit_note = ""
+  if mover then
+    local params = {
+      files = { { oldUri = vim.uri_from_fname(from_full), newUri = vim.uri_from_fname(to_full) } },
+    }
+    local result, err = client_request(ctx, mover, "workspace/willRenameFiles", params, buf, 8000)
+    if result and type(result) == "table" and (result.changes or result.documentChanges) then
+      local okap, files = pcall(apply_workspace_edit_and_save, result, mover.offset_encoding)
+      if okap then
+        edit_note = string.format("; server updated %d reference file%s:\n%s",
+          #files, #files == 1 and "" or "s", table.concat(files, "\n"))
+      else
+        edit_note = "; server returned an edit but it failed to apply: " .. tostring(files)
+      end
+    elseif err then
+      edit_note = "; willRenameFiles request " .. tostring(err) .. " (moved anyway)"
+    end
+  end
+
+  local ok_rn, rn_err = pcall(vim.lsp.util.rename, from_full, to_full, {})
+  if not ok_rn then
+    return "move_file: rename failed: " .. tostring(rn_err)
+  end
+
+  if mover then
+    local ok_s2, supports_did = pcall(function()
+      return mover:supports_method("workspace/didRenameFiles")
+    end)
+    if ok_s2 and supports_did then
+      pcall(function()
+        mover:notify("workspace/didRenameFiles", {
+          files = { { oldUri = vim.uri_from_fname(from_full), newUri = vim.uri_from_fname(to_full) } },
+        })
+      end)
+    end
+  end
+
+  return string.format("moved %s -> %s%s", relname(from_full), relname(to_full), edit_note)
+end
+]==]),
+  })
+
+  -- ------------------------------------------------------------ move_files
+
+  define({
+    name = "tool.move_files",
+    kind = "tool",
+    doc = "Bulk version of move_file: move/rename several files in one call."
+      .. " The WHOLE batch is validated first (every source exists, every"
+      .. " destination is free, no path used as both a source and a"
+      .. " destination) and nothing moves if any entry is invalid — a typo"
+      .. " in entry 5 of 20 never leaves a partial move. For files with an"
+      .. " attached LSP client that supports workspace/willRenameFiles, ALL"
+      .. " of that client's files are sent in ONE batched request (not one"
+      .. " request per file) and the returned WorkspaceEdit(s) — e.g. import"
+      .. " path fixups — are applied through buffers (native undo) before"
+      .. " any file moves; workspace/didRenameFiles then notifies each"
+      .. " client, batched the same way. Files with no capable client just"
+      .. " move plainly, same as move_file. This is a WRITE tool and prompts"
+      .. " for confirmation. Parameters: moves (required) — array of"
+      .. " {from, to} objects.",
+    input_schema = {
+      type = "object",
+      properties = {
+        moves = {
+          type = "array",
+          description = "Files to move: [{from, to}, ...].",
+          items = {
+            type = "object",
+            properties = {
+              from = { type = "string", description = "Existing file path." },
+              to = { type = "string", description = "Destination path (parent dirs created)." },
+            },
+            required = { "from", "to" },
+          },
+        },
+      },
+      required = { "moves" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local moves = input.moves
+  if type(moves) ~= "table" or #moves == 0 then
+    return "move_files: moves must be a non-empty array of {from, to}"
+  end
+
+  -- Validate the WHOLE batch before touching disk: collect every problem
+  -- rather than stopping at the first, so one tool call surfaces all of them.
+  local entries, problems = {}, {}
+  local from_seen, to_seen = {}, {}
+  for i, m in ipairs(moves) do
+    if type(m) ~= "table" or type(m.from) ~= "string" or m.from == ""
+      or type(m.to) ~= "string" or m.to == "" then
+      problems[#problems + 1] = ("#%d: needs from and to"):format(i)
+    else
+      local from_full = vim.fn.fnamemodify(m.from, ":p")
+      local to_full = vim.fn.fnamemodify(m.to, ":p")
+      if from_full == to_full then
+        problems[#problems + 1] = ("#%d: from and to are the same path (%s)"):format(i, relname(from_full))
+      elseif vim.fn.filereadable(from_full) ~= 1 then
+        problems[#problems + 1] = ("#%d: no such file: %s"):format(i, relname(from_full))
+      elseif vim.fn.filereadable(to_full) == 1 then
+        problems[#problems + 1] = ("#%d: destination already exists: %s"):format(i, relname(to_full))
+      elseif from_seen[from_full] then
+        problems[#problems + 1] = ("#%d: %s is moved twice in this batch"):format(i, relname(from_full))
+      elseif to_seen[to_full] then
+        problems[#problems + 1] = ("#%d: two entries target %s"):format(i, relname(to_full))
+      else
+        from_seen[from_full], to_seen[to_full] = true, true
+        entries[#entries + 1] = { from = from_full, to = to_full }
+      end
+    end
+  end
+  if #problems > 0 then
+    return "move_files: refusing the whole batch — fix these and retry:\n"
+      .. table.concat(problems, "\n")
+  end
+
+  -- Bucket entries by the one client (per filetype, cached — files sharing a
+  -- filetype share the same attached clients) that supports willRenameFiles,
+  -- so each capable server gets ONE request covering all its files, not one
+  -- request per file. Entries with no capable client just move plainly.
+  local ft_clients = {}
+  local buckets, bucket_order = {}, {}
+  for _, e in ipairs(entries) do
+    e.buf = load_buf(e.from)
+    local ft = vim.bo[e.buf].filetype or ""
+    if ft_clients[ft] == nil then
+      ft_clients[ft] = wait_clients(ctx, e.buf) or false
+    end
+    local mover
+    for _, c in ipairs(ft_clients[ft] or {}) do
+      local ok_s, supports = pcall(function() return c:supports_method("workspace/willRenameFiles") end)
+      if ok_s and supports then mover = c; break end
+    end
+    if mover then
+      if not buckets[mover.id] then
+        buckets[mover.id] = { client = mover, entries = {} }
+        bucket_order[#bucket_order + 1] = mover.id
+      end
+      table.insert(buckets[mover.id].entries, e)
+    end
+  end
+
+  local server_files, seen_file = {}, {}
+  local function note_files(files)
+    for _, f in ipairs(files) do
+      if not seen_file[f] then seen_file[f] = true; server_files[#server_files + 1] = f end
+    end
+  end
+  local notes = {}
+
+  for _, id in ipairs(bucket_order) do
+    local bucket = buckets[id]
+    local files_param = {}
+    for _, e in ipairs(bucket.entries) do
+      files_param[#files_param + 1] =
+        { oldUri = vim.uri_from_fname(e.from), newUri = vim.uri_from_fname(e.to) }
+    end
+    local result, err = client_request(ctx, bucket.client, "workspace/willRenameFiles",
+      { files = files_param }, bucket.entries[1].buf, 8000)
+    if result and type(result) == "table" and (result.changes or result.documentChanges) then
+      local okap, files = pcall(apply_workspace_edit_and_save, result, bucket.client.offset_encoding)
+      if okap then
+        note_files(files)
+      else
+        notes[#notes + 1] = bucket.client.name .. ": edit returned but failed to apply: " .. tostring(files)
+      end
+    elseif err then
+      notes[#notes + 1] = bucket.client.name .. ": willRenameFiles " .. tostring(err) .. " (moved anyway)"
+    end
+  end
+
+  -- Validation already guaranteed every source exists and every destination
+  -- is free, so each move is expected to succeed; a failure here still lets
+  -- the loop finish the rest rather than losing track of remaining files.
+  local moved, failed = {}, {}
+  for _, e in ipairs(entries) do
+    local ok_rn, rn_err = pcall(vim.lsp.util.rename, e.from, e.to, {})
+    if ok_rn then
+      moved[#moved + 1] = string.format("%s -> %s", relname(e.from), relname(e.to))
+    else
+      failed[#failed + 1] = string.format("%s -> %s: %s", relname(e.from), relname(e.to), tostring(rn_err))
+    end
+  end
+
+  for _, id in ipairs(bucket_order) do
+    local bucket = buckets[id]
+    local ok_s, supports_did = pcall(function() return bucket.client:supports_method("workspace/didRenameFiles") end)
+    if ok_s and supports_did then
+      local files_param = {}
+      for _, e in ipairs(bucket.entries) do
+        files_param[#files_param + 1] =
+          { oldUri = vim.uri_from_fname(e.from), newUri = vim.uri_from_fname(e.to) }
+      end
+      pcall(function() bucket.client:notify("workspace/didRenameFiles", { files = files_param }) end)
+    end
+  end
+
+  local out = { string.format("moved %d file%s:", #moved, #moved == 1 and "" or "s") }
+  vim.list_extend(out, moved)
+  if #failed > 0 then
+    out[#out + 1] = string.format("%d move%s FAILED:", #failed, #failed == 1 and "" or "s")
+    vim.list_extend(out, failed)
+  end
+  if #server_files > 0 then
+    out[#out + 1] = string.format("server updated %d reference file%s:", #server_files, #server_files == 1 and "" or "s")
+    vim.list_extend(out, server_files)
+  end
+  vim.list_extend(out, notes)
+  return table.concat(out, "\n")
+end
+]==]),
+  })
+
+  -- ----------------------------------------------------------- delete_file
+
+  define({
+    name = "tool.delete_file",
+    kind = "tool",
+    doc = "Delete a file from disk. UNLIKE write_file/edit_file/move_file,"
+      .. " this is NOT undo-tree reversible — there is no buffer undo for"
+      .. " 'the file is gone'; recovery is whatever the user's own backup or"
+      .. " VCS provides. Refuses if the file's buffer has unsaved changes"
+      .. " (delete that file's buffer or write it first) rather than"
+      .. " silently discarding them. If a language server is attached and"
+      .. " supports workspace/willDeleteFiles, it is asked FIRST for a"
+      .. " WorkspaceEdit (e.g. removing now-dangling imports elsewhere) —"
+      .. " applied through buffers (native undo) before the file itself is"
+      .. " removed; workspace/didDeleteFiles notifies the server afterward."
+      .. " No attached/capable server: a plain filesystem delete, never an"
+      .. " error. Any loaded buffer on the file is wiped after deletion."
+      .. " This is a WRITE tool and prompts for confirmation. Parameters:"
+      .. " path (required, existing file).",
+    input_schema = {
+      type = "object",
+      properties = {
+        path = { type = "string", description = "Existing file path to delete." },
+      },
+      required = { "path" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local path = input.path
+  if type(path) ~= "string" or path == "" then return "delete_file: path is required" end
+
+  local full = vim.fn.fnamemodify(path, ":p")
+  if vim.fn.filereadable(full) ~= 1 then
+    return "delete_file: no such file: " .. relname(full)
+  end
+
+  local existing_buf = vim.fn.bufnr(full)
+  if existing_buf ~= -1 and vim.api.nvim_buf_is_loaded(existing_buf)
+    and vim.bo[existing_buf].modified then
+    return "delete_file: refusing — " .. relname(full)
+      .. " has unsaved buffer changes (write or discard them first)"
+  end
+
+  local buf = load_buf(full)
+  local clients = wait_clients(ctx, buf)
+  local deleter
+  for _, c in ipairs(clients or {}) do
+    local ok_s, supports = pcall(function() return c:supports_method("workspace/willDeleteFiles") end)
+    if ok_s and supports then deleter = c; break end
+  end
+
+  local edit_note = ""
+  if deleter then
+    local params = { files = { { uri = vim.uri_from_fname(full) } } }
+    local result, err = client_request(ctx, deleter, "workspace/willDeleteFiles", params, buf, 8000)
+    if result and type(result) == "table" and (result.changes or result.documentChanges) then
+      local okap, files = pcall(apply_workspace_edit_and_save, result, deleter.offset_encoding)
+      if okap then
+        edit_note = string.format("; server updated %d reference file%s:\n%s",
+          #files, #files == 1 and "" or "s", table.concat(files, "\n"))
+      else
+        edit_note = "; server returned an edit but it failed to apply: " .. tostring(files)
+      end
+    elseif err then
+      edit_note = "; willDeleteFiles request " .. tostring(err) .. " (deleted anyway)"
+    end
+  end
+
+  local ok_rm, succ, rm_err = pcall(os.remove, full)
+  if not ok_rm or succ ~= true then
+    return "delete_file: failed to delete: " .. tostring((not ok_rm and succ) or rm_err or "unknown error")
+  end
+
+  pcall(function()
+    if vim.api.nvim_buf_is_loaded(buf) then vim.cmd("bwipeout! " .. buf) end
+  end)
+
+  if deleter then
+    local ok_s2, supports_did = pcall(function() return deleter:supports_method("workspace/didDeleteFiles") end)
+    if ok_s2 and supports_did then
+      pcall(function()
+        deleter:notify("workspace/didDeleteFiles", { files = { { uri = vim.uri_from_fname(full) } } })
+      end)
+    end
+  end
+
+  return string.format("deleted %s (not undo-tree reversible)%s", relname(full), edit_note)
+end
+]==]),
+  })
+
+  -- ---------------------------------------------------------- delete_files
+
+  define({
+    name = "tool.delete_files",
+    kind = "tool",
+    doc = "Bulk version of delete_file: delete several files in one call."
+      .. " UNLIKE write_file/edit_file/move_file, deletion is NOT undo-tree"
+      .. " reversible. The WHOLE batch is validated first (every path"
+      .. " exists, no duplicates, no unsaved buffer changes on any of them)"
+      .. " and nothing is deleted if any entry is invalid. For files with an"
+      .. " attached LSP client that supports workspace/willDeleteFiles, ALL"
+      .. " of that client's files are sent in ONE batched request (not one"
+      .. " per file) and the returned WorkspaceEdit(s) are applied through"
+      .. " buffers (native undo) before any file is removed;"
+      .. " workspace/didDeleteFiles then notifies each client, also batched."
+      .. " This is a WRITE tool and prompts for confirmation. Parameters:"
+      .. " paths (required) — array of existing file paths.",
+    input_schema = {
+      type = "object",
+      properties = {
+        paths = {
+          type = "array",
+          description = "Existing file paths to delete.",
+          items = { type = "string" },
+        },
+      },
+      required = { "paths" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local paths = input.paths
+  if type(paths) ~= "table" or #paths == 0 then
+    return "delete_files: paths must be a non-empty array of file paths"
+  end
+
+  -- Validate the WHOLE batch before touching disk, collecting every problem.
+  local entries, problems, seen = {}, {}, {}
+  for i, p in ipairs(paths) do
+    if type(p) ~= "string" or p == "" then
+      problems[#problems + 1] = ("#%d: not a valid path"):format(i)
+    else
+      local full = vim.fn.fnamemodify(p, ":p")
+      if seen[full] then
+        problems[#problems + 1] = ("#%d: %s is listed twice"):format(i, relname(full))
+      elseif vim.fn.filereadable(full) ~= 1 then
+        problems[#problems + 1] = ("#%d: no such file: %s"):format(i, relname(full))
+      else
+        local existing_buf = vim.fn.bufnr(full)
+        if existing_buf ~= -1 and vim.api.nvim_buf_is_loaded(existing_buf)
+          and vim.bo[existing_buf].modified then
+          problems[#problems + 1] = ("#%d: %s has unsaved buffer changes"):format(i, relname(full))
+        else
+          seen[full] = true
+          entries[#entries + 1] = { path = full }
+        end
+      end
+    end
+  end
+  if #problems > 0 then
+    return "delete_files: refusing the whole batch — fix these and retry:\n"
+      .. table.concat(problems, "\n")
+  end
+
+  -- Bucket by the one client (per filetype) that supports willDeleteFiles,
+  -- so each capable server gets ONE request covering all its files.
+  local ft_clients = {}
+  local buckets, bucket_order = {}, {}
+  for _, e in ipairs(entries) do
+    e.buf = load_buf(e.path)
+    local ft = vim.bo[e.buf].filetype or ""
+    if ft_clients[ft] == nil then
+      ft_clients[ft] = wait_clients(ctx, e.buf) or false
+    end
+    local deleter
+    for _, c in ipairs(ft_clients[ft] or {}) do
+      local ok_s, supports = pcall(function() return c:supports_method("workspace/willDeleteFiles") end)
+      if ok_s and supports then deleter = c; break end
+    end
+    if deleter then
+      if not buckets[deleter.id] then
+        buckets[deleter.id] = { client = deleter, entries = {} }
+        bucket_order[#bucket_order + 1] = deleter.id
+      end
+      table.insert(buckets[deleter.id].entries, e)
+    end
+  end
+
+  local server_files, seen_file = {}, {}
+  local function note_files(files)
+    for _, f in ipairs(files) do
+      if not seen_file[f] then seen_file[f] = true; server_files[#server_files + 1] = f end
+    end
+  end
+  local notes = {}
+
+  for _, id in ipairs(bucket_order) do
+    local bucket = buckets[id]
+    local files_param = {}
+    for _, e in ipairs(bucket.entries) do
+      files_param[#files_param + 1] = { uri = vim.uri_from_fname(e.path) }
+    end
+    local result, err = client_request(ctx, bucket.client, "workspace/willDeleteFiles",
+      { files = files_param }, bucket.entries[1].buf, 8000)
+    if result and type(result) == "table" and (result.changes or result.documentChanges) then
+      local okap, files = pcall(apply_workspace_edit_and_save, result, bucket.client.offset_encoding)
+      if okap then
+        note_files(files)
+      else
+        notes[#notes + 1] = bucket.client.name .. ": edit returned but failed to apply: " .. tostring(files)
+      end
+    elseif err then
+      notes[#notes + 1] = bucket.client.name .. ": willDeleteFiles " .. tostring(err) .. " (deleted anyway)"
+    end
+  end
+
+  -- Validation already confirmed every path exists; a failure here still
+  -- lets the loop finish the rest rather than losing track of the remainder.
+  local deleted, failed = {}, {}
+  for _, e in ipairs(entries) do
+    local ok_rm, succ, rm_err = pcall(os.remove, e.path)
+    if ok_rm and succ == true then
+      deleted[#deleted + 1] = relname(e.path)
+      pcall(function()
+        if vim.api.nvim_buf_is_loaded(e.buf) then vim.cmd("bwipeout! " .. e.buf) end
+      end)
+    else
+      failed[#failed + 1] = relname(e.path) .. ": "
+        .. tostring((not ok_rm and succ) or rm_err or "unknown error")
+    end
+  end
+
+  for _, id in ipairs(bucket_order) do
+    local bucket = buckets[id]
+    local ok_s, supports_did = pcall(function() return bucket.client:supports_method("workspace/didDeleteFiles") end)
+    if ok_s and supports_did then
+      local files_param = {}
+      for _, e in ipairs(bucket.entries) do
+        files_param[#files_param + 1] = { uri = vim.uri_from_fname(e.path) }
+      end
+      pcall(function() bucket.client:notify("workspace/didDeleteFiles", { files = files_param }) end)
+    end
+  end
+
+  local out = { string.format("deleted %d file%s (not undo-tree reversible):",
+    #deleted, #deleted == 1 and "" or "s") }
+  vim.list_extend(out, deleted)
+  if #failed > 0 then
+    out[#out + 1] = string.format("%d delete%s FAILED:", #failed, #failed == 1 and "" or "s")
+    vim.list_extend(out, failed)
+  end
+  if #server_files > 0 then
+    out[#out + 1] = string.format("server updated %d reference file%s:", #server_files, #server_files == 1 and "" or "s")
+    vim.list_extend(out, server_files)
+  end
+  vim.list_extend(out, notes)
+  return table.concat(out, "\n")
+end
+]==]),
+  })
+
   -- -------------------------------------------------------------- code_action
 
   define({
@@ -1221,27 +1738,54 @@ end
     doc = "Ask the user a question through their own picker UI (vim.ui.select,"
       .. " so Telescope/fzf-lua/dressing pickers apply automatically). Use it"
       .. " to propose concrete options — approaches, fixes, names — instead of"
-      .. " guessing or asking in prose. With options: the user picks one, and"
-      .. " an '(other: type your own answer)' entry is always appended (routed"
+      .. " guessing or asking in prose. An option is a plain string, or a"
+      .. " { label, preview, filetype } object when the choice is between"
+      .. " competing implementations: put a sketch of what that option's code"
+      .. " or outcome looks like in preview, so the user picks between things"
+      .. " they can see. Previews render in a live preview pane beside the"
+      .. " picker (snacks.nvim) or in labeled splits while the question is up."
+      .. " An '(other: type your own answer)' entry is always appended (routed"
       .. " through vim.ui.input); without options: a free-text vim.ui.input"
       .. " prompt. content (optional) is displayed in a scratch split while"
-      .. " the question is up — show the code or plan you are proposing —"
+      .. " the question is up — one proposal shared by the whole question —"
       .. " with optional filetype for highlighting; it closes when the user"
       .. " answers. The run blocks until the user responds; a dismissal is"
       .. " reported as such (do not re-ask the identical question)."
       .. " Parameters: question (required); options (optional array of"
-      .. " strings); content (optional); filetype (optional).",
+      .. " strings or { label, preview, filetype } objects); content"
+      .. " (optional); filetype (optional — highlights content, and is the"
+      .. " default filetype for option previews).",
     input_schema = {
       type = "object",
       properties = {
         question = { type = "string", description = "The question to ask the user." },
         options = {
           type = "array",
-          items = { type = "string" },
-          description = "Choices to offer; an 'other' free-text entry is appended automatically.",
+          items = {
+            anyOf = {
+              { type = "string" },
+              {
+                type = "object",
+                properties = {
+                  label = { type = "string", description = "Option text shown in the picker." },
+                  preview = {
+                    type = "string",
+                    description = "Sketch of what choosing this option looks like — code, a diff, a plan.",
+                  },
+                  filetype = { type = "string", description = "Filetype for highlighting this option's preview." },
+                },
+                required = { "label" },
+              },
+            },
+          },
+          description = "Choices to offer, as strings or { label, preview, filetype } objects;"
+            .. " an 'other' free-text entry is appended automatically.",
         },
         content = { type = "string", description = "Content shown in a scratch split while the question is up." },
-        filetype = { type = "string", description = "Filetype for highlighting the content split." },
+        filetype = {
+          type = "string",
+          description = "Filetype for highlighting the content split; also the default for option previews.",
+        },
       },
       required = { "question" },
     },
@@ -1252,35 +1796,68 @@ return function(input, ctx)
     return "ask_user: question is required"
   end
 
+  -- Normalize options: plain strings, or { label, preview, filetype } objects
+  -- for choices between competing implementations. previews[i] belongs to
+  -- options[i]; input.filetype is the fallback highlight for every preview.
+  local options, previews = {}, {}
+  local default_ft = (type(input.filetype) == "string" and input.filetype ~= "")
+    and input.filetype or nil
+  if type(input.options) == "table" then
+    for _, o in ipairs(input.options) do
+      if type(o) == "string" and o ~= "" then
+        options[#options + 1] = o
+      elseif type(o) == "table" and type(o.label) == "string" and o.label ~= "" then
+        options[#options + 1] = o.label
+        if type(o.preview) == "string" and o.preview ~= "" then
+          local ft = (type(o.filetype) == "string" and o.filetype ~= "")
+            and o.filetype or default_ft
+          previews[#options] = { text = o.preview, ft = ft }
+        end
+      end
+    end
+  end
+
+  -- Scratch-split plumbing, shared by the content pane and the fallback
+  -- per-option previews. Every window opened for this question lands in
+  -- `wins` and is closed the moment the user answers.
+  local wins = {}
+  local function capped_lines(text)
+    local lines = vim.split(text, "\n", { plain = true })
+    if #lines > 200 then
+      local capped = {}
+      for i = 1, 200 do capped[i] = lines[i] end
+      capped[#capped + 1] = ("... (%d more lines)"):format(#lines - 200)
+      lines = capped
+    end
+    return lines
+  end
+  local function scratch_buf(lines, ft)
+    local pbuf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(pbuf, 0, -1, false, lines)
+    vim.bo[pbuf].bufhidden = "wipe"
+    if type(ft) == "string" and ft ~= "" then
+      pcall(function() vim.bo[pbuf].filetype = ft end)
+    end
+    return pbuf
+  end
+  local function done(result)
+    for _, w in ipairs(wins) do pcall(vim.api.nvim_win_close, w, true) end
+    return result
+  end
+
   -- Optional content split, shown while the question is up (same pattern as
   -- the confirm diff preview) and closed as soon as the user answers.
-  local cwin
   if type(input.content) == "string" and input.content ~= "" then
     pcall(function()
-      local lines = vim.split(input.content, "\n", { plain = true })
-      if #lines > 200 then
-        local capped = {}
-        for i = 1, 200 do capped[i] = lines[i] end
-        capped[#capped + 1] = ("... (%d more lines)"):format(#lines - 200)
-        lines = capped
-      end
-      local pbuf = vim.api.nvim_create_buf(false, true)
-      vim.api.nvim_buf_set_lines(pbuf, 0, -1, false, lines)
-      vim.bo[pbuf].bufhidden = "wipe"
-      if type(input.filetype) == "string" and input.filetype ~= "" then
-        pcall(function() vim.bo[pbuf].filetype = input.filetype end)
-      end
+      local lines = capped_lines(input.content)
       local prev = vim.api.nvim_get_current_win()
       vim.cmd("botright " .. math.min(#lines + 1, 15) .. "split")
-      cwin = vim.api.nvim_get_current_win()
-      vim.api.nvim_win_set_buf(cwin, pbuf)
+      local cwin = vim.api.nvim_get_current_win()
+      wins[#wins + 1] = cwin
+      vim.api.nvim_win_set_buf(cwin, scratch_buf(lines, default_ft))
       pcall(vim.api.nvim_set_current_win, prev)
       vim.cmd("redraw")
     end)
-  end
-  local function done(result)
-    if cwin then pcall(vim.api.nvim_win_close, cwin, true) end
-    return result
   end
 
   local function free_text(prefix)
@@ -1293,17 +1870,118 @@ return function(input, ctx)
     return done("user answered" .. prefix .. ": " .. typed)
   end
 
-  local options = {}
-  if type(input.options) == "table" then
-    for _, o in ipairs(input.options) do
-      if type(o) == "string" and o ~= "" then options[#options + 1] = o end
-    end
-  end
   if #options == 0 then
     return free_text("")
   end
 
   local OTHER = "(other: type your own answer)"
+
+  -- snacks.nvim path: options with previews become native picker items whose
+  -- preview pane renders live as the selection moves (opts.preview =
+  -- "preview" renders each item's own { text, ft }). Only taken when at
+  -- least one option carries a preview — plain choices stay on
+  -- vim.ui.select, whichever picker the user has wired to it.
+  if next(previews) ~= nil then
+    local ok_snacks, snacks = pcall(require, "snacks")
+    local pick = ok_snacks and type(snacks) == "table"
+      and type(snacks.picker) == "table" and snacks.picker.pick or nil
+    if pick then
+      -- Resolves { label = s } on a choice, { dismissed = true } on close
+      -- without one, false when the pick call itself failed (then the
+      -- split-based fallback below still asks the question).
+      local res = ctx.await(function(resolve)
+        local resolved = false
+        local function finish(v)
+          if not resolved then
+            resolved = true
+            resolve(v)
+          end
+        end
+        local items = {}
+        for i, label in ipairs(options) do
+          local p = previews[i]
+          items[#items + 1] = {
+            text = label,
+            preview = p and { text = p.text, ft = p.ft, loc = false }
+              or { text = "(no preview for this option)", loc = false },
+          }
+        end
+        items[#items + 1] = {
+          text = OTHER,
+          preview = { text = "(type your own answer)", loc = false },
+        }
+        local ok_pick = pcall(pick, {
+          title = question,
+          items = items,
+          format = "text",
+          preview = "preview",
+          -- finish BEFORE close: closing fires on_close, and the first
+          -- resolution must be the user's choice, not the dismissal.
+          confirm = function(picker, item)
+            finish(item and { label = item.text } or { dismissed = true })
+            picker:close()
+          end,
+          on_close = function()
+            finish({ dismissed = true })
+          end,
+        })
+        if not ok_pick then
+          finish(false)
+        end
+      end)
+      if res ~= false then
+        if type(res) ~= "table" or res.dismissed or res.label == nil then
+          return done("user dismissed the picker without choosing — proceed on your best judgment or ask differently")
+        end
+        if res.label == OTHER then
+          return free_text(" (free text)")
+        end
+        for i, o in ipairs(options) do
+          if o == res.label then
+            return done(string.format("user chose option %d: %s", i, o))
+          end
+        end
+        return done("user chose: " .. res.label)
+      end
+      -- res == false: the snacks call itself failed; fall through to the
+      -- split-based rendering below and ask via vim.ui.select instead.
+    end
+
+    -- No snacks (or snacks failed): show every option's preview at once in
+    -- labeled splits — one bottom row, one vertical window per preview —
+    -- while vim.ui.select is up. Best effort; the question works without
+    -- them.
+    pcall(function()
+      local prev = vim.api.nvim_get_current_win()
+      local height, panes = 3, {}
+      for i = 1, #options do
+        local p = previews[i]
+        if p then
+          local lines = capped_lines(p.text)
+          height = math.max(height, math.min(#lines + 1, 15))
+          panes[#panes + 1] = {
+            buf = scratch_buf(lines, p.ft),
+            label = i .. ": " .. options[i],
+          }
+        end
+      end
+      for n, pane in ipairs(panes) do
+        if n == 1 then
+          vim.cmd("botright " .. height .. "split")
+        else
+          vim.cmd("rightbelow vsplit")
+        end
+        local w = vim.api.nvim_get_current_win()
+        wins[#wins + 1] = w
+        vim.api.nvim_win_set_buf(w, pane.buf)
+        -- winbar interprets % codes; the label is plain text.
+        pcall(function() vim.wo[w].winbar = pane.label:gsub("%%", "%%%%") end)
+      end
+      pcall(vim.api.nvim_set_current_win, prev)
+      vim.cmd("redraw")
+    end)
+  end
+
   local items = {}
   for _, o in ipairs(options) do items[#items + 1] = o end
   items[#items + 1] = OTHER

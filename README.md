@@ -623,6 +623,24 @@ when none is available. The tree-sitter tools (`symbols`, `read_symbol`) work
 with no server at all — they parse the buffer directly and cover common
 languages, degrading to a clear message for filetypes with no parser.
 
+Alongside these, a few editor-native tools WRITE and so go through
+`hook.confirm` like `write_file`/`edit_file`: `rename_symbol` (semantic
+rename via `textDocument/rename`), `code_action` (list, then apply by index),
+`format`, and `move_file` — moves/renames a file on disk, and when an LSP
+client is attached and supports `workspace/willRenameFiles`, asks it first
+for a `WorkspaceEdit` fixing up references elsewhere (e.g. import paths)
+before the move, applied through each touched buffer's native undo, then
+notifies the server via `workspace/didRenameFiles` once the move is done.
+The move itself goes through `vim.lsp.util.rename`, so an open buffer on
+the file is renamed in place (undo history intact) rather than orphaned.
+No attached/capable server: a plain filesystem move, never an error.
+`move_files` is the bulk form — one call, an array of `{from, to}` pairs.
+The whole batch is validated up front (every source exists, every
+destination is free, no path reused) and nothing moves if any entry is
+invalid, so a single typo in a large batch can't leave a partial move.
+Files sharing a capable LSP client are sent to that server in ONE batched
+`workspace/willRenameFiles` request rather than one request per file.
+
 ### Quickfix
 
 straps wires its search tools into Neovim's own quickfix list, so results are
@@ -649,6 +667,21 @@ machinery.
   report how many entries and files *would* be edited without touching
   anything. A typical flow: `grep` for the old name, eyeball the matches with
   `:copen`, then `bulk_replace` to rename across all of them at once.
+
+### Design choices with previews (`ask_user`)
+
+When the agent needs your decision, `ask_user` puts concrete options in your
+own picker (`vim.ui.select`, so Telescope/fzf-lua/dressing apply). An option
+can be a plain string, or a `{ label, preview, filetype }` object — the agent
+is prompted to attach a preview whenever the options are competing
+implementations, so you choose between visible sketches of the code rather
+than one-line summaries. With **snacks.nvim** installed, previewed options
+open in snacks' native picker with a live preview pane that follows the
+selection; without it, each preview appears in a labeled split (`1: <option>`)
+alongside the plain `vim.ui.select` prompt, and every window closes the
+moment you answer. A free-text "(other: type your own answer)" entry is
+always appended, and the tool can still show a single shared `content` split
+for context that isn't tied to one option.
 
 ## Configuration
 

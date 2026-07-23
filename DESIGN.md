@@ -678,17 +678,24 @@ Written for agent-ability and ecosystem norms; concise, imperative:
   shelling out when the editor already knows the answer.
 - Permissions: some tool calls prompt the user for approval; a denial comes
   back as a tool error — respect it, adjust the approach, do not retry the
-  identical call.
+  identical call. Genuinely ambiguous scope goes through `ask_user`; when the
+  options are competing implementations, each is passed as `{ label, preview }`
+  with a sketch of that option's code, so the user picks between visible
+  sketches rather than one-line summaries (rendered by the snacks picker's
+  live preview pane when snacks.nvim is installed, labeled splits otherwise).
 - Presentation norms (`# Showing the user`): the editor is the display
   surface — match the medium to the data's shape: show_user for one location,
   the quickfix list for many (grep already fills it), diff splits for
   comparisons, filetype'd scratch buffers for generated content,
-  extmarks/virtual text for line-pinned notes. `eval_lua` builds any view
-  Neovim can express and presentation is a first-class use of it; views are
-  for hand-off (end of a task, not every intermediate search; a closing recap
-  referencing 4+ file:line locations builds the view first), supplement the
-  reply text rather than replace it, and superseded ones get cleaned up while
-  the final hand-off view stays open.
+  extmarks/virtual text for line-pinned notes, and for editor MECHANISM
+  itself (a statusline/winbar/tabline component, keymap, option, highlight
+  group) wiring the real thing onto a real window/buffer live rather than
+  describing it in prose. `eval_lua` builds any view Neovim can express and
+  presentation is a first-class use of it; views are for hand-off (end of a
+  task, not every intermediate search; a closing recap referencing 4+
+  file:line locations builds the view first), supplement the reply text
+  rather than replace it, and superseded ones get cleaned up while the final
+  hand-off view stays open.
 - Self-extension (kept, tightened): every tool/hook/fn is a registry entry;
   registry_list/registry_get to inspect, registry_define to add or redefine;
   redefinitions are immediate, new tools callable next turn; sources are

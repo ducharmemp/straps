@@ -180,6 +180,292 @@ case("references with no LSP client returns the graceful fallback", function()
   assert(out:find("no LSP client", 1, true), "expected no-client fallback, got: " .. tostring(out))
 end)
 
+-- ----------------------------------------------------------------- move_file
+
+case("move_file: plain move (no LSP client) relocates the file, creating dirs", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local from = dir .. "/a.txt"
+  local to = dir .. "/sub/b.txt"
+  write_file(from, "hello\nworld\n")
+
+  local out = drive(function(ctx)
+    return registry.call("tool.move_file", { from = from, to = to }, ctx)
+  end)
+
+  assert(out:find("moved", 1, true), "unexpected result: " .. tostring(out))
+  assert(vim.fn.filereadable(from) == 0, "source should be gone")
+  assert(vim.fn.filereadable(to) == 1, "destination should exist")
+  assert(table.concat(vim.fn.readfile(to), "\n") == "hello\nworld", "content not preserved")
+end)
+
+case("move_file: missing source errors with a clear message", function()
+  local out = drive(function(ctx)
+    return registry.call("tool.move_file",
+      { from = "/no/such/file.txt", to = "/tmp/whatever.txt" }, ctx)
+  end)
+  assert(out:find("no such file", 1, true), "unexpected message: " .. tostring(out))
+end)
+
+case("move_file: existing destination refuses rather than overwriting", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local from, to = dir .. "/a.txt", dir .. "/b.txt"
+  write_file(from, "a\n")
+  write_file(to, "b\n")
+
+  local out = drive(function(ctx)
+    return registry.call("tool.move_file", { from = from, to = to }, ctx)
+  end)
+
+  assert(out:find("already exists", 1, true), "unexpected message: " .. tostring(out))
+  assert(vim.fn.filereadable(from) == 1, "source should be untouched")
+  assert(table.concat(vim.fn.readfile(to), "\n") == "b", "destination should be untouched")
+end)
+
+case("move_file requires both from and to", function()
+  local out1 = drive(function(ctx) return registry.call("tool.move_file", { to = "x" }, ctx) end)
+  assert(out1:find("from is required", 1, true), "missing from-required message: " .. tostring(out1))
+  local out2 = drive(function(ctx) return registry.call("tool.move_file", { from = "x" }, ctx) end)
+  assert(out2:find("to is required", 1, true), "missing to-required message: " .. tostring(out2))
+end)
+
+case("move_file is registered with the right schema and requires confirmation", function()
+  local e = registry.get("tool.move_file")
+  assert(e, "tool.move_file not registered")
+  assert(type(e.fn) == "function", "tool.move_file did not compile")
+  local req = e.input_schema and e.input_schema.required
+  assert(req and vim.tbl_contains(req, "from") and vim.tbl_contains(req, "to"),
+    "input_schema should require from and to")
+  -- Unlike the read-only editor tools, move_file writes to disk: it must NOT
+  -- be in hook.confirm's auto-allow set (headless vim.fn.confirm denies).
+  local allowed = registry.call("hook.confirm", "move_file", { from = "a", to = "b" }, { bufnr = 0 })
+  assert(allowed ~= true, "move_file should not be auto-allowed, got: " .. tostring(allowed))
+end)
+
+-- ---------------------------------------------------------------- move_files
+
+case("move_files: plain batch (no LSP client) moves every file", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local a, b = dir .. "/a.txt", dir .. "/b.txt"
+  write_file(a, "A\n")
+  write_file(b, "B\n")
+
+  local out = drive(function(ctx)
+    return registry.call("tool.move_files", { moves = {
+      { from = a, to = dir .. "/moved/a.txt" },
+      { from = b, to = dir .. "/moved/b.txt" },
+    } }, ctx)
+  end)
+
+  assert(out:find("moved 2 files", 1, true), "unexpected result: " .. tostring(out))
+  assert(vim.fn.filereadable(a) == 0, "a should be gone from its source")
+  assert(vim.fn.filereadable(b) == 0, "b should be gone from its source")
+  assert(vim.fn.filereadable(dir .. "/moved/a.txt") == 1, "a should exist at destination")
+  assert(vim.fn.filereadable(dir .. "/moved/b.txt") == 1, "b should exist at destination")
+end)
+
+case("move_files: one invalid entry refuses the WHOLE batch (no partial move)", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local c = dir .. "/c.txt"
+  write_file(c, "C\n")
+
+  local out = drive(function(ctx)
+    return registry.call("tool.move_files", { moves = {
+      { from = c, to = dir .. "/moved/c.txt" },
+      { from = dir .. "/nope.txt", to = dir .. "/moved/nope.txt" },
+    } }, ctx)
+  end)
+
+  assert(out:find("refusing the whole batch", 1, true), "unexpected result: " .. tostring(out))
+  assert(out:find("no such file", 1, true), "should name the missing source: " .. tostring(out))
+  assert(vim.fn.filereadable(c) == 1, "the VALID entry must not have moved either")
+end)
+
+case("move_files: two entries targeting the same destination are refused", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  write_file(dir .. "/d1.txt", "D1\n")
+  write_file(dir .. "/d2.txt", "D2\n")
+
+  local out = drive(function(ctx)
+    return registry.call("tool.move_files", { moves = {
+      { from = dir .. "/d1.txt", to = dir .. "/same.txt" },
+      { from = dir .. "/d2.txt", to = dir .. "/same.txt" },
+    } }, ctx)
+  end)
+
+  assert(out:find("two entries target", 1, true), "unexpected result: " .. tostring(out))
+  assert(vim.fn.filereadable(dir .. "/d1.txt") == 1, "d1 should be untouched")
+  assert(vim.fn.filereadable(dir .. "/d2.txt") == 1, "d2 should be untouched")
+end)
+
+case("move_files: from == to in one entry is refused", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local p = dir .. "/same.txt"
+  write_file(p, "x\n")
+  local out = drive(function(ctx)
+    return registry.call("tool.move_files", { moves = { { from = p, to = p } } }, ctx)
+  end)
+  assert(out:find("same path", 1, true), "unexpected result: " .. tostring(out))
+end)
+
+case("move_files requires a non-empty moves array", function()
+  local out1 = drive(function(ctx) return registry.call("tool.move_files", {}, ctx) end)
+  assert(out1:find("non-empty array", 1, true), "missing message: " .. tostring(out1))
+  local out2 = drive(function(ctx) return registry.call("tool.move_files", { moves = {} }, ctx) end)
+  assert(out2:find("non-empty array", 1, true), "missing message: " .. tostring(out2))
+end)
+
+case("move_files is registered with the right schema and requires confirmation", function()
+  local e = registry.get("tool.move_files")
+  assert(e, "tool.move_files not registered")
+  assert(type(e.fn) == "function", "tool.move_files did not compile")
+  local req = e.input_schema and e.input_schema.required
+  assert(req and vim.tbl_contains(req, "moves"), "input_schema should require moves")
+  local allowed = registry.call("hook.confirm", "move_files", { moves = {} }, { bufnr = 0 })
+  assert(allowed ~= true, "move_files should not be auto-allowed, got: " .. tostring(allowed))
+end)
+
+-- --------------------------------------------------------------- delete_file
+
+case("delete_file: plain delete (no LSP client) removes the file", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local p = dir .. "/a.txt"
+  write_file(p, "A\n")
+
+  local out = drive(function(ctx)
+    return registry.call("tool.delete_file", { path = p }, ctx)
+  end)
+
+  assert(out:find("deleted", 1, true), "unexpected result: " .. tostring(out))
+  assert(out:find("not undo-tree reversible", 1, true), "should warn it's not undoable: " .. tostring(out))
+  assert(vim.fn.filereadable(p) == 0, "file should be gone")
+end)
+
+case("delete_file: missing file errors with a clear message", function()
+  local out = drive(function(ctx)
+    return registry.call("tool.delete_file", { path = "/no/such/file.txt" }, ctx)
+  end)
+  assert(out:find("no such file", 1, true), "unexpected message: " .. tostring(out))
+end)
+
+case("delete_file: refuses when the buffer has unsaved changes", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local p = dir .. "/b.txt"
+  write_file(p, "B\n")
+  local buf = vim.fn.bufadd(p)
+  vim.fn.bufload(buf)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "MODIFIED" })
+
+  local out = drive(function(ctx)
+    return registry.call("tool.delete_file", { path = p }, ctx)
+  end)
+
+  assert(out:find("unsaved buffer changes", 1, true), "unexpected message: " .. tostring(out))
+  assert(vim.fn.filereadable(p) == 1, "file should be untouched")
+end)
+
+case("delete_file requires path", function()
+  local out = drive(function(ctx) return registry.call("tool.delete_file", {}, ctx) end)
+  assert(out:find("path is required", 1, true), "missing path-required message: " .. tostring(out))
+end)
+
+case("delete_file is registered with the right schema and requires confirmation", function()
+  local e = registry.get("tool.delete_file")
+  assert(e, "tool.delete_file not registered")
+  assert(type(e.fn) == "function", "tool.delete_file did not compile")
+  local req = e.input_schema and e.input_schema.required
+  assert(req and vim.tbl_contains(req, "path"), "input_schema should require path")
+  local allowed = registry.call("hook.confirm", "delete_file", { path = "a" }, { bufnr = 0 })
+  assert(allowed ~= true, "delete_file should not be auto-allowed, got: " .. tostring(allowed))
+end)
+
+-- -------------------------------------------------------------- delete_files
+
+case("delete_files: plain batch (no LSP client) deletes every file", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local a, b = dir .. "/a.txt", dir .. "/b.txt"
+  write_file(a, "A\n")
+  write_file(b, "B\n")
+
+  local out = drive(function(ctx)
+    return registry.call("tool.delete_files", { paths = { a, b } }, ctx)
+  end)
+
+  assert(out:find("deleted 2 files", 1, true), "unexpected result: " .. tostring(out))
+  assert(vim.fn.filereadable(a) == 0, "a should be gone")
+  assert(vim.fn.filereadable(b) == 0, "b should be gone")
+end)
+
+case("delete_files: one invalid entry refuses the WHOLE batch (no partial delete)", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local c = dir .. "/c.txt"
+  write_file(c, "C\n")
+
+  local out = drive(function(ctx)
+    return registry.call("tool.delete_files", { paths = { c, dir .. "/nope.txt" } }, ctx)
+  end)
+
+  assert(out:find("refusing the whole batch", 1, true), "unexpected result: " .. tostring(out))
+  assert(vim.fn.filereadable(c) == 1, "the VALID entry must not have been deleted either")
+end)
+
+case("delete_files: a duplicate path in the batch is refused", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local p = dir .. "/d.txt"
+  write_file(p, "D\n")
+  local out = drive(function(ctx)
+    return registry.call("tool.delete_files", { paths = { p, p } }, ctx)
+  end)
+  assert(out:find("listed twice", 1, true), "unexpected result: " .. tostring(out))
+  assert(vim.fn.filereadable(p) == 1, "file should be untouched")
+end)
+
+case("delete_files: an unsaved buffer among many entries refuses the whole batch", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local a, b = dir .. "/a.txt", dir .. "/b.txt"
+  write_file(a, "A\n")
+  write_file(b, "B\n")
+  local buf = vim.fn.bufadd(b)
+  vim.fn.bufload(buf)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "MODIFIED" })
+
+  local out = drive(function(ctx)
+    return registry.call("tool.delete_files", { paths = { a, b } }, ctx)
+  end)
+
+  assert(out:find("unsaved buffer changes", 1, true), "unexpected result: " .. tostring(out))
+  assert(vim.fn.filereadable(a) == 1, "a must not be deleted either — whole batch refused")
+  assert(vim.fn.filereadable(b) == 1, "b should be untouched")
+end)
+
+case("delete_files requires a non-empty paths array", function()
+  local out1 = drive(function(ctx) return registry.call("tool.delete_files", {}, ctx) end)
+  assert(out1:find("non-empty array", 1, true), "missing message: " .. tostring(out1))
+  local out2 = drive(function(ctx) return registry.call("tool.delete_files", { paths = {} }, ctx) end)
+  assert(out2:find("non-empty array", 1, true), "missing message: " .. tostring(out2))
+end)
+
+case("delete_files is registered with the right schema and requires confirmation", function()
+  local e = registry.get("tool.delete_files")
+  assert(e, "tool.delete_files not registered")
+  assert(type(e.fn) == "function", "tool.delete_files did not compile")
+  local req = e.input_schema and e.input_schema.required
+  assert(req and vim.tbl_contains(req, "paths"), "input_schema should require paths")
+  local allowed = registry.call("hook.confirm", "delete_files", { paths = {} }, { bufnr = 0 })
+  assert(allowed ~= true, "delete_files should not be auto-allowed, got: " .. tostring(allowed))
+end)
+
 -- ----------------------------------------------------- hook.confirm auto-allow
 
 case("the five editor tools are auto-allowed by hook.confirm", function()

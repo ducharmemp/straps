@@ -22,6 +22,22 @@ connected only at setup time, so:
 - `registry_define` does NOT change the repo. A live redefinition is an
   experiment, not a delivered change, until the same source is in the
   file.
+- `require("straps.xxx")` is a THIRD, separate cache from the registry:
+  Lua resolves a module once via `package.path`/`runtimepath` and keeps it
+  in `package.loaded`. Clearing `package.loaded["straps.xxx"]` and calling
+  `require` again does NOT re-read your edit — it re-resolves from the
+  SAME path, which is very often not this checkout at all (a plugin
+  manager can point this Neovim at a pinned install elsewhere, e.g. a Nix
+  store copy). Before attempting any live reload or demo, check which
+  file this session is actually running:
+
+      :lua =debug.getinfo(require("straps.loop").start, "S").source
+
+  If that path is not under this repo, stop — no `require`/`package.loaded`
+  trick will ever pick up an on-disk edit here. Mirror the change into the
+  session's registry with `registry_define` instead (session-scoped,
+  reversible), exactly as the flow below describes, and verify the on-disk
+  edit headless.
 
 The flow for changing a default: edit the source in the repo, verify
 headless (below), and only then — if trying it live is useful — mirror

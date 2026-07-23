@@ -1,0 +1,253 @@
+[
+  {
+    "type": "assistant_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "assistant_marker",
+          "named": true
+        },
+        {
+          "type": "content",
+          "named": true
+        },
+        {
+          "type": "inline",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "attrs",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "content",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "escaped_line",
+          "named": true
+        },
+        {
+          "type": "text_line",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "document",
+    "named": true,
+    "root": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "assistant_block",
+          "named": true
+        },
+        {
+          "type": "preamble",
+          "named": true
+        },
+        {
+          "type": "system_block",
+          "named": true
+        },
+        {
+          "type": "tool_result_block",
+          "named": true
+        },
+        {
+          "type": "tool_use_block",
+          "named": true
+        },
+        {
+          "type": "user_block",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "escaped_line",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "esc_prefix",
+          "named": true
+        },
+        {
+          "type": "line_text",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "inline",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "line_text",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "preamble",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "escaped_line",
+          "named": true
+        },
+        {
+          "type": "text_line",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "system_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "content",
+          "named": true
+        },
+        {
+          "type": "inline",
+          "named": true
+        },
+        {
+          "type": "system_marker",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "tool_result_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "attrs",
+          "named": true
+        },
+        {
+          "type": "content",
+          "named": true
+        },
+        {
+          "type": "tool_result_marker",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "tool_use_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "attrs",
+          "named": true
+        },
+        {
+          "type": "content",
+          "named": true
+        },
+        {
+          "type": "tool_use_marker",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "user_block",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "content",
+          "named": true
+        },
+        {
+          "type": "inline",
+          "named": true
+        },
+        {
+          "type": "user_marker",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "assistant_marker",
+    "named": true
+  },
+  {
+    "type": "esc_prefix",
+    "named": true
+  },
+  {
+    "type": "system_marker",
+    "named": true
+  },
+  {
+    "type": "text_line",
+    "named": true
+  },
+  {
+    "type": "tool_result_marker",
+    "named": true
+  },
+  {
+    "type": "tool_use_marker",
+    "named": true
+  },
+  {
+    "type": "user_marker",
+    "named": true
+  }
+]

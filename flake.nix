@@ -8,6 +8,16 @@
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
+      # The transcript-format grammar (tree-sitter-straps/). generate = false:
+      # the committed src/parser.c is authoritative, so the build needs only a
+      # C compiler, not a tree-sitter CLI whose output could drift by version.
+      mkGrammar = pkgs: pkgs.tree-sitter.buildGrammar {
+        language = "straps";
+        version = self.shortRev or self.dirtyShortRev or "dev";
+        src = "${self}/tree-sitter-straps";
+        generate = false;
+      };
+
       mkStraps = pkgs: pkgs.vimUtils.buildVimPlugin {
         pname = "straps.nvim";
         version = self.shortRev or self.dirtyShortRev or "dev";
@@ -20,11 +30,22 @@
           description = "Self-extending coding agent inside Neovim; every tool, hook and prompt layer is a live registry entry";
           license = nixpkgs.lib.licenses.mit;
         };
+        # Ship the compiled grammars on the plugin's own rtp: with the straps
+        # parser present, ftplugin/straps.lua starts treesitter highlighting
+        # (injected markdown/JSON) instead of the legacy syntax file. json
+        # rides along because Neovim does not bundle it and the tool-body
+        # injection silently renders plain without it; a json parser earlier
+        # on the user's rtp (user site dir, nvim-treesitter) still wins.
+        postInstall = ''
+          install -Dm755 ${mkGrammar pkgs}/parser $out/parser/straps.so
+          install -Dm755 ${pkgs.tree-sitter-grammars.tree-sitter-json}/parser $out/parser/json.so
+        '';
       };
     in
     {
       packages = forAllSystems (pkgs: rec {
         straps-nvim = mkStraps pkgs;
+        tree-sitter-straps = mkGrammar pkgs;
         default = straps-nvim;
       });
 
@@ -87,10 +108,24 @@
           checkPhase = ''
             export HOME=$TMPDIR
             export XDG_DATA_HOME=$TMPDIR/data XDG_STATE_HOME=$TMPDIR/state XDG_CACHE_HOME=$TMPDIR/cache
+            # stdenvNoCC has no C compiler, so run_treesitter.lua's local
+            # compile fallback cannot run here — without this parser it would
+            # silently SKIP and the grammar would go untested in CI. The json
+            # parser is not bundled with Neovim (markdown is); provide it so
+            # the tool-body injection assertions run instead of skipping.
+            install -Dm755 ${mkGrammar pkgs}/parser parser/straps.so
+            install -Dm755 ${pkgs.tree-sitter-grammars.tree-sitter-json}/parser parser/json.so
+            # Both parsers were just installed above, so run_treesitter.lua's
+            # soft skip-on-missing-parser paths must be hard failures here —
+            # a broken install must not leave the grammar untested with CI
+            # green. The test enforces that itself when this is set.
+            export STRAPS_TS_REQUIRED=1
+            fail=0
             for t in tests/run_*.lua; do
               echo "== $t"
-              nvim --headless -l "$t"
+              nvim --headless -l "$t" || fail=1
             done
+            [ "$fail" = 0 ]
           '';
           installPhase = "touch $out";
         };

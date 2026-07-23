@@ -35,7 +35,10 @@ lua/straps/loop.lua        -- coroutine agent loop
 lua/straps/tools.lua       -- registers all builtin tools + default hooks
 lua/straps/ui.lua          -- registry edit buffers, listing, keymaps, folds
 plugin/straps.lua          -- user commands (guarded, no heavy requires at load)
-syntax/straps.vim          -- syntax highlighting for filetype=straps buffers
+syntax/straps.vim          -- legacy syntax highlighting (no-parser fallback)
+ftplugin/straps.lua        -- starts treesitter when the straps parser exists
+queries/straps/            -- highlight + injection queries (markdown/JSON)
+tree-sitter-straps/        -- the transcript grammar (generated src/ committed)
 tests/run_registry_state.lua
 tests/run_loop.lua
 README.md
@@ -136,6 +139,14 @@ return function(input, ctx) ... end
 
 %%[straps:user]%%
 ```
+
+This grammar has a second, display-only implementation: the tree-sitter
+grammar in `tree-sitter-straps/` (with `queries/straps/` injecting markdown
+into prose content and JSON into tool bodies). It exists so treesitter
+highlighting and language-tree-driven markdown renderers work on the
+transcript; it never feeds parsing — `state.lua` is the parser of record for
+API messages in all cases. `tests/run_treesitter.lua` pins the two
+implementations' block boundaries to each other.
 
 ### Parse → Anthropic messages
 
@@ -734,6 +745,18 @@ schemes clear highlights on load.
 | StrapsToolError | DiagnosticError | `✗` on `is_error` |
 | StrapsRule      | Comment         | the turn rules |
 | StrapsCardBorder| Comment         | the expanded-tool box art |
+| StrapsWinbar    | StatusLine      | session-window winbar |
+| StrapsFileRef   | Underlined      | path:line refs (treesitter engine) |
+| @straps.marker.system      | Title    | marker line, treesitter engine |
+| @straps.marker.user        | Question | marker line, treesitter engine |
+| @straps.marker.assistant   | Function | marker line, treesitter engine |
+| @straps.marker.tool_use    | PreProc  | marker line, treesitter engine |
+| @straps.marker.tool_result | Comment  | marker line, treesitter engine |
+| @straps.esc                | Special  | `%%[[esc]]` prefix, treesitter engine |
+
+The `@straps.*` targets mirror the `hi def link straps*Marker` block in
+`syntax/straps.vim` so both highlighting engines look alike; the ftplugin also
+applies these links, so they exist even when `setup()` never ran.
 
 ### fn.render(bufnr) — the render pass (define_default in ui.setup's register)
 

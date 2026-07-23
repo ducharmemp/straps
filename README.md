@@ -236,6 +236,70 @@ default preview, so the display never errors. `fn.tool_display` is an ordinary
 registry entry: `:StrapsEdit fn.tool_display` (and `:w`) to add a formatter for
 a tool the agent defined, or to change the style — the next render picks it up.
 
+### Syntax highlighting and markdown rendering
+
+Transcript highlighting has two engines, chosen per buffer by whether the
+`straps` tree-sitter parser (`tree-sitter-straps/`) is installed:
+
+- **Parser absent**: the legacy regex syntax file (`syntax/straps.vim`),
+  exactly as before.
+- **Parser present**: `ftplugin/straps.lua` starts tree-sitter highlighting
+  instead. The transcript's language tree then carries real **markdown** trees
+  for prose blocks and **JSON** trees for tool bodies (`queries/straps/`), so
+  fenced code in an agent reply gets its language's own highlighting, and any
+  language-tree-driven markdown renderer lights up on the transcript with no
+  straps involvement. The grammar is display-only — parsing for API requests
+  is `state.lua` in both cases, and the buffer text is never touched.
+
+  The markdown parsers ship with Neovim; a **json** parser does not, and
+  without one tool bodies render plain. The Nix package ships `json.so`
+  alongside the straps parser; elsewhere `:TSInstall json` (or your existing
+  json parser) covers it.
+
+Installing the parser:
+
+- **Nix**: nothing to do — the flake's plugin package ships
+  `parser/straps.so`. (It is also exposed as `packages.<system>.tree-sitter-straps`.)
+- **nvim-treesitter** (`master` branch API; the `main` rewrite changed how
+  parsers register — use the manual compile there): register it, then
+  `:TSInstall straps`:
+
+  ```lua
+  require("nvim-treesitter.parsers").get_parser_configs().straps = {
+    install_info = {
+      url = "https://github.com/matt/straps", -- wherever this repo lives
+      location = "tree-sitter-straps",
+      files = { "src/parser.c" },
+    },
+  }
+  ```
+
+- **Manually**: compile the committed C and drop it on your runtimepath:
+
+  ```sh
+  mkdir -p ~/.local/share/nvim/site/parser
+  cc -shared -fPIC -O2 -I tree-sitter-straps/src \
+     tree-sitter-straps/src/parser.c -o ~/.local/share/nvim/site/parser/straps.so
+  ```
+
+For rendered markdown (headings, bullets, code-block backgrounds) install
+[render-markdown.nvim](https://github.com/MeanderingProgrammer/render-markdown.nvim)
+(or any renderer that walks the language tree) and enable it for the `straps`
+filetype. The `win_options` below matter: the plugin resets window options
+from the **global** defaults when leaving rendered mode, which would otherwise
+reveal the raw `%%[straps:...]%%` markers while you type — these values
+reproduce what straps sets for its session windows:
+
+```lua
+require("render-markdown").setup({
+  file_types = { "straps" },
+  win_options = {
+    conceallevel = { default = 2, rendered = 3 },
+    concealcursor = { default = "nc", rendered = "nc" },
+  },
+})
+```
+
 ### Long sessions
 
 The transcript IS the request: every turn re-parses the whole buffer, so a

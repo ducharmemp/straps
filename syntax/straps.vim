@@ -19,7 +19,9 @@ unlet! b:current_syntax
 syn match strapsEscMarker "^%%\[\[esc\]\]" contained
 
 " path:line[:col] references — press gf on one to jump there
-" (ui.map_file_refs); underlined so they read as navigable.
+" (ui.map_file_refs); underlined so they read as navigable. Same regex as
+" apply_file_ref_match in lua/straps/ui.lua (the treesitter engine's copy) —
+" change both together.
 syn match strapsFileRef "[[:alnum:]_./~-]\+:\d\+\%(:\d\+\)\=" contained
 
 " Prose blocks (system/user/assistant content) render as markdown. Defined
@@ -49,6 +51,8 @@ syn match strapsAssistantMarker "^%%\[straps:assistant\]%%.*$"
 syn match strapsToolUseMarker    "^%%\[straps:tool_use\]%%.*$"     nextgroup=strapsToolUseBody skipnl
 syn match strapsToolResultMarker "^%%\[straps:tool_result\]%%.*$" nextgroup=strapsToolResultBody skipnl
 
+" Targets mirror the @straps.* entries in ui.lua's HL_LINKS (the treesitter
+" engine's palette) — retheme a marker in both places.
 hi def link strapsSystemMarker     Title
 hi def link strapsUserMarker       Question
 hi def link strapsAssistantMarker  Function

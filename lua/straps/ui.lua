@@ -28,6 +28,17 @@ local HL_LINKS = {
   StrapsRule = "Comment",          -- the turn rules
   StrapsCardBorder = "Comment",    -- the expanded-tool box art
   StrapsWinbar = "StatusLine",     -- session-window winbar (model/effort/status)
+  StrapsFileRef = "Underlined",    -- path:line[:col] under treesitter (apply_file_ref_match)
+  -- Treesitter captures (queries/straps/highlights.scm). The targets must
+  -- stay in lockstep with the `hi def link straps*Marker` block in
+  -- syntax/straps.vim — the legacy engine keeps its own copy so a bare
+  -- `:e file.straps` without the parser stays colored with no Lua involved.
+  ["@straps.marker.system"] = "Title",
+  ["@straps.marker.user"] = "Question",
+  ["@straps.marker.assistant"] = "Function",
+  ["@straps.marker.tool_use"] = "PreProc",
+  ["@straps.marker.tool_result"] = "Comment",
+  ["@straps.esc"] = "Special",
 }
 
 --- (Re)establish the straps highlight groups as default links. Called from
@@ -453,6 +464,7 @@ function M.show_session(bufnr)
   -- open_session_file), so the FileType autocmd's vim.opt_local never had a
   -- window to land on; apply the fold options now that one exists.
   M.apply_fold_opts(bufnr)
+  M.apply_file_ref_match(bufnr)
   -- Window-local winbar: show the session's active model/effort (and run
   -- phase) right on its own window, so "what am I talking to" is always
   -- visible without touching the user's global statusline. config.session_winbar
@@ -1158,6 +1170,86 @@ function M.apply_fold_opts(bufnr)
   end
 end
 
+local function clear_file_ref_match(win)
+  local id = vim.w[win].straps_file_ref_match
+  if id then
+    pcall(vim.fn.matchdelete, id, win)
+    vim.w[win].straps_file_ref_match = nil
+  end
+end
+
+-- The match lifecycle autocmds are registered on first use, not in setup():
+-- matches are created on paths that never ran setup() (:Straps and `:e
+-- file.straps` both work without it), and users who never touch a session
+-- shouldn't pay a WinEnter callback forever.
+local file_ref_lifecycle = false
+
+local function register_file_ref_lifecycle()
+  if file_ref_lifecycle then
+    return
+  end
+  file_ref_lifecycle = true
+  local grp = vim.api.nvim_create_augroup("StrapsFileRefMatch", { clear = true })
+  -- A match is window-scoped and, unlike window-local options, stays with the
+  -- window across buffer switches: without cleanup a window that once showed
+  -- a session would underline path:line-shaped text in every buffer it shows
+  -- afterwards. Remove it when a non-straps buffer enters the window; apply
+  -- it when a straps buffer does. Both events are needed: BufWinEnter for a
+  -- buffer switch inside a window, WinEnter for a new or revisited window
+  -- (:split of a visible buffer fires only the latter).
+  vim.api.nvim_create_autocmd({ "BufWinEnter", "WinEnter" }, {
+    group = grp,
+    callback = function(ev)
+      local win = vim.api.nvim_get_current_win()
+      if vim.api.nvim_win_get_buf(win) ~= ev.buf then
+        return
+      end
+      if vim.bo[ev.buf].filetype == "straps" then
+        M.apply_file_ref_match(ev.buf)
+      else
+        clear_file_ref_match(win)
+      end
+    end,
+  })
+  -- An in-place filetype change (`:set ft=text`, a modeline) fires neither of
+  -- the events above; drop the match from every window showing the buffer.
+  vim.api.nvim_create_autocmd("FileType", {
+    group = grp,
+    callback = function(ev)
+      if ev.match ~= "straps" then
+        for _, win in ipairs(vim.fn.win_findbuf(ev.buf)) do
+          clear_file_ref_match(win)
+        end
+      end
+    end,
+  })
+end
+
+--- Underline path:line[:col] references in every window showing bufnr, but
+--- only when the treesitter highlighter owns the buffer — under legacy syntax
+--- the strapsFileRef rule in syntax/straps.vim already does this. matchadd is
+--- window-local with the same set-while-hidden trap as the fold options (see
+--- apply_fold_opts), so the ftplugin, show_session and the FileType autocmd
+--- all call this, guarded per-window by the returned match id.
+function M.apply_file_ref_match(bufnr)
+  if not vim.treesitter.highlighter.active[bufnr] then
+    return
+  end
+  register_file_ref_lifecycle()
+  for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
+    if vim.w[win].straps_file_ref_match == nil then
+      -- Same vim regex as strapsFileRef in syntax/straps.vim (and the Lua
+      -- pattern in file_ref_at_cursor is its gf-side equivalent) — a change
+      -- to what counts as a file ref must land in all three. Scope is wider
+      -- than the legacy rule (window-wide, so marker lines and tool_use JSON
+      -- bodies get underlines too): accepted, since gf works buffer-wide
+      -- under both engines.
+      vim.w[win].straps_file_ref_match = vim.fn.matchadd(
+        "StrapsFileRef", [=[[[:alnum:]_./~-]\+:\d\+\%(:\d\+\)\=]=], 10, -1, { window = win })
+    end
+  end
+end
+
 -- Source for the fn.tool_display registry entry (compiled on define). A pure
 -- function(name, input) -> string; wholly self-contained so it round-trips
 -- through registry.render. The whole body is pcall-guarded: any branch throwing
@@ -1310,6 +1402,7 @@ function M.setup()
       -- actually in a window; this autocmd covers `:e some.straps` instead,
       -- where FileType fires with the buffer already current.
       M.apply_fold_opts(ev.buf)
+      M.apply_file_ref_match(ev.buf)
       M.map_file_refs(ev.buf)
     end,
   })

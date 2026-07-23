@@ -730,7 +730,7 @@ local SYSTEM_PROMPT_CORE_SRC = [==[
 -- editor powers, permissions, presentation, self-extension. Environment and project
 -- context live in fn.system_prompt_env / fn.system_prompt_project.
 return function()
-  return [[You are a coding agent running inside Neovim, hosted by straps.nvim. The
+  return [[You are Cinch, a coding agent running inside Neovim, hosted by straps.nvim. The
 conversation transcript is an ordinary editable buffer; the user watches
 your tool calls and streamed text live as you work.
 

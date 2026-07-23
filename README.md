@@ -124,7 +124,7 @@ line and runs until the next marker:
 
 ```
 %%[straps:system]%%
-You are a coding agent...
+You are Cinch, a coding agent...
 
 %%[straps:user]%%
 add a linter hook
@@ -163,8 +163,12 @@ decorative — a small mark per block type for glance-level pattern recognition,
 never a wash or a background tint:
 
 - Each `user` / `assistant` / `system` marker line is concealed and replaced
-  by a colored turn rule — `──── you ─────…`, `──── agent ─────…`,
-  `──── system ─────…` — so the transcript reads as a conversation.
+  by a colored turn rule — `──── you ─────…`, `━━━━ Cinch ━━━━━…`,
+  `──── system ─────…` — so the transcript reads as a conversation. The agent
+  is named **Cinch**, after the strap that pulls a harness tight. User and
+  agent turns read apart at a glance: your rules use the light `─` bar, Cinch's
+  use the heavy `━`, and the leading segment + role word take the role's
+  color (trailing bars stay dim).
 - A `tool_use` + `tool_result` pair folds to **one colored summary line**,
   `▸ <verb> <args>  ✓|✗` (green ✓ / red ✗ from the result's `is_error`) —
   the call rendered command-style by [`fn.tool_display`](#command-style-tool-calls),
@@ -177,8 +181,8 @@ own `hi link`; `default = true` means yours wins):
 
 | group | default link | mark |
 | --- | --- | --- |
-| `StrapsRoleUser`   | `Function`        | the `you` role tag |
-| `StrapsRoleAgent`  | `Keyword`         | the `agent` role tag |
+| `StrapsRoleUser`   | `Function`        | the `you` role tag + leading rule segment |
+| `StrapsRoleAgent`  | `Keyword`         | the `Cinch` (agent) role tag + leading rule segment |
 | `StrapsRoleSystem` | `Comment`         | the `system` tag (dim) |
 | `StrapsTool`       | `Special`         | `⚙` glyph + tool name |
 | `StrapsToolOk`     | `DiagnosticOk`    | `✓` on a good result |

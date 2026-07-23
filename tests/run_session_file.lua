@@ -26,6 +26,17 @@ local state = require("straps.state")
 -- Hermetic session dir; register the real provider so new_session uses the
 -- real fn.system_prompt (new_session also has a fallback prompt if absent).
 straps.config.session_dir = vim.fn.tempname()
+
+-- Before the real provider registers, the registry is bare: this exercises
+-- new_session's built-in fallback prompt.
+local function case_fallback()
+  local bufnr = require("straps.state").new_session()
+  local parsed = require("straps.state").parse(bufnr)
+  assert(parsed.system:find("You are Cinch, a coding agent running inside Neovim", 1, true),
+    "fallback system prompt missing the Cinch identity line")
+end
+case("new_session falls back to the built-in identity line without fn.system_prompt", case_fallback)
+
 require("straps.provider").register()
 
 local function read_file(path)

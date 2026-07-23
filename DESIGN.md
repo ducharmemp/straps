@@ -121,7 +121,7 @@ Example transcript:
 
 ```
 %%[straps:system]%%
-You are a coding agent...
+You are Cinch, a coding agent...
 
 %%[straps:user]%%
 add a linter hook
@@ -671,8 +671,10 @@ the block or start a new session to refresh — document this):
 
 Written for agent-ability and ecosystem norms; concise, imperative:
 
-- Identity: a coding agent inside Neovim via straps.nvim; the transcript is
-  an editable buffer; the user sees tool calls and streamed text live.
+- Identity: Cinch, a coding agent inside Neovim via straps.nvim; the
+  transcript is an editable buffer; the user sees tool calls and streamed
+  text live. (The name is not explained in the prompt itself: a cinch is
+  the strap that pulls a harness tight.)
 - Output norms (ecosystem standard): be concise and direct; no preamble or
   postamble around actions; reference code as `path:line`; report outcomes
   factually — never claim success that was not observed; if a command fails,
@@ -737,8 +739,8 @@ schemes clear highlights on load.
 
 | group | default link | mark |
 | --- | --- | --- |
-| StrapsRoleUser  | Function        | the `you` role tag |
-| StrapsRoleAgent | Keyword         | the `agent` role tag |
+| StrapsRoleUser  | Function        | the `you` role tag + leading rule segment |
+| StrapsRoleAgent | Keyword         | the `Cinch` (agent) role tag + leading rule segment |
 | StrapsRoleSystem| Comment         | the `system` tag (dim) |
 | StrapsTool      | Special         | `⚙` glyph + tool name |
 | StrapsToolOk    | DiagnosticOk    | `✓` on a good result |
@@ -765,9 +767,13 @@ Clears the straps-render namespace and repopulates by walking
 
 - **user / assistant / system marker line** → a `conceal=""` extmark hiding the
   raw marker text, plus an `overlay` `virt_text` at col 0 drawing a turn rule
-  `──── you ─────────…` (fixed ~52-col rule; StrapsRule) with the role word in
-  StrapsRoleUser/Agent/System. The blank line the writer puts before each
-  marker gives vertical separation.
+  (fixed ~52-col): light `─` rules for user and system (`──── you ─────…`,
+  `──── system ─────…`), a heavy `━` rule for the assistant
+  (`━━━━ Cinch ━━━━━…`, labeled Cinch). The rule char differs per role and the
+  leading segment + role word take the StrapsRole* color while trailing bars
+  stay dim StrapsRule — a bounded categorical mark, not a wash, sized so user
+  and agent turns delineate at a glance. The blank line the writer puts before
+  each marker gives vertical separation.
 - **tool_use + tool_result run** → left to the fold (below); the marker lines
   are concealed so the open state is clean.
 - Rendering is window-agnostic (extmarks are buffer-scoped); conceal needs the
@@ -855,8 +861,10 @@ for an agent-defined tool or change the style.
 Build a session buffer with a scripted transcript (user, assistant, a
 tool_use+tool_result pair, system). Then, without a real window where
 possible, assert on `nvim_buf_get_extmarks(buf, ns, ..., {details=true})`:
-- marker lines carry a conceal extmark and an overlay virt_text whose chunks
-  include the rule + role word with StrapsRoleUser/Agent/System hl.
+- marker lines carry a conceal extmark and an overlay virt_text: a lead rule
+  segment + role word in StrapsRoleUser/Agent/System, a dim StrapsRule
+  trailing run, and per-role bar chars (light `─` for user/system, heavy `━`
+  for the assistant) on lead and trailing alike.
 - message body lines carry NO straps-render extmark (color only on marks).
 - fn.render is idempotent (same extmark set after two runs).
 - the foldtext function (exposed for test) returns a colored chunk list with

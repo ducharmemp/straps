@@ -19,8 +19,8 @@ end
 -- default=true so a user's own `hi link StrapsTool X` wins; re-applied on
 -- ColorScheme because many schemes clear highlights on load.
 local HL_LINKS = {
-  StrapsRoleUser = "Function",     -- the `you` role tag
-  StrapsRoleAgent = "Keyword",     -- the `agent` role tag
+  StrapsRoleUser = "Function",     -- the `you` role tag + leading rule segment
+  StrapsRoleAgent = "Keyword",     -- the `Cinch` (agent) role tag + leading rule segment
   StrapsRoleSystem = "Comment",    -- the `system` tag (dim)
   StrapsTool = "Special",          -- ⚙ glyph + tool name
   StrapsToolOk = "DiagnosticOk",   -- ✓ on a good result
@@ -59,25 +59,28 @@ local function marker_len(line)
   return tok and #tok or nil
 end
 
--- A horizontal ─ run of n cells (>= 1).
-local function bar(n)
-  return string.rep("─", math.max(1, n))
+-- A horizontal rule run of n cells (>= 1); ch defaults to the light ─.
+local function bar(n, ch)
+  return string.rep(ch or "─", math.max(1, n))
 end
 
 local ROLE = {
-  user = { label = "you", hl = "StrapsRoleUser" },
-  assistant = { label = "agent", hl = "StrapsRoleAgent" },
-  system = { label = "system", hl = "StrapsRoleSystem" },
+  user = { label = "you", hl = "StrapsRoleUser", bar = "─" },
+  assistant = { label = "Cinch", hl = "StrapsRoleAgent", bar = "━" },
+  system = { label = "system", hl = "StrapsRoleSystem", bar = "─" },
 }
 
--- Overlay chunk list for a role marker line: ──── <role> ─────… (StrapsRule
--- rule chars, the role word in its StrapsRole* group), fixed ~RULE_WIDTH wide.
+-- Overlay chunk list for a role marker line, fixed ~RULE_WIDTH wide. The
+-- leading segment and role word carry the role's StrapsRole* group and the
+-- rule char differs per role (light ─ for you/system, heavy ━ for Cinch) so
+-- user and agent turns read apart at a glance; the trailing run stays dim
+-- StrapsRule.
 local function role_overlay(role)
   local trailing = RULE_WIDTH - 5 - #role.label - 1
   return {
-    { "──── ", "StrapsRule" },
+    { bar(4, role.bar) .. " ", role.hl },
     { role.label, role.hl },
-    { " " .. bar(trailing), "StrapsRule" },
+    { " " .. bar(trailing, role.bar), "StrapsRule" },
   }
 end
 

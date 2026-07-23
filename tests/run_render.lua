@@ -37,7 +37,7 @@ local render_ns = vim.api.nvim_create_namespace("straps_render")
 -- the 1-based line numbers of a few landmark lines for row-precise asserts.
 local TRANSCRIPT = {
   "%%[straps:system]%%",       -- 1
-  "You are a coding agent.",   -- 2
+  "You are Cinch, a coding agent.",   -- 2
   "",                          -- 3
   "%%[straps:user]%%",         -- 4
   "hello there",               -- 5 (message body)
@@ -121,7 +121,7 @@ registry.call("fn.render", buf)
 case("marker lines carry a conceal extmark and a role-rule overlay", function()
   for _, spec in ipairs({
     { lnum = LN.user_marker, word = "you", hl = "StrapsRoleUser" },
-    { lnum = LN.assistant_marker, word = "agent", hl = "StrapsRoleAgent" },
+    { lnum = LN.assistant_marker, word = "Cinch", hl = "StrapsRoleAgent" },
     { lnum = LN.system_marker, word = "system", hl = "StrapsRoleSystem" },
   }) do
     local marks = marks_on_row(buf, spec.lnum)
@@ -143,6 +143,41 @@ case("marker lines carry a conceal extmark and a role-rule overlay", function()
     assert(saw_conceal, "no conceal mark on " .. spec.word .. " marker")
     assert(saw_overlay, "no overlay with " .. spec.word .. "/" .. spec.hl)
   end
+end)
+
+case("role rules read apart: per-role bar char + role-colored lead", function()
+  local function overlay_chunks(lnum)
+    for _, m in ipairs(marks_on_row(buf, lnum)) do
+      local d = m[4]
+      if d.virt_text and d.virt_text_pos == "overlay" then
+        return d.virt_text
+      end
+    end
+  end
+  local user = overlay_chunks(LN.user_marker)
+  local agent = overlay_chunks(LN.assistant_marker)
+  local system = overlay_chunks(LN.system_marker)
+  assert(user and agent and system, "missing role-rule overlay on a marker line")
+  assert(user[1][1]:find("─", 1, true) and not user[1][1]:find("━", 1, true),
+    "user lead must use the light ─ bar")
+  assert(agent[1][1]:find("━", 1, true) and not agent[1][1]:find("─", 1, true),
+    "agent lead must use the heavy ━ bar")
+  assert(system[1][1]:find("─", 1, true) and not system[1][1]:find("━", 1, true),
+    "system lead must use the light ─ bar")
+  assert(user[1][2] == "StrapsRoleUser",
+    "user lead must carry StrapsRoleUser, got " .. tostring(user[1][2]))
+  assert(agent[1][2] == "StrapsRoleAgent",
+    "agent lead must carry StrapsRoleAgent, got " .. tostring(agent[1][2]))
+  assert(system[1][2] == "StrapsRoleSystem",
+    "system lead must carry StrapsRoleSystem, got " .. tostring(system[1][2]))
+  assert(agent[3][1]:find("━", 1, true) and not agent[3][1]:find("─", 1, true),
+    "agent trailing run must keep the heavy ━ bar")
+  assert(user[3][1]:find("─", 1, true) and not user[3][1]:find("━", 1, true),
+    "user trailing run must keep the light ─ bar")
+  assert(system[3][1]:find("─", 1, true) and not system[3][1]:find("━", 1, true),
+    "system trailing run must keep the light ─ bar")
+  assert(user[3][2] == "StrapsRule" and agent[3][2] == "StrapsRule" and system[3][2] == "StrapsRule",
+    "trailing bars must stay dim StrapsRule")
 end)
 
 case("message body lines carry no render extmark", function()

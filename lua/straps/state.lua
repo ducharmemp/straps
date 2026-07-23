@@ -390,7 +390,7 @@ function M.new_session()
   -- fn.system_prompt is registered by provider.register(); fall back so a
   -- bare registry (e.g. in tests) still yields a usable session.
   local prompt = registry.try_call("fn.system_prompt")
-    or "You are a coding agent running inside Neovim via straps.nvim."
+    or "You are Cinch, a coding agent running inside Neovim via straps.nvim."
   M.append(bufnr, "system", nil, prompt) -- persists (block boundary)
   M.ensure_trailing_user(bufnr) -- persists
   return bufnr

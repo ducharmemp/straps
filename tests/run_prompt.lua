@@ -53,7 +53,7 @@ case("fn.system_prompt composes core + env; project stays out of a bare dir", fu
   cd(deep)
   local ok, err = pcall(function()
     local prompt = registry.call("fn.system_prompt")
-    assert(prompt:find("coding agent running inside Neovim", 1, true),
+    assert(prompt:find("You are Cinch, a coding agent running inside Neovim", 1, true),
       "core identity phrase missing")
     assert(prompt:find("registry_define", 1, true), "self-extension material missing")
     assert(prompt:find("\n# Environment\n", 1, true), "# Environment section missing")
@@ -148,7 +148,7 @@ case("new_session writes the composed prompt into the system block", function()
     local bufnr = state.new_session()
     local parsed = state.parse(bufnr)
     assert(type(parsed.system) == "string" and parsed.system ~= "", "system block empty")
-    assert(parsed.system:find("coding agent running inside Neovim", 1, true),
+    assert(parsed.system:find("You are Cinch, a coding agent running inside Neovim", 1, true),
       "core layer missing from session system block")
     assert(parsed.system:find("agents-norm-marker", 1, true),
       "AGENTS.md content missing from session system block")

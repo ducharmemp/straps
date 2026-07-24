@@ -275,15 +275,18 @@ end)
 
 case("spawn round trip: child session runs and its answer returns to the parent", function()
   allow_all()
-  define("fn.provider", "fn", "test: parent spawns, child answers", [==[
+  -- The parent spawns (fire-and-return, gets a buffer handle), then in a later
+  -- turn calls spawn_wait on that handle to collect the child's answer. The
+  -- provider recovers the child bufnr by scanning the spawn tool_result text.
+  define("fn.provider", "fn", "test: parent spawns, waits, child answers", [==[
 return function(req, ctx)
-  local first_user
+  local first_user, last_result
   for _, m in ipairs(req.messages) do
     if m.role == "user" then
       for _, p in ipairs(m.content) do
-        if p.type == "text" then first_user = p.text; break end
+        if p.type == "text" and not first_user then first_user = p.text end
+        if p.type == "tool_result" then last_result = p.content end
       end
-      break
     end
   end
   local is_child = first_user and first_user:find("CHILD-TASK", 1, true)
@@ -293,7 +296,7 @@ return function(req, ctx)
     vim.defer_fn(function()
       if is_child then
         ctx.emit({ type = "text_delta", text = "CHILD-ANSWER-XYZ" })
-      elseif #req.messages > 1 then
+      elseif last_result and last_result:find("## subagent", 1, true) then
         ctx.emit({ type = "text_delta", text = "PARENT-DONE" })
       end
       resolve()
@@ -309,6 +312,14 @@ return function(req, ctx)
         input = { task = "CHILD-TASK: report the magic string." } },
     } }
   end
+  -- Second turn: the spawn result named a child buffer. Wait on it.
+  local child = last_result and tonumber(last_result:match("buffer (%d+)"))
+  if child and not last_result:find("## subagent", 1, true) then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "w1", name = "spawn_wait",
+        input = { buffers = { child } } },
+    } }
+  end
   return { stop_reason = "end_turn", content = { { type = "text", text = "PARENT-DONE" } } }
 end
 ]==])
@@ -319,7 +330,8 @@ end
   wait_done(parent)
 
   local text = buf_text(parent)
-  assert(text:find("subagent finished", 1, true), "spawn result header missing:\n" .. text:sub(-400))
+  assert(text:find("subagent started", 1, true), "spawn start header missing:\n" .. text:sub(-400))
+  assert(text:find("subagent (buffer", 1, true), "spawn_wait result header missing:\n" .. text:sub(-400))
   assert(text:find("CHILD-ANSWER-XYZ", 1, true), "child's answer missing from parent transcript")
   assert(text:find("PARENT-DONE", 1, true), "parent did not continue after the spawn")
 
@@ -337,7 +349,67 @@ end
   assert(vim.b[child].straps_spawn_depth == 1, "child depth not stamped")
 end)
 
--- Helper: run a parent whose only move is to spawn with the given extra input,
+case("spawn fires and returns; spawn_wait collects N children run concurrently", function()
+  allow_all()
+  -- Two children each sleep ~300ms before answering. Started via two spawn
+  -- calls (fire-and-return), then a single spawn_wait over both. If they ran
+  -- concurrently the wait is ~300ms, not ~600ms; we assert well under the sum.
+  define("fn.provider", "fn", "test: slow children answer their tag", [==[
+return function(req, ctx)
+  local first_user
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" then first_user = p.text; break end
+      end
+      break
+    end
+  end
+  local tag = first_user and first_user:match("PAR%-(%u)")
+  ctx.await(function(resolve) vim.defer_fn(resolve, 500) end)
+  ctx.emit({ type = "text_delta", text = "ANS-" .. (tag or "?") })
+  -- Let the scheduled delta flush into the assistant block before the run ends
+  -- (the real SSE provider streams throughout; a single end-of-run emit would
+  -- otherwise race the trailing-user marker).
+  ctx.await(function(resolve) vim.defer_fn(resolve, 10) end)
+  return { stop_reason = "end_turn", content = { { type = "text", text = "ANS-" .. (tag or "?") } } }
+end
+]==])
+
+  local parent = vim.api.nvim_create_buf(true, false)
+  local t0 = vim.uv.hrtime()
+  local out = drive(function(ctx)
+    ctx.bufnr = parent
+    local a = registry.call("tool.spawn", { task = "PAR-A: answer" }, ctx)
+    local b = registry.call("tool.spawn", { task = "PAR-B: answer" }, ctx)
+    -- Both children are already running here; spawn returned immediately.
+    local ba = tonumber(a:match("buffer (%d+)"))
+    local bb = tonumber(b:match("buffer (%d+)"))
+    return registry.call("tool.spawn_wait", { buffers = { ba, bb } }, ctx)
+  end)
+  local ms = (vim.uv.hrtime() - t0) / 1e6
+  assert(out:find("ANS-A", 1, true), "child A answer missing:\n" .. out)
+  assert(out:find("ANS-B", 1, true), "child B answer missing:\n" .. out)
+  assert(select(2, out:gsub("## subagent", "")) == 2, "expected two subagent sections:\n" .. out)
+  -- Concurrent: ~500ms (slowest child) + ~100ms poll granularity + 200ms
+  -- settle ≈ 800ms. Sequential would be ~2x the child time (1200ms+). The
+  -- generous 950ms ceiling still cleanly separates the two regimes.
+  assert(ms < 950, "children did not run concurrently (" .. math.floor(ms) .. "ms for 2x500ms)")
+end)
+
+case("spawn_wait skips buffers that are not this session's children", function()
+  allow_all()
+  local parent = vim.api.nvim_create_buf(true, false)
+  local stranger = vim.api.nvim_create_buf(true, false) -- no straps_parent == parent
+  local out = drive(function(ctx)
+    ctx.bufnr = parent
+    return registry.call("tool.spawn_wait", { buffers = { stranger } }, ctx)
+  end)
+  assert(out:find("not a subagent of this session", 1, true),
+    "stranger buffer should be reported as skipped: " .. out)
+end)
+
+
 -- then return the child buffer. Identifying the child by scanning transcripts
 -- is unreliable (the parent transcript also holds the spawn tool_use input, and
 -- the child buffer may unload after its run), so record the child bufnr
@@ -490,8 +562,10 @@ end
   local parent = vim.api.nvim_create_buf(true, false)
   local out = drive(function(ctx)
     ctx.bufnr = parent
-    return registry.call("tool.spawn",
+    local started = registry.call("tool.spawn",
       { task = "RCHILD-TASK: write a file.", readonly = true }, ctx)
+    local child = tonumber(started:match("buffer (%d+)"))
+    return registry.call("tool.spawn_wait", { buffers = { child } }, ctx)
   end)
   assert(out:find("rchild-done", 1, true), "child did not finish: " .. out)
 
@@ -601,9 +675,11 @@ end
   local parent = vim.api.nvim_create_buf(true, false)
   local out = drive(function(ctx)
     ctx.bufnr = parent
-    return registry.call("tool.spawn", { task = "CRASH-TASK: boom" }, ctx)
+    local started = registry.call("tool.spawn", { task = "CRASH-TASK: boom" }, ctx)
+    local child = tonumber(started:match("buffer (%d+)"))
+    return registry.call("tool.spawn_wait", { buffers = { child } }, ctx)
   end)
-  assert(out:find("subagent finished", 1, true), "spawn should return, not hang: " .. out)
+  assert(out:find("subagent (buffer", 1, true), "spawn_wait should return, not hang: " .. out)
   assert(out:find("child exploded spectacularly", 1, true),
     "child's error should surface in the parent's result: " .. out)
 end)
@@ -623,26 +699,28 @@ end
   local t0 = vim.uv.hrtime()
   local out = drive(function(ctx)
     ctx.bufnr = parent
-    return registry.call("tool.spawn",
+    local started = registry.call("tool.spawn",
       { task = "HANG-TASK: never answer", timeout_ms = 400 }, ctx)
+    local child = tonumber(started:match("buffer (%d+)"))
+    return registry.call("tool.spawn_wait", { buffers = { child } }, ctx)
   end)
   local ms = (vim.uv.hrtime() - t0) / 1e6
-  assert(out:find("subagent timed out (stopped)", 1, true), "timeout header missing: " .. out)
-  assert(ms < 5000, "spawn timeout too slow: " .. math.floor(ms) .. "ms")
+  assert(out:find("timed out (stopped)", 1, true), "timeout status missing: " .. out)
+  assert(ms < 5000, "spawn_wait timeout too slow: " .. math.floor(ms) .. "ms")
 end)
 
 case("cancelling the parent stops a spawned child mid-flight", function()
   allow_all()
   _G.straps_hang_child = nil
-  define("fn.provider", "fn", "test: parent spawns a hanging child", [==[
+  define("fn.provider", "fn", "test: parent spawns a hanging child then waits", [==[
 return function(req, ctx)
-  local first_user
+  local first_user, last_result
   for _, m in ipairs(req.messages) do
     if m.role == "user" then
       for _, p in ipairs(m.content) do
-        if p.type == "text" then first_user = p.text; break end
+        if p.type == "text" and not first_user then first_user = p.text end
+        if p.type == "tool_result" then last_result = p.content end
       end
-      break
     end
   end
   if first_user and first_user:find("HANG2-TASK", 1, true) then
@@ -659,20 +737,38 @@ return function(req, ctx)
         input = { task = "HANG2-TASK: hang forever" } },
     } }
   end
+  -- Parent blocks in spawn_wait on the hanging child until it is cancelled.
+  local child = last_result and tonumber(last_result:match("buffer (%d+)"))
+  if child then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "w9", name = "spawn_wait",
+        input = { buffers = { child } } },
+    } }
+  end
   return { stop_reason = "end_turn", content = { { type = "text", text = "unreachable" } } }
 end
 ]==])
 
   local parent = state.new_session()
   state.append_text(parent, "spawn something that hangs")
+  -- Cancel only once the parent is actually inside spawn_wait, else the run's
+  -- post-provider cancel check returns before the tool (and its child-stopping
+  -- on_cancel handler) ever runs.
+  _G.straps_parent_waiting = false
+  define("hook.before_tool", "hook", "test: note spawn_wait entry", [[
+return function(name) if name == "spawn_wait" then _G.straps_parent_waiting = true end end
+]])
   loop.start(parent)
   assert(vim.wait(8000, function() return _G.straps_hang_child ~= nil end, 20),
     "child never started")
   local child = _G.straps_hang_child
   assert(loop.running(child), "child should be mid-run")
+  assert(vim.wait(8000, function() return _G.straps_parent_waiting end, 20),
+    "parent never reached spawn_wait")
 
   loop.stop(parent)
   wait_done(parent)
+  define("hook.before_tool", "hook", "test: noop", "return function() end")
   assert(vim.wait(4000, function() return not loop.running(child) end, 20),
     "cancelling the parent did not stop the child")
   assert(buf_text(parent):find("[straps: run cancelled]", 1, true),

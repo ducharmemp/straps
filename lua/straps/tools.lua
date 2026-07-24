@@ -483,24 +483,29 @@ end
   define({
     name = "tool.spawn",
     kind = "tool",
-    doc = "Run a subagent on a task in its OWN session buffer and return its"
-      .. " final answer. The child is a full straps session: its transcript is"
-      .. " a real buffer the user can open, watch and steer (show=true opens"
+    doc = "Launch a subagent on a task in its OWN session buffer and return"
+      .. " IMMEDIATELY with a handle — the subagent runs concurrently while you"
+      .. " keep working. Call spawn N times (batch the calls in one turn) to fan"
+      .. " out N subagents that all run in parallel, then collect their answers"
+      .. " with spawn_wait. The child is a full straps session: its transcript"
+      .. " is a real buffer the user can open, watch and steer (show=true opens"
       .. " it in a split). The child inherits this session's registry view —"
       .. " your session-scoped tools included — but anything IT defines lands"
       .. " in its own scope and never leaks back. Use it to isolate context:"
       .. " the child burns its own transcript on a broad investigation and you"
-      .. " receive only its final answer. The task must be COMPLETE and"
-      .. " self-contained; the child sees none of this conversation."
-      .. " Parameters: task (required); system (optional) — extra standing"
-      .. " instructions, prepended to the task; tools (optional array of tool"
-      .. " names) — the child sees only these tools; readonly (optional"
+      .. " receive only its final answer (via spawn_wait). The task must be"
+      .. " COMPLETE and self-contained; the child sees none of this"
+      .. " conversation. Returns the child's handle (buffer number) to pass to"
+      .. " spawn_wait. Parameters: task (required); system (optional) — extra"
+      .. " standing instructions, prepended to the task; tools (optional array"
+      .. " of tool names) — the child sees only these tools; readonly (optional"
       .. " boolean) — the child may use only auto-allowed read-only tools,"
       .. " every write is denied without prompting; show (optional boolean) —"
       .. " open the child's transcript in a split; max_turns (optional,"
       .. " default 24); model (optional) — run the child on this model id"
       .. " instead of the session's; effort (optional) — extended-thinking"
-      .. " effort name for the child; timeout_ms (optional, default 600000).",
+      .. " effort name for the child; timeout_ms (optional, default 600000) —"
+      .. " enforced by spawn_wait.",
     input_schema = {
       type = "object",
       properties = {
@@ -516,7 +521,7 @@ end
         max_turns = { type = "integer", description = "Child turn budget (default 24)." },
         model = { type = "string", description = "Model id for the child (default: this session's model)." },
         effort = { type = "string", description = "Extended-thinking effort name for the child (default: this session's effort)." },
-        timeout_ms = { type = "integer", description = "Wall-clock cap in milliseconds (default 600000)." },
+        timeout_ms = { type = "integer", description = "Wall-clock cap in milliseconds (default 600000), enforced by spawn_wait." },
       },
       required = { "task" },
     },
@@ -546,6 +551,11 @@ return function(input, ctx)
   local child = state.new_session()
   vim.b[child].straps_spawn_depth = depth + 1
   vim.b[child].straps_max_turns = math.floor(tonumber(input.max_turns) or 24)
+  -- Timeout is stored for spawn_wait to enforce (spawn itself returns at once).
+  -- Stamp the start time too, so the deadline measures the child's real
+  -- lifetime, not just the time spent inside spawn_wait.
+  vim.b[child].straps_spawn_timeout_ms = tonumber(input.timeout_ms) or 600000
+  vim.b[child].straps_spawn_started_ms = vim.uv.now()
   -- Model / effort: an explicit spawn arg wins; else inherit the PARENT's
   -- per-buffer override if it has one (so a subagent matches its session by
   -- default), else leave unset so fn.provider falls back to the global config.
@@ -604,47 +614,149 @@ end
     end)
   end
 
-  -- Wait for the child's run to end; cancelling the parent stops the child.
-  local timeout_ms = tonumber(input.timeout_ms) or 600000
-  local finished = ctx.await(function(resolve)
-    local start = vim.uv.now()
-    local function poll()
-      if not loop.running(child) then resolve(true); return end
-      if vim.uv.now() - start >= timeout_ms then resolve(false); return end
-      vim.defer_fn(poll, 100)
+  -- Fire-and-return: the child is now running on its own coroutine. Report its
+  -- handle so the parent can launch more (they run concurrently) and later
+  -- collect answers with spawn_wait. Cancelling the parent while children are
+  -- outstanding is handled by spawn_wait's cancel handler.
+  local name = vim.api.nvim_buf_get_name(child)
+  local where = name ~= "" and vim.fn.fnamemodify(name, ":~:.") or ("buffer " .. child)
+  return ("subagent started — buffer %d, transcript: %s\n"
+    .. "collect its answer with spawn_wait{ buffers = { %d } }"):format(child, where, child)
+end
+]==],
+  })
+
+  -- ---------------------------------------------------------------- spawn_wait
+
+  define({
+    name = "tool.spawn_wait",
+    kind = "tool",
+    doc = "Wait for one or more subagents (started with spawn) to finish and"
+      .. " return their final answers. Pass the buffer handles spawn returned;"
+      .. " all are awaited CONCURRENTLY, so waiting on N children costs the"
+      .. " time of the slowest, not the sum. Each child's own timeout_ms (set"
+      .. " at spawn) is enforced here; a child that overruns is stopped and"
+      .. " reported as timed out. Cancelling the parent run stops every"
+      .. " outstanding child. Returns one section per child: its handle, task,"
+      .. " status (finished/timed out), and its final answer text."
+      .. " Parameters: buffers (required) — array of subagent buffer numbers"
+      .. " returned by spawn.",
+    input_schema = {
+      type = "object",
+      properties = {
+        buffers = {
+          type = "array",
+          items = { type = "integer" },
+          description = "Subagent buffer numbers returned by spawn.",
+        },
+      },
+      required = { "buffers" },
+    },
+    source = [==[
+return function(input, ctx)
+  local state = require("straps.state")
+  local loop = require("straps.loop")
+
+  local bufs = input.buffers
+  if type(bufs) ~= "table" or #bufs == 0 then
+    error("spawn_wait: buffers must be a non-empty array of subagent buffer numbers")
+  end
+  -- Normalize + validate: only wait on live buffers that this session spawned
+  -- (straps_parent == us). Unknown/invalid handles are reported, never awaited.
+  local children, bad = {}, {}
+  for _, b in ipairs(bufs) do
+    local child = math.floor(tonumber(b) or -1)
+    local ok_valid = child >= 0 and vim.api.nvim_buf_is_valid(child)
+    local parent
+    if ok_valid then pcall(function() parent = vim.b[child].straps_parent end) end
+    if ok_valid and parent == ctx.bufnr then
+      children[#children + 1] = child
+    else
+      bad[#bad + 1] = child
     end
-    if ctx.on_cancel then
-      ctx.on_cancel(function() pcall(loop.stop, child) end)
-    end
-    poll()
-  end)
-  if not finished then
-    pcall(loop.stop, child)
+  end
+
+  -- Await ALL outstanding children in a SINGLE await: one poll loop checks
+  -- every child, so the wait costs the slowest child, not the sum. Each child
+  -- carries its own deadline (straps_spawn_timeout_ms, stamped by spawn); a
+  -- child past its deadline is stopped and marked timed out. Cancelling the
+  -- parent stops every child at once.
+  local timed_out = {}
+  if #children > 0 then
+    ctx.await(function(resolve)
+      local starts = {}
+      for _, c in ipairs(children) do
+        -- Deadline is measured from the child's spawn (straps_spawn_started_ms),
+        -- so time the parent spent working before calling spawn_wait counts
+        -- against the child's timeout. Fall back to now if the stamp is missing.
+        local started = vim.uv.now()
+        pcall(function() started = vim.b[c].straps_spawn_started_ms or started end)
+        starts[c] = started
+      end
+      local function poll()
+        local pending = false
+        for _, c in ipairs(children) do
+          if loop.running(c) then
+            local limit = 600000
+            pcall(function() limit = vim.b[c].straps_spawn_timeout_ms or 600000 end)
+            if vim.uv.now() - starts[c] >= limit then
+              timed_out[c] = true
+              pcall(loop.stop, c)
+            else
+              pending = true
+            end
+          end
+        end
+        if pending then vim.defer_fn(poll, 100) else resolve(true) end
+      end
+      if ctx.on_cancel then
+        ctx.on_cancel(function()
+          for _, c in ipairs(children) do pcall(loop.stop, c) end
+        end)
+      end
+      poll()
+    end)
+    -- A stopped child (timed-out/cancelled) needs a beat to unwind its run;
+    -- and a just-finished child may have a final streamed text_delta still
+    -- scheduled (emit is vim.schedule'd, so it can trail the run-done signal).
+    -- One settle tick lets both land before we read the answers.
     ctx.await(function(resolve) vim.defer_fn(resolve, 200) end)
   end
 
   -- The child's last assistant text IS its report to us.
-  local answer = ""
-  pcall(function()
-    local msgs = state.parse(child).messages
-    for i = #msgs, 1, -1 do
-      if msgs[i].role == "assistant" then
-        local parts = {}
-        for _, p in ipairs(msgs[i].content) do
-          if p.type == "text" then parts[#parts + 1] = p.text end
-        end
-        if #parts > 0 then
-          answer = table.concat(parts, "\n")
-          break
+  local function answer_of(child)
+    local answer = ""
+    pcall(function()
+      local msgs = state.parse(child).messages
+      for i = #msgs, 1, -1 do
+        if msgs[i].role == "assistant" then
+          local parts = {}
+          for _, p in ipairs(msgs[i].content) do
+            if p.type == "text" then parts[#parts + 1] = p.text end
+          end
+          if #parts > 0 then answer = table.concat(parts, "\n"); break end
         end
       end
-    end
-  end)
-  local name = vim.api.nvim_buf_get_name(child)
-  local where = name ~= "" and vim.fn.fnamemodify(name, ":~:.") or ("buffer " .. child)
-  return (finished and "subagent finished" or "subagent timed out (stopped)")
-    .. " — transcript: " .. where .. "\n\n"
-    .. (answer ~= "" and answer or "(no final answer text)")
+    end)
+    return answer
+  end
+
+  local out = {}
+  for _, child in ipairs(children) do
+    local nm = vim.api.nvim_buf_get_name(child)
+    local where = nm ~= "" and vim.fn.fnamemodify(nm, ":~:.") or ("buffer " .. child)
+    local task = ""
+    pcall(function() task = vim.b[child].straps_task or "" end)
+    local answer = answer_of(child)
+    local status = timed_out[child] and "timed out (stopped)" or "finished"
+    out[#out + 1] = ("## subagent (buffer %d) — %s\ntask: %s\ntranscript: %s\n\n%s")
+      :format(child, status, task ~= "" and task or "(none)", where,
+        answer ~= "" and answer or "(no final answer text)")
+  end
+  for _, b in ipairs(bad) do
+    out[#out + 1] = ("## buffer %d — not a subagent of this session (skipped)"):format(b)
+  end
+  return table.concat(out, "\n\n")
 end
 ]==],
   })

@@ -934,25 +934,24 @@ case("agents_status drops a stale/invalid parent to a top-level count", function
 end)
 
 case("tool.spawn tags the child buffer with parent and task", function()
-  -- Drive spawn far enough to create + tag the child, then stop it. The child
-  -- has no provider wired here; loop.start will attempt a request and error
-  -- inside the coroutine, but the tagging happens before loop.start.
+  -- spawn tags the child buffer, then fires loop.start and returns immediately
+  -- (no await). Stub loop.start so no network happens; the tagging happens
+  -- before loop.start regardless.
   local parent = state.new_session()
   local before = {}
   for _, b in ipairs(vim.api.nvim_list_bufs()) do before[b] = true end
 
-  -- Stub loop.start so no network happens; spawn's await then times out fast.
   local loop = require("straps.loop")
-  local real_start, real_running = loop.start, loop.running
+  local real_start = loop.start
   loop.start = function() end
-  loop.running = function() return false end -- so spawn's poll resolves immediately
   local ok, out = pcall(drive, function(ctx)
     ctx.bufnr = parent
     return registry.call("tool.spawn",
       { task = "  do   the    thing  ", timeout_ms = 2000 }, ctx)
   end, 8000)
-  loop.start, loop.running = real_start, real_running
+  loop.start = real_start
   assert(ok, "spawn errored: " .. tostring(out))
+  assert(out:find("subagent started", 1, true), "spawn should return a start handle: " .. tostring(out))
 
   -- Find the newly-created session buffer.
   local child

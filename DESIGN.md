@@ -621,6 +621,23 @@ API names (registry names prefixed `tool.`):
   redefinitions of any tool/hook/fn, including the provider and confirm hook.
 - `eval_lua {code}` — `load` + pcall, returns `vim.inspect` of results.
   Dangerous by design; gated by `hook.confirm`.
+- `spawn {task, system?, tools?, readonly?, show?, max_turns?, model?, effort?, timeout_ms?}`
+  — creates a child session buffer (`state.new_session`), chains its registry
+  scope under the parent (`registry.ensure_scope`), stamps parentage/task/model/
+  effort/timeout vim.b vars, seeds the task, `loop.start`s it, and **returns
+  IMMEDIATELY** with the child's buffer handle — it does NOT await. The child
+  runs concurrently on its own coroutine. This makes N-way parallelism a matter
+  of issuing N `spawn` calls (their children all run at once) instead of one
+  blocking call per child run serially.
+- `spawn_wait {buffers}` — awaits the named child buffers (validated: live +
+  `straps_parent == ctx.bufnr`) in a SINGLE poll loop, so the wait costs the
+  slowest child, not the sum. Each child's `straps_spawn_timeout_ms` (stamped by
+  `spawn`) is enforced against its `straps_spawn_started_ms` (so time the parent
+  spent before calling spawn_wait counts against the child) — an overrunning
+  child is `loop.stop`ped and marked timed out; cancelling the parent stops
+  every outstanding child. Returns one `## subagent (buffer N)` section per
+  child (status + task + transcript path + the child's last assistant text).
+  `fn.build_tools` hides BOTH `spawn` and `spawn_wait` at the spawn depth limit.
 
 Default hooks registered here:
 

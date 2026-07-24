@@ -151,8 +151,8 @@ return function()
   end
 
   -- Session shaping (set by tool.spawn on child sessions): an allow-list
-  -- filter, and hiding spawn entirely once the depth budget is spent — a
-  -- tool the model cannot use should not be offered.
+  -- filter, and hiding spawn/spawn_wait entirely once the depth budget is
+  -- spent — a tool the model cannot use should not be offered.
   local scope = registry.active_scope()
   if scope then
     local filter, depth, max_depth
@@ -173,7 +173,7 @@ return function()
     if (depth or 0) >= (max_depth or 1) then
       local kept = {}
       for _, t in ipairs(tools) do
-        if t.name ~= "spawn" then kept[#kept + 1] = t end
+        if t.name ~= "spawn" and t.name ~= "spawn_wait" then kept[#kept + 1] = t end
       end
       tools = kept
     end
@@ -829,10 +829,16 @@ your tool calls and streamed text live as you work.
 
 # Subagents
 
-- spawn runs a subagent in its own session buffer and returns only its
-  final answer. Use it when a broad investigation would flood this
-  transcript with tool results you will not need again — the child burns
-  its own context, you keep the conclusion.
+- spawn launches a subagent in its own session buffer and returns
+  IMMEDIATELY with a handle (its buffer number); the child runs
+  concurrently. spawn_wait{ buffers = {...} } then blocks until the named
+  children finish and returns their answers. Use spawn when a broad
+  investigation would flood this transcript with tool results you will not
+  need again — the child burns its own context, you keep the conclusion.
+- To run N investigations in PARALLEL, emit N spawn calls in one turn (or
+  across turns), collect the handles, then one spawn_wait over all of
+  them — they run at once, so the wait costs the slowest child, not the
+  sum. Do NOT spawn one, wait, spawn the next: that serializes them.
 - The child sees NONE of this conversation: write the task complete and
   self-contained, including every path, constraint, and the exact shape
   of the answer you want back.

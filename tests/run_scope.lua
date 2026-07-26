@@ -583,6 +583,29 @@ end
   assert(vim.fn.filereadable("/tmp/should-not-exist.txt") == 0, "denied write happened anyway")
 end)
 
+case("fn.readonly_policy is the single source of truth for read-only calls", function()
+  local policy = function(name, input)
+    return registry.try_call("fn.readonly_policy", name, input)
+  end
+  -- Presentation / help / interaction tools that had drifted out of spawn's
+  -- readonly copy are read-only.
+  for _, n in ipairs({
+    "read_file", "grep", "show_user", "show_diff", "show_buffer",
+    "set_quickfix", "ask_user", "help_search", "definition", "references",
+  }) do
+    assert(policy(n) == true, n .. " should be read-only")
+  end
+  -- Writes are not.
+  for _, n in ipairs({ "write_file", "edit_file", "patch_file", "bash" }) do
+    assert(policy(n) ~= true, n .. " should not be read-only")
+  end
+  -- List-mode exceptions.
+  assert(policy("code_action", {}) == true, "code_action list mode is read-only")
+  assert(policy("code_action", { index = 0 }) ~= true, "applying a code_action is a write")
+  assert(policy("undo_edit", { history = true }) == true, "undo history is read-only")
+  assert(policy("undo_edit", { to_seq = 3 }) ~= true, "undoing is a write")
+end)
+
 case("spawn depth guard refuses a child spawning a grandchild", function()
   local buf = vim.api.nvim_create_buf(true, false)
   vim.b[buf].straps_spawn_depth = 1

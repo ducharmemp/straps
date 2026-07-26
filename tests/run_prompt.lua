@@ -1,7 +1,8 @@
 -- System prompt tests: the layered prompt (fn.system_prompt_core/_env/
 -- _project composed by fn.system_prompt). Covers composition, AGENTS.md/
--- CLAUDE.md discovery, config.instructions_files, the 20000-byte cap,
--- late-bound layer redefinition, new_session pickup, and the env VCS line.
+-- CLAUDE.md discovery and upward layering, config.instructions_files, the
+-- 20000-byte cap, late-bound layer redefinition, new_session pickup, and
+-- the env VCS line.
 -- Run: nvim --headless -l tests/run_prompt.lua
 
 local here = debug.getinfo(1, "S").source:sub(2)
@@ -97,6 +98,32 @@ case("project layer includes AGENTS.md, CLAUDE.md and instructions_files", funct
     assert(prompt:find("project's memory files", 1, true), "framing sentence missing")
   end)
   straps.config.instructions_files = saved_extras
+  cd(orig_cwd)
+  assert(ok, err)
+end)
+
+-- ---------------------------------------------------------------- layering
+case("upward AGENTS.md files layer, ancestor first and nearest last", function()
+  local ancestor = tmp .. "/isolated"
+  write_file(ancestor .. "/AGENTS.md", "ancestor-agents-marker")
+  write_file(deep .. "/AGENTS.md", "nearest-agents-marker")
+
+  cd(deep)
+  local ok, err = pcall(function()
+    local project = registry.call("fn.system_prompt_project")
+    local at_ancestor = project:find("ancestor-agents-marker", 1, true)
+    local at_nearest = project:find("nearest-agents-marker", 1, true)
+    assert(at_ancestor, "ancestor AGENTS.md missing (no layering)")
+    assert(at_nearest, "nearest AGENTS.md missing")
+    assert(at_ancestor < at_nearest,
+      "nearest AGENTS.md should come AFTER the ancestor (general -> specific)")
+    assert(project:find("## " .. ancestor .. "/AGENTS.md", 1, true),
+      "ancestor path header missing")
+    assert(project:find("## " .. deep .. "/AGENTS.md", 1, true),
+      "nearest path header missing")
+  end)
+  os.remove(ancestor .. "/AGENTS.md")
+  write_file(deep .. "/AGENTS.md", "agents-norm-marker") -- restore for later cases
   cd(orig_cwd)
   assert(ok, err)
 end)

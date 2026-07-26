@@ -74,7 +74,11 @@ you (or the agent) redefined at runtime.
 4. While a run is active, the same `<CR>` steers it instead — you're prompted
    for a message that's queued and delivered at the next turn boundary.
 5. Non-read-only tool calls prompt for confirmation; answer Yes, No, or
-   "Always this tool" (remembered per session buffer).
+   "Always this tool" (remembered per session buffer). File edits offer
+   finer grants instead: "Always in <parent dir>", "Always in this project
+   <root>" (when a `.git`/`.jj`/`.straps.lua`/`.hg`/`.svn` marker is found
+   above the file), and "Always all edits" — pick the project scope to stop
+   re-approving edits directory by directory across the repo.
 6. `:StrapsStop` cancels a run in flight.
 
 Editing history is a feature, not a bug: the buffer is the canonical state,
@@ -539,6 +543,20 @@ transcript you pick — handy when you don't remember the exact name
 `:StrapsResume <Tab>`-completion would need. No saved sessions falls back
 to opening a fresh one, same as bare `:StrapsResume`.
 
+Because a transcript's filename is only a timestamp, sessions are hard to
+tell apart by name — so the picker identifies them by *content*. Each row
+in `list_sessions()` carries a `summary`: the session's durable title if
+one is set (`:StrapsRename`, stored in a companion `<transcript>.meta`
+JSON file — the transcript itself stays pristine), otherwise the first
+user prompt read straight off disk with no buffer load
+(`state.session_summary`). The picker shows that plus a relative age
+("2h ago", "3d ago", an absolute date past a week), and with snacks.nvim
+present it fuzzy-matches the rows and previews the transcript live
+(`ui._pick_session_rich`, overridable). `:StrapsSearch {pattern}` grep
+the conversation content of every transcript (ripgrep, else `:vimgrep`;
+transcript scaffolding skipped) into the quickfix list, so you can find a
+session by what was *said* in it, not its name.
+
 Extended thinking is model-generation-dependent, so `config.models` tags
 each entry with which mechanism it speaks (`thinking = "adaptive"` or
 `"budget"`; see the Configuration table below) and `fn.provider` sends the
@@ -600,12 +618,15 @@ The system prompt is layered, and every layer is a registry entry:
 - `fn.system_prompt_env` — a generated environment block: cwd, platform,
   Neovim version, date, and version control (jj or git, with branch and
   dirty/clean for git).
-- `fn.system_prompt_project` — project instruction files: the nearest
-  `AGENTS.md` and the nearest `CLAUDE.md` found upward from the working
-  directory are discovered automatically (the ecosystem's memory-file
-  convention), plus any paths you list in `config.instructions_files`.
-  Each file is included under a header naming its path, capped at 20000
-  bytes.
+- `fn.system_prompt_project` — project instruction files, layered from
+  general to specific so the nearest file has the last word: a global tier
+  (`AGENTS.md` / `CLAUDE.md` under `stdpath('config')/straps/` then
+  `$HOME`), then every `AGENTS.md` and `CLAUDE.md` found walking upward
+  from the working directory (farthest ancestor first, nearest last), then
+  any paths you list in `config.instructions_files` (the ecosystem's
+  memory-file convention). Each distinct file is included under a header
+  naming its path, capped at 20000 bytes; a path seen twice is included
+  once, at its most general position.
 - `fn.system_prompt` — the composer: joins the three layers (environment
   under `# Environment`, project files under `# Project instructions`)
   and is what `state.new_session` calls.
@@ -911,7 +932,7 @@ for context that isn't tied to one option.
 | `cache` | `true` | Prompt caching: the provider marks `cache_control` breakpoints on the system prompt and the conversation tail so each turn's replayed prefix is a server-side cache hit. Set `false` for Anthropic-compatible servers that reject unknown fields. |
 | `cache_ttl` | unset (`"5m"`) | Cache lifetime per breakpoint. Set `"1h"` for human-paced sessions where turns are often more than 5 minutes apart; costlier writes, break-even after ~3 requests. |
 | `compact_keep_turns` | `2` | How many of the most recent assistant turns `fn.compact` leaves fully intact. |
-| `instructions_files` | `{}` | Extra instruction files for `fn.system_prompt_project`, included after the auto-discovered `AGENTS.md`/`CLAUDE.md`. Paths, absolute or relative to the working directory; unreadable entries are skipped silently. |
+| `instructions_files` | `{}` | Extra instruction files for `fn.system_prompt_project`, included last (after the layered global + upward `AGENTS.md`/`CLAUDE.md`). Paths, absolute or relative to the working directory; unreadable entries are skipped silently. |
 | `auto_compact_tokens` | unset | When set, the loop runs `fn.compact` near this estimated token count (bytes ÷ ~3.5), with a growth guard so it fires coarsely rather than every turn. Set it near your model's context window. Unset = off. |
 | `auto_compact_bytes` | unset | Raw-size alternative to `auto_compact_tokens`: compact when the transcript exceeds this many bytes. Unset = off: automatic history rewriting is opt-in. |
 | `render` | `true` | Transcript rendering (`fn.render`): a display-only conceal + extmark + fold layer that gives each block a categorical colored mark and collapses tool calls to a one-line summary. Buffer text, `modified`, parse and persist are never touched. `false` skips the wiring (raw markers). See [Rendering](#rendering). |

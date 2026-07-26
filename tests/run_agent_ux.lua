@@ -869,6 +869,61 @@ case("'Always all edits' grants every path for edit tools only", function()
   vim.fn.confirm = real_confirm
 end)
 
+case("'Always in this project' grants the whole repo root, covering sibling dirs", function()
+  local base = vim.fn.tempname()
+  local root = vim.uv.fs_realpath(base) or base
+  vim.fn.mkdir(root .. "/.git", "p")
+  vim.fn.mkdir(root .. "/lua/straps", "p")
+  vim.fn.mkdir(root .. "/tests", "p")
+  local cbuf = vim.api.nvim_create_buf(true, false)
+  local prompts = 0
+  local real_confirm = vim.fn.confirm
+  -- The project choice sits at index 4 for a file under lua/straps (parent
+  -- dir is index 3, project root index 4, all-edits index 5).
+  vim.fn.confirm = function() prompts = prompts + 1; return 4 end
+
+  local allowed = registry.call("hook.confirm", "edit_file",
+    { path = root .. "/lua/straps/one.txt", old_string = "x", new_string = "y" },
+    { bufnr = cbuf })
+  assert(allowed == true, "project choice should allow")
+  assert(prompts == 1, "expected one prompt, got " .. prompts)
+  local set = vim.b[cbuf].straps_allowed
+  assert(type(set) == "table" and set["editdir:" .. root],
+    "project-root grant missing: " .. vim.inspect(set))
+
+  -- A file in a SIBLING directory of the repo must now auto-allow (this is
+  -- the whole point: one grant covers the project, not one directory).
+  vim.fn.confirm = function() prompts = prompts + 1; return 0 end -- deny if asked
+  allowed = registry.call("hook.confirm", "write_file",
+    { path = root .. "/tests/two.txt", content = "c" }, { bufnr = cbuf })
+  assert(allowed == true, "sibling dir under the project root should auto-allow")
+  assert(prompts == 1, "sibling-dir edit must not prompt, prompts = " .. prompts)
+
+  -- Outside the project root: still prompts.
+  allowed = registry.call("hook.confirm", "edit_file",
+    { path = vim.fn.tempname() .. "/outside.txt", old_string = "x", new_string = "y" },
+    { bufnr = cbuf })
+  assert(allowed ~= true, "a path outside the project root must not auto-allow")
+
+  vim.fn.confirm = real_confirm
+end)
+
+case("the project choice is absent when the file has no root marker above it", function()
+  -- tempname() lives under /tmp with no .git/.jj/etc above it, so the edit
+  -- prompt has only 3 real choices and 'Always all edits' stays at index 4.
+  local cbuf = vim.api.nvim_create_buf(true, false)
+  local real_confirm = vim.fn.confirm
+  vim.fn.confirm = function() return 4 end -- would be project idx if it existed
+  local allowed = registry.call("hook.confirm", "write_file",
+    { path = vim.fn.tempname() .. "/a.txt", content = "c" }, { bufnr = cbuf })
+  vim.fn.confirm = real_confirm
+  assert(allowed == true, "choice 4 should allow")
+  -- With no project marker, index 4 is 'Always all edits', not a project grant.
+  assert(vim.b[cbuf].straps_allowed["editfiles:*"],
+    "index 4 should be 'all edits' when no project choice is offered: "
+      .. vim.inspect(vim.b[cbuf].straps_allowed))
+end)
+
 -- -------------------------------------------------------------- autocmd_bridge
 
 case("autocmd_bridge queues a hook's string onto the session buffer", function()

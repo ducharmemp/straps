@@ -9,6 +9,8 @@ local M = {}
 -- Shared Lua helpers prepended to every tool source. Each tool source is a
 -- separate compiled chunk, so the helpers live in this prelude string and are
 -- concatenated in; keeps buffer loading / position math / LSP plumbing DRY.
+-- Includes tags_fallback (the no-LSP-client tag lookup shared by definition and
+-- references) and is_session (used by window/buffer-scanning tools).
 local PRELUDE = [==[
 local uv = vim.uv or vim.loop
 
@@ -447,6 +449,32 @@ local function unified_diff(old, new, ctxlen)
   local d = differ((old or "") .. "\n", (new or "") .. "\n", { ctxlen = ctxlen or 3 })
   return type(d) == "string" and d or ""
 end
+
+-- No-LSP-client fallback for a position-based navigation tool: look the symbol
+-- under the cursor up in the tags files. Returns a formatted tag list, or the
+-- standard "no LSP client … (and no tags)" message. Shared by definition and
+-- references, which degrade identically.
+local function tags_fallback(buf, ft, line0, col0)
+  local sym = symbol_at(buf, line0, col0)
+  if sym and sym ~= "" then
+    local okt, tags = pcall(vim.fn.taglist, "^" .. sym .. "$")
+    if okt and type(tags) == "table" and #tags > 0 then
+      local out = {}
+      for _, t in ipairs(tags) do
+        out[#out + 1] = string.format("%s\t%s", t.filename or "?", t.name or sym)
+      end
+      return "tags for " .. sym .. ":\n" .. table.concat(out, "\n")
+    end
+  end
+  return "no LSP client for filetype " .. (ft ~= "" and ft or "?") .. " (and no tags)"
+end
+
+-- True if buffer b is a straps session transcript (marked with b:straps_session).
+-- Tools that scan windows/buffers use it to skip their own session buffer.
+local function is_session(b)
+  local okv, v = pcall(function() return vim.b[b].straps_session end)
+  return okv and v ~= nil and v ~= false
+end
 ]==]
 
 -- Build a full tool source: the shared prelude followed by the tool body.
@@ -877,28 +905,13 @@ return function(input, ctx)
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
 
-  local function fallback()
-    local sym = symbol_at(buf, line0, col0)
-    if sym and sym ~= "" then
-      local okt, tags = pcall(vim.fn.taglist, "^" .. sym .. "$")
-      if okt and type(tags) == "table" and #tags > 0 then
-        local out = {}
-        for _, t in ipairs(tags) do
-          out[#out + 1] = string.format("%s\t%s", t.filename or "?", t.name or sym)
-        end
-        return "tags for " .. sym .. ":\n" .. table.concat(out, "\n")
-      end
-    end
-    return "no LSP client for filetype " .. (ft ~= "" and ft or "?") .. " (and no tags)"
-  end
-
   local params = {
     textDocument = { uri = vim.uri_from_bufnr(buf) },
     position = { line = line0, character = col0 },
   }
   local ok, res, err = pcall(lsp_request, ctx, buf, "textDocument/definition", params, 5000)
   if not ok then return "definition: " .. tostring(res) end
-  if err == "noclient" then return fallback() end
+  if err == "noclient" then return tags_fallback(buf, ft, line0, col0) end
   if err == "timeout" then return "definition: LSP request timed out" end
 
   local locs = {}
@@ -938,21 +951,6 @@ return function(input, ctx)
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
 
-  local function fallback()
-    local sym = symbol_at(buf, line0, col0)
-    if sym and sym ~= "" then
-      local okt, tags = pcall(vim.fn.taglist, "^" .. sym .. "$")
-      if okt and type(tags) == "table" and #tags > 0 then
-        local out = {}
-        for _, t in ipairs(tags) do
-          out[#out + 1] = string.format("%s\t%s", t.filename or "?", t.name or sym)
-        end
-        return "tags for " .. sym .. ":\n" .. table.concat(out, "\n")
-      end
-    end
-    return "no LSP client for filetype " .. (ft ~= "" and ft or "?") .. " (and no tags)"
-  end
-
   local params = {
     textDocument = { uri = vim.uri_from_bufnr(buf) },
     position = { line = line0, character = col0 },
@@ -960,7 +958,7 @@ return function(input, ctx)
   }
   local ok, res, err = pcall(lsp_request, ctx, buf, "textDocument/references", params, 5000)
   if not ok then return "references: " .. tostring(res) end
-  if err == "noclient" then return fallback() end
+  if err == "noclient" then return tags_fallback(buf, ft, line0, col0) end
   if err == "timeout" then return "references: LSP request timed out" end
 
   local locs = {}
@@ -2146,10 +2144,6 @@ end
     input_schema = { type = "object" },
     source = src([==[
 return function(input, ctx)
-  local function is_session(b)
-    local okv, v = pcall(function() return vim.b[b].straps_session end)
-    return okv and v ~= nil and v ~= false
-  end
   local lines = {}
   local cur_win = vim.api.nvim_get_current_win()
   local wins = vim.api.nvim_list_wins()
@@ -2243,10 +2237,6 @@ return function(input, ctx)
   local buf = vim.fn.bufadd(full)
   if not pcall(vim.fn.bufload, buf) then
     return "show_user: could not load " .. path
-  end
-  local function is_session(b)
-    local okv, v = pcall(function() return vim.b[b].straps_session end)
-    return okv and v ~= nil and v ~= false
   end
   local target
   for _, win in ipairs(vim.api.nvim_list_wins()) do

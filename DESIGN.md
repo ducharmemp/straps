@@ -241,7 +241,15 @@ load_project_registry.
 
 **plugin/straps.lua** — `:StrapsResume [path]`: resume_session; completion
 lists session basenames (resolve basename → full path); no arg → most recent.
-`:Straps` stays "new session".
+`:Straps` stays "new session". `:StrapsRename [title]` gives the current
+session a durable title (stored in a companion `<transcript>.meta` JSON file,
+not the transcript); `:StrapsSearch {pattern}` greps every transcript's
+conversation content into the quickfix list. Since a transcript's filename is
+only a timestamp, `state.list_sessions()` carries a `summary` per session (the
+`.meta` title, else the first user prompt via `state.session_summary`, read
+off disk with no buffer load) and the `:StrapsResume!` picker shows it plus a
+relative age — a preview-capable fuzzy backend when one is present
+(`ui._pick_session_rich`), else `vim.ui.select`.
 
 **ftdetect** — `ftdetect/straps.vim` (or an autocmd): `*.straps` → setf straps,
 so a file opened with `:e` gets folding via ui.setup's FileType autocmd.
@@ -770,15 +778,25 @@ API names (registry names prefixed `tool.`):
 
 Default hooks registered here:
 
+- `fn.readonly_policy(name, input) -> boolean` — the single source of truth for
+  "is this tool call read-only": the allowlist (file/search introspection,
+  registry/skill reads, editor-native LSP/tree-sitter/status lookups,
+  presentation tools, ask_user) plus the list-mode exceptions (code_action /
+  fix_diagnostic without an index, undo_edit history). Both `hook.confirm` and
+  spawn's readonly-child gate consult it, so the two cannot drift.
 - `hook.confirm(name, input, ctx) -> allowed, reason` — auto-allow the
-  read-only tools (file/search introspection, registry/skill reads,
-  editor-native LSP/tree-sitter/status lookups, presentation tools, ask_user,
-  code_action list mode, undo_edit history); for everything else
+  read-only tools (via `fn.readonly_policy`); for everything else
   `vim.fn.confirm("straps: allow <name>?\n<preview of input>", ...)`
-  — "Always" adds the name to an allow-set stored in
-  `vim.b[ctx.bufnr].straps_allowed` (buffer state, on theme). Must be called
-  on the main loop (wrap in a scheduled await, since we're inside a coroutine
-  driven from callbacks).
+  — "Always this tool" adds the name to an allow-set stored in
+  `vim.b[ctx.bufnr].straps_allowed` (buffer state, on theme). File edits
+  (write_file/edit_file/patch_file) get path-scoped grants instead of a
+  per-tool toggle: "Always in <parent dir>" stores `editdir:<dir>`
+  (matched as a realpath prefix, so it covers the subtree), "Always in
+  this project <root>" stores `editdir:<root>` for the nearest ancestor
+  holding a `.git`/`.jj`/`.straps.lua`/`.hg`/`.svn` marker (offered only
+  when found and distinct from the parent dir), and "Always all edits"
+  stores `editfiles:*`. Must be called on the main loop (wrap in a
+  scheduled await, since we're inside a coroutine driven from callbacks).
 - `hook.after_write` — default is the editor-native lint feedback loop: after
   a write, wait (bounded via `ctx.await`, `config.after_write_diagnostics_ms`,
   default 800ms) for the file's LSP to re-lint, then return its ERROR/WARN
@@ -805,13 +823,19 @@ the block or start a new session to refresh — document this):
   dirty/clean note from `git status --porcelain` line count. All external
   calls via `vim.system({...}):wait(500)` wrapped in pcall — the block
   degrades gracefully to fewer lines, never errors.
-- `fn.system_prompt_project()` — ecosystem memory files: the NEAREST
-  `AGENTS.md` and the NEAREST `CLAUDE.md` found upward from cwd
-  (`vim.fs.find(..., {upward = true})`, two separate searches), plus any
-  explicit paths in `config.instructions_files` (list, default {}). Each
-  included file is fenced with a header naming its path; each capped at
-  20000 bytes with a truncation note; unreadable/missing files are silently
-  skipped. Returns "" when nothing found.
+- `fn.system_prompt_project()` — ecosystem memory files, LAYERED from
+  general to specific so the nearest file wins. Discovered furthest first:
+  (1) a global tier — `AGENTS.md` / `CLAUDE.md` under
+  `stdpath('config')/straps/` then `$HOME`; (2) every `AGENTS.md` and
+  `CLAUDE.md` found walking upward from cwd
+  (`vim.fs.find(..., {upward = true, limit = math.huge})`, reversed so the
+  farthest ancestor is added first and the nearest last); (3) any explicit
+  paths in `config.instructions_files` (list, default {}), last of all.
+  Each distinct file is fenced with a header naming its path and capped at
+  20000 bytes with a truncation note; a path seen twice (e.g. `$HOME` is
+  also an ancestor) is included once at its most general position;
+  unreadable/missing files are silently skipped. Returns "" when nothing
+  found.
 - `fn.system_prompt()` — joins core, env (under a `# Environment` heading),
   and project (under `# Project instructions` with a sentence telling the
   agent these come from the project's memory files and must be followed)
@@ -1206,8 +1230,8 @@ workspace_symbols.
   name → list the matches.
 
 All are read-only except none; `hook.confirm` auto-allows the read-only set
-(add these names to it). Async LSP tools use ctx.await + a timeout so a wedged
-server can't hang the run.
+via `fn.readonly_policy` (see below). Async LSP tools use ctx.await + a timeout
+so a wedged server can't hang the run.
 
 Presentation tools (also lua/straps/editor.lua) turn agent output into real
 Neovim views instead of transcript prose. They change no files — they open

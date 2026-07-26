@@ -187,6 +187,10 @@ case("ui.pick_session offers list_sessions() items and resumes the picked one", 
 
   local ui = require("straps.ui")
   local real_pick = ui.pick
+  -- Force the plain vim.ui.select path so this stub is the picker under test
+  -- (a preview-capable snacks picker may be on the rtp even headless).
+  local real_rich = ui._pick_session_rich
+  ui._pick_session_rich = function() return false end
   local seen_items, picked
   ui.pick = function(items, opts, on_choice)
     seen_items = items
@@ -200,6 +204,7 @@ case("ui.pick_session offers list_sessions() items and resumes the picked one", 
   end
   local ok, err = pcall(ui.pick_session)
   ui.pick = real_pick
+  ui._pick_session_rich = real_rich
   straps.config.session_dir = saved
   if not ok then
     error(err, 0)
@@ -233,6 +238,116 @@ case("ui.pick_session falls back to open_session when there are no saved session
   assert(ok, "pick_session threw: " .. tostring(bufnr))
   assert(not pick_called, "pick_session should not open a picker with zero saved sessions")
   assert(bufnr and vim.api.nvim_buf_is_valid(bufnr), "pick_session fallback did not return a valid buffer")
+end)
+
+-- ------------------------------------------- session_summary = first prompt
+case("session_summary returns the first user prompt when no title is set", function()
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "how do I search sessions?\nsecond line ignored")
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  local summary = state.session_summary(path)
+  assert(summary and summary:find("how do I search sessions", 1, true),
+    "summary did not surface the first user prompt: " .. tostring(summary))
+end)
+
+case("session_summary is nil for a transcript with no user prompt yet", function()
+  -- new_session appends a trailing EMPTY user block; that must not count.
+  local bufnr = state.new_session()
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  assert(state.session_summary(path) == nil,
+    "empty trailing user block should yield no summary, got: " .. tostring(state.session_summary(path)))
+end)
+
+-- --------------------------------------------- durable titles (.meta files)
+case("set_session_title / session_title round-trip via the companion .meta file", function()
+  local bufnr = state.new_session()
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  assert(state.session_title(path) == nil, "fresh session should have no title")
+  assert(state.set_session_title(path, "My named session"), "set_session_title failed")
+  assert(vim.fn.filereadable(path .. ".meta") == 1, "companion .meta file not written")
+  assert(state.session_title(path) == "My named session", "title did not round-trip")
+  -- Title wins over the first-prompt summary.
+  state.append(bufnr, "user", nil, "an actual prompt")
+  assert(state.session_summary(path) == "My named session",
+    "session_summary should prefer the durable title over the prompt")
+  -- Clearing removes the .meta file.
+  assert(state.set_session_title(path, ""), "clearing title failed")
+  assert(state.session_title(path) == nil, "title not cleared")
+  assert(vim.fn.filereadable(path .. ".meta") == 0, ".meta file should be removed on clear")
+end)
+
+-- --------------------------------------------------- list_sessions summaries
+case("list_sessions carries a per-session summary field", function()
+  local savedir = straps.config.session_dir
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
+  local b = state.new_session()
+  state.append(b, "user", nil, "unique-summary-marker-42")
+  local list = state.list_sessions()
+  straps.config.session_dir = savedir
+  local found
+  for _, s in ipairs(list) do
+    if s.summary and s.summary:find("unique-summary-marker-42", 1, true) then
+      found = true
+    end
+  end
+  assert(found, "list_sessions did not carry the first-prompt summary")
+end)
+
+-- --------------------------------------------------------- ui.rename_session
+case("ui.rename_session with an explicit title writes it", function()
+  local bufnr = state.new_session()
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  require("straps.ui").rename_session(bufnr, "explicit title here")
+  assert(state.session_title(path) == "explicit title here",
+    "rename_session did not persist the explicit title")
+end)
+
+-- ---------------------------------------------------------- ui.grep_sessions
+case("ui.grep_sessions loads content matches into the quickfix list", function()
+  local savedir = straps.config.session_dir
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
+  local b = state.new_session()
+  state.append(b, "user", nil, "please find the needle xyzzy here")
+  state.append(b, "assistant", nil, "unrelated content")
+  local n = require("straps.ui").grep_sessions("xyzzy")
+  local qf = vim.fn.getqflist({ title = 1, items = 1 })
+  straps.config.session_dir = savedir
+
+  assert(n >= 1, "grep_sessions found no matches for a known needle")
+  assert(qf.title:find("xyzzy", 1, true), "quickfix title missing the pattern: " .. tostring(qf.title))
+  local hit
+  for _, it in ipairs(qf.items) do
+    if it.text and it.text:find("xyzzy", 1, true) then hit = it end
+  end
+  assert(hit, "quickfix items missing the matching line")
+end)
+
+case("ui.grep_sessions skips transcript marker lines", function()
+  local savedir = straps.config.session_dir
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
+  local b = state.new_session()
+  state.append(b, "user", nil, "some ordinary content")
+  -- "straps:user" appears on every user marker line; a naive grep would hit
+  -- the scaffolding. grep_sessions must skip marker lines.
+  local n = require("straps.ui").grep_sessions("straps:user")
+  straps.config.session_dir = savedir
+  assert(n == 0, "grep_sessions matched transcript marker lines (should skip them): " .. n)
+end)
+
+case("relative_time buckets ages sensibly", function()
+  local rt = require("straps.ui")._relative_time
+  local now = os.time()
+  assert(rt(now) == "just now", "0s should be 'just now'")
+  assert(rt(now - 300):find("m ago"), "5m should be minutes")
+  assert(rt(now - 7200):find("h ago"), "2h should be hours")
+  assert(rt(now - 3 * 86400):find("d ago"), "3d should be days")
+  assert(rt(now - 30 * 86400):match("%d%d%d%d%-"), "30d should be an absolute date")
 end)
 
 if failed then

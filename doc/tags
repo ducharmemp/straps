@@ -7,7 +7,9 @@
 :StrapsHelp	straps.txt	/*:StrapsHelp*
 :StrapsModel	straps.txt	/*:StrapsModel*
 :StrapsRegistry	straps.txt	/*:StrapsRegistry*
+:StrapsRename	straps.txt	/*:StrapsRename*
 :StrapsResume	straps.txt	/*:StrapsResume*
+:StrapsSearch	straps.txt	/*:StrapsSearch*
 :StrapsSend	straps.txt	/*:StrapsSend*
 :StrapsSteer	straps.txt	/*:StrapsSteer*
 :StrapsStop	straps.txt	/*:StrapsStop*

@@ -61,6 +61,21 @@ end, {
   desc = "straps: resume a saved session (no arg = most recent; ! = pick via picker)",
 })
 
+vim.api.nvim_create_user_command("StrapsRename", function(opts)
+  local ui = require("straps.ui")
+  local target = ui.resolve_session(vim.api.nvim_get_current_buf())
+  if not target then
+    vim.notify("straps: run :StrapsRename on a session buffer", vim.log.levels.ERROR)
+    return
+  end
+  -- No arg: prompt (pre-filled with current title). Arg: set it directly.
+  ui.rename_session(target, opts.args ~= "" and opts.args or nil)
+end, { nargs = "?", desc = "straps: give this session a durable title (no arg = prompt)" })
+
+vim.api.nvim_create_user_command("StrapsSearch", function(opts)
+  require("straps.ui").grep_sessions(opts.args)
+end, { nargs = "+", desc = "straps: full-text search across all saved session transcripts" })
+
 vim.api.nvim_create_user_command("StrapsSend", function()
   local bufnr = resolve_session()
   if not bufnr then

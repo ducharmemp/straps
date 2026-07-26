@@ -77,8 +77,29 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 :StrapsResume [{name}]	Resume a saved session. No argument resumes the most
 			recent; an argument is a session basename (completed
 			from saved sessions) or a path.
-:StrapsResume!		Open a picker over all saved sessions
-			(|vim.ui.select|, or snacks.nvim when present).
+:StrapsResume!		Open a picker over all saved sessions. Each row shows
+			the session's durable title (see |:StrapsRename|) or,
+			absent one, its first user prompt, plus a relative age
+			— so sessions are identified by what they were about,
+			not by a timestamped filename. With snacks.nvim present
+			the picker fuzzy-matches those rows and previews the
+			transcript; otherwise it is a |vim.ui.select| list.
+
+							*:StrapsRename*
+:StrapsRename [{title}]	Give the current session a durable title, stored in a
+			companion "<transcript>.meta" file (the transcript
+			itself is untouched). The title is what |:StrapsResume!|
+			shows for the session. No argument prompts for one
+			(pre-filled with the current title); an empty title
+			clears it.
+
+							*:StrapsSearch*
+:StrapsSearch {pattern}	Full-text search across every saved transcript for
+			{pattern} (ripgrep when available, else |:vimgrep|) and
+			load the conversation matches — transcript scaffolding
+			is skipped — into the |quickfix| list, so |:cnext| /
+			|:cprev| step through them and <CR> opens the transcript
+			at the hit. Finds a session by what was said in it.
 
 							*:StrapsSend*
 :StrapsSend		Send the current session buffer as-is. If a run is

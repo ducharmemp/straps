@@ -1746,17 +1746,25 @@ end
 ]==]
 
 local SYSTEM_PROMPT_PROJECT_SRC = [==[
--- Project layer of the system prompt: the NEAREST AGENTS.md and the
--- NEAREST CLAUDE.md found upward from cwd (ecosystem memory-file
--- convention), plus every path in config.instructions_files verbatim.
--- Each file is fenced under a "## <absolute path>" header and capped at
--- 20000 bytes with a truncation note. Unreadable/missing files are
--- skipped silently. Returns "" when nothing is found.
+-- Project layer of the system prompt: LAYERED memory files, ordered
+-- general -> specific so the nearest file has the last word. Discovery,
+-- furthest first:
+--   1. global tier: <stdpath('config')>/straps/ then $HOME — AGENTS.md
+--      and CLAUDE.md (broad, cross-project rules);
+--   2. every AGENTS.md / CLAUDE.md found walking UPWARD from cwd, farthest
+--      ancestor first and the nearest one last (project- and subdir-level);
+--   3. config.instructions_files verbatim, last of all.
+-- Each distinct file is fenced under a "## <absolute path>" header and
+-- capped at 20000 bytes with a truncation note; a path seen twice (e.g.
+-- $HOME == an ancestor) is included once, at its first (most general)
+-- position. Unreadable/missing files are skipped silently. Returns ""
+-- when nothing is found.
 return function()
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
   local cwd = vim.fn.getcwd()
   local CAP = 20000
+  local NAMES = { "AGENTS.md", "CLAUDE.md" }
 
   local paths, seen = {}, {}
   local function add(path)
@@ -1770,9 +1778,31 @@ return function()
     end
   end
 
-  for _, name in ipairs({ "AGENTS.md", "CLAUDE.md" }) do
-    add(vim.fs.find(name, { upward = true, path = cwd, type = "file" })[1])
+  -- Global tier (lowest precedence): XDG config dir, then $HOME.
+  local globals = {}
+  local cfg = vim.fn.stdpath("config")
+  if type(cfg) == "string" and cfg ~= "" then
+    globals[#globals + 1] = cfg .. "/straps"
   end
+  local home = vim.loop.os_homedir()
+  if type(home) == "string" and home ~= "" then
+    globals[#globals + 1] = home
+  end
+  for _, dir in ipairs(globals) do
+    for _, name in ipairs(NAMES) do
+      add(dir .. "/" .. name)
+    end
+  end
+
+  -- Upward walk from cwd: vim.fs.find returns nearest first, so reverse to
+  -- add the farthest ancestor first and let the nearest file win.
+  for _, name in ipairs(NAMES) do
+    local found = vim.fs.find(name, { upward = true, path = cwd, type = "file", limit = math.huge })
+    for i = #found, 1, -1 do
+      add(found[i])
+    end
+  end
+
   local extras = type(config.instructions_files) == "table" and config.instructions_files or {}
   for _, p in ipairs(extras) do
     add(p)
@@ -1878,7 +1908,7 @@ function M.register()
   define({
     name = "fn.system_prompt_project",
     kind = "fn",
-    doc = "Project layer of the system prompt: AGENTS.md/CLAUDE.md + config.instructions_files.",
+    doc = "Project layer of the system prompt: layered AGENTS.md/CLAUDE.md (global -> nearest) + config.instructions_files.",
     source = SYSTEM_PROMPT_PROJECT_SRC,
   })
   define({

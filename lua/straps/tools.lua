@@ -898,19 +898,9 @@ return function(input, ctx)
       doc = "spawn: readonly child — allow read-only tools, deny everything else.",
       source = [[
 return function(name, tin, tctx)
-  local auto = {
-    read_file = true, glob = true, tree = true, path_info = true, grep = true, registry_list = true,
-    registry_get = true, skill = true, diagnostics = true,
-    diagnostic_at = true, diagnostic_next = true, lsp_status = true,
-    declaration = true, definition = true, type_definition = true,
-    implementation = true, references = true,
-    symbols = true, read_symbol = true, tree_sitter_status = true, node_at = true,
-    read_node = true, hover = true,
-    workspace_symbols = true, context = true, help_search = true,
-  }
-  if auto[name] then return true end
-  if (name == "code_action" or name == "fix_diagnostic")
-    and (type(tin) ~= "table" or tin.index == nil) then
+  -- Permit exactly the read-only tool calls (fn.readonly_policy is the shared
+  -- definition; see hook.confirm), deny every write.
+  if require("straps.registry").try_call("fn.readonly_policy", name, tin) then
     return true
   end
   return false, "readonly subagent: " .. tostring(name) .. " is not allowed"
@@ -1891,40 +1881,22 @@ end
 ]==],
   })
 
-  -- ------------------------------------------------------------- hook.confirm
+  -- -------------------------------------------------------- fn.readonly_policy
 
+  -- Single source of truth for "which tool calls are read-only". Both the
+  -- default hook.confirm (to auto-allow them without a prompt) and spawn's
+  -- readonly-child hook (to permit only these) consult it, so the policy
+  -- cannot drift between the two. Called as (name, input) -> boolean.
   define({
-    name = "hook.confirm",
-    kind = "hook",
-    doc = "Confirmation gate called before every tool execution as"
-      .. " (name, input, ctx) -> allowed, reason. Default behavior: auto-allow"
-      .. " the read-only tools (read_file, glob, tree, path_info, grep, registry_list,"
-      .. " registry_get, diagnostics, diagnostic_at, diagnostic_next, lsp_status,"
-      .. " declaration, definition, type_definition, implementation, references,"
-      .. " symbols, read_symbol, tree_sitter_status, node_at, read_node, hover,"
-      .. " workspace_symbols, context, show_user,"
-      .. " show_diff, show_buffer, set_quickfix, help_search, ask_user,"
-      .. " code_action/fix_diagnostic in list mode i.e. without"
-      .. " index, and undo_edit in history mode);"
-      .. " otherwise prompt via vim.fn.confirm. For"
-      .. " file-editing tools (write_file, edit_file, patch_file) a unified diff of the"
-      .. " proposed change is shown in a scratch split while the dialog is up"
-      .. " (closed after), and the prompt offers"
-      .. " Yes / No / 'Always in <parent dir>' / 'Always all edits': the"
-      .. " directory choice grants every future write_file/edit_file/patch_file whose"
-      .. " path falls under that file's PARENT directory (not just that one"
-      .. " file), and 'Always all edits' grants every future"
-      .. " write_file/edit_file/patch_file call regardless of path. Other tools get"
-      .. " Yes / No / 'Always this tool', scoped to the tool name. All"
-      .. " grants persist in vim.b[ctx.bufnr].straps_allowed. Redefine to"
-      .. " change the policy.",
+    name = "fn.readonly_policy",
+    kind = "fn",
+    doc = "Return true if the tool call (name, input) is read-only: it opens"
+      .. " views or lists things but changes no files. The read-only allowlist"
+      .. " plus the list-mode exceptions (code_action/fix_diagnostic without an"
+      .. " index, undo_edit with history=true) live here so hook.confirm and"
+      .. " spawn's readonly-child gate share one policy.",
     source = [==[
--- NOTE: this hook runs inside the loop coroutine. vim.fn.confirm must run on
--- the main loop; because the loop driver resumes the coroutine via
--- vim.schedule, every resume (and therefore this call) is already on the main
--- loop, so calling vim.fn.confirm directly here is safe — no extra await/
--- schedule wrapper is needed.
-return function(name, input, ctx)
+return function(name, input)
   local auto = {
     read_file = true, glob = true, tree = true, path_info = true, grep = true,
     registry_list = true, registry_get = true, skill = true,
@@ -1944,21 +1916,67 @@ return function(name, input, ctx)
     -- be asking permission to ask a question.
     ask_user = true,
   }
-  if auto[name] then
-    return true
-  end
+  if auto[name] then return true end
 
   -- code_action / fix_diagnostic without an index only LIST available actions
-  -- (read-only); applying one (index set) is a write and falls through to
-  -- the prompt.
+  -- (read-only); applying one (index set) is a write.
   if (name == "code_action" or name == "fix_diagnostic")
     and (type(input) ~= "table" or input.index == nil) then
     return true
   end
 
   -- undo_edit with history=true only lists the undo states (read-only); an
-  -- actual undo is a buffer+file change and falls through to the prompt.
+  -- actual undo is a buffer+file change.
   if name == "undo_edit" and type(input) == "table" and input.history == true then
+    return true
+  end
+
+  return false
+end
+]==],
+  })
+
+  -- ------------------------------------------------------------- hook.confirm
+
+  define({
+    name = "hook.confirm",
+    kind = "hook",
+    doc = "Confirmation gate called before every tool execution as"
+      .. " (name, input, ctx) -> allowed, reason. Default behavior: auto-allow"
+      .. " the read-only tools (read_file, glob, tree, path_info, grep, registry_list,"
+      .. " registry_get, diagnostics, diagnostic_at, diagnostic_next, lsp_status,"
+      .. " declaration, definition, type_definition, implementation, references,"
+      .. " symbols, read_symbol, tree_sitter_status, node_at, read_node, hover,"
+      .. " workspace_symbols, context, show_user,"
+      .. " show_diff, show_buffer, set_quickfix, help_search, ask_user,"
+      .. " code_action/fix_diagnostic in list mode i.e. without"
+      .. " index, and undo_edit in history mode);"
+      .. " otherwise prompt via vim.fn.confirm. For"
+      .. " file-editing tools (write_file, edit_file, patch_file) a unified diff of the"
+      .. " proposed change is shown in a scratch split while the dialog is up"
+      .. " (closed after), and the prompt offers"
+      .. " Yes / No / 'Always in <parent dir>' / 'Always in this project <root>'"
+      .. " (shown only when a project root marker — .jj/.git/.straps.lua/.hg/.svn —"
+      .. " is found above the file, and not identical to the parent dir) /"
+      .. " 'Always all edits': the directory choice grants every future"
+      .. " write_file/edit_file/patch_file whose path falls under that file's PARENT"
+      .. " directory (not just that one file), the project choice grants every"
+      .. " edit anywhere under the detected project root, and 'Always all edits'"
+      .. " grants every future write_file/edit_file/patch_file call regardless of path."
+      .. " Other tools get Yes / No / 'Always this tool', scoped to the tool name. All"
+      .. " grants persist in vim.b[ctx.bufnr].straps_allowed. Redefine to"
+      .. " change the policy.",
+    source = [==[
+-- NOTE: this hook runs inside the loop coroutine. vim.fn.confirm must run on
+-- the main loop; because the loop driver resumes the coroutine via
+-- vim.schedule, every resume (and therefore this call) is already on the main
+-- loop, so calling vim.fn.confirm directly here is safe — no extra await/
+-- schedule wrapper is needed.
+return function(name, input, ctx)
+  -- Read-only tool calls (the allowlist plus the list-mode exceptions) are
+  -- auto-allowed. The policy lives in fn.readonly_policy so this hook and
+  -- spawn's readonly-child gate share one definition.
+  if require("straps.registry").try_call("fn.readonly_policy", name, input) then
     return true
   end
 
@@ -1973,6 +1991,18 @@ return function(name, input, ctx)
   local function parent_dir(path)
     local p = vim.fn.fnamemodify(path, ":p:h")
     return vim.uv.fs_realpath(p) or p
+  end
+
+  -- Walk up from the file's directory for a project marker so the user can
+  -- authorize edits across the WHOLE repo in one grant, not one directory at
+  -- a time. Returns nil when no marker is found (so the choice is hidden).
+  local function project_root(path)
+    local start = vim.fn.fnamemodify(path, ":p:h")
+    local markers = { ".jj", ".git", ".straps.lua", ".hg", ".svn" }
+    local found = vim.fs.find(markers, { upward = true, path = start })[1]
+    if not found then return nil end
+    local root = vim.fn.fnamemodify(found, ":h")
+    return vim.uv.fs_realpath(root) or root
   end
 
   local function canonical_existing(path)
@@ -2109,11 +2139,30 @@ return function(name, input, ctx)
     preview = "diff preview shown in the split below"
   end
 
-  local dir
+  -- For edits the choices are, in order:
+  --   1 Yes  2 No  3 Always in <parent dir>  [4 Always in this project <root>]
+  --   last  Always all edits
+  -- The project choice is only present when a root marker is found, so its
+  -- index is dynamic; capture it rather than hard-coding.
+  local dir, root
+  local root_choice_idx, all_choice_idx
   local choices
   if is_edit then
     dir = parent_dir(input.path)
-    choices = "&Yes\n&No\n&Always in " .. dir .. "\nAlways &all edits"
+    root = project_root(input.path)
+    -- Don't offer the project choice when it would be identical to the
+    -- immediate parent (editing a file directly in the repo root).
+    if root == dir then root = nil end
+    choices = "&Yes\n&No\n&Always in " .. dir
+    local idx = 3
+    if root then
+      idx = idx + 1
+      root_choice_idx = idx
+      choices = choices .. "\nAlways in this &project (" .. root .. ")"
+    end
+    idx = idx + 1
+    all_choice_idx = idx
+    choices = choices .. "\nAlways &all edits"
   else
     choices = "&Yes\n&No\n&Always this tool"
   end
@@ -2142,7 +2191,11 @@ return function(name, input, ctx)
     grant("editdir:" .. dir)
     return true
   end
-  if is_edit and choice == 4 then
+  if is_edit and root_choice_idx and choice == root_choice_idx then
+    grant("editdir:" .. root)
+    return true
+  end
+  if is_edit and choice == all_choice_idx then
     grant("editfiles:*")
     return true
   end

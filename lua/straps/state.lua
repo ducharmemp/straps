@@ -250,8 +250,93 @@ function M.persist(bufnr)
   end)
 end
 
---- List *.straps transcripts in session_dir as { {path, name, mtime}, ... },
---- sorted most-recent first. pcall-safe; {} on any error or missing dir.
+-- Path of the companion metadata file (durable session titles) for a
+-- transcript: "<name>.straps" -> "<name>.straps.meta". JSON, best-effort.
+local function meta_path(transcript_path)
+  return transcript_path .. ".meta"
+end
+
+--- The user-set title for a session transcript, or nil. Read from the
+--- companion "<path>.meta" JSON file ({ title = "..." }). pcall-safe.
+function M.session_title(path)
+  local ok, title = pcall(function()
+    local mp = meta_path(path)
+    if vim.fn.filereadable(mp) == 0 then
+      return nil
+    end
+    local raw = table.concat(vim.fn.readfile(mp), "\n")
+    local decoded = vim.json.decode(raw)
+    if type(decoded) == "table" and type(decoded.title) == "string"
+      and decoded.title ~= "" then
+      return decoded.title
+    end
+    return nil
+  end)
+  return ok and title or nil
+end
+
+--- Set (or clear, with nil/"") the durable title for a session transcript,
+--- written to its companion "<path>.meta" JSON file. Returns true on success.
+function M.set_session_title(path, title)
+  local ok = pcall(function()
+    local mp = meta_path(path)
+    if title == nil or title == "" then
+      if vim.fn.filereadable(mp) == 1 then
+        os.remove(mp)
+      end
+      return
+    end
+    vim.fn.writefile({ vim.json.encode({ title = title }) }, mp)
+  end)
+  return ok
+end
+
+--- A one-line summary of a transcript, read directly from disk (no buffer
+--- load): the durable title when set, else the first non-empty user prompt,
+--- else nil. The first user block is typically past a long system prompt, so
+--- the whole file is read; the scan stops as soon as that block is captured.
+--- Escaped/marker lines are unescaped; the summary is trimmed and collapsed
+--- to a single line. pcall-safe; nil on any error.
+function M.session_summary(path)
+  local title = M.session_title(path)
+  if title then
+    return title
+  end
+  local ok, summary = pcall(function()
+    if vim.fn.filereadable(path) == 0 then
+      return nil
+    end
+    local lines = vim.fn.readfile(path)
+    local in_user, collected = false, {}
+    local function has_content()
+      for _, c in ipairs(collected) do
+        if c:match("%S") then return true end
+      end
+      return false
+    end
+    for _, line in ipairs(lines) do
+      local kind = match_marker(line)
+      if kind then
+        if has_content() then
+          break -- first non-empty user block ended
+        end
+        in_user = (kind == "user")
+        collected = {} -- reset across empty user/other blocks
+      elseif in_user then
+        collected[#collected + 1] = unescape_line(line)
+      end
+    end
+    local text = vim.trim(table.concat(collected, " "))
+    text = text:gsub("%s+", " ")
+    return text ~= "" and text or nil
+  end)
+  return ok and summary or nil
+end
+
+--- List *.straps transcripts in session_dir as
+--- { {path, name, mtime, summary}, ... }, sorted most-recent first. `summary`
+--- is the durable title or first user prompt (state.session_summary), nil when
+--- the transcript has no prompt yet. pcall-safe; {} on any error or missing dir.
 function M.list_sessions()
   local ok, result = pcall(function()
     local dir = M.session_dir()
@@ -265,6 +350,7 @@ function M.list_sessions()
         path = abs,
         name = vim.fn.fnamemodify(abs, ":t"),
         mtime = vim.fn.getftime(abs),
+        summary = M.session_summary(abs),
       }
     end
     table.sort(entries, function(a, b)

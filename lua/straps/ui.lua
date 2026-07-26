@@ -641,6 +641,73 @@ end
 --- first) and resume_session() whichever one is picked. No saved sessions →
 --- notify and fall through to a fresh session (mirrors resume_session()'s
 --- own no-path fallback).
+-- A compact relative age for a session mtime: "just now", "5m ago", "2h ago",
+-- "3d ago", else an absolute date once it's a week or more old.
+local function relative_time(mtime)
+  local delta = os.time() - (mtime or 0)
+  if delta < 0 then delta = 0 end
+  if delta < 60 then
+    return "just now"
+  elseif delta < 3600 then
+    return ("%dm ago"):format(math.floor(delta / 60))
+  elseif delta < 86400 then
+    return ("%dh ago"):format(math.floor(delta / 3600))
+  elseif delta < 7 * 86400 then
+    return ("%dd ago"):format(math.floor(delta / 86400))
+  end
+  return os.date("%Y-%m-%d", mtime)
+end
+M._relative_time = relative_time -- exposed for tests
+
+-- The picker row for a saved session: its summary (durable title or first
+-- prompt) when present, else the timestamped filename, followed by a
+-- right-of-centre relative age. Kept in one place so pick_session and any
+-- fuzzy-backend override format rows identically.
+local function session_format_item(s)
+  local label = (s.summary and s.summary ~= "") and s.summary or s.name
+  return ("%s  ·  %s"):format(label, relative_time(s.mtime))
+end
+M._session_format_item = session_format_item
+
+-- Rich session picker with a transcript preview pane, via snacks.nvim when it
+-- exposes a full picker (Snacks.picker). Returns true when it drove the pick,
+-- false to fall back to the plain vim.ui.select list. Each row fuzzy-matches on
+-- the summary; the preview pane renders the transcript file itself. Exposed as
+-- M._pick_session_rich so tests (and users without a preview-capable picker)
+-- can override it to force the plain list path.
+function M._pick_session_rich(sessions, on_choice)
+  local ok_snacks, snacks = pcall(require, "snacks")
+  if not (ok_snacks and type(snacks) == "table" and snacks.picker
+    and type(snacks.picker.pick) == "function") then
+    return false
+  end
+  local pok = pcall(function()
+    local finder_items = {}
+    for i, s in ipairs(sessions) do
+      finder_items[#finder_items + 1] = {
+        idx = i,
+        text = session_format_item(s), -- what fuzzy-matches
+        file = s.path, -- previewed + shows syntax as filetype=straps
+        session = s,
+      }
+    end
+    snacks.picker.pick({
+      source = "straps sessions",
+      title = "straps: resume session",
+      items = finder_items,
+      format = "text",
+      preview = "file",
+      confirm = function(picker, item)
+        picker:close()
+        if item and item.session then
+          vim.schedule(function() on_choice(item.session) end)
+        end
+      end,
+    })
+  end)
+  return pok
+end
+
 function M.pick_session()
   local state = require("straps.state")
   local sessions = state.list_sessions()
@@ -648,17 +715,134 @@ function M.pick_session()
     vim.notify("straps: no saved sessions")
     return M.open_session()
   end
+  local function resume(choice)
+    if choice then
+      M.resume_session(choice.path)
+    end
+  end
+  -- Prefer a fuzzy picker with a live transcript preview; fall back to the
+  -- plain vim.ui.select list (M.pick) when no rich backend is available.
+  if M._pick_session_rich(sessions, resume) then
+    return
+  end
   M.pick(sessions, {
     prompt = "straps: resume session",
-    format_item = function(s)
-      return ("%s  (%s)"):format(s.name, os.date("%Y-%m-%d %H:%M", s.mtime))
-    end,
-  }, function(choice)
-    if not choice then
+    format_item = session_format_item,
+  }, resume)
+end
+
+--- Give a saved session a durable title (state.set_session_title), so the
+--- resume picker shows it instead of the timestamp/first-prompt. `bufnr` is a
+--- file-backed session buffer; `title` nil prompts for one (pre-filled with the
+--- current title), "" clears it. No-op with a notice on an ephemeral session.
+function M.rename_session(bufnr, title)
+  local state = require("straps.state")
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  if not path:match("%.straps$") or vim.fn.filereadable(path) == 0 then
+    vim.notify("straps: not a saved session — nothing to rename", vim.log.levels.WARN)
+    return
+  end
+  local function apply(t)
+    if t == nil then
+      return -- cancelled
+    end
+    if state.set_session_title(path, t) then
+      vim.notify(t == "" and "straps: session title cleared"
+        or ("straps: session titled " .. t))
+    else
+      vim.notify("straps: could not write session title", vim.log.levels.WARN)
+    end
+  end
+  if title ~= nil then
+    return apply(title)
+  end
+  vim.ui.input({
+    prompt = "session title: ",
+    default = state.session_title(path) or "",
+  }, apply)
+end
+
+--- Full-text search across every saved transcript: grep session_dir/*.straps
+--- for `pattern` and load the hits into the quickfix list (title
+--- "straps: sessions /pattern/"), so :cnext/:cprev step through them and <CR>
+--- opens the transcript at the matching line. Uses ripgrep when present, else
+--- Vim's :vimgrep. Marker/escape lines are skipped so hits are conversation
+--- content, not transcript scaffolding. Returns the number of matches.
+function M.grep_sessions(pattern)
+  local state = require("straps.state")
+  if not pattern or pattern == "" then
+    vim.notify("straps: :StrapsSearch needs a pattern", vim.log.levels.WARN)
+    return 0
+  end
+  local dir = state.session_dir()
+  if not dir then
+    vim.notify("straps: no session dir to search", vim.log.levels.WARN)
+    return 0
+  end
+  local files = vim.fn.glob(dir .. "/*.straps", false, true)
+  if #files == 0 then
+    vim.notify("straps: no saved sessions to search")
+    return 0
+  end
+
+  local items = {}
+  local seen_files = {}
+  local function add_hit(path, lnum, text)
+    -- Skip transcript scaffolding: marker lines and escaped lines.
+    if text:match("^%%%%%[straps:") or text:match("^%%%%%[%[esc%]%]") then
       return
     end
-    M.resume_session(choice.path)
-  end)
+    local abs = vim.fn.fnamemodify(path, ":p")
+    local summary = seen_files[abs]
+    if summary == nil then
+      summary = state.session_summary(abs) or vim.fn.fnamemodify(abs, ":t")
+      seen_files[abs] = summary
+    end
+    items[#items + 1] = {
+      filename = abs,
+      lnum = lnum,
+      text = vim.trim(text),
+    }
+  end
+
+  if vim.fn.executable("rg") == 1 then
+    local out = vim.fn.systemlist({
+      "rg", "--vimgrep", "--no-heading", "--color=never",
+      "--", pattern, unpack(files),
+    })
+    if vim.v.shell_error <= 1 then -- 0 = matches, 1 = no matches
+      for _, line in ipairs(out) do
+        local f, l, _, t = line:match("^(.-):(%d+):(%d+):(.*)$")
+        if f then
+          add_hit(f, tonumber(l), t)
+        end
+      end
+    end
+  else
+    -- Fallback: Vim's :vimgrep (magic regex). pcall: no matches errors E480.
+    pcall(function()
+      vim.fn.setqflist({}, "r")
+      vim.cmd("silent noautocmd vimgrep /" .. pattern:gsub("/", "\\/")
+        .. "/j " .. table.concat(vim.tbl_map(vim.fn.fnameescape, files), " "))
+      for _, e in ipairs(vim.fn.getqflist()) do
+        local name = vim.api.nvim_buf_get_name(e.bufnr)
+        add_hit(name, e.lnum, e.text)
+      end
+    end)
+  end
+
+  if #items == 0 then
+    vim.notify("straps: no session matches for /" .. pattern .. "/")
+    vim.fn.setqflist({}, "r", { title = "straps: sessions /" .. pattern .. "/", items = {} })
+    return 0
+  end
+  vim.fn.setqflist({}, "r", {
+    title = "straps: sessions /" .. pattern .. "/",
+    items = items,
+  })
+  vim.cmd("botright copen")
+  return #items
 end
 
 -- A short label for a session buffer: its filename tail, or a synthetic name

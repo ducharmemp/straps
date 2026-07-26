@@ -89,7 +89,11 @@ end
 - `try_call(name, ...) -> nil | ...` — returns nil (no error) if the entry does
   not exist; used for optional hooks. Errors inside the fn still propagate.
 - `names(kind?) -> string[]` — sorted.
-- `remove(name)`
+- `remove(name, opts?)` — scope-aware. Default removes what the ACTIVE scope
+  resolves: a session-scoped shadow in the active chain is dropped first
+  (un-shadowing the global), else the global entry. `opts.scope = "global"`
+  forces the global; `opts.scope = <bufnr>` targets a specific overlay.
+  Returns true if something was removed.
 - `render(name) -> string` — the entry as an executable Lua chunk (see ui.lua):
   a `require("straps.registry").define{ ... }` call with the source embedded in
   a `[==[ ]==]` long string (bump `=` count if the source contains `]==]`).
@@ -171,6 +175,11 @@ messages are Anthropic Messages API shaped:
 - A run of `tool_result` blocks → ONE
   `{ role="user", content={ {type="tool_result", tool_use_id=, content=..., is_error=...}... } }`.
 - Adjacent same-role messages must be merged (API requires alternation).
+- A `tool_use`/`tool_result` block whose marker attrs failed to decode (no
+  `id`, or no `name` for a tool_use) is SKIPPED, never emitted with a null
+  `id`/`name` (which the API rejects). Unpaired-but-well-formed tool blocks
+  are still preserved: a `tool_use` with no result yet is the normal mid-turn
+  state the loop parses right before the provider call.
 
 ### API
 
@@ -209,7 +218,9 @@ transcript format is already plain text, so buffer content == file content.
   file via `nvim_buf_call` + `silent noautocmd write` (noautocmd so it can't
   fire user autocmds / LSP / our own hooks). **No-op unless the buffer is
   file-backed** (`buftype == ""` and has a name) — so the scratch buffers the
-  tests create directly are never touched. pcall-wrapped.
+  tests create directly are never touched. Also a no-op when the buffer is not
+  `modified`, so no-op block boundaries do not churn the file's mtime (which
+  would reorder `list_sessions`). pcall-wrapped.
 - Persist is called from `state.append` and `state.ensure_trailing_user`
   (block boundaries), NOT from `append_text` (per-delta streaming). A crash
   mid-stream loses only the in-flight assistant text since the last block; the
@@ -301,9 +312,11 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
       - `result = registry.try_call("hook.after_tool", name, input, result, ok, ctx) or result`
       - `state.append(bufnr, "tool_result", {id=, is_error=not ok}, tostring(result))`
    e. Stall check (progress-aware soft stop): classify the turn — stalled when
-      it issued tool calls AND either every call errored or any call repeats a
-      `(tool, input)` already made this run (inputs canonicalized via
-      `pretty_json`, so key order doesn't matter). `run.stall` counts
+      it issued tool calls AND either every call errored, OR every call was an
+      exact repeat of a `(tool, input)` already made this run (i.e. the turn
+      made no NEW distinct call). A turn that mixes an idempotent re-read with
+      a fresh call is productive, not a stall. Inputs canonicalized via
+      `pretty_json`, so key order doesn't matter. `run.stall` counts
       CONSECUTIVE stalled turns; a productive turn resets it to 0. When it
       reaches `config.stall_limit` (default 6, 0 disables), end the run with
       reason `"stalled"` and a loud, distinct note (below). This measures the
@@ -448,7 +461,10 @@ secret, so no mode-600 guard.
   if neither source yields a key),
   `anthropic-version: 2023-06-01`, `content-type: application/json`.
 - Body: `{ model=config.model, max_tokens=config.max_tokens, stream=true,
-  system=req.system (omit if nil), messages=req.messages, tools=req.tools (omit if empty) }`.
+  system=req.system (omit if nil), messages=req.messages, tools=req.tools (omit if empty) }`,
+  plus optional `tool_choice=req.tool_choice` and
+  `stop_sequences=req.stop_sequences` when the caller sets them (both backends
+  thread these through; the loop leaves them unset today).
   NOTE (LuaJIT): empty Lua tables encode as `{}` not `[]` — omit empty arrays,
   and ensure `input` for tool_use with no args decodes to an object
   (`vim.json.decode("{}")`; use `vim.empty_dict()` where an empty OBJECT is
@@ -458,15 +474,22 @@ secret, so no mode-600 guard.
   Buffer partial lines; parse SSE (`event:`/`data:` lines). Handle:
   `content_block_start` (text | tool_use), `content_block_delta`
   (`text_delta` → `ctx.emit{type="text_delta", text=...}`;
-  `input_json_delta` → accumulate partial_json), `content_block_stop`
+  `input_json_delta` → accumulate partial_json; `thinking_delta` → emit +
+  accumulate; `signature_delta` → accumulate onto the thinking block's
+  `signature` so a future state grammar could round-trip a signed thinking
+  block — today it is streamed for visibility but not resent),
+  `content_block_stop`
   (tool_use: `input = vim.json.decode(partial ~= "" and partial or "{}")`),
   `message_delta` (capture stop_reason), `message_stop` (resolve),
   `error` (reject), ignore `ping`. All emits/resolve via the resolve mechanics
   of `ctx.await`; register curl kill via `ctx.on_cancel`.
 - Non-2xx or curl failure → error with status + response body (which arrives
   as a plain JSON body, not SSE — detect and surface it).
-- HTTP 429/529 → retry with backoff, max 3 attempts (sleep via
-  `vim.defer_fn` + await, not blocking).
+- Transient failures → retry with backoff, max 3 attempts (sleep via
+  `vim.defer_fn` + await, not blocking). Retryable: HTTP 429/529/500/502/503/408,
+  the typed `rate_limit_error`/`overloaded_error`, and a curl-level failure
+  with no HTTP status (connection refused, DNS, TLS, timeout). The OpenAI
+  backend retries the same status set (429/500/502/503/408 + curl failures).
 - `config.base_url` (default `https://api.anthropic.com`) prefixes
   `/v1/messages` so Anthropic-compatible servers/proxies are a config knob.
 - Idle watchdog: `config.request_timeout_ms` (default 300000) — a uv timer
@@ -503,7 +526,11 @@ Same `(req, ctx)` contract, OpenAI's wire shape. Selected when
   `prompt_tokens_details.cached_tokens` are normalized to the
   `input_tokens`/`output_tokens`/`cache_read_input_tokens` names the loop reads.
 - Reasoning: the active `config.efforts` entry's `level` (when set) becomes
-  `reasoning_effort`; `"off"`/no level sends none.
+  `reasoning_effort`; `"off"`/no level sends none. Reasoning deltas
+  (`delta.reasoning_content`, or `delta.reasoning` on some gateways) are
+  streamed to the transcript via `ctx.emit{type="text_delta"}` like the
+  Anthropic `thinking_delta` path, but not accumulated into the returned
+  assistant text (the block grammar has no thinking kind).
 - Same idle watchdog and backoff scaffolding; retries 429/500/502/503.
 
 `fn.system_prompt` default source returns the default system prompt (below).
@@ -699,7 +726,13 @@ API names (registry names prefixed `tool.`):
   bounded filesystem introspection without shelling out.
 - `fetch_url {url, max_bytes?, timeout_ms?, follow_redirects?}` — bounded curl
   fetch with config disabled (`curl --disable`), no ambient cookies/credentials,
-  timeout and byte cap; not auto-allowed by the default confirm hook.
+  timeout and byte cap; not auto-allowed by the default confirm hook. SSRF
+  guard: refuses obviously-internal hosts (localhost, loopback 127/8, private
+  10/8 · 172.16/12 · 192.168/16, link-local 169.254/16 incl. cloud metadata,
+  IPv6 ::1 / fc00::/7 / fe80::/10; userinfo in the authority cannot mask the
+  host), and with `follow_redirects` passes `--proto-redir =http,https` so a
+  redirect cannot downgrade to `file://` etc. The byte cap is enforced
+  client-side by killing curl once `max_bytes` is reached.
 - `bash {command, timeout_ms?}` — `vim.system({"bash","-lc",cmd})` through
   `ctx.await`; returns exit code + stdout + stderr; default timeout 120s.
 - `glob {pattern}` — `vim.fn.glob(pattern, false, true)`, cap 500 entries.
@@ -721,7 +754,10 @@ API names (registry names prefixed `tool.`):
   IMMEDIATELY** with the child's buffer handle — it does NOT await. The child
   runs concurrently on its own coroutine. This makes N-way parallelism a matter
   of issuing N `spawn` calls (their children all run at once) instead of one
-  blocking call per child run serially.
+  blocking call per child run serially. `spawn` also registers a
+  `ctx.on_cancel` that stops the child, so a parent cancelled BEFORE the
+  matching `spawn_wait` does not orphan already-launched children (spawn_wait
+  installs its own cancel handler for the wait window).
 - `spawn_wait {buffers}` — awaits the named child buffers (validated: live +
   `straps_parent == ctx.bufnr`) in a SINGLE poll loop, so the wait costs the
   slowest child, not the sum. Each child's `straps_spawn_timeout_ms` (stamped by
@@ -902,8 +938,12 @@ Clears the straps-render namespace and repopulates by walking
 Trigger: `nvim_buf_attach(bufnr, false, { on_lines = <schedule render> })`
 installed when the session buffer opens — buf_attach fires on BOTH user edits
 and programmatic `nvim_buf_set_lines` (unlike TextChanged), so appends and
-hand-edits both refresh. Debounce with a per-buffer scheduled guard so a
-streaming burst coalesces into one render. Also render once on open.
+hand-edits both refresh. Debounce with a per-buffer TRAILING `uv` timer
+(~30ms, re-armed on each `on_lines`) so a streaming burst — one `text_delta`
+per chunk, each on its own scheduled tick — coalesces into ONE render after it
+settles, instead of a full re-render per delta. The timer is stopped/closed
+on buffer wipe, detach, or render being switched off (so no stale state stops
+future renders). Also render once on open.
 
 Idempotent: clears before repopulating, so N renders == 1 render's extmarks.
 
@@ -1126,7 +1166,14 @@ New tools in a dedicated module (register() called from init.setup, mirroring
 tools/provider). LSP calls are async through ctx.await; tree-sitter tools are
 synchronous and need no server, so they are the reliable core. Every tool
 degrades gracefully (no client / no parser → a clear message, never an error).
-Positions: read_file emits 1-based lines; LSP is 0-based — convert at the seam.
+Positions: read_file emits 1-based lines and BYTE columns; LSP is 0-based and
+its `character` is a UTF-16 code-unit offset (per the client's
+`offset_encoding`). Convert at the seam: `line + 1` for the row, and map the
+character offset to a byte column via `vim.str_byteindex` against the target
+line (helper `lsp_char_to_byte_col`, encoding from `buf_offset_encoding`), so a
+line with multibyte characters reports the right column. Applies to
+definition/declaration/type_definition/implementation/references and
+workspace_symbols.
 
 - `diagnostics {path?, quickfix?}` — `vim.diagnostic.get` for path's buffer
   (bufadd+load it) or all loaded straps-relevant buffers when omitted. Returns

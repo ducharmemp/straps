@@ -371,6 +371,14 @@ return function(req, ctx)
       req.tools[#req.tools].cache_control = cache_mark()
     end
   end
+  -- Optional request controls, passed through by the loop/caller when set.
+  -- Anthropic tool_choice shape: {type="auto"|"any"|"tool", name?=...}.
+  if req.tool_choice ~= nil then
+    body.tool_choice = req.tool_choice
+  end
+  if type(req.stop_sequences) == "table" and #req.stop_sequences > 0 then
+    body.stop_sequences = req.stop_sequences
+  end
   if cache_on then
     -- The moving conversation breakpoint: each turn's prefix extends the
     -- previous turn's cache. Valid on text, tool_use and tool_result blocks
@@ -482,10 +490,16 @@ return function(req, ctx)
           blocks[msg.index] = { type = "tool_use", id = cb.id, name = cb.name, partial = "" }
         elseif cb.type == "thinking" or cb.type == "redacted_thinking" then
           -- Extended thinking (config.effort): streamed into the transcript
-          -- like ordinary text via emit, but never round-tripped back to the
-          -- API (state.lua's block grammar has no "thinking" kind, and
-          -- resending it without a valid signature would be rejected anyway).
-          blocks[msg.index] = { type = cb.type, thinking = cb.thinking or "" }
+          -- like ordinary text via emit. The signature is captured so a
+          -- future state grammar could round-trip a signed thinking block
+          -- (required by the API for interleaved thinking + tool_use); today
+          -- the block grammar has no "thinking" kind, so it is not resent.
+          blocks[msg.index] = {
+            type = cb.type,
+            thinking = cb.thinking or "",
+            signature = cb.signature or "",
+            data = cb.data, -- redacted_thinking carries opaque `data`
+          }
         end
       elseif etype == "content_block_delta" then
         local b, d = blocks[msg.index], msg.delta or {}
@@ -497,6 +511,8 @@ return function(req, ctx)
         elseif b and d.type == "thinking_delta" then
           b.thinking = b.thinking .. (d.thinking or "")
           ctx.emit({ type = "text_delta", text = d.thinking or "" })
+        elseif b and d.type == "signature_delta" then
+          b.signature = (b.signature or "") .. (d.signature or "")
         end
       elseif etype == "content_block_stop" then
         local b = blocks[msg.index]
@@ -654,8 +670,16 @@ return function(req, ctx)
       end
     end
     local etype = type(res.err) == "table" and res.err.type or nil
+    -- Retry transient failures: rate limits, overload, and 5xx/408 server
+    -- errors (Anthropic does return 500/503 under load). A curl-level failure
+    -- with no HTTP status (connection refused, DNS, TLS, timeout) is also
+    -- transient — res.err is then the "curl exited with code N" string.
+    local curl_failure = res.status == nil and type(res.err) == "string"
     local retryable = res.status == 429 or res.status == 529
+      or res.status == 500 or res.status == 502 or res.status == 503
+      or res.status == 408
       or etype == "rate_limit_error" or etype == "overloaded_error"
+      or curl_failure
 
     if retryable and attempt < 3 then
       -- Backoff without blocking: deferred resolve, cut short on cancel.
@@ -908,6 +932,15 @@ return function(req, ctx)
 
     local function handle_choice(choice)
       local delta = choice.delta or {}
+      -- Reasoning deltas (o-series / gateways expose delta.reasoning_content;
+      -- some use delta.reasoning). Stream them for visibility like the
+      -- Anthropic thinking_delta path; they are not round-tripped into the
+      -- returned assistant text (the transcript grammar has no thinking kind).
+      local reasoning = delta.reasoning_content
+      if type(reasoning) ~= "string" then reasoning = delta.reasoning end
+      if type(reasoning) == "string" and reasoning ~= "" then
+        ctx.emit({ type = "text_delta", text = reasoning })
+      end
       if type(delta.content) == "string" and delta.content ~= "" then
         if not text_block then
           text_block = { type = "text", text = "" }
@@ -1061,8 +1094,10 @@ return function(req, ctx)
         res.err = parsed.error
       end
     end
+    local curl_failure = res.status == nil and type(res.err) == "string"
     local retryable = res.status == 429 or res.status == 500
-      or res.status == 502 or res.status == 503
+      or res.status == 502 or res.status == 503 or res.status == 408
+      or curl_failure
 
     if retryable and attempt < 3 then
       local delay_ms = 1000 * attempt * attempt

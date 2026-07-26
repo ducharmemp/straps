@@ -116,25 +116,36 @@ function M.parse(bufnr)
         push("assistant", { type = "text", text = b.content })
       end
     elseif b.kind == "tool_use" then
-      local ok, input = pcall(vim.json.decode, b.content ~= "" and b.content or "{}")
-      if not ok then
-        input = vim.empty_dict()
+      local id = b.attrs and b.attrs.id
+      local name = b.attrs and b.attrs.name
+      -- A tool_use with no id/name (marker attrs failed to decode) is invalid
+      -- to the API; skip it rather than ship a null-id block that 400s.
+      if id and name then
+        local ok, input = pcall(vim.json.decode, b.content ~= "" and b.content or "{}")
+        if not ok then
+          input = vim.empty_dict()
+        end
+        push("assistant", {
+          type = "tool_use",
+          id = id,
+          name = name,
+          input = input,
+        })
       end
-      push("assistant", {
-        type = "tool_use",
-        id = b.attrs and b.attrs.id,
-        name = b.attrs and b.attrs.name,
-        input = input,
-      })
     elseif b.kind == "tool_result" then
-      push("user", {
-        type = "tool_result",
-        tool_use_id = b.attrs and b.attrs.id,
-        content = b.content,
-        is_error = (b.attrs and b.attrs.is_error) or false,
-      })
+      local id = b.attrs and b.attrs.id
+      -- Likewise, a tool_result with no id cannot be paired to a tool_use.
+      if id then
+        push("user", {
+          type = "tool_result",
+          tool_use_id = id,
+          content = b.content,
+          is_error = (b.attrs and b.attrs.is_error) or false,
+        })
+      end
     end
   end
+
   return { system = system, messages = messages }
 end
 
@@ -226,6 +237,12 @@ function M.persist(bufnr)
     return
   end
   if vim.api.nvim_buf_get_name(bufnr) == "" then
+    return
+  end
+  -- Nothing to write if the buffer is already in sync with its file; skip the
+  -- write so we do not churn the file's mtime (which reorders list_sessions)
+  -- on no-op block boundaries.
+  if not vim.bo[bufnr].modified then
     return
   end
   pcall(vim.api.nvim_buf_call, bufnr, function()

@@ -598,6 +598,44 @@ end
   assert(text:find("repeated tool calls", 1, true), "repeat stall should note repetition, not an error")
 end)
 
+case("a repeat mixed with a new call is not a stall", function()
+  allow_all()
+  define("tool.ping", "tool", "ping", [[return function() return "pong" end]])
+  local straps = require("straps")
+  local saved_max, saved_stall = straps.config.max_turns, straps.config.stall_limit
+  straps.config.max_turns = 50
+  straps.config.stall_limit = 3
+  _G.straps_test_calls = 0
+  -- Every turn repeats the SAME ping (q="same") AND issues a fresh ping with a
+  -- new input. Because each turn makes a never-seen call, it is productive, so
+  -- the stall detector must NOT trip on the repeat alone. Ends at turn 6.
+  define("fn.provider", "fn", "test: repeat + new every turn", [==[
+return function(req, ctx)
+  _G.straps_test_calls = _G.straps_test_calls + 1
+  local n = _G.straps_test_calls
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  if n >= 6 then
+    return { stop_reason = "end_turn", content = { { type = "text", text = "stop" } } }
+  end
+  return { stop_reason = "tool_use", content = {
+    { type = "tool_use", id = "same" .. n, name = "ping", input = { q = "same" } },
+    { type = "tool_use", id = "new" .. n, name = "ping", input = { q = "fresh-" .. n } },
+  } }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("repeat plus new")
+  loop.start(bufnr)
+  wait_done(bufnr)
+  straps.config.max_turns, straps.config.stall_limit = saved_max, saved_stall
+
+  assert(_G.straps_test_calls == 6,
+    "provider called " .. _G.straps_test_calls .. " times, want 6 (never stalled — each turn had a new call)")
+  local text = buf_text(bufnr)
+  assert(not text:find("no apparent progress", 1, true),
+    "stall note appeared even though every turn made a new distinct call")
+end)
+
 case("a productive turn resets the stall counter", function()
   allow_all()
   define("tool.ping", "tool", "ping", [[return function() return "pong" end]])
@@ -863,6 +901,48 @@ end
   end
   assert(done_ev and done_ev.reason == "ok",
     "done reason is " .. tostring(done_ev and done_ev.reason) .. ", want ok")
+end)
+
+case("oversized tool result truncates on a UTF-8 char boundary", function()
+  allow_all()
+  local straps = require("straps")
+  local saved = straps.config.max_tool_result_bytes
+  -- "é" is 2 bytes (0xC3 0xA9). Cap at an odd byte so the naive cut would land
+  -- between the two bytes of a character; the guard must back up to a boundary.
+  straps.config.max_tool_result_bytes = 101
+  define("tool.big", "tool", "returns many multibyte chars",
+    [[return function() return string.rep("é", 200) end]])
+  define("fn.provider", "fn", "test: call big once then stop", [==[
+return function(req, ctx)
+  _G.straps_test_calls = (_G.straps_test_calls or 0) + 1
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  if _G.straps_test_calls == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "b1", name = "big", input = {} } } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "done" } } }
+end
+]==])
+  _G.straps_test_calls = 0
+  local bufnr = new_session_with_prompt("big result")
+  loop.start(bufnr)
+  wait_done(bufnr)
+  straps.config.max_tool_result_bytes = saved
+
+  -- Find the tool_result content and assert it is valid UTF-8 (no split char).
+  local parsed = state.parse(bufnr)
+  local result
+  for _, msg in ipairs(parsed.messages) do
+    for _, part in ipairs(msg.content) do
+      if part.type == "tool_result" then result = part.content end
+    end
+  end
+  assert(result, "no tool_result found")
+  assert(result:find("result truncated at 101 bytes", 1, true), "missing truncation note")
+  local body = result:gsub("\n%[straps: result truncated.*$", "")
+  assert(pcall(vim.str_utfindex, body), "truncated body is not valid UTF-8")
+  -- The kept prefix must be whole 'é's: even byte count.
+  assert(#body % 2 == 0, "cut landed mid-character (odd byte length): " .. #body)
 end)
 
 print(failed == 0 and "ALL PASS" or (failed .. " case(s) FAILED"))

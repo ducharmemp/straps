@@ -297,21 +297,46 @@ function M._render(bufnr)
   end
 end
 
--- Debounced render trigger: a per-buffer scheduled guard coalesces a
--- streaming burst of nvim_buf_set_lines into a single render pass.
-local render_scheduled = {}
+-- Debounced render trigger: a per-buffer trailing uv timer coalesces a
+-- streaming burst of nvim_buf_set_lines (one text_delta each, and each on its
+-- own scheduled tick) into a SINGLE render pass ~30ms after the burst settles,
+-- instead of a full re-render per delta chunk.
+local render_timers = {}
 local render_attached = {}
+local RENDER_DEBOUNCE_MS = 30
+
+local function cancel_render_timer(bufnr)
+  local t = render_timers[bufnr]
+  render_timers[bufnr] = nil
+  if t and not t:is_closing() then
+    pcall(function() t:stop(); t:close() end)
+  end
+end
 
 local function schedule_render(bufnr)
-  if render_scheduled[bufnr] then
-    return
-  end
-  render_scheduled[bufnr] = true
-  vim.schedule(function()
-    render_scheduled[bufnr] = nil
-    if vim.api.nvim_buf_is_valid(bufnr) then
-      require("straps.registry").try_call("fn.render", bufnr)
+  local t = render_timers[bufnr]
+  if not t then
+    t = vim.uv.new_timer()
+    if not t then
+      -- Handle exhaustion: fall back to a one-shot scheduled render.
+      vim.schedule(function()
+        if vim.api.nvim_buf_is_valid(bufnr) then
+          require("straps.registry").try_call("fn.render", bufnr)
+        end
+      end)
+      return
     end
+    render_timers[bufnr] = t
+  end
+  -- (Re)arm the trailing timer; a fresh delta within the window pushes it out.
+  t:stop()
+  t:start(RENDER_DEBOUNCE_MS, 0, function()
+    vim.schedule(function()
+      cancel_render_timer(bufnr)
+      if vim.api.nvim_buf_is_valid(bufnr) then
+        require("straps.registry").try_call("fn.render", bufnr)
+      end
+    end)
   end)
 end
 
@@ -327,19 +352,20 @@ function M._attach_render(bufnr)
   vim.api.nvim_buf_attach(bufnr, false, {
     on_lines = function(_, b)
       if not vim.api.nvim_buf_is_valid(b) then
-        render_scheduled[b] = nil
+        cancel_render_timer(b)
         render_attached[b] = nil
         return true
       end
       local ok, straps = pcall(require, "straps")
       if ok and type(straps) == "table" and straps.config and straps.config.render == false then
+        cancel_render_timer(b)
         render_attached[b] = nil
         return true
       end
       schedule_render(b)
     end,
     on_detach = function(_, b)
-      render_scheduled[b] = nil
+      cancel_render_timer(b)
       render_attached[b] = nil
     end,
   })

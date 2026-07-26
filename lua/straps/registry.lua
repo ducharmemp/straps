@@ -264,8 +264,33 @@ function M.names(kind)
   return out
 end
 
-function M.remove(name)
+--- Remove an entry. By default this removes the entry that the ACTIVE scope
+--- would resolve: a session-scoped shadow in the active chain is removed first
+--- (un-shadowing any global of the same name), otherwise the global entry is
+--- removed. Pass opts.scope = "global" to force removing the global entry, or
+--- a buffer number to remove from that specific scope's overlay. Returns true
+--- if something was removed.
+function M.remove(name, opts)
+  opts = opts or {}
+  if opts.scope == "global" then
+    local had = M.entries[name] ~= nil
+    M.entries[name] = nil
+    return had
+  end
+  local scope_buf = type(opts.scope) == "number" and opts.scope or active
+  -- Walk the active chain leaf-first; remove from the nearest scope holding it.
+  local buf, hops = scope_buf, 0
+  while buf and M.scopes[buf] and hops < 8 do
+    if M.scopes[buf].entries[name] ~= nil then
+      M.scopes[buf].entries[name] = nil
+      return true
+    end
+    buf = M.scopes[buf].parent
+    hops = hops + 1
+  end
+  local had = M.entries[name] ~= nil
   M.entries[name] = nil
+  return had
 end
 
 --- Render an entry as an executable Lua chunk that re-defines it. Resolves

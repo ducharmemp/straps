@@ -592,6 +592,15 @@ return function(input, ctx)
       if not finished then
         timed_out = true
         pcall(vim.fn.jobstop, job)
+        -- jobstop sends SIGTERM; a child trapping/ignoring it survives and
+        -- the split would keep running while we report a timeout. Escalate to
+        -- SIGKILL on the process group after a short grace period.
+        vim.defer_fn(function()
+          if not finished then
+            local pid = tonumber(vim.fn.jobpid(job))
+            if pid then pcall(vim.uv.kill, -pid, 9) end
+          end
+        end, 2000)
       end
     end, timeout_ms)
     if ctx.on_cancel then
@@ -917,6 +926,18 @@ end
   state.append_text(child, header)
 
   loop.start(child)
+  -- If the parent run is cancelled before the matching spawn_wait, nothing
+  -- else would stop this child; register a cancel handler so it is not
+  -- orphaned (spawn_wait installs its own for the wait window).
+  if ctx and ctx.on_cancel then
+    ctx.on_cancel(function()
+      pcall(function()
+        if vim.api.nvim_buf_is_valid(child) and loop.running(child) then
+          loop.stop(child)
+        end
+      end)
+    end)
+  end
   if input.show then
     pcall(function()
       local prev = vim.api.nvim_get_current_win()
@@ -1801,14 +1822,48 @@ return function(input, ctx)
   if type(url) ~= "string" or not url:match("^https?://") then
     error("fetch_url: url must start with http:// or https://")
   end
+  -- Basic SSRF guard: refuse obviously-internal hosts. Extract the host from
+  -- the authority (strip userinfo, port, and IPv6 brackets), lowercase it.
+  local function host_of(u)
+    local authority = u:match("^https?://([^/?#]+)") or ""
+    authority = authority:gsub("^[^@]*@", "")          -- strip userinfo
+    local h = authority:match("^%[([^%]]+)%]") or authority:match("^([^:]+)")
+    return (h or ""):lower()
+  end
+  local function is_internal(h)
+    if h == "" then return false end
+    if h == "localhost" or h:match("%.localhost$") then return true end
+    if h == "0.0.0.0" or h == "::1" or h == "::" then return true end
+    -- IPv4 literal ranges: loopback, private, link-local (incl. cloud metadata).
+    local a, b = h:match("^(%d+)%.(%d+)%.%d+%.%d+$")
+    a, b = tonumber(a), tonumber(b)
+    if a then
+      if a == 127 then return true end            -- 127.0.0.0/8 loopback
+      if a == 10 then return true end             -- 10.0.0.0/8
+      if a == 169 and b == 254 then return true end -- 169.254.0.0/16 link-local / metadata
+      if a == 172 and b >= 16 and b <= 31 then return true end -- 172.16.0.0/12
+      if a == 192 and b == 168 then return true end -- 192.168.0.0/16
+    end
+    -- IPv6 unique-local (fc00::/7) and link-local (fe80::/10).
+    if h:match("^f[cd]") or h:match("^fe[89ab]") then return true end
+    return false
+  end
+  if is_internal(host_of(url)) then
+    error("fetch_url: refusing to fetch an internal/loopback/link-local host ("
+      .. host_of(url) .. ")")
+  end
   if vim.fn.executable("curl") ~= 1 then
     return "fetch_url: curl is not executable"
   end
   local max_bytes = math.min(math.max(tonumber(input.max_bytes) or 200000, 1), 1000000)
   local timeout_ms = tonumber(input.timeout_ms) or 10000
   local cmd = { "curl", "--disable", "--silent", "--show-error", "--include", "--max-time", tostring(math.ceil(timeout_ms / 1000)) }
-  if input.follow_redirects then cmd[#cmd + 1] = "--location" end
-  cmd[#cmd + 1] = "--range"; cmd[#cmd + 1] = "0-" .. tostring(max_bytes - 1)
+  if input.follow_redirects then
+    cmd[#cmd + 1] = "--location"
+    -- Never let a redirect downgrade the protocol or reach non-http(s) schemes
+    -- (e.g. file://, gopher://) — a common SSRF pivot.
+    cmd[#cmd + 1] = "--proto-redir"; cmd[#cmd + 1] = "=http,https"
+  end
   cmd[#cmd + 1] = "--"; cmd[#cmd + 1] = url
   local chunks, n, capped, proc = {}, 0, false, nil
   local res = ctx.await(function(resolve)

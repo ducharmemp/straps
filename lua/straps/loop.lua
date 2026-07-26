@@ -200,7 +200,15 @@ local function execute_tool(bufnr, ctx, block, cfg, opts)
     result = tostring(result)
   end
   if #result > cfg.max_tool_result_bytes then
-    result = result:sub(1, cfg.max_tool_result_bytes)
+    -- Back the cut up to a UTF-8 character boundary so we never emit a byte
+    -- sequence split mid-character into the transcript / API payload.
+    local cut = cfg.max_tool_result_bytes
+    while cut > 0 do
+      local b = result:byte(cut + 1)
+      if not b or b < 0x80 or b >= 0xC0 then break end -- next byte is not a continuation byte
+      cut = cut - 1
+    end
+    result = result:sub(1, cut)
       .. ("\n[straps: result truncated at %d bytes]"):format(cfg.max_tool_result_bytes)
   end
 
@@ -245,13 +253,15 @@ local function child_ctx(parent_ctx, bufnr, finish)
   }
   ctx.await = function(start)
     local co = assert(coroutine.running(), "straps: child ctx.await outside coroutine")
+    ctx._await_seq = (ctx._await_seq or 0) + 1
+    local seq = ctx._await_seq
     local resolved = false
     start(function(...)
       if resolved then return end
       resolved = true
       local args = pack(...)
       vim.schedule(function()
-        if coroutine.status(co) ~= "suspended" then return end
+        if ctx._await_seq ~= seq or coroutine.status(co) ~= "suspended" then return end
         local reg = require("straps.registry")
         local prev_scope = reg.set_active_scope(bufnr)
         local ok, err = coroutine.resume(co, unpack(args, 1, args.n))
@@ -415,14 +425,17 @@ local function run_turns(bufnr, ctx, run)
           { id = block.id, name = block.name }, pretty_json(block.input or {}))
       end
     end
-    -- Per-turn stall signals, folded in as each tool runs.
-    local n_calls, n_errors, any_repeat, last_error = 0, 0, false, nil
+    -- Per-turn stall signals, folded in as each tool runs. any_new tracks
+    -- whether the turn made at least one call never seen before, so a turn
+    -- that mixes fresh work with an idempotent re-read (a legitimate pattern)
+    -- is not mistaken for spinning.
+    local n_calls, n_errors, any_repeat, any_new, last_error = 0, 0, false, false, nil
     if all_parallel_readonly(tool_blocks) then
       local jobs = {}
       for i, block in ipairs(tool_blocks) do
         progress(bufnr, ctx, { type = "tool", name = block.name }, "tool: " .. tostring(block.name))
         local key = tostring(block.name) .. "\0" .. pretty_json(block.input or {})
-        if run.seen_calls[key] then any_repeat = true end
+        if run.seen_calls[key] then any_repeat = true else any_new = true end
         run.seen_calls[key] = true
         n_calls = n_calls + 1
         local t0 = vim.uv.hrtime()
@@ -496,6 +509,8 @@ local function run_turns(bufnr, ctx, run)
         local key = tostring(block.name) .. "\0" .. pretty_json(block.input or {})
         if run.seen_calls[key] then
           any_repeat = true
+        else
+          any_new = true
         end
         run.seen_calls[key] = true
         local t0 = vim.uv.hrtime()
@@ -514,10 +529,12 @@ local function run_turns(bufnr, ctx, run)
 
     -- Classify the turn for the stall detector. A turn with no tool calls is
     -- never a stall (it is either the final answer or steering). A turn that
-    -- did work is stalled when every call errored, or any call repeated an
-    -- earlier one. Consecutive stalls accumulate; a productive turn resets.
+    -- did work is stalled when every call errored, or when every call was an
+    -- exact repeat of an earlier one (no new distinct call this turn) — a
+    -- turn that also made progress on something new is not spinning.
+    -- Consecutive stalls accumulate; a productive turn resets.
     if stall_limit > 0 and n_calls > 0 then
-      local stalled = (n_errors == n_calls) or any_repeat
+      local stalled = (n_errors == n_calls) or (any_repeat and not any_new)
       run.stall = stalled and (run.stall + 1) or 0
       if run.stall >= stall_limit then
         local why = last_error and (" Last error: " .. last_error:gsub("%s+", " "):sub(1, 200))

@@ -117,6 +117,34 @@ case("fetch_url is registered but not auto-allowed", function()
   assert(allowed ~= true, "fetch_url should require confirmation")
 end)
 
+case("fetch_url refuses internal/loopback/link-local hosts (SSRF guard)", function()
+  local blocked = {
+    "http://localhost/x",
+    "http://127.0.0.1/x",
+    "http://127.5.5.5/x",
+    "http://169.254.169.254/latest/meta-data/", -- cloud metadata
+    "http://10.0.0.1/x",
+    "http://192.168.1.1/x",
+    "http://172.16.0.1/x",
+    "http://[::1]/x",
+    "http://user:pass@localhost/x", -- userinfo must not hide the host
+  }
+  for _, url in ipairs(blocked) do
+    local ok, err = pcall(registry.call, "tool.fetch_url", { url = url }, ctx)
+    assert(not ok, "expected refusal for " .. url)
+    assert(tostring(err):find("internal", 1, true),
+      "wrong error for " .. url .. ": " .. tostring(err))
+  end
+  -- A public host is NOT blocked by the guard (it gets past to curl, which the
+  -- disabled-network test env then fails — but not with the SSRF message).
+  local ok, err = pcall(registry.call, "tool.fetch_url",
+    { url = "http://93.184.216.34/x", timeout_ms = 1 }, ctx)
+  if not ok then
+    assert(not tostring(err):find("internal", 1, true),
+      "public IP wrongly blocked as internal: " .. tostring(err))
+  end
+end)
+
 case("huge output is capped before returning to the loop", function()
   local out = bash("yes x | head -c 400000")
   assert(out:find("output truncated", 1, true), "missing truncation note: " .. out:sub(1, 200))

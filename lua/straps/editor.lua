@@ -52,25 +52,54 @@ local function symbol_at(buf, line0, col0)
   return l:sub(s, e - 1)
 end
 
+-- Convert an LSP (line, character) position to a 1-based byte column. LSP
+-- `character` is a UTF-16 code-unit offset by default; read_file and the
+-- quickfix list use byte columns, so a line with multibyte characters before
+-- the symbol would otherwise report the wrong column. Reads the target line
+-- from its buffer (loading it if needed) and maps the offset with
+-- vim.str_byteindex; falls back to character+1 if anything is unavailable.
+local function lsp_char_to_byte_col(uri, line0, char0, encoding)
+  local ok, col = pcall(function()
+    local fname = vim.uri_to_fname(uri)
+    local buf = vim.fn.bufadd(fname)
+    if not vim.api.nvim_buf_is_loaded(buf) then vim.fn.bufload(buf) end
+    local text = vim.api.nvim_buf_get_lines(buf, line0, line0 + 1, false)[1]
+    if not text then return char0 + 1 end
+    -- str_byteindex(text, encoding, index, strict?) on 0.11+; older signature
+    -- is (text, index, use_utf16). Guard both.
+    local enc = encoding == "utf-8" and "utf-8" or (encoding == "utf-32" and "utf-32" or "utf-16")
+    local byte
+    local ok2, b = pcall(vim.str_byteindex, text, enc, char0, false)
+    if ok2 and type(b) == "number" then
+      byte = b
+    else
+      byte = select(1, vim.str_byteindex(text, char0, enc ~= "utf-8"))
+    end
+    return byte + 1
+  end)
+  return (ok and type(col) == "number") and col or (char0 + 1)
+end
+
 -- Format a single LSP Location / LocationLink into "file:line:col".
-local function add_loc(loc, out)
+local function add_loc(loc, out, encoding)
   if type(loc) ~= "table" then return end
   local uri = loc.uri or loc.targetUri
   local range = loc.range or loc.targetSelectionRange or loc.targetRange
   if uri and range and range.start then
     local file = vim.fn.fnamemodify(vim.uri_to_fname(uri), ":~:.")
-    out[#out + 1] = string.format("%s:%d:%d", file, range.start.line + 1, range.start.character + 1)
+    local col = lsp_char_to_byte_col(uri, range.start.line, range.start.character, encoding)
+    out[#out + 1] = string.format("%s:%d:%d", file, range.start.line + 1, col)
   end
 end
 
 -- Collect locations from one client result (single Location, LocationLink, or
 -- an array of them) into `out`.
-local function collect_locations(result, out)
+local function collect_locations(result, out, encoding)
   if type(result) ~= "table" then return end
   if result.uri or result.targetUri or result.range or result.targetUri then
-    add_loc(result, out)
+    add_loc(result, out, encoding)
   else
-    for _, loc in ipairs(result) do add_loc(loc, out) end
+    for _, loc in ipairs(result) do add_loc(loc, out, encoding) end
   end
 end
 
@@ -135,6 +164,16 @@ local function wait_clients(ctx, buf)
     end
     poll()
   end)
+end
+
+-- The offset_encoding of the first LSP client attached to `buf` ("utf-16" if
+-- none), used to convert LSP character offsets to byte columns.
+local function buf_offset_encoding(buf)
+  local ok, cs = pcall(vim.lsp.get_clients, { bufnr = buf })
+  if ok and cs and cs[1] and cs[1].offset_encoding then
+    return cs[1].offset_encoding
+  end
+  return "utf-16"
 end
 
 -- Wait for an LSP client on `buf`, then run one request through ctx.await
@@ -749,7 +788,8 @@ return function(input, ctx)
   if err == "noclient" then return "no LSP client for filetype " .. (ft ~= "" and ft or "?") end
   if err == "timeout" then return %q .. ": LSP request timed out" end
   local locs = {}
-  each_result(res, function(result) collect_locations(result, locs) end)
+  local enc = buf_offset_encoding(buf)
+  each_result(res, function(result) collect_locations(result, locs, enc) end)
   return location_output(ctx, input, "straps: %s", locs, "no %s found")
 end
 ]]):format(method, api_name, api_name, api_name, api_name:gsub("_", " "))),
@@ -862,7 +902,8 @@ return function(input, ctx)
   if err == "timeout" then return "definition: LSP request timed out" end
 
   local locs = {}
-  each_result(res, function(result) collect_locations(result, locs) end)
+  local enc = buf_offset_encoding(buf)
+  each_result(res, function(result) collect_locations(result, locs, enc) end)
   return location_output(ctx, input, "straps: definition", locs, "no definition found")
 end
 ]==]),
@@ -923,7 +964,8 @@ return function(input, ctx)
   if err == "timeout" then return "references: LSP request timed out" end
 
   local locs = {}
-  each_result(res, function(result) collect_locations(result, locs) end)
+  local enc = buf_offset_encoding(buf)
+  each_result(res, function(result) collect_locations(result, locs, enc) end)
   return location_output(ctx, input, "straps: references", locs, "no references found")
 end
 ]==]),
@@ -1288,6 +1330,7 @@ return function(input, ctx)
   if err == "timeout" then return "workspace_symbols: LSP request timed out" end
   local kinds = vim.lsp.protocol.SymbolKind or {}
   local seen, out, locs = {}, {}, {}
+  local enc = buf_offset_encoding(buf)
   each_result(res, function(result)
     for _, s in ipairs(result or {}) do
       local where = ""
@@ -1295,8 +1338,9 @@ return function(input, ctx)
       if type(loc) == "table" and loc.uri then
         local file = vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":~:.")
         if loc.range and loc.range.start then
+          local col = lsp_char_to_byte_col(loc.uri, loc.range.start.line, loc.range.start.character, enc)
           where = string.format("%s:%d:%d",
-            file, loc.range.start.line + 1, loc.range.start.character + 1)
+            file, loc.range.start.line + 1, col)
           locs[#locs + 1] = where
         else
           where = file

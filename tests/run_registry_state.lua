@@ -114,6 +114,27 @@ case("remove", function()
   eq(registry.get("fn.gone"), nil)
 end)
 
+case("scope-aware remove un-shadows a session-scoped entry", function()
+  -- A global entry shadowed by a session-scoped one: remove (with that scope
+  -- active) must drop the shadow and un-cover the global, not delete global.
+  registry.define{ name = "fn.shadowed", kind = "fn",
+    source = 'return function() return "global" end' }
+  local sbuf = vim.api.nvim_create_buf(false, true)
+  registry.ensure_scope(sbuf)
+  local prev = registry.set_active_scope(sbuf)
+  registry.define({ name = "fn.shadowed", kind = "fn",
+    source = 'return function() return "scoped" end' }, { scope = sbuf })
+  eq(registry.call("fn.shadowed"), "scoped", "scoped shadow resolves while active")
+  local removed = registry.remove("fn.shadowed")
+  assert(removed, "remove reported nothing removed")
+  eq(registry.call("fn.shadowed"), "global", "global re-exposed after shadow removed")
+  registry.set_active_scope(prev)
+  -- Global is still intact and now the only definition.
+  eq(registry.call("fn.shadowed"), "global")
+  registry.remove("fn.shadowed", { scope = "global" })
+  eq(registry.get("fn.shadowed"), nil)
+end)
+
 case("hook.on_define fires and cannot break define", function()
   local seen = {}
   registry.define{ name = "hook.on_define", kind = "hook",
@@ -255,6 +276,39 @@ case("empty assistant block omitted", function()
   eq(#parsed.messages, 2)
   eq(#parsed.messages[2].content, 1, "no empty text part")
   eq(parsed.messages[2].content[1].type, "tool_use")
+end)
+
+case("tool blocks with undecodable attrs are skipped, not emitted null", function()
+  -- A hand-edited/corrupt transcript can have a tool_use marker whose attrs
+  -- JSON failed to decode (match_marker returns attrs=nil). Emitting it would
+  -- ship a null-id/name block that the API rejects; parse must skip it.
+  local bufnr = state.new_session()
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+    "%%[straps:user]%%",
+    "hi",
+    "",
+    "%%[straps:assistant]%%",
+    "working",
+    "",
+    "%%[straps:tool_use]%% {not valid json",
+    "{}",
+    "",
+    "%%[straps:tool_result]%% {not valid json",
+    "orphan result",
+  })
+  local parsed = state.parse(bufnr)
+  for _, msg in ipairs(parsed.messages) do
+    for _, part in ipairs(msg.content) do
+      if part.type == "tool_use" then
+        error("a null-attr tool_use survived parse")
+      elseif part.type == "tool_result" then
+        error("a null-attr tool_result survived parse")
+      end
+    end
+  end
+  -- The valid user/assistant text still parses.
+  eq(parsed.messages[1].content[1], { type = "text", text = "hi" })
+  eq(parsed.messages[2].content[1], { type = "text", text = "working" })
 end)
 
 case("escaping round-trips marker-like content", function()

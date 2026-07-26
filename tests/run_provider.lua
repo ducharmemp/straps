@@ -865,6 +865,13 @@ do
 
   local models, err = registry.call("fn.list_models")
 
+  case("fn.list_models explicit provider arg overrides config/provider pref", function()
+    straps.config.provider = "anthropic"
+    local forced = registry.call("fn.list_models", "openai")
+    assert(type(forced) == "table" and forced[1].id == "gpt-5",
+      "explicit openai provider did not return OpenAI models: " .. vim.inspect(forced))
+  end)
+
   case("fn.list_models (openai) hits openai_base_url/v1/models with Bearer auth", function()
     local argv = table.concat(vim.fn.readfile(tmp .. "/models_openai_argv"), "\n")
     assert(argv:find("http://straps-openai-models.invalid/v1/models", 1, true),
@@ -970,6 +977,26 @@ do
     assert(tool_msg.tool_call_id == "call_1", "tool_call_id not threaded back")
     assert(tostring(tool_msg.content):find("openai-e2e-output", 1, true),
       "tool output not sent back in the tool message")
+  end)
+
+  case("openai backend: per-buffer OpenAI model slot wins over config.openai_model", function()
+    vim.b[oai_buf].straps_openai_model = "gpt-5-mini-session"
+    state.append_text(oai_buf, "run with a session-specific OpenAI model")
+    loop.start(oai_buf)
+    vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
+    local body = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/oai_body.3"), "\n"))
+    assert(body.model == "gpt-5-mini-session", "per-buffer OpenAI model ignored: " .. tostring(body.model))
+  end)
+
+  case("openai backend: unset openai_model does not fall through to the Claude default", function()
+    vim.b[oai_buf].straps_openai_model = nil
+    straps.config.openai_model = nil
+    straps.config.model = "claude-sonnet-5"
+    state.append_text(oai_buf, "one more openai turn for model fallback")
+    loop.start(oai_buf)
+    vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
+    local body = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/oai_body.4"), "\n"))
+    assert(body.model == "gpt-5", "OpenAI fallback model should be gpt-5, got " .. tostring(body.model))
   end)
 
   straps.config.provider = saved_provider

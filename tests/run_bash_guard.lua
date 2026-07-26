@@ -49,6 +49,10 @@ local function assert_refused(cmd, tool)
   assert(out:find(tool, 1, true), cmd .. " refusal should point at " .. tool .. ", got: " .. out)
 end
 
+local function call_tool(name, input)
+  return registry.call("tool." .. name, input, ctx)
+end
+
 local function assert_ran(cmd)
   local out = bash(cmd)
   assert(out:match("^exit code:"), cmd .. " should have run, got: " .. out)
@@ -66,11 +70,30 @@ case("bare searches are refused toward grep", function()
   assert_refused("rg pattern", "tool.grep")
 end)
 
-case("bare listings are refused toward glob", function()
-  assert_refused("ls", "tool.glob")
-  assert_refused("ls -la lua/", "tool.glob")
-  assert_refused("find . -name '*.lua'", "tool.glob")
-  assert_refused("fd straps", "tool.glob")
+case("bare listings are refused toward tree/glob", function()
+  assert_refused("ls", "tool.tree")
+  assert_refused("ls -la lua/", "tool.tree")
+  assert_refused("find . -name '*.lua'", "tool.tree")
+  assert_refused("fd straps", "tool.tree")
+end)
+
+case("bare metadata and web fetch commands are refused toward native tools", function()
+  assert_refused("stat lua/straps/tools.lua", "tool.path_info")
+  assert_refused("file lua/straps/tools.lua", "tool.path_info")
+  assert_refused("curl https://example.com", "tool.fetch_url")
+  assert_refused("wget https://example.com", "tool.fetch_url")
+end)
+
+case("path_info and tree provide native filesystem introspection", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local file = dir .. "/a.txt"
+  local f = assert(io.open(file, "w")); f:write("hi\n"); f:close()
+  local info = call_tool("path_info", { paths = { file, dir .. "/missing" } })
+  assert(info:find("a.txt: file", 1, true), "path_info file missing: " .. info)
+  assert(info:find("missing: missing", 1, true), "path_info missing entry missing: " .. info)
+  local tree = call_tool("tree", { path = dir, max_depth = 1 })
+  assert(tree:find("a.txt", 1, true), "tree missing file: " .. tree)
 end)
 
 case("shell logic exempts a command from the guard", function()
@@ -82,8 +105,22 @@ end)
 case("prefix lookalikes and unrelated commands run", function()
   assert_ran("lsof -h 2>&1 || true") -- not "ls"
   assert_ran("catalog() { true; }; catalog") -- has shell logic anyway
+  assert_ran("curl https://example.com | head -1") -- shell logic: tool no longer equivalent
   assert_ran("sed -i.bak -e '' /dev/null || true") -- sed without -n
   assert_ran("true")
+end)
+
+case("fetch_url is registered but not auto-allowed", function()
+  local e = registry.get("tool.fetch_url")
+  assert(e and e.kind == "tool", "fetch_url not registered")
+  local allowed = registry.call("hook.confirm", "fetch_url", { url = "https://example.com" }, { bufnr = 0 })
+  assert(allowed ~= true, "fetch_url should require confirmation")
+end)
+
+case("huge output is capped before returning to the loop", function()
+  local out = bash("yes x | head -c 400000")
+  assert(out:find("output truncated", 1, true), "missing truncation note: " .. out:sub(1, 200))
+  assert(#out < 300000, "bash returned too much output: " .. #out)
 end)
 
 if failed then

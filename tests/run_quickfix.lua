@@ -262,6 +262,18 @@ case("bulk_replace with an empty quickfix list returns the error string", functi
     "unexpected empty-list message: " .. tostring(out))
 end)
 
+case("bulk_replace rejects Ex command separators in user-controlled fragments", function()
+  seed_two_files()
+  local ok, err = pcall(registry.call, "tool.bulk_replace",
+    { pattern = "FOO", replacement = "BAR | edit /tmp/owned" }, { bufnr = 0 })
+  assert(not ok and tostring(err):find("must not contain", 1, true),
+    "replacement separator should be rejected, got: " .. tostring(err))
+  ok, err = pcall(registry.call, "tool.bulk_replace",
+    { pattern = "FOO", replacement = "BAR", flags = "ge | qall!" }, { bufnr = 0 })
+  assert(not ok and tostring(err):find("flags contain", 1, true),
+    "flag separator should be rejected, got: " .. tostring(err))
+end)
+
 case("bulk_replace is NOT in hook.confirm's auto-allow set (it is a write)", function()
   -- read-only editor/search tools auto-allow (return true); bulk_replace must
   -- fall through to a prompt. Headless, vim.fn.confirm returns 0 -> denied.

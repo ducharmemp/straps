@@ -73,7 +73,15 @@ end
 local function check_api_key()
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
-  local openai = config.provider == "openai"
+  local provider = config.provider
+  if provider == nil or provider == "" then
+    local ok_pref, pref = pcall(function()
+      return require("straps.registry").try_call("fn.provider_pref")
+    end)
+    if ok_pref and type(pref) == "string" and pref ~= "" then provider = pref end
+  end
+  if provider ~= "openai" then provider = "anthropic" end
+  local openai = provider == "openai"
 
   local env_var = openai and "OPENAI_API_KEY" or "ANTHROPIC_API_KEY"
   local entry_name = openai and "fn.openai_api_key" or "fn.api_key"

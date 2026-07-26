@@ -162,6 +162,9 @@ case("core layer carries the self-extension triggers and .straps.lua persistence
   local core = registry.call("fn.system_prompt_core")
   assert(core:find(".straps.lua", 1, true), "core prompt does not mention .straps.lua")
   assert(core:find("twice", 1, true), "core prompt missing the done-it-twice trigger rule")
+  assert(core:find("lsp_status", 1, true), "core prompt should mention the LSP status probe")
+  assert(core:find("project's build, test or lint", 1, true),
+    "core prompt missing the test/build/lint tool trigger")
 end)
 
 -- ----------------------------------------------------------------- env VCS

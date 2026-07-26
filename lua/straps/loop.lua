@@ -172,17 +172,17 @@ local function new_ctx(bufnr, run)
 end
 
 -- One tool_use block (its tool_use marker is already in the buffer):
--- confirm -> before_tool -> call -> after_tool -> result.
-local function run_tool(bufnr, ctx, block, cfg)
+-- confirm -> before_tool -> call -> after_tool -> normalized result. The caller
+-- appends tool_result blocks in API order, even when execution was parallel.
+local function execute_tool(bufnr, ctx, block, cfg, opts)
   local registry = require("straps.registry")
-  local state = require("straps.state")
-  local id, name, input = block.id, block.name, block.input or {}
+  local name, input = block.name, block.input or {}
 
-  local allowed, reason = registry.call("hook.confirm", name, input, ctx)
-  if not allowed then
-    state.append(bufnr, "tool_result", { id = id, is_error = true },
-      "user denied: " .. (reason or ""))
-    return false
+  if not (opts and opts.skip_confirm) then
+    local allowed, reason = registry.call("hook.confirm", name, input, ctx)
+    if not allowed then
+      return false, "user denied: " .. (reason or "")
+    end
   end
 
   registry.try_call("hook.before_tool", name, input, ctx)
@@ -205,8 +205,63 @@ local function run_tool(bufnr, ctx, block, cfg)
   end
 
   result = registry.try_call("hook.after_tool", name, input, result, ok, ctx) or result
-  state.append(bufnr, "tool_result", { id = id, is_error = not ok }, tostring(result))
   return ok, tostring(result)
+end
+
+local function append_tool_result(bufnr, block, ok, result)
+  require("straps.state").append(bufnr, "tool_result",
+    { id = block.id, is_error = not ok }, tostring(result))
+end
+
+-- Builtin read-only tools whose effects are safe to overlap when the model
+-- sends a batch. Writes and user-interaction/presentation tools stay serial.
+local PARALLEL_READONLY = {
+  read_file = true, glob = true, tree = true, path_info = true, grep = true,
+  registry_list = true, registry_get = true, skill = true,
+  diagnostics = true, diagnostic_at = true, diagnostic_next = true,
+  lsp_status = true,
+  declaration = true, definition = true, type_definition = true,
+  implementation = true, references = true,
+  symbols = true, read_symbol = true, tree_sitter_status = true, node_at = true,
+  read_node = true, hover = true, workspace_symbols = true,
+  context = true, help_search = true,
+}
+
+local function all_parallel_readonly(blocks)
+  if #blocks < 2 then return false end
+  for _, block in ipairs(blocks) do
+    if not PARALLEL_READONLY[block.name] then return false end
+  end
+  return true
+end
+
+local function child_ctx(parent_ctx, bufnr, finish)
+  local ctx = {
+    bufnr = bufnr,
+    emit = parent_ctx.emit,
+    on_cancel = parent_ctx.on_cancel,
+    cancelled = parent_ctx.cancelled,
+    activity = parent_ctx.activity,
+  }
+  ctx.await = function(start)
+    local co = assert(coroutine.running(), "straps: child ctx.await outside coroutine")
+    local resolved = false
+    start(function(...)
+      if resolved then return end
+      resolved = true
+      local args = pack(...)
+      vim.schedule(function()
+        if coroutine.status(co) ~= "suspended" then return end
+        local reg = require("straps.registry")
+        local prev_scope = reg.set_active_scope(bufnr)
+        local ok, err = coroutine.resume(co, unpack(args, 1, args.n))
+        reg.set_active_scope(prev_scope)
+        if not ok then finish(false, tostring(err)) end
+      end)
+    end)
+    return coroutine.yield()
+  end
+  return ctx
 end
 
 -- Drain the steering queue (vim.b straps_steering): append each queued string
@@ -362,35 +417,99 @@ local function run_turns(bufnr, ctx, run)
     end
     -- Per-turn stall signals, folded in as each tool runs.
     local n_calls, n_errors, any_repeat, last_error = 0, 0, false, nil
-    for i, block in ipairs(tool_blocks) do
-      if run.cancelled then
-        -- Every appended tool_use must get a result, or the next parse
-        -- ships an unpaired tool_use block and the API rejects the request.
-        for j = i, #tool_blocks do
-          state.append(bufnr, "tool_result",
-            { id = tool_blocks[j].id, is_error = true },
-            "run cancelled before this tool executed")
+    if all_parallel_readonly(tool_blocks) then
+      local jobs = {}
+      for i, block in ipairs(tool_blocks) do
+        progress(bufnr, ctx, { type = "tool", name = block.name }, "tool: " .. tostring(block.name))
+        local key = tostring(block.name) .. "\0" .. pretty_json(block.input or {})
+        if run.seen_calls[key] then any_repeat = true end
+        run.seen_calls[key] = true
+        n_calls = n_calls + 1
+        local t0 = vim.uv.hrtime()
+        local allowed, reason = registry.call("hook.confirm", block.name, block.input or {}, ctx)
+        if not allowed then
+          jobs[i] = { done = true, ok = false, result = "user denied: " .. (reason or ""), ms = 0 }
+        else
+          jobs[i] = { done = false, block = block, started = t0 }
+          local job = jobs[i]
+          local function finish(ok, result)
+            if job.done then return end
+            job.done = true
+            job.ok = ok
+            job.result = tostring(result)
+            job.ms = math.floor((vim.uv.hrtime() - job.started) / 1e6)
+          end
+          local co = coroutine.create(function()
+            local cctx = child_ctx(ctx, bufnr, finish)
+            finish(execute_tool(bufnr, cctx, block, cfg, { skip_confirm = true }))
+          end)
+          local reg = require("straps.registry")
+          local prev_scope = reg.set_active_scope(bufnr)
+          local ok_resume, err = coroutine.resume(co)
+          reg.set_active_scope(prev_scope)
+          if not ok_resume then finish(false, err) end
         end
-        return cancelled_note()
       end
-      progress(bufnr, ctx, { type = "tool", name = block.name }, "tool: " .. tostring(block.name))
-      -- (tool.name .. canonical input) identifies a call for repeat detection;
-      -- pretty_json sorts object keys, so equivalent inputs hash identically.
-      local key = tostring(block.name) .. "\0" .. pretty_json(block.input or {})
-      if run.seen_calls[key] then
-        any_repeat = true
+      ctx.await(function(resolve)
+        local function poll()
+          local pending = false
+          for _, job in ipairs(jobs) do
+            if not job.done then pending = true break end
+          end
+          if pending and not run.cancelled then
+            vim.defer_fn(poll, 20)
+          else
+            resolve()
+          end
+        end
+        poll()
+      end)
+      for i, block in ipairs(tool_blocks) do
+        local job = jobs[i]
+        local ok, result = job.ok == true, job.result or ""
+        if run.cancelled and not job.done then
+          ok, result = false, "run cancelled before this tool executed"
+        end
+        append_tool_result(bufnr, block, ok, result)
+        if not ok then
+          n_errors = n_errors + 1
+          last_error = result
+        end
+        log(bufnr, { ev = "tool", name = block.name, ms = job.ms or 0, is_error = not ok })
+        progress(bufnr, ctx, { type = "tool_done", name = block.name, is_error = not ok })
       end
-      run.seen_calls[key] = true
-      local t0 = vim.uv.hrtime()
-      local ok, result = run_tool(bufnr, ctx, block, cfg)
-      n_calls = n_calls + 1
-      if not ok then
-        n_errors = n_errors + 1
-        last_error = result
+      if run.cancelled then return cancelled_note() end
+    else
+      for i, block in ipairs(tool_blocks) do
+        if run.cancelled then
+          -- Every appended tool_use must get a result, or the next parse
+          -- ships an unpaired tool_use block and the API rejects the request.
+          for j = i, #tool_blocks do
+            append_tool_result(bufnr, tool_blocks[j], false,
+              "run cancelled before this tool executed")
+          end
+          return cancelled_note()
+        end
+        progress(bufnr, ctx, { type = "tool", name = block.name }, "tool: " .. tostring(block.name))
+        -- (tool.name .. canonical input) identifies a call for repeat detection;
+        -- pretty_json sorts object keys, so equivalent inputs hash identically.
+        local key = tostring(block.name) .. "\0" .. pretty_json(block.input or {})
+        if run.seen_calls[key] then
+          any_repeat = true
+        end
+        run.seen_calls[key] = true
+        local t0 = vim.uv.hrtime()
+        local ok, result = execute_tool(bufnr, ctx, block, cfg)
+        append_tool_result(bufnr, block, ok, result)
+        n_calls = n_calls + 1
+        if not ok then
+          n_errors = n_errors + 1
+          last_error = result
+        end
+        log(bufnr, { ev = "tool", name = block.name,
+          ms = math.floor((vim.uv.hrtime() - t0) / 1e6), is_error = not ok })
+        progress(bufnr, ctx, { type = "tool_done", name = block.name, is_error = not ok })
       end
-      log(bufnr, { ev = "tool", name = block.name,
-        ms = math.floor((vim.uv.hrtime() - t0) / 1e6), is_error = not ok })
-      progress(bufnr, ctx, { type = "tool_done", name = block.name, is_error = not ok })
     end
 
     -- Classify the turn for the stall detector. A turn with no tool calls is

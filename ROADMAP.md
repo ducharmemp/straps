@@ -77,6 +77,25 @@ small `tool.vcs` (or a few focused ones) that knows jj-colocated-with-git —
 matching this repo's own workflow — would cut a lot of bash. Keep it thin;
 jj first (per AGENTS.md), git fallback.
 
+## Persistent terminals / long-running job handles
+
+`run_in_terminal` is excellent for visible one-shot tests/builds, but every call
+owns a short-lived terminal split and returns only when the job exits. Some
+workflows want a persistent job surface the agent can revisit: dev servers,
+watch-mode tests, REPLs, log tails, or a build that should keep streaming while
+the agent edits.
+
+Sketch:
+- `terminal_start { name?, command, cwd?, env? }` opens/reuses a named terminal
+  job, returns a handle, and records it on the session buffer.
+- `terminal_send { handle, text }`, `terminal_read { handle, lines? }`,
+  `terminal_stop { handle }`, `terminal_list`.
+- Keep safety close to today's model: starting/sending/stopping prompts;
+  reading/listing is read-only. Never use this for compiler-style diagnostics
+  when `run_quickfix` is the right native surface.
+- Agent nudge: use only when the task needs a long-lived process; otherwise keep
+  `bash` / `run_in_terminal` for bounded commands.
+
 ## Findings-list isolation for WINDOWLESS sessions
 
 Shipped: on-screen sessions route grep/bulk_replace/etc. to their window's

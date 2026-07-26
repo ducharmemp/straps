@@ -4,8 +4,8 @@
 :StrapsEdit	straps.txt	/*:StrapsEdit*
 :StrapsEffort	straps.txt	/*:StrapsEffort*
 :StrapsEval	straps.txt	/*:StrapsEval*
+:StrapsHelp	straps.txt	/*:StrapsHelp*
 :StrapsModel	straps.txt	/*:StrapsModel*
-:StrapsProvider	straps.txt	/*:StrapsProvider*
 :StrapsRegistry	straps.txt	/*:StrapsRegistry*
 :StrapsResume	straps.txt	/*:StrapsResume*
 :StrapsSend	straps.txt	/*:StrapsSend*

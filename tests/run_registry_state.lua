@@ -1,7 +1,10 @@
 -- Tests for straps.registry and straps.state.
 -- Run from the repo root: nvim --headless -l tests/run_registry_state.lua
 
-package.path = "lua/?.lua;lua/?/init.lua;" .. package.path
+local here = debug.getinfo(1, "S").source:sub(2)
+local root = vim.fn.fnamemodify(vim.fn.fnamemodify(here, ":p"), ":h:h")
+vim.opt.rtp:prepend(root)
+package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
 
 local registry = require("straps.registry")
 local state = require("straps.state")
@@ -69,6 +72,9 @@ case("define validates name and kind", function()
   assert(not pcall(registry.define, { kind = "fn", source = "return function() end" }))
   assert(not pcall(registry.define, { name = "fn.x", kind = "nope", source = "return function() end" }))
   assert(not pcall(registry.define, { name = "fn.x", kind = "fn" }))
+  assert(not pcall(registry.define, { name = "tool.bad/name", kind = "tool", source = "return function() end" }))
+  assert(not pcall(registry.define, { name = "fn", kind = "fn", source = "return function() end" }))
+  assert(not pcall(registry.define, { name = "skill.bad name", kind = "skill", source = "body" }))
 end)
 
 case("call errors on missing, try_call returns nil", function()

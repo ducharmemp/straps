@@ -143,6 +143,20 @@ case("changed content is untrusted again: not executed", function()
     "changed content executed without confirmation; count = " .. tostring(_G.STRAPS_PROJ_COUNT))
 end)
 
+case("trust_all does not record a hash when .straps.lua fails to execute", function()
+  local bad = tmp .. "/badproj"
+  vim.fn.mkdir(bad, "p")
+  local bad_src = "error('boom during project load')\n"
+  write_file(bad .. "/.straps.lua", bad_src)
+  cd(bad)
+  local loaded = straps.load_project_registry({ trust_all = true, store_path = store })
+  cd(orig_cwd)
+  assert(loaded == false, "broken project file should not load")
+  local decoded = vim.json.decode(read_file(store))
+  local abs = vim.fn.fnamemodify(bad .. "/.straps.lua", ":p")
+  assert(decoded[abs] == nil, "failed project file was recorded as trusted")
+end)
+
 -- ------------------------------------------------------------ seq ordering
 case("project-defined tool lands AFTER builtins in names_by_seq order", function()
   local names = registry.names_by_seq("tool")

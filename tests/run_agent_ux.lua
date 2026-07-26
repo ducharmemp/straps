@@ -305,11 +305,17 @@ case("new read-only tools are auto-allowed; code_action gates on index", functio
   assert(registry.call("hook.confirm", "code_action",
     { path = "x", line = 1, col = 1 }, { bufnr = 0 }) == true,
     "code_action without index (list mode) should be auto-allowed")
+  assert(registry.call("hook.confirm", "fix_diagnostic",
+    { path = "x", line = 1, col = 1 }, { bufnr = 0 }) == true,
+    "fix_diagnostic without index (list mode) should be auto-allowed")
   -- Applying (index set) must fall through to the prompt; headless confirm
   -- returns 0 -> denied.
   local allowed = registry.call("hook.confirm", "code_action",
     { path = "x", line = 1, col = 1, index = 1 }, { bufnr = 0 })
   assert(allowed ~= true, "code_action with index must not be auto-allowed")
+  allowed = registry.call("hook.confirm", "fix_diagnostic",
+    { path = "x", line = 1, col = 1, index = 1 }, { bufnr = 0 })
+  assert(allowed ~= true, "fix_diagnostic with index must not be auto-allowed")
   for _, n in ipairs({ "rename_symbol", "format", "run_in_terminal" }) do
     assert(registry.call("hook.confirm", n, {}, { bufnr = 0 }) ~= true,
       n .. " must not be auto-allowed")
@@ -821,6 +827,29 @@ case("'Always in <dir>' grants the parent directory, not neighbors with the same
   vim.fn.confirm = real_confirm
 end)
 
+case("'Always in <dir>' grant resolves symlinks before auto-allowing", function()
+  local base = vim.fn.tempname()
+  vim.fn.mkdir(base .. "/allowed", "p")
+  vim.fn.mkdir(base .. "/outside", "p")
+  local link = base .. "/allowed/link"
+  local ok_link = pcall(vim.uv.fs_symlink, base .. "/outside", link, { dir = true })
+  if not ok_link then
+    print("SKIP  symlink creation unsupported")
+    return
+  end
+  local cbuf = vim.api.nvim_create_buf(true, false)
+  local real_confirm = vim.fn.confirm
+  vim.fn.confirm = function() return 3 end
+  local allowed = registry.call("hook.confirm", "edit_file",
+    { path = base .. "/allowed/one.txt", old_string = "x", new_string = "y" }, { bufnr = cbuf })
+  assert(allowed == true, "initial grant should allow")
+  vim.fn.confirm = function() return 0 end
+  allowed = registry.call("hook.confirm", "edit_file",
+    { path = link .. "/escape.txt", old_string = "x", new_string = "y" }, { bufnr = cbuf })
+  vim.fn.confirm = real_confirm
+  assert(allowed ~= true, "symlink escape under granted dir must not auto-allow")
+end)
+
 case("'Always all edits' grants every path for edit tools only", function()
   local cbuf = vim.api.nvim_create_buf(true, false)
   local real_confirm = vim.fn.confirm
@@ -844,12 +873,14 @@ end)
 
 case("autocmd_bridge queues a hook's string onto the session buffer", function()
   local session = state.new_session()
+  local prev = registry.set_active_scope(session)
   registry.define({
     name = "hook.bridge_test",
     kind = "hook",
     doc = "test bridge hook",
     source = [[return function(args) return "BRIDGE-MSG-42 (" .. tostring(args.event) .. ")" end]],
   })
+  registry.set_active_scope(prev)
   local id = registry.call("fn.autocmd_bridge", {
     event = "User",
     pattern = "StrapsBridgeTest",
@@ -1071,6 +1102,17 @@ case("hook.confirm auto-allows the presentation tools", function()
     local allowed = registry.call("hook.confirm", n, {}, { bufnr = 0 })
     assert(allowed == true, n .. " should be auto-allowed (read-only view)")
   end
+end)
+
+case(":StrapsHelp command opens a straps help tag", function()
+  vim.g.loaded_straps = nil
+  vim.cmd("source " .. vim.fn.fnameescape(root .. "/plugin/straps.lua"))
+  vim.cmd("silent! helptags " .. vim.fn.fnameescape(root .. "/doc"))
+  vim.cmd("StrapsHelp straps-tools")
+  assert(vim.bo.filetype == "help", "StrapsHelp should open a help buffer")
+  assert(vim.api.nvim_buf_get_name(0):find("straps.txt", 1, true),
+    "StrapsHelp did not open straps.txt")
+  vim.cmd("quit")
 end)
 
 print(failed and "FAILED" or "ALL PASS")

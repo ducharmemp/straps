@@ -114,6 +114,10 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 :StrapsRegistry		Open a scratch listing of every registry entry;
 			<CR> on a line opens that entry with |:StrapsEdit|.
 
+							*:StrapsHelp*
+:StrapsHelp [tag]	Open |:help| for straps (default tag `straps`, or
+				a supplied straps help tag such as `straps-tools`).
+
 							*:StrapsEval*
 :StrapsEval		Execute the current buffer as Lua.
 
@@ -123,10 +127,10 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			See |straps-subagents|.
 
 							*:StrapsModel*
-:StrapsModel		Pick the model for the current session (or the global
-			default off a non-session buffer). Does live discovery
-			via |fn.list_models| and merges your account catalog
-			over |straps-config| `models`.
+:StrapsModel		Pick the provider-specific model for the current session
+			(or global default off a non-session buffer). Does live
+			discovery via |fn.list_models| and merges your account
+			catalog over `models` or `openai_models`.
 
 							*:StrapsEffort*
 :StrapsEffort		Pick the extended-thinking effort (off/low/medium/high
@@ -213,15 +217,18 @@ render			(boolean) true. Master switch for the |fn.render|
 			presentation layer.
 tools_expanded		(boolean) false. Fold tool blocks OPEN by default.
 session_winbar		(boolean) true. Window-local winbar on session windows.
-models			(list) 4 curated entries { id, label?, thinking?,
-			context? }. The |:StrapsModel| seed; `thinking` is
-			"adaptive" or "budget" (which extended-thinking
-			mechanism the model speaks) and `context` is its token
-			window (for the winbar's context-fill %). An unlisted
+models			(list) 4 curated Anthropic entries { id, label?,
+			thinking?, context? }. The |:StrapsModel| Anthropic
+			seed/cache; `thinking` is "adaptive" or "budget" and
+			`context` is its token window. An unlisted Anthropic
 			model sends no thinking block.
+openai_models		(list) curated OpenAI entries { id, label? }. The
+			|:StrapsModel| OpenAI seed/cache, separate from
+			`models` so provider switches do not show stale ids.
 context_window		(number|nil) 200000. Fallback token window for a model
-			with no `context` in `models`, used only to render the
-			winbar's context-fill percentage. nil hides the %.
+			with no `context` in the active provider's model list,
+			used only to render the winbar's context-fill percentage.
+			nil hides the %.
 effort			(string) "off". Name of the active |:StrapsEffort|
 			entry.
 efforts			(list) off/low/medium/high, each { name, level?,
@@ -234,8 +241,8 @@ provider		(string|nil) nil. Backend for |fn.provider|: "anthropic"
 			Per session via b:straps_provider.
 openai_base_url		(string|nil) nil -> https://api.openai.com. Prefixes
 			/v1/chat/completions for the OpenAI backend.
-openai_model		(string|nil) nil. Model id when provider == "openai";
-			falls back to `model`.
+openai_model		(string|nil) "gpt-5". Model id when provider ==
+			"openai"; kept separate from Anthropic `model`.
 request_timeout_ms	(number) 300000. Idle watchdog: kill a request whose
 			stream is silent this long.
 log_file		(string|nil) nil (off). Structured JSONL event log; see
@@ -286,16 +293,22 @@ Tools are what the agent calls. Every one is a registry entry (|:StrapsEdit
 tool.NAME|) and every write goes through |hook.confirm|. The defaults:
 
 File & shell:
-	read_file, write_file, edit_file, glob, grep, bash,
-	run_in_terminal, run_quickfix, move_file(s), delete_file(s)
+	read_file, write_file, edit_file, patch_file, path_info, tree,
+	fetch_url, glob, grep, bash, run_in_terminal, run_quickfix,
+	move_file(s), delete_file(s)
 
 Editor-native (tree-sitter / LSP, degrade gracefully with no server):
-	diagnostics, definition, references, hover, symbols, read_symbol,
-	workspace_symbols, code_action, rename_symbol, format, bulk_replace
+	diagnostics, diagnostic_at, diagnostic_next, fix_diagnostic,
+	lsp_status,
+	declaration, definition, type_definition, implementation,
+	references, hover, tree_sitter_status, node_at, read_node,
+	symbols,
+	read_symbol, workspace_symbols, code_action, rename_symbol,
+	format, bulk_replace
 
 Presentation & interaction:
 	show_user, show_diff, show_buffer, set_quickfix, context, ask_user,
-	undo_edit
+	help_search, undo_edit
 
 Self-extension & orchestration:
 	registry_list, registry_get, registry_define, skill, eval_lua,
@@ -377,7 +390,7 @@ fn.provider_anthropic(req, ctx)	The Anthropic Messages API over streaming SSE
 fn.provider_openai(req, ctx)	The OpenAI Chat Completions API over streaming
 		SSE via curl. Translates the request/response to and from the
 		same block shape; Bearer auth via |fn.openai_api_key|, endpoint
-		config `openai_base_url`, reasoning_effort from config `efforts`.
+		config `openai_base_url`, and model config `openai_model`.
 						*fn.provider_pref*
 fn.provider_pref(value?)	Read (no arg) or write (a string) the persisted
 		provider choice at $XDG_CONFIG_HOME/straps/provider. Written by
@@ -388,7 +401,9 @@ fn.api_key() -> string		Resolve the Anthropic API key (see |straps-setup|).
 fn.openai_api_key() -> string	Resolve the OpenAI API key ($OPENAI_API_KEY,
 		then $XDG_CONFIG_HOME/straps/openai_api_key, chmod 600).
 						*fn.list_models*
-fn.list_models() -> entries	Live GET /v1/models for |:StrapsModel|.
+fn.list_models(provider?) -> entries
+			Live GET /v1/models for |:StrapsModel|. Optional provider is
+			"anthropic" or "openai"; omitted means effective provider.
 						*fn.build_tools*
 fn.build_tools() -> tools	Map every tool.* entry to an API tool def.
 						*fn.system_prompt*

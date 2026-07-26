@@ -14,13 +14,14 @@ function M.register()
   define({
     name = "tool.read_file",
     kind = "tool",
-    doc = "Read a file from disk. Returns the content with 1-based line numbers"
-      .. " in the form '  N<TAB>line'. Parameters: path (required) — absolute or"
-      .. " cwd-relative path of the file to read; offset (optional, default 1) —"
-      .. " 1-based line number to start reading from; limit (optional) — maximum"
-      .. " number of lines to return. At most 2000 lines are returned per call;"
-      .. " if the file has more, the output ends with a truncation note telling"
-      .. " you the next offset to use.",
+    doc = "Read a file through its Neovim buffer, so open unsaved changes are"
+      .. " the source of truth (matching edit/write paths). Returns the content with"
+      .. " 1-based line numbers in the form '  N<TAB>line'. Parameters: path"
+      .. " (required) — absolute or cwd-relative path of the file to read; offset"
+      .. " (optional, default 1) — 1-based line number to start reading from; limit"
+      .. " (optional) — maximum number of lines to return. At most 2000 lines are"
+      .. " returned per call; if the file has more, the output ends with a truncation"
+      .. " note telling you the next offset to use.",
     input_schema = {
       type = "object",
       properties = {
@@ -32,21 +33,24 @@ function M.register()
     },
     source = [==[
 return function(input, ctx)
-  local f, err = io.open(input.path, "r")
-  if not f then
-    error("read_file: cannot open " .. tostring(input.path) .. ": " .. tostring(err))
+  local path = input.path
+  if type(path) ~= "string" or path == "" then
+    error("read_file: path must be a non-empty string")
   end
-  local text = f:read("*a") or ""
-  f:close()
-  local lines = {}
-  for line in (text .. "\n"):gmatch("(.-)\n") do
-    lines[#lines + 1] = line
+  local full = vim.fn.fnamemodify(path, ":p")
+  local existing = vim.fn.bufnr(full)
+  if existing == -1 and vim.fn.filereadable(full) ~= 1 then
+    error("read_file: cannot open " .. tostring(path) .. ": no such file")
   end
-  -- Reading "content\n" yields a spurious trailing "" only when the file
-  -- already ended in a newline; drop it.
-  if #lines > 0 and lines[#lines] == "" and text:sub(-1) == "\n" then
-    lines[#lines] = nil
+  local buf = vim.fn.bufadd(full)
+  if not buf or buf == 0 then
+    error("read_file: could not create a buffer for " .. tostring(path))
   end
+  local ok_load, load_err = pcall(vim.fn.bufload, buf)
+  if not ok_load then
+    error("read_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(load_err))
+  end
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local total = #lines
   local offset = math.max(1, tonumber(input.offset) or 1)
   local limit = math.min(tonumber(input.limit) or 2000, 2000)
@@ -287,6 +291,136 @@ end
 ]==],
   })
 
+  -- --------------------------------------------------------------- patch_file
+
+  define({
+    name = "tool.patch_file",
+    kind = "tool",
+    doc = "Apply one or more structured line-range hunks to a file through its"
+      .. " live Neovim buffer. Each hunk is {start_line, end_line, new_text,"
+      .. " expected_old_text?}: 1-based inclusive lines to replace; for insertion,"
+      .. " set end_line to start_line-1. Hunks are validated for overlap/staleness,"
+      .. " buffer edit, saved to disk, and hook.after_write fires. This is the"
+      .. " structured alternative to exact-string edit_file when line ranges are"
+      .. " already known. Parameters: path (required); hunks (required array).",
+    input_schema = {
+      type = "object",
+      properties = {
+        path = { type = "string", description = "Path of the file to patch." },
+        hunks = {
+          type = "array",
+          description = "Line hunks: {start_line, end_line, new_text}. Use end_line=start_line-1 for insertion.",
+          items = {
+            type = "object",
+            properties = {
+              start_line = { type = "integer", description = "1-based first line to replace, or insertion point." },
+              end_line = { type = "integer", description = "1-based last line to replace; may be start_line-1 for insertion." },
+              new_text = { type = "string", description = "Replacement text for this range." },
+              expected_old_text = { type = "string", description = "Optional exact text expected in the live buffer range before patching." },
+            },
+            required = { "start_line", "end_line", "new_text" },
+          },
+        },
+      },
+      required = { "path", "hunks" },
+    },
+    source = [==[
+return function(input, ctx)
+  local registry = require("straps.registry")
+  local path = input.path
+  if type(path) ~= "string" or path == "" then
+    error("patch_file: path must be a non-empty string")
+  end
+  if type(input.hunks) ~= "table" or #input.hunks == 0 then
+    error("patch_file: hunks must be a non-empty array")
+  end
+  local full = vim.fn.fnamemodify(path, ":p")
+  local bok, buf = pcall(vim.fn.bufadd, full)
+  if not bok or not buf or buf == 0 then
+    error("patch_file: could not create a buffer for " .. tostring(path) .. ": " .. tostring(buf))
+  end
+  local lok, lerr = pcall(vim.fn.bufload, buf)
+  if not lok then
+    error("patch_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(lerr))
+  end
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  local hunks, problems = {}, {}
+  for i, h in ipairs(input.hunks) do
+    local s, e = tonumber(h.start_line), tonumber(h.end_line)
+    local text = h.new_text
+    if not s or not e or type(text) ~= "string" then
+      problems[#problems + 1] = ("#%d: needs integer start_line/end_line and string new_text"):format(i)
+    elseif s < 1 or e < s - 1 then
+      problems[#problems + 1] = ("#%d: invalid range %s-%s"):format(i, tostring(s), tostring(e))
+    elseif s > line_count + 1 or e > line_count then
+      problems[#problems + 1] = ("#%d: range %d-%d outside file with %d lines"):format(i, s, e, line_count)
+    else
+      hunks[#hunks + 1] = {
+        idx = i,
+        s = math.floor(s),
+        e = math.floor(e),
+        text = text,
+        expected = type(h.expected_old_text) == "string" and h.expected_old_text or nil,
+      }
+    end
+  end
+  table.sort(hunks, function(a, b) return a.s < b.s end)
+  for i = 2, #hunks do
+    if hunks[i].s <= hunks[i - 1].e then
+      problems[#problems + 1] = ("#%d overlaps #%d"):format(hunks[i].idx, hunks[i - 1].idx)
+    end
+  end
+  local live_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local function slice_lines(lines, first, last)
+    local out = {}
+    for i = first, last do out[#out + 1] = lines[i] end
+    return out
+  end
+  for _, h in ipairs(hunks) do
+    if h.expected ~= nil then
+      local actual = ""
+      if h.e >= h.s then
+        actual = table.concat(slice_lines(live_lines, h.s, h.e), "\n")
+      end
+      local expected = h.expected:gsub("\n$", "")
+      if actual ~= expected then
+        problems[#problems + 1] = ("#%d: expected_old_text mismatch at %d-%d"):format(h.idx, h.s, h.e)
+      end
+    end
+  end
+  if #problems > 0 then
+    error("patch_file: refused:\n" .. table.concat(problems, "\n"))
+  end
+
+  local function split_replacement(text)
+    if text == "" then return {} end
+    local lines = vim.split(text, "\n", { plain = true })
+    if lines[#lines] == "" then table.remove(lines) end
+    return lines
+  end
+
+  local ok, err = pcall(function()
+    vim.api.nvim_buf_call(buf, function()
+      vim.cmd("let &l:undolevels = &l:undolevels")
+      for i = #hunks, 1, -1 do
+        local h = hunks[i]
+        vim.api.nvim_buf_set_lines(buf, h.s - 1, h.e, false, split_replacement(h.text))
+      end
+      vim.cmd("silent noautocmd write")
+    end)
+  end)
+  if not ok then
+    error("patch_file: failed to apply patch to " .. tostring(path) .. ": " .. tostring(err))
+  end
+  local result = string.format("patched %s (%d hunk%s) — undo with u in the buffer",
+    path, #hunks, #hunks == 1 and "" or "s")
+  local extra = registry.try_call("hook.after_write", path, ctx)
+  if type(extra) == "string" and extra ~= "" then result = result .. "\n" .. extra end
+  return result
+end
+]==],
+  })
+
   -- --------------------------------------------------------------------- bash
 
   define({
@@ -294,8 +428,8 @@ end
     kind = "tool",
     doc = "Run a shell command via `bash -lc` and return its result with"
       .. " clearly labeled sections: exit code, stdout, stderr. Never use this"
-      .. " tool to search or read files: use the grep tool instead of shell"
-      .. " grep/rg (it also populates the user's quickfix list), the glob tool"
+      .. " tool to search, read, or inspect files: use the grep tool instead of shell"
+      .. " grep/rg (it also populates the user's quickfix list), tree/path_info/glob"
       .. " instead of find/ls, and read_file instead of cat/head/tail. For a"
       .. " build/test/lint command whose output is compiler/linter-style"
       .. " diagnostics, prefer run_quickfix — it parses them into the user's"
@@ -304,9 +438,9 @@ end
       .. " command (required) — the shell command line to execute; timeout_ms"
       .. " (optional, default 120000) — the process is killed if it runs longer"
       .. " than this many milliseconds (exit code 124 indicates a timeout)."
-      .. " Refuses bare read/search/list commands (cat/head/tail/sed -n,"
-      .. " grep/rg, ls/find/fd with no pipe or redirect) in favor of the"
-      .. " vim-native read_file, grep, and glob tools.",
+      .. " Refuses bare read/search/list/stat/fetch commands (cat/head/tail/sed -n,"
+      .. " grep/rg, ls/find/fd/stat/file, curl/wget with no pipe or redirect) in favor"
+      .. " of the vim-native read_file, grep, tree/path_info, and fetch_url tools.",
     input_schema = {
       type = "object",
       properties = {
@@ -334,7 +468,11 @@ return function(input, ctx)
       redirect = "tool.grep (regex search, also populates the user's quickfix list)"
     elseif trimmed == "ls" or trimmed:match("^ls%s")
       or trimmed:match("^find%s+%S") or trimmed:match("^fd%s+%S") then
-      redirect = "tool.glob (lists files matching a pattern)"
+      redirect = "tool.tree or tool.glob (bounded file listings)"
+    elseif trimmed:match("^stat%s+%S") or trimmed:match("^file%s+%S") then
+      redirect = "tool.path_info (filesystem metadata without shelling out)"
+    elseif trimmed:match("^curl%s+https?://") or trimmed:match("^wget%s+https?://") then
+      redirect = "tool.fetch_url (bounded web fetch without ambient shell state)"
     end
     if redirect then
       return "bash: refusing plain read/search/list command (" .. trimmed ..
@@ -343,10 +481,32 @@ return function(input, ctx)
   end
 
   local timeout_ms = tonumber(input.timeout_ms) or 120000
+  local cap = 262144
+  local stdout, stderr = {}, {}
+  local out_len, err_len = 0, 0
+  local capped = false
+  local proc
+  local function stop_for_cap()
+    if proc then pcall(function() proc:kill(9) end) end
+  end
+  local function take(dst, len_name, chunk)
+    if not chunk or chunk == "" then return end
+    local len = (len_name == "out") and out_len or err_len
+    if len >= cap then capped = true; stop_for_cap(); return end
+    local keep = math.min(#chunk, cap - len)
+    dst[#dst + 1] = chunk:sub(1, keep)
+    if keep < #chunk then capped = true; stop_for_cap() end
+    if len_name == "out" then out_len = len + keep else err_len = len + keep end
+  end
   local res = ctx.await(function(resolve)
-    local proc = vim.system(
+    proc = vim.system(
       { "bash", "-lc", cmd },
-      { text = true, timeout = timeout_ms },
+      {
+        text = true,
+        timeout = timeout_ms,
+        stdout = function(_, chunk) take(stdout, "out", chunk) end,
+        stderr = function(_, chunk) take(stderr, "err", chunk) end,
+      },
       function(out) resolve(out) end)
     if ctx.on_cancel then
       ctx.on_cancel(function() pcall(function() proc:kill(9) end) end)
@@ -356,10 +516,13 @@ return function(input, ctx)
   if res.code == 124 then
     lines[#lines] = lines[#lines] .. " (killed: exceeded timeout of " .. timeout_ms .. " ms)"
   end
+  if capped then
+    lines[#lines + 1] = "output truncated at " .. cap .. " bytes per stream"
+  end
   lines[#lines + 1] = "stdout:"
-  lines[#lines + 1] = res.stdout or ""
+  lines[#lines + 1] = table.concat(stdout)
   lines[#lines + 1] = "stderr:"
-  lines[#lines + 1] = res.stderr or ""
+  lines[#lines + 1] = table.concat(stderr)
   return table.concat(lines, "\n")
 end
 ]==],
@@ -627,7 +790,8 @@ end
       .. " COMPLETE and self-contained; the child sees none of this"
       .. " conversation. Returns the child's handle (buffer number) to pass to"
       .. " spawn_wait. Parameters: task (required); system (optional) — extra"
-      .. " standing instructions, prepended to the task; tools (optional array"
+      .. " standing instructions, prepended to the task; provider (optional) —"
+      .. " child backend, inherited from this session/global default when unset; tools (optional array"
       .. " of tool names) — the child sees only these tools; readonly (optional"
       .. " boolean) — the child may use only auto-allowed read-only tools,"
       .. " every write is denied without prompting; show (optional boolean) —"
@@ -641,6 +805,7 @@ end
       properties = {
         task = { type = "string", description = "Complete, self-contained instructions for the subagent." },
         system = { type = "string", description = "Extra standing instructions for the child." },
+        provider = { type = "string", enum = { "anthropic", "openai" }, description = "Provider for the child (default: this session's provider/global default)." },
         tools = {
           type = "array",
           items = { type = "string" },
@@ -686,15 +851,24 @@ return function(input, ctx)
   -- lifetime, not just the time spent inside spawn_wait.
   vim.b[child].straps_spawn_timeout_ms = tonumber(input.timeout_ms) or 600000
   vim.b[child].straps_spawn_started_ms = vim.uv.now()
-  -- Model / effort: an explicit spawn arg wins; else inherit the PARENT's
-  -- per-buffer override if it has one (so a subagent matches its session by
-  -- default), else leave unset so fn.provider falls back to the global config.
+  -- Provider / model / effort: explicit spawn args win; else inherit the
+  -- PARENT's per-buffer overrides if it has them (so a subagent matches its
+  -- session by default), else leave unset so fn.provider falls back globally.
   do
-    local pm, pe
-    pcall(function() pm, pe = vim.b[ctx.bufnr].straps_model, vim.b[ctx.bufnr].straps_effort end)
-    local model = input.model or pm
+    local pp, pm, pom, pe
+    pcall(function()
+      pp = vim.b[ctx.bufnr].straps_provider
+      pm = vim.b[ctx.bufnr].straps_model
+      pom = vim.b[ctx.bufnr].straps_openai_model
+      pe = vim.b[ctx.bufnr].straps_effort
+    end)
+    local provider = input.provider or pp
+    local model = input.model or ((provider == "openai") and pom or pm)
     local effort = input.effort or pe
-    if type(model) == "string" and model ~= "" then vim.b[child].straps_model = model end
+    if type(provider) == "string" and provider ~= "" then vim.b[child].straps_provider = provider end
+    if type(model) == "string" and model ~= "" then
+      if provider == "openai" then vim.b[child].straps_openai_model = model else vim.b[child].straps_model = model end
+    end
     if type(effort) == "string" and effort ~= "" then vim.b[child].straps_effort = effort end
   end
   -- Parentage lets ui.pick_agents / the statusline show the spawn tree: who
@@ -716,12 +890,20 @@ return function(input, ctx)
       source = [[
 return function(name, tin, tctx)
   local auto = {
-    read_file = true, glob = true, grep = true, registry_list = true,
-    registry_get = true, diagnostics = true, definition = true,
-    references = true, symbols = true, read_symbol = true, hover = true,
+    read_file = true, glob = true, tree = true, path_info = true, grep = true, registry_list = true,
+    registry_get = true, skill = true, diagnostics = true,
+    diagnostic_at = true, diagnostic_next = true, lsp_status = true,
+    declaration = true, definition = true, type_definition = true,
+    implementation = true, references = true,
+    symbols = true, read_symbol = true, tree_sitter_status = true, node_at = true,
+    read_node = true, hover = true,
     workspace_symbols = true, context = true, help_search = true,
   }
   if auto[name] then return true end
+  if (name == "code_action" or name == "fix_diagnostic")
+    and (type(tin) ~= "table" or tin.index == nil) then
+    return true
+  end
   return false, "readonly subagent: " .. tostring(name) .. " is not allowed"
 end
 ]],
@@ -927,6 +1109,125 @@ end
 ]==],
   })
 
+  -- ----------------------------------------------------------------- path_info
+
+  define({
+    name = "tool.path_info",
+    kind = "tool",
+    doc = "Inspect filesystem metadata for one or more paths without shelling out."
+      .. " Returns type, size, permissions, mtime, symlink target, and whether a"
+      .. " loaded buffer has unsaved changes. Read-only. Parameters: paths"
+      .. " (required array of paths).",
+    input_schema = {
+      type = "object",
+      properties = {
+        paths = { type = "array", description = "Paths to inspect.", items = { type = "string" } },
+      },
+      required = { "paths" },
+    },
+    source = [==[
+return function(input, ctx)
+  if type(input.paths) ~= "table" or #input.paths == 0 then
+    return "path_info: paths must be a non-empty array"
+  end
+  local out = {}
+  for _, p in ipairs(input.paths) do
+    if type(p) == "string" and p ~= "" then
+      local full = vim.fn.fnamemodify(p, ":p")
+      local stat = vim.uv.fs_lstat(full)
+      if not stat then
+        out[#out + 1] = p .. ": missing"
+      else
+        local target = ""
+        if stat.type == "link" then
+          local ok, t = pcall(vim.uv.fs_readlink, full)
+          if ok and t then target = " -> " .. t end
+        end
+        local buf = vim.fn.bufnr(full)
+        local mod = ""
+        if buf ~= -1 and vim.api.nvim_buf_is_loaded(buf) then
+          mod = vim.bo[buf].modified and " loaded modified" or " loaded clean"
+        end
+        out[#out + 1] = string.format("%s: %s%s size=%s mode=%o mtime=%s%s",
+          p, stat.type or "?", target, tostring(stat.size or 0), stat.mode or 0,
+          stat.mtime and tostring(stat.mtime.sec) or "?", mod)
+      end
+    end
+  end
+  if #out == 0 then return "path_info: no valid paths" end
+  return table.concat(out, "\n")
+end
+]==],
+  })
+
+  -- ---------------------------------------------------------------------- tree
+
+  define({
+    name = "tool.tree",
+    kind = "tool",
+    doc = "List a bounded directory tree without shelling out. Honors optional"
+      .. " max_depth (default 2, max 6), max_entries (default 200, max 1000),"
+      .. " and hidden (default false). Read-only. Parameters: path (optional,"
+      .. " default '.').",
+    input_schema = {
+      type = "object",
+      properties = {
+        path = { type = "string", description = "Directory to list (default '.')." },
+        max_depth = { type = "integer", description = "Maximum depth (default 2, max 6)." },
+        max_entries = { type = "integer", description = "Maximum entries (default 200, max 1000)." },
+        hidden = { type = "boolean", description = "Include dotfiles/directories (default false)." },
+      },
+      required = {},
+    },
+    source = [==[
+return function(input, ctx)
+  local root = vim.fn.fnamemodify(input.path or ".", ":p")
+  local stat = vim.uv.fs_stat(root)
+  if not stat then return "tree: no such path: " .. tostring(input.path or ".") end
+  if stat.type ~= "directory" then return "tree: not a directory: " .. tostring(input.path or ".") end
+  local max_depth = math.min(math.max(tonumber(input.max_depth) or 2, 0), 6)
+  local max_entries = math.min(math.max(tonumber(input.max_entries) or 200, 1), 1000)
+  local include_hidden = input.hidden == true
+  local out, count, truncated = { vim.fn.fnamemodify(root, ":~:.") .. "/" }, 0, false
+  local function children(dir)
+    local items = {}
+    local fs = vim.uv.fs_scandir(dir)
+    if not fs then return items end
+    while true do
+      local name, typ = vim.uv.fs_scandir_next(fs)
+      if not name then break end
+      if include_hidden or name:sub(1, 1) ~= "." then
+        items[#items + 1] = { name = name, type = typ or "?" }
+      end
+    end
+    table.sort(items, function(a, b)
+      if a.type == b.type then return a.name < b.name end
+      return a.type == "directory"
+    end)
+    return items
+  end
+  local function walk(dir, prefix, depth)
+    if depth >= max_depth or truncated then return end
+    local items = children(dir)
+    for i, it in ipairs(items) do
+      if count >= max_entries then truncated = true; return end
+      count = count + 1
+      local last = i == #items
+      local branch = last and "└── " or "├── "
+      local next_prefix = prefix .. (last and "    " or "│   ")
+      local suffix = it.type == "directory" and "/" or ""
+      out[#out + 1] = prefix .. branch .. it.name .. suffix
+      if it.type == "directory" then walk(dir .. "/" .. it.name, next_prefix, depth + 1) end
+      if truncated then return end
+    end
+  end
+  walk(root:gsub("/+$", ""), "", 0)
+  if truncated then out[#out + 1] = string.format("[truncated: showing %d entries; raise max_entries or narrow path]", count) end
+  return table.concat(out, "\n")
+end
+]==],
+  })
+
   -- --------------------------------------------------------------------- grep
 
   define({
@@ -1125,6 +1426,15 @@ return function(input, ctx)
       #qf, list_kind, #qf == 1 and "y" or "ies", #bufs, #bufs == 1 and "" or "s")
   end
 
+  local function reject_cmd_chars(label, value)
+    if value:find("\n", 1, true) or value:find("\r", 1, true)
+      or value:find("|", 1, true) then
+      error("bulk_replace: " .. label .. " must not contain newline or |")
+    end
+  end
+  reject_cmd_chars("pattern", pattern)
+  reject_cmd_chars("replacement", replacement)
+
   -- Use '#' as the :s delimiter and escape only that in pattern/replacement, so
   -- the pattern keeps its Vim-regex meaning and the delimiter can never be
   -- mistaken for a real character in the text.
@@ -1135,6 +1445,9 @@ return function(input, ctx)
   -- the list with no match would otherwise raise E486 and stop the whole run.
   local flags = input.flags
   if type(flags) ~= "string" or flags == "" then flags = "ge" end
+  if not flags:match("^[&cegijklmnpr#]*$") then
+    error("bulk_replace: flags contain unsupported characters")
+  end
   if not flags:find("e", 1, true) then flags = flags .. "e" end
 
   -- Snapshot changedtick of each target buffer so we can count what actually
@@ -1461,6 +1774,68 @@ end
 ]==],
   })
 
+  -- ---------------------------------------------------------------- fetch_url
+
+  define({
+    name = "tool.fetch_url",
+    kind = "tool",
+    doc = "Fetch an http(s) URL with curl using a timeout and byte cap. It sends"
+      .. " no cookies or credentials, follows redirects only when follow_redirects"
+      .. " is true, and returns status/headers/body. Use for public docs or small"
+      .. " artifacts, not secrets. Parameters: url (required); max_bytes (optional,"
+      .. " default 200000, max 1000000); timeout_ms (optional, default 10000);"
+      .. " follow_redirects (optional boolean).",
+    input_schema = {
+      type = "object",
+      properties = {
+        url = { type = "string", description = "http(s) URL to fetch." },
+        max_bytes = { type = "integer", description = "Maximum body bytes (default 200000, max 1000000)." },
+        timeout_ms = { type = "integer", description = "Timeout in milliseconds (default 10000)." },
+        follow_redirects = { type = "boolean", description = "Follow redirects (default false)." },
+      },
+      required = { "url" },
+    },
+    source = [==[
+return function(input, ctx)
+  local url = input.url
+  if type(url) ~= "string" or not url:match("^https?://") then
+    error("fetch_url: url must start with http:// or https://")
+  end
+  if vim.fn.executable("curl") ~= 1 then
+    return "fetch_url: curl is not executable"
+  end
+  local max_bytes = math.min(math.max(tonumber(input.max_bytes) or 200000, 1), 1000000)
+  local timeout_ms = tonumber(input.timeout_ms) or 10000
+  local cmd = { "curl", "--disable", "--silent", "--show-error", "--include", "--max-time", tostring(math.ceil(timeout_ms / 1000)) }
+  if input.follow_redirects then cmd[#cmd + 1] = "--location" end
+  cmd[#cmd + 1] = "--range"; cmd[#cmd + 1] = "0-" .. tostring(max_bytes - 1)
+  cmd[#cmd + 1] = "--"; cmd[#cmd + 1] = url
+  local chunks, n, capped, proc = {}, 0, false, nil
+  local res = ctx.await(function(resolve)
+    proc = vim.system(cmd, {
+      text = true,
+      timeout = timeout_ms,
+      stdout = function(_, chunk)
+        if not chunk or chunk == "" then return end
+        if n >= max_bytes then capped = true; if proc then pcall(function() proc:kill(9) end) end; return end
+        local keep = math.min(#chunk, max_bytes - n)
+        chunks[#chunks + 1] = chunk:sub(1, keep)
+        n = n + keep
+        if keep < #chunk then capped = true; if proc then pcall(function() proc:kill(9) end) end end
+      end,
+    }, function(out) resolve(out) end)
+    if ctx.on_cancel then ctx.on_cancel(function() pcall(function() proc:kill(9) end) end) end
+  end)
+  local body = table.concat(chunks)
+  local lines = { "exit code: " .. tostring(res.code) }
+  if capped then lines[#lines + 1] = "body truncated at " .. tostring(max_bytes) .. " bytes" end
+  if res.stderr and res.stderr ~= "" then lines[#lines + 1] = "stderr:\n" .. res.stderr end
+  lines[#lines + 1] = body
+  return table.concat(lines, "\n")
+end
+]==],
+  })
+
   -- ------------------------------------------------------------- hook.confirm
 
   define({
@@ -1468,21 +1843,23 @@ end
     kind = "hook",
     doc = "Confirmation gate called before every tool execution as"
       .. " (name, input, ctx) -> allowed, reason. Default behavior: auto-allow"
-      .. " the read-only tools (read_file, glob, grep, registry_list,"
-      .. " registry_get, diagnostics, definition, references, symbols,"
-      .. " read_symbol, hover, workspace_symbols, context, show_user,"
+      .. " the read-only tools (read_file, glob, tree, path_info, grep, registry_list,"
+      .. " registry_get, diagnostics, diagnostic_at, diagnostic_next, lsp_status,"
+      .. " declaration, definition, type_definition, implementation, references,"
+      .. " symbols, read_symbol, tree_sitter_status, node_at, read_node, hover,"
+      .. " workspace_symbols, context, show_user,"
       .. " show_diff, show_buffer, set_quickfix, help_search, ask_user,"
-      .. " code_action in list mode i.e. without"
+      .. " code_action/fix_diagnostic in list mode i.e. without"
       .. " index, and undo_edit in history mode);"
       .. " otherwise prompt via vim.fn.confirm. For"
-      .. " file-editing tools (write_file, edit_file) a unified diff of the"
+      .. " file-editing tools (write_file, edit_file, patch_file) a unified diff of the"
       .. " proposed change is shown in a scratch split while the dialog is up"
       .. " (closed after), and the prompt offers"
       .. " Yes / No / 'Always in <parent dir>' / 'Always all edits': the"
-      .. " directory choice grants every future write_file/edit_file whose"
+      .. " directory choice grants every future write_file/edit_file/patch_file whose"
       .. " path falls under that file's PARENT directory (not just that one"
       .. " file), and 'Always all edits' grants every future"
-      .. " write_file/edit_file call regardless of path. Other tools get"
+      .. " write_file/edit_file/patch_file call regardless of path. Other tools get"
       .. " Yes / No / 'Always this tool', scoped to the tool name. All"
       .. " grants persist in vim.b[ctx.bufnr].straps_allowed. Redefine to"
       .. " change the policy.",
@@ -1494,11 +1871,15 @@ end
 -- schedule wrapper is needed.
 return function(name, input, ctx)
   local auto = {
-    read_file = true, glob = true, grep = true,
-    registry_list = true, registry_get = true,
+    read_file = true, glob = true, tree = true, path_info = true, grep = true,
+    registry_list = true, registry_get = true, skill = true,
     -- editor-native read-only tools (straps.editor)
-    diagnostics = true, definition = true, references = true,
-    symbols = true, read_symbol = true, hover = true,
+    diagnostics = true, diagnostic_at = true, diagnostic_next = true,
+    lsp_status = true,
+    declaration = true, definition = true, type_definition = true,
+    implementation = true, references = true,
+    symbols = true, read_symbol = true, tree_sitter_status = true, node_at = true,
+    read_node = true, hover = true,
     workspace_symbols = true, context = true, show_user = true,
     help_search = true,
     -- presentation tools: they open views / set the quickfix list but change
@@ -1512,10 +1893,11 @@ return function(name, input, ctx)
     return true
   end
 
-  -- code_action without an index only LISTS the available actions
+  -- code_action / fix_diagnostic without an index only LIST available actions
   -- (read-only); applying one (index set) is a write and falls through to
   -- the prompt.
-  if name == "code_action" and (type(input) ~= "table" or input.index == nil) then
+  if (name == "code_action" or name == "fix_diagnostic")
+    and (type(input) ~= "table" or input.index == nil) then
     return true
   end
 
@@ -1530,16 +1912,28 @@ return function(name, input, ctx)
   -- toggle, so the user can grant "everywhere under this directory" or
   -- "all edits, any path" without being forced to blanket-authorize every
   -- other tool too.
-  local path_scoped = { write_file = true, edit_file = true }
+  local path_scoped = { write_file = true, edit_file = true, patch_file = true }
   local is_edit = path_scoped[name] and type(input) == "table" and type(input.path) == "string"
 
   local function parent_dir(path)
-    return vim.fn.fnamemodify(path, ":p:h")
+    local p = vim.fn.fnamemodify(path, ":p:h")
+    return vim.uv.fs_realpath(p) or p
+  end
+
+  local function canonical_existing(path)
+    local p = vim.fn.fnamemodify(path, ":p")
+    local real = vim.uv.fs_realpath(p)
+    if real then return real end
+    local parent = vim.fn.fnamemodify(p, ":h")
+    local base = vim.fn.fnamemodify(p, ":t")
+    local parent_real = vim.uv.fs_realpath(parent)
+    if parent_real then return parent_real .. "/" .. base end
+    return p
   end
 
   local function under_dir(path, dir)
-    local abspath = vim.fn.fnamemodify(path, ":p")
-    local absdir = vim.fn.fnamemodify(dir, ":p")
+    local abspath = canonical_existing(path)
+    local absdir = canonical_existing(dir)
     if absdir:sub(-1) ~= "/" then
       absdir = absdir .. "/"
     end
@@ -1590,6 +1984,25 @@ return function(name, input, ctx)
         -- The buffer join above has no trailing newline; normalize content
         -- the same way so the diff doesn't show a phantom last-line change.
         new = (input.content or ""):gsub("\n$", "")
+      elseif name == "patch_file" then
+        local lines = vim.split(old, "\n", { plain = true })
+        local hunks = input.hunks
+        if type(hunks) ~= "table" then return end
+        local normalized = {}
+        for _, h in ipairs(hunks) do
+          local s, e = tonumber(h.start_line), tonumber(h.end_line)
+          if not s or not e or type(h.new_text) ~= "string" then return end
+          normalized[#normalized + 1] = { s = math.floor(s), e = math.floor(e), text = h.new_text }
+        end
+        table.sort(normalized, function(a, b) return a.s < b.s end)
+        for i = #normalized, 1, -1 do
+          local h = normalized[i]
+          local repl = h.text == "" and {} or vim.split(h.text, "\n", { plain = true })
+          if repl[#repl] == "" then table.remove(repl) end
+          for j = h.e, h.s, -1 do table.remove(lines, j) end
+          for j = #repl, 1, -1 do table.insert(lines, h.s, repl[j]) end
+        end
+        new = table.concat(lines, "\n")
       else -- edit_file: preview the same plain-text replacement the tool does
         local olds, news = input.old_string, input.new_string or ""
         if type(olds) ~= "string" or olds == "" then return end
@@ -1842,7 +2255,12 @@ return function(spec)
     pattern = spec.pattern,
     callback = function(args)
       local ok, s = pcall(function()
-        return require("straps.registry").try_call(spec.entry, args)
+        local registry = require("straps.registry")
+        local prev = registry.set_active_scope(session)
+        local ok_call, out = pcall(registry.try_call, spec.entry, args)
+        registry.set_active_scope(prev)
+        if not ok_call then error(out) end
+        return out
       end)
       if ok and type(s) == "string" and s ~= "" then
         vim.schedule(function()

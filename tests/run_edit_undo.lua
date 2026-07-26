@@ -34,6 +34,7 @@ require("straps.tools").register()
 local ctx = { bufnr = 0 }
 local function write_file(input) return registry.call("tool.write_file", input, ctx) end
 local function edit_file(input) return registry.call("tool.edit_file", input, ctx) end
+local function patch_file(input) return registry.call("tool.patch_file", input, ctx) end
 
 -- Absolute-path buffer lookup / content helpers.
 local function bufnr_for(path) return vim.fn.bufnr(vim.fn.fnamemodify(path, ":p")) end
@@ -135,7 +136,7 @@ end)
 
 -- -------------------------------- already-open buffer with unsaved user changes
 
-case("edit_file matches the live buffer and stacks on unsaved user changes", function()
+case("read_file/edit_file share the live buffer source of truth", function()
   local path = vim.fn.tempname() .. ".txt"
   seed_file(path, "line1\nORIGINAL\nline3\n")
 
@@ -148,8 +149,12 @@ case("edit_file matches the live buffer and stacks on unsaved user changes", fun
   assert(not disk_text(path):find("USER-UNSAVED-LINE", 1, true),
     "precondition: unsaved line must not be on disk yet")
 
-  -- The agent edits text that only exists in the live buffer's current state,
-  -- and its edit must stack on top of the user's unsaved change.
+  local read_before = registry.call("tool.read_file", { path = path }, ctx)
+  assert(read_before:find("USER-UNSAVED-LINE", 1, true),
+    "read_file must read the live buffer, not stale disk: " .. read_before)
+
+  -- The agent edits text in the live buffer's current state, and the edit must
+  -- stack on top of the user's unsaved change.
   edit_file({ path = path, old_string = "ORIGINAL", new_string = "AGENT-EDIT" })
 
   local content = buf_text(buf)
@@ -160,6 +165,54 @@ case("edit_file matches the live buffer and stacks on unsaved user changes", fun
   -- The write persisted the live buffer (unsaved line included) to disk.
   assert(disk_text(path):find("USER-UNSAVED-LINE", 1, true),
     "unsaved user line not persisted with the edit: " .. disk_text(path))
+end)
+
+-- ---------------------------------------------------------- patch_file ranges
+
+case("patch_file applies multiple line hunks through the live buffer as one undo step", function()
+  local path = vim.fn.tempname() .. ".txt"
+  write_file({ path = path, content = "one\ntwo\nthree\nfour\n" })
+  local buf = bufnr_for(path)
+  local before = buf_text(buf)
+  local result = patch_file({ path = path, hunks = {
+    { start_line = 2, end_line = 2, new_text = "TWO" },
+    { start_line = 4, end_line = 3, new_text = "INSERTED" },
+  } })
+  local after = "one\nTWO\nthree\nINSERTED\nfour"
+  assert(buf_text(buf) == after, "patched buffer wrong: " .. buf_text(buf))
+  assert(disk_text(path) == after, "patched disk wrong: " .. disk_text(path))
+  assert(result:find("2 hunks", 1, true), "result should report hunks: " .. result)
+  vim.api.nvim_buf_call(buf, function() vim.cmd("silent undo") end)
+  assert(buf_text(buf) == before, "one undo did not revert whole patch: " .. buf_text(buf))
+end)
+
+case("patch_file refuses overlapping hunks before changing the file", function()
+  local path = vim.fn.tempname() .. ".txt"
+  write_file({ path = path, content = "a\nb\nc\n" })
+  local buf = bufnr_for(path)
+  local ok, err = pcall(patch_file, { path = path, hunks = {
+    { start_line = 1, end_line = 2, new_text = "x" },
+    { start_line = 2, end_line = 3, new_text = "y" },
+  } })
+  assert(not ok, "overlapping patch should error")
+  assert(tostring(err):find("overlaps", 1, true), "wrong error: " .. tostring(err))
+  assert(buf_text(buf) == "a\nb\nc", "buffer changed on failed patch: " .. buf_text(buf))
+end)
+
+case("patch_file refuses stale expected_old_text before changing the file", function()
+  local path = vim.fn.tempname() .. ".txt"
+  write_file({ path = path, content = "a\nb\nc\n" })
+  local buf = bufnr_for(path)
+  local ok, err = pcall(patch_file, { path = path, hunks = {
+    { start_line = 2, end_line = 2, expected_old_text = "NOT-B", new_text = "B" },
+  } })
+  assert(not ok, "stale patch should error")
+  assert(tostring(err):find("expected_old_text mismatch", 1, true), "wrong error: " .. tostring(err))
+  assert(buf_text(buf) == "a\nb\nc", "buffer changed on failed stale patch: " .. buf_text(buf))
+  patch_file({ path = path, hunks = {
+    { start_line = 2, end_line = 2, expected_old_text = "b", new_text = "B" },
+  } })
+  assert(buf_text(buf) == "a\nB\nc", "expected patch did not apply: " .. buf_text(buf))
 end)
 
 -- ---------------------------------------------------- hook.after_write fires
@@ -176,6 +229,9 @@ case("hook.after_write still fires and its return is appended to the result", fu
 
   local eres = edit_file({ path = path, old_string = "hi", new_string = "bye" })
   assert(eres:find("AFTER_WRITE_MARKER:", 1, true), "after_write marker missing from edit_file result: " .. eres)
+
+  local pres = patch_file({ path = path, hunks = { { start_line = 1, end_line = 1, new_text = "patched" } } })
+  assert(pres:find("AFTER_WRITE_MARKER:", 1, true), "after_write marker missing from patch_file result: " .. pres)
 
   -- Restore the no-op so we don't affect any later suites sharing the registry.
   registry.define({

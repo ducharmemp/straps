@@ -55,28 +55,35 @@ end
 -- -> "budget", else nil (send no thinking block). Returns a list on success, or
 -- (nil, errmsg) on any failure so callers can fall back to the static list.
 local LIST_MODELS_SRC = [==[
-return function()
+return function(provider_override)
   local registry = require("straps.registry")
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
 
   -- Discovery must follow the SAME backend the loop would talk to, otherwise
   -- :StrapsModel shows the wrong catalog (e.g. Claude models while the OpenAI
-  -- provider is active). Resolve the effective provider the way fn.provider
-  -- does — config.provider, else the persisted file, else per-session
-  -- vim.b straps_provider on the current buffer — then hit that API's
-  -- /v1/models with its own auth and response shape.
-  local provider = config.provider
+  -- provider is active). Callers may pass "anthropic"/"openai" explicitly;
+  -- otherwise resolve like fn.provider: per-session buffer override, then
+  -- config.provider, then the persisted file, then Anthropic.
+  local provider = (provider_override == "anthropic" or provider_override == "openai") and provider_override or nil
+  if provider == nil then
+    pcall(function()
+      local bufnr = vim.api.nvim_get_current_buf()
+      if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+        local b = vim.b[bufnr].straps_provider
+        if b and b ~= "" then provider = b end
+      end
+    end)
+  end
+  if provider == nil or provider == "" then
+    provider = config.provider
+  end
   if provider == nil or provider == "" then
     provider = registry.try_call("fn.provider_pref")
   end
-  pcall(function()
-    local bufnr = vim.api.nvim_get_current_buf()
-    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-      local b = vim.b[bufnr].straps_provider
-      if b and b ~= "" then provider = b end
-    end
-  end)
+  if provider ~= "anthropic" and provider ~= "openai" then
+    provider = "anthropic"
+  end
 
   local openai = provider == "openai"
   local base_url, headers, key_fn
@@ -706,11 +713,13 @@ return function(req, ctx)
   pcall(function()
     local bufnr = ctx and ctx.bufnr
     if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-      b_model = vim.b[bufnr].straps_model
+      b_model = vim.b[bufnr].straps_openai_model
       b_effort = vim.b[bufnr].straps_effort
     end
   end)
-  local model_id = b_model or config.openai_model or config.model or "gpt-5"
+  -- OpenAI has its own default and per-buffer model slot. Do not fall through
+  -- to config.model/vim.b.straps_model here: those are Anthropic ids.
+  local model_id = b_model or config.openai_model or "gpt-5"
 
   -- Translate the Anthropic-shaped req.messages into OpenAI's flat role
   -- messages. Anthropic content blocks map like so:
@@ -1113,10 +1122,14 @@ return function(req, ctx)
     end
   end)
 
+  if provider == nil or provider == "" or provider == "anthropic" then
+    return registry.call("fn.provider_anthropic", req, ctx)
+  end
   if provider == "openai" then
     return registry.call("fn.provider_openai", req, ctx)
   end
-  return registry.call("fn.provider_anthropic", req, ctx)
+  error("straps provider: unknown provider " .. tostring(provider)
+    .. " (expected 'anthropic' or 'openai')")
 end
 ]==]
 
@@ -1142,6 +1155,10 @@ return function(value)
   local path = dir .. "/provider"
 
   if value ~= nil then
+    value = tostring(value)
+    if value ~= "anthropic" and value ~= "openai" then
+      return nil, "unknown provider " .. value .. " (expected anthropic or openai)"
+    end
     if vim.fn.isdirectory(dir) == 0 then
       local ok = pcall(vim.fn.mkdir, dir, "p")
       if not ok then return nil, "could not create " .. dir end
@@ -1162,6 +1179,7 @@ return function(value)
   f:close()
   line = line and vim.trim(line) or ""
   if line == "" then return nil end
+  if line ~= "anthropic" and line ~= "openai" then return nil end
   return line
 end
 ]==]
@@ -1363,10 +1381,11 @@ your tool calls and streamed text live as you work.
   interesting runs so the user watches the output live; bash for quick,
   quiet checks.
 - To rename an identifier, use rename_symbol (LSP-powered, renames the
-  symbol, not the text). Fall back to grep + bulk_replace only for plain
-  text patterns or when no language server is attached. For quick-fixes
-  and auto-imports, list code_action at the diagnostic and apply by
-  index; format beats hand-reindenting.
+  symbol, not the text). If unsure whether Neovim has an LSP client for
+  a file, call lsp_status first. Fall back to grep + bulk_replace only
+  for plain text patterns or when no language server is attached. For
+  quick-fixes and auto-imports, list code_action at the diagnostic and
+  apply by index; format beats hand-reindenting.
 - After verifying, ask yourself (not the user): did I do anything manually
   that a hook could do automatically next time? If yes, install it now
   (see Self-extension).
@@ -1860,7 +1879,7 @@ function M.register()
   define({
     name = "fn.list_models",
     kind = "fn",
-    doc = "GET /v1/models from the effective backend (Anthropic or OpenAI, per config.provider) and return picker entries { id, label, thinking } (Anthropic infers the thinking tag from capabilities; OpenAI has none); (nil, err) on failure.",
+    doc = "GET /v1/models from the effective backend, or an explicit provider argument ('anthropic'/'openai'), and return picker entries { id, label, thinking } (Anthropic infers the thinking tag from capabilities; OpenAI has none); (nil, err) on failure.",
     source = LIST_MODELS_SRC,
   })
   define({

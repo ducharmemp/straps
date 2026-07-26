@@ -75,13 +75,50 @@ local function collect_locations(result, out)
 end
 
 -- Dedup + sort a list of "file:line:col" strings and join with newlines.
-local function join_sorted(list)
+local function sorted_unique(list)
   local seen, out = {}, {}
   for _, s in ipairs(list) do
     if not seen[s] then seen[s] = true; out[#out + 1] = s end
   end
   table.sort(out)
-  return table.concat(out, "\n")
+  return out
+end
+
+local function join_sorted(list)
+  return table.concat(sorted_unique(list), "\n")
+end
+
+local function loc_string_to_item(s)
+  local file, line, col = s:match("^(.-):(%d+):(%d+)$")
+  if not file then return nil end
+  return { filename = file, lnum = tonumber(line), col = tonumber(col), text = s }
+end
+
+local function maybe_set_locations(ctx, input, title, locs)
+  if not (input and input.quickfix) then return nil end
+  local items = {}
+  for _, s in ipairs(sorted_unique(locs)) do
+    local item = loc_string_to_item(s)
+    if item then items[#items + 1] = item end
+  end
+  local ok, kind = pcall(function()
+    return require("straps.ui").set_locations(ctx and ctx.bufnr,
+      { title = title, items = items }, input.open ~= false)
+  end)
+  return ok and kind or "quickfix"
+end
+
+local function location_output(ctx, input, title, locs, empty)
+  if #locs == 0 then
+    maybe_set_locations(ctx, input, title, {})
+    return empty
+  end
+  local kind = maybe_set_locations(ctx, input, title, locs)
+  local out = join_sorted(locs)
+  if kind then
+    out = out .. "\n" .. kind .. ": " .. tostring(#sorted_unique(locs)) .. " location(s)"
+  end
+  return out
 end
 
 -- Wait (up to ~1s) for an LSP client to attach to `buf`; returns the client
@@ -170,10 +207,28 @@ local function client_request(ctx, client, method, params, buf, timeout_ms)
   end)
 end
 
--- Apply a WorkspaceEdit through buffers (native undo, like write_file /
--- edit_file: each touched buffer gets its own undo break first), then
--- :update every touched file. Returns the sorted list of touched files.
-local function apply_workspace_edit_and_save(edit, enc)
+local function workspace_root()
+  return (vim.uv.fs_realpath(vim.fn.getcwd()) or vim.fn.fnamemodify(vim.fn.getcwd(), ":p")):gsub("/+$", "")
+end
+
+local function uri_path(uri)
+  if type(uri) ~= "string" or not uri:match("^file://") then
+    return nil, "non-file URI in WorkspaceEdit: " .. tostring(uri)
+  end
+  local ok, fname = pcall(vim.uri_to_fname, uri)
+  if not ok or type(fname) ~= "string" or fname == "" then
+    return nil, "invalid file URI in WorkspaceEdit: " .. tostring(uri)
+  end
+  local full = vim.fn.fnamemodify(fname, ":p")
+  local real = vim.uv.fs_realpath(full)
+  if not real then
+    local parent = vim.uv.fs_realpath(vim.fn.fnamemodify(full, ":h"))
+    if parent then real = parent .. "/" .. vim.fn.fnamemodify(full, ":t") end
+  end
+  return real or full
+end
+
+local function workspace_edit_uris(edit)
   local uris = {}
   if type(edit.changes) == "table" then
     for uri in pairs(edit.changes) do uris[#uris + 1] = uri end
@@ -182,19 +237,29 @@ local function apply_workspace_edit_and_save(edit, enc)
     for _, dc in ipairs(edit.documentChanges) do
       if type(dc) == "table" and dc.textDocument and dc.textDocument.uri then
         uris[#uris + 1] = dc.textDocument.uri
+      elseif type(dc) == "table" and dc.kind == "rename" then
+        uris[#uris + 1] = dc.oldUri; uris[#uris + 1] = dc.newUri
+      elseif type(dc) == "table" and (dc.kind == "create" or dc.kind == "delete") then
+        uris[#uris + 1] = dc.uri
       end
     end
   end
-  for _, uri in ipairs(uris) do
-    local buf = vim.uri_to_bufnr(uri)
-    pcall(vim.fn.bufload, buf)
-    pcall(function()
-      vim.api.nvim_buf_call(buf, function()
-        vim.cmd("let &l:undolevels = &l:undolevels")
-      end)
-    end)
+  return uris
+end
+
+local function guard_workspace_edit(edit)
+  local root = workspace_root()
+  for _, uri in ipairs(workspace_edit_uris(edit)) do
+    local path, err = uri_path(uri)
+    if not path then return nil, err end
+    if path ~= root and path:sub(1, #root + 1) ~= root .. "/" then
+      return nil, "WorkspaceEdit touches outside cwd: " .. relname(path)
+    end
   end
-  vim.lsp.util.apply_workspace_edit(edit, enc or "utf-16")
+  return true
+end
+
+local function save_workspace_files(uris)
   local files, seen = {}, {}
   for _, uri in ipairs(uris) do
     local buf = vim.uri_to_bufnr(uri)
@@ -208,6 +273,39 @@ local function apply_workspace_edit_and_save(edit, enc)
   end
   table.sort(files)
   return files
+end
+
+-- Apply a WorkspaceEdit through buffers (native undo, like write_file /
+-- edit_file: each touched buffer gets its own undo break first). By default it
+-- :update's every touched file; opts.save=false leaves them modified so callers
+-- can do a filesystem operation first and save only after that succeeds.
+local function apply_workspace_edit_and_save(edit, enc, opts)
+  local ok_guard, guard_err = guard_workspace_edit(edit)
+  if not ok_guard then error(guard_err) end
+  local uris = workspace_edit_uris(edit)
+  for _, uri in ipairs(uris) do
+    local buf = vim.uri_to_bufnr(uri)
+    pcall(vim.fn.bufload, buf)
+    pcall(function()
+      vim.api.nvim_buf_call(buf, function()
+        vim.cmd("let &l:undolevels = &l:undolevels")
+      end)
+    end)
+  end
+  vim.lsp.util.apply_workspace_edit(edit, enc or "utf-16")
+  if opts and opts.save == false then
+    local files, seen = {}, {}
+    for _, uri in ipairs(uris) do
+      local buf = vim.uri_to_bufnr(uri)
+      if not seen[buf] then
+        seen[buf] = true
+        files[#files + 1] = relname(vim.api.nvim_buf_get_name(buf), buf)
+      end
+    end
+    table.sort(files)
+    return files, uris
+  end
+  return save_workspace_files(uris), uris
 end
 
 -- Node types treated as outline entries, mapped to a kind label. Kept small
@@ -409,6 +507,306 @@ end
 ]==]),
   })
 
+  -- ----------------------------------------------------------- diagnostic_at
+
+  define({
+    name = "tool.diagnostic_at",
+    kind = "tool",
+    doc = "Report diagnostics covering a specific file position. Returns matching"
+      .. " diagnostics as file:line:col: SEVERITY message [source], or a clear"
+      .. " no-diagnostic message. Use before code_action when fixing a specific"
+      .. " diagnostic. Parameters: path, line, col (all required).",
+    input_schema = {
+      type = "object",
+      properties = {
+        path = { type = "string", description = "File to inspect." },
+        line = { type = "integer", description = "1-based line." },
+        col = { type = "integer", description = "1-based column." },
+      },
+      required = { "path", "line", "col" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local buf = load_buf(input.path)
+  local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
+  local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
+  local sev = vim.diagnostic.severity
+  local names = { [sev.ERROR] = "ERROR", [sev.WARN] = "WARN", [sev.INFO] = "INFO", [sev.HINT] = "HINT" }
+  local name = vim.api.nvim_buf_get_name(buf)
+  local out = {}
+  for _, d in ipairs(vim.diagnostic.get(buf) or {}) do
+    local dl0, dc0 = d.lnum or 0, d.col or 0
+    local de0 = d.end_lnum or dl0
+    local dec0 = d.end_col or (dc0 + 1)
+    local covers = (line0 > dl0 or (line0 == dl0 and col0 >= dc0))
+      and (line0 < de0 or (line0 == de0 and col0 <= dec0))
+    if covers then
+      local source = (d.source and d.source ~= "") and (" [" .. d.source .. "]") or ""
+      out[#out + 1] = string.format("%s:%d:%d: %s %s%s",
+        relname(name, buf), dl0 + 1, dc0 + 1, names[d.severity] or "UNKNOWN", tostring(d.message or ""), source)
+    end
+  end
+  if #out == 0 then return "no diagnostic at that position" end
+  return table.concat(out, "\n")
+end
+]==]),
+  })
+
+  -- --------------------------------------------------------- diagnostic_next
+
+  define({
+    name = "tool.diagnostic_next",
+    kind = "tool",
+    doc = "Find the next or previous diagnostic in a file relative to a position."
+      .. " Returns one location as file:line:col: SEVERITY message [source]."
+      .. " Parameters: path, line, col; direction ('next' default or 'prev');"
+      .. " severity optional (ERROR/WARN/INFO/HINT); wrap optional boolean.",
+    input_schema = {
+      type = "object",
+      properties = {
+        path = { type = "string", description = "File to inspect." },
+        line = { type = "integer", description = "1-based line." },
+        col = { type = "integer", description = "1-based column." },
+        direction = { type = "string", description = "'next' (default) or 'prev'." },
+        severity = { type = "string", description = "Optional severity filter: ERROR/WARN/INFO/HINT." },
+        wrap = { type = "boolean", description = "Wrap around file ends (default true)." },
+      },
+      required = { "path", "line", "col" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local buf = load_buf(input.path)
+  local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
+  local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
+  local sev = vim.diagnostic.severity
+  local names = { [sev.ERROR] = "ERROR", [sev.WARN] = "WARN", [sev.INFO] = "INFO", [sev.HINT] = "HINT" }
+  local want = type(input.severity) == "string" and sev[input.severity:upper()] or nil
+  local diags = vim.diagnostic.get(buf, want and { severity = want } or nil) or {}
+  table.sort(diags, function(a, b)
+    if (a.lnum or 0) == (b.lnum or 0) then return (a.col or 0) < (b.col or 0) end
+    return (a.lnum or 0) < (b.lnum or 0)
+  end)
+  if #diags == 0 then return "no diagnostics" end
+  local dir = input.direction == "prev" and "prev" or "next"
+  local chosen
+  if dir == "next" then
+    for _, d in ipairs(diags) do
+      if (d.lnum or 0) > line0 or ((d.lnum or 0) == line0 and (d.col or 0) > col0) then chosen = d; break end
+    end
+    if not chosen and input.wrap ~= false then chosen = diags[1] end
+  else
+    for i = #diags, 1, -1 do
+      local d = diags[i]
+      if (d.lnum or 0) < line0 or ((d.lnum or 0) == line0 and (d.col or 0) < col0) then chosen = d; break end
+    end
+    if not chosen and input.wrap ~= false then chosen = diags[#diags] end
+  end
+  if not chosen then return "no " .. dir .. " diagnostic" end
+  local source = (chosen.source and chosen.source ~= "") and (" [" .. chosen.source .. "]") or ""
+  return string.format("%s:%d:%d: %s %s%s", relname(vim.api.nvim_buf_get_name(buf), buf),
+    (chosen.lnum or 0) + 1, (chosen.col or 0) + 1, names[chosen.severity] or "UNKNOWN",
+    tostring(chosen.message or ""), source)
+end
+]==]),
+  })
+
+  -- ----------------------------------------------------------- fix_diagnostic
+
+  define({
+    name = "tool.fix_diagnostic",
+    kind = "tool",
+    doc = "List or apply code actions for the diagnostic at a file position."
+      .. " Without index, it lists fixes for diagnostics covering the position"
+      .. " (read-only). With index=N, applies the Nth action via the same LSP"
+      .. " WorkspaceEdit path as code_action (write, confirm-gated). Parameters:"
+      .. " path, line, col, index?",
+    input_schema = {
+      type = "object",
+      properties = {
+        path = { type = "string", description = "File containing the diagnostic." },
+        line = { type = "integer", description = "1-based line." },
+        col = { type = "integer", description = "1-based column." },
+        index = { type = "integer", description = "Apply the Nth fix from the listing (omit to list)." },
+      },
+      required = { "path", "line", "col" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local buf, ft = load_buf(input.path)
+  local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
+  local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
+  local covering = {}
+  for _, d in ipairs(vim.diagnostic.get(buf) or {}) do
+    local dl0, dc0 = d.lnum or 0, d.col or 0
+    local de0 = d.end_lnum or dl0
+    local dec0 = d.end_col or (dc0 + 1)
+    local covers = (line0 > dl0 or (line0 == dl0 and col0 >= dc0))
+      and (line0 < de0 or (line0 == de0 and col0 <= dec0))
+    if covers then
+      local lsp = d.user_data and d.user_data.lsp
+      covering[#covering + 1] = lsp or {
+        range = { start = { line = dl0, character = dc0 }, ["end"] = { line = de0, character = dec0 } },
+        severity = d.severity,
+        source = d.source,
+        message = d.message,
+      }
+    end
+  end
+  if #covering == 0 then return "fix_diagnostic: no diagnostic at that position" end
+  local params = {
+    textDocument = { uri = vim.uri_from_bufnr(buf) },
+    range = covering[1].range or {
+      start = { line = line0, character = col0 }, ["end"] = { line = line0, character = col0 },
+    },
+    context = { diagnostics = covering, only = { "quickfix" } },
+  }
+  local ok, res, err = pcall(lsp_request, ctx, buf, "textDocument/codeAction", params, 5000)
+  if not ok then return "fix_diagnostic: " .. tostring(res) end
+  if err == "noclient" then return "no LSP client for filetype " .. (ft ~= "" and ft or "?") end
+  if err == "timeout" then return "fix_diagnostic: LSP request timed out" end
+  local cids = {}
+  for cid in pairs(res or {}) do cids[#cids + 1] = cid end
+  table.sort(cids)
+  local actions = {}
+  for _, cid in ipairs(cids) do
+    local result = result_of(res[cid])
+    for _, a in ipairs(type(result) == "table" and result or {}) do
+      actions[#actions + 1] = { action = a, client_id = cid }
+    end
+  end
+  if #actions == 0 then return "fix_diagnostic: no fixes available for diagnostic" end
+  local index = tonumber(input.index)
+  if not index then
+    local lines = {}
+    for i, entry in ipairs(actions) do
+      local a = entry.action
+      lines[#lines + 1] = string.format("%d. %s%s", i, a.title or "?",
+        a.kind and ("  [" .. a.kind .. "]") or "")
+    end
+    lines[#lines + 1] = "(call again with index=N to apply one)"
+    return table.concat(lines, "\n")
+  end
+  local entry = actions[index]
+  if not entry then return string.format("fix_diagnostic: index %d out of range (1-%d)", index, #actions) end
+  local action = entry.action
+  local client = vim.lsp.get_client_by_id(entry.client_id)
+  if client and not action.edit and not action.command then
+    local resolved = client_request(ctx, client, "codeAction/resolve", action, buf, 5000)
+    if type(resolved) == "table" then action = resolved end
+  end
+  local did = {}
+  if type(action.edit) == "table" then
+    local okap, files = pcall(apply_workspace_edit_and_save, action.edit, client and client.offset_encoding)
+    if not okap then return "fix_diagnostic: failed to apply edit: " .. tostring(files) end
+    did[#did + 1] = "edited " .. table.concat(files, ", ")
+  end
+  local cmd = action.command
+  if type(cmd) == "string" then cmd = { command = cmd } end
+  if type(cmd) == "table" and cmd.command and client then
+    local _, cerr = client_request(ctx, client, "workspace/executeCommand",
+      { command = cmd.command, arguments = cmd.arguments }, buf, 5000)
+    did[#did + 1] = cerr and ("command " .. cmd.command .. " failed: " .. cerr) or ("ran command " .. cmd.command)
+  end
+  if #did == 0 then return "fix_diagnostic: action had no edit or command to apply" end
+  return string.format("applied %q: %s — undo with u in each edited buffer", action.title or "?", table.concat(did, "; "))
+end
+]==]),
+  })
+
+  -- --------------------------------------------------------- declaration/etc.
+
+  local function location_tool(api_name, method, label)
+    define({
+      name = "tool." .. api_name,
+      kind = "tool",
+      doc = label .. " for the symbol at a position via the attached LSP client"
+        .. " (" .. method .. "). Returns target location(s) as 'file:line:col'."
+        .. " With quickfix=true it also loads locations into this session's"
+        .. " findings list. Parameters: path (required); line/col (required,"
+        .. " 1-based); quickfix/open (optional).",
+      input_schema = {
+        type = "object",
+        properties = {
+          path = { type = "string", description = "File containing the symbol." },
+          line = { type = "integer", description = "1-based line of the symbol." },
+          col = { type = "integer", description = "1-based column of the symbol." },
+          quickfix = { type = "boolean", description = "Also populate this session's findings list with the locations." },
+          open = { type = "boolean", description = "Open the findings list when quickfix=true (default true)." },
+        },
+        required = { "path", "line", "col" },
+      },
+      source = src(([[
+return function(input, ctx)
+  local buf, ft = load_buf(input.path)
+  local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
+  local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
+  local params = {
+    textDocument = { uri = vim.uri_from_bufnr(buf) },
+    position = { line = line0, character = col0 },
+  }
+  local ok, res, err = pcall(lsp_request, ctx, buf, %q, params, 5000)
+  if not ok then return %q .. ": " .. tostring(res) end
+  if err == "noclient" then return "no LSP client for filetype " .. (ft ~= "" and ft or "?") end
+  if err == "timeout" then return %q .. ": LSP request timed out" end
+  local locs = {}
+  each_result(res, function(result) collect_locations(result, locs) end)
+  return location_output(ctx, input, "straps: %s", locs, "no %s found")
+end
+]]):format(method, api_name, api_name, api_name, api_name:gsub("_", " "))),
+    })
+  end
+
+  location_tool("declaration", "textDocument/declaration", "Go to declaration")
+  location_tool("type_definition", "textDocument/typeDefinition", "Go to type definition")
+  location_tool("implementation", "textDocument/implementation", "Go to implementation")
+
+  -- --------------------------------------------------------------- lsp_status
+
+  define({
+    name = "tool.lsp_status",
+    kind = "tool",
+    doc = "Report whether Neovim LSP clients are attached/enabled for a file."
+      .. " Loads the file's buffer, waits briefly for clients to attach, and lists"
+      .. " each client name/id plus whether it supports common navigation methods."
+      .. " Read-only. Parameters: path (required) — file to inspect.",
+    input_schema = {
+      type = "object",
+      properties = {
+        path = { type = "string", description = "File whose LSP attachment/status to inspect." },
+      },
+      required = { "path" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local buf, ft = load_buf(input.path)
+  local clients = wait_clients(ctx, buf)
+  if not clients or #clients == 0 then
+    return "no LSP client attached for " .. relname(vim.api.nvim_buf_get_name(buf), buf)
+      .. " (filetype " .. (ft ~= "" and ft or "?") .. ")"
+  end
+  local methods = {
+    "textDocument/definition", "textDocument/declaration",
+    "textDocument/typeDefinition", "textDocument/implementation",
+    "textDocument/references", "textDocument/hover",
+    "textDocument/signatureHelp", "textDocument/codeAction",
+    "textDocument/formatting", "textDocument/rename",
+  }
+  local out = { string.format("%d LSP client%s attached to %s (filetype %s):",
+    #clients, #clients == 1 and "" or "s", relname(vim.api.nvim_buf_get_name(buf), buf), ft ~= "" and ft or "?") }
+  for _, c in ipairs(clients) do
+    local caps = {}
+    for _, m in ipairs(methods) do
+      local ok, yes = pcall(function() return c:supports_method(m) end)
+      if ok and yes then caps[#caps + 1] = m:gsub("^textDocument/", "") end
+    end
+    out[#out + 1] = string.format("- %s (id %s): %s", c.name or "?", tostring(c.id),
+      #caps > 0 and table.concat(caps, ", ") or "no common textDocument capabilities reported")
+  end
+  return table.concat(out, "\n")
+end
+]==]),
+  })
+
   -- --------------------------------------------------------------- definition
 
   define({
@@ -418,14 +816,18 @@ end
       .. " LSP client (textDocument/definition). Returns the target location(s)"
       .. " as 'file:line:col'. If no LSP client is attached, falls back to a tags"
       .. " lookup of the symbol under the position; if that finds nothing,"
-      .. " returns a clear 'no LSP client' message. Parameters: path (required);"
-      .. " line (required, 1-based); col (required, 1-based).",
+      .. " returns a clear 'no LSP client' message. With quickfix=true it also"
+      .. " loads locations into this session's findings list. Parameters: path"
+      .. " (required); line (required, 1-based); col (required, 1-based);"
+      .. " quickfix/open (optional).",
     input_schema = {
       type = "object",
       properties = {
         path = { type = "string", description = "File containing the symbol." },
         line = { type = "integer", description = "1-based line of the symbol." },
         col = { type = "integer", description = "1-based column of the symbol." },
+        quickfix = { type = "boolean", description = "Also populate this session's findings list with the locations." },
+        open = { type = "boolean", description = "Open the findings list when quickfix=true (default true)." },
       },
       required = { "path", "line", "col" },
     },
@@ -461,8 +863,7 @@ return function(input, ctx)
 
   local locs = {}
   each_result(res, function(result) collect_locations(result, locs) end)
-  if #locs == 0 then return "no definition found" end
-  return join_sorted(locs)
+  return location_output(ctx, input, "straps: definition", locs, "no definition found")
 end
 ]==]),
   })
@@ -476,14 +877,17 @@ end
       .. " client (textDocument/references, including the declaration). Returns a"
       .. " deduped, sorted list of 'file:line:col'. If no LSP client is attached,"
       .. " falls back to a tags lookup of the symbol, and otherwise returns a"
-      .. " clear 'no LSP client' message. Parameters: path (required); line"
-      .. " (required, 1-based); col (required, 1-based).",
+      .. " clear 'no LSP client' message. With quickfix=true it also loads locations"
+      .. " into this session's findings list. Parameters: path (required); line"
+      .. " (required, 1-based); col (required, 1-based); quickfix/open (optional).",
     input_schema = {
       type = "object",
       properties = {
         path = { type = "string", description = "File containing the symbol." },
         line = { type = "integer", description = "1-based line of the symbol." },
         col = { type = "integer", description = "1-based column of the symbol." },
+        quickfix = { type = "boolean", description = "Also populate this session's findings list with the locations." },
+        open = { type = "boolean", description = "Open the findings list when quickfix=true (default true)." },
       },
       required = { "path", "line", "col" },
     },
@@ -520,8 +924,137 @@ return function(input, ctx)
 
   local locs = {}
   each_result(res, function(result) collect_locations(result, locs) end)
-  if #locs == 0 then return "no references found" end
-  return join_sorted(locs)
+  return location_output(ctx, input, "straps: references", locs, "no references found")
+end
+]==]),
+  })
+
+  -- --------------------------------------------------------- tree_sitter_status
+
+  define({
+    name = "tool.tree_sitter_status",
+    kind = "tool",
+    doc = "Report whether tree-sitter can parse a file: detected filetype, mapped"
+      .. " language, parser availability, root node type, and top-level child count."
+      .. " Read-only. Parameters: path (required).",
+    input_schema = {
+      type = "object",
+      properties = { path = { type = "string", description = "File to inspect." } },
+      required = { "path" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local buf, ft = load_buf(input.path)
+  local lang = ft
+  local ok_l, mapped = pcall(vim.treesitter.language.get_lang, ft)
+  if ok_l and mapped then lang = mapped end
+  local parser = get_parser(buf, ft)
+  if not parser then
+    return "no tree-sitter parser for " .. relname(vim.api.nvim_buf_get_name(buf), buf)
+      .. " (filetype " .. (ft ~= "" and ft or "?") .. ", language " .. (lang ~= "" and lang or "?") .. ")"
+  end
+  local ok, trees = pcall(function() return parser:parse() end)
+  if not ok or not trees or not trees[1] then return "tree-sitter parser exists but parse failed" end
+  local root = trees[1]:root()
+  local children = 0
+  for _ in root:iter_children() do children = children + 1 end
+  return string.format("tree-sitter parser ready for %s: filetype=%s language=%s root=%s top_level_children=%d",
+    relname(vim.api.nvim_buf_get_name(buf), buf), ft ~= "" and ft or "?", lang ~= "" and lang or "?", root:type(), children)
+end
+]==]),
+  })
+
+  -- ------------------------------------------------------------- node_at
+
+  define({
+    name = "tool.node_at",
+    kind = "tool",
+    doc = "Inspect the tree-sitter node at a file position. Returns the smallest"
+      .. " named node, its range, parent chain, and capped source text. Read-only."
+      .. " Parameters: path, line, col; max_text_bytes optional (default 500).",
+    input_schema = {
+      type = "object",
+      properties = {
+        path = { type = "string", description = "File to inspect." },
+        line = { type = "integer", description = "1-based line." },
+        col = { type = "integer", description = "1-based column." },
+        max_text_bytes = { type = "integer", description = "Maximum node text bytes (default 500)." },
+      },
+      required = { "path", "line", "col" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local buf, ft = load_buf(input.path)
+  local parser = get_parser(buf, ft)
+  if not parser then return "node_at: no tree-sitter parser for " .. (ft ~= "" and ft or "?") end
+  local ok, trees = pcall(function() return parser:parse() end)
+  if not ok or not trees or not trees[1] then return "node_at: parse failed" end
+  local root = trees[1]:root()
+  local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
+  local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
+  local node = root:named_descendant_for_range(line0, col0, line0, col0)
+  if not node then return "node_at: no named node at that position" end
+  local sr, sc, er, ec = node:range()
+  local chain, cur = {}, node
+  while cur do
+    chain[#chain + 1] = cur:type()
+    cur = cur:parent()
+  end
+  local text = vim.treesitter.get_node_text(node, buf) or ""
+  local cap = math.min(math.max(tonumber(input.max_text_bytes) or 500, 0), 5000)
+  if #text > cap then text = text:sub(1, cap) .. "\n[truncated: node text exceeded " .. cap .. " bytes]" end
+  return string.format("%s  L%d:%d-L%d:%d\nparents: %s\ntext:\n%s",
+    node:type(), sr + 1, sc + 1, er + 1, ec + 1, table.concat(chain, " <- "), text)
+end
+]==]),
+  })
+
+  -- ------------------------------------------------------------- read_node
+
+  define({
+    name = "tool.read_node",
+    kind = "tool",
+    doc = "Read source for the tree-sitter node at a position, optionally climbing"
+      .. " to an ancestor type (for example function_declaration or class_definition)."
+      .. " Returns numbered lines like read_file. Read-only. Parameters: path, line,"
+      .. " col; ancestor optional; max_lines optional (default 200, max 1000).",
+    input_schema = {
+      type = "object",
+      properties = {
+        path = { type = "string", description = "File to inspect." },
+        line = { type = "integer", description = "1-based line." },
+        col = { type = "integer", description = "1-based column." },
+        ancestor = { type = "string", description = "Optional ancestor node type to climb to." },
+        max_lines = { type = "integer", description = "Maximum lines to return (default 200, max 1000)." },
+      },
+      required = { "path", "line", "col" },
+    },
+    source = src([==[
+return function(input, ctx)
+  local buf, ft = load_buf(input.path)
+  local parser = get_parser(buf, ft)
+  if not parser then return "read_node: no tree-sitter parser for " .. (ft ~= "" and ft or "?") end
+  local ok, trees = pcall(function() return parser:parse() end)
+  if not ok or not trees or not trees[1] then return "read_node: parse failed" end
+  local root = trees[1]:root()
+  local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
+  local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
+  local node = root:named_descendant_for_range(line0, col0, line0, col0)
+  if not node then return "read_node: no named node at that position" end
+  if type(input.ancestor) == "string" and input.ancestor ~= "" then
+    local want, cur = input.ancestor, node
+    while cur and cur:type() ~= want do cur = cur:parent() end
+    if not cur then return "read_node: no ancestor of type " .. want .. " from node " .. node:type() end
+    node = cur
+  end
+  local sr, _, er, _ = node:range()
+  local max_lines = math.min(math.max(tonumber(input.max_lines) or 200, 1), 1000)
+  local last = math.min(er + 1, sr + max_lines)
+  local body = vim.api.nvim_buf_get_lines(buf, sr, last, false)
+  local out = { string.format("%s  L%d-%d", node:type(), sr + 1, er + 1) }
+  for i, l in ipairs(body) do out[#out + 1] = string.format("  %d\t%s", sr + i, l) end
+  if er + 1 > last then out[#out + 1] = string.format("[truncated: showing %d of %d lines]", max_lines, er - sr + 1) end
+  return table.concat(out, "\n")
 end
 ]==]),
   })
@@ -716,15 +1249,18 @@ end
       .. " (workspace/symbol) — the step BEFORE definition/references when you"
       .. " do not yet know which file a symbol lives in. Returns one line per"
       .. " match: 'name  kind  file:line:col', deduped and capped at 200."
-      .. " Parameters: query (required) — the symbol name or a prefix of it;"
-      .. " path (optional) — a file of the target language, used to pick the"
-      .. " LSP client; without it the first loaded buffer with a client is"
-      .. " used.",
+      .. " With quickfix=true it also loads symbol locations into this session's"
+      .. " findings list. Parameters: query (required) — the symbol name or a"
+      .. " prefix of it; path (optional) — a file of the target language, used to"
+      .. " pick the LSP client; without it the first loaded buffer with a client is"
+      .. " used; quickfix/open (optional).",
     input_schema = {
       type = "object",
       properties = {
         query = { type = "string", description = "Symbol name (or prefix) to search for." },
         path = { type = "string", description = "A file of the target language (picks the LSP client)." },
+        quickfix = { type = "boolean", description = "Also populate this session's findings list with symbol locations." },
+        open = { type = "boolean", description = "Open the findings list when quickfix=true (default true)." },
       },
       required = { "query" },
     },
@@ -751,7 +1287,7 @@ return function(input, ctx)
   if err == "noclient" then return "no LSP client for filetype " .. (ft ~= "" and ft or "?") end
   if err == "timeout" then return "workspace_symbols: LSP request timed out" end
   local kinds = vim.lsp.protocol.SymbolKind or {}
-  local seen, out = {}, {}
+  local seen, out, locs = {}, {}, {}
   each_result(res, function(result)
     for _, s in ipairs(result or {}) do
       local where = ""
@@ -761,6 +1297,7 @@ return function(input, ctx)
         if loc.range and loc.range.start then
           where = string.format("%s:%d:%d",
             file, loc.range.start.line + 1, loc.range.start.character + 1)
+          locs[#locs + 1] = where
         else
           where = file
         end
@@ -773,7 +1310,10 @@ return function(input, ctx)
       end
     end
   end)
-  if #out == 0 then return "no workspace symbols match " .. query end
+  if #out == 0 then
+    maybe_set_locations(ctx, input, "straps: workspace_symbols " .. query, {})
+    return "no workspace symbols match " .. query
+  end
   local total = #out
   if total > 200 then
     local capped = {}
@@ -781,7 +1321,10 @@ return function(input, ctx)
     capped[#capped + 1] = string.format("[truncated: showing 200 of %d matches; narrow the query]", total)
     out = capped
   end
-  return table.concat(out, "\n")
+  local kind = maybe_set_locations(ctx, input, "straps: workspace_symbols " .. query, locs)
+  local text = table.concat(out, "\n")
+  if kind then text = text .. "\n" .. kind .. ": " .. tostring(#sorted_unique(locs)) .. " location(s)" end
+  return text
 end
 ]==]),
   })
@@ -904,14 +1447,16 @@ return function(input, ctx)
   end
 
   local edit_note = ""
+  local pending_uris
   if mover then
     local params = {
       files = { { oldUri = vim.uri_from_fname(from_full), newUri = vim.uri_from_fname(to_full) } },
     }
     local result, err = client_request(ctx, mover, "workspace/willRenameFiles", params, buf, 8000)
     if result and type(result) == "table" and (result.changes or result.documentChanges) then
-      local okap, files = pcall(apply_workspace_edit_and_save, result, mover.offset_encoding)
+      local okap, files, uris = pcall(apply_workspace_edit_and_save, result, mover.offset_encoding, { save = false })
       if okap then
+        pending_uris = uris
         edit_note = string.format("; server updated %d reference file%s:\n%s",
           #files, #files == 1 and "" or "s", table.concat(files, "\n"))
       else
@@ -926,6 +1471,7 @@ return function(input, ctx)
   if not ok_rn then
     return "move_file: rename failed: " .. tostring(rn_err)
   end
+  if pending_uris then save_workspace_files(pending_uris) end
 
   if mover then
     local ok_s2, supports_did = pcall(function()
@@ -1054,6 +1600,7 @@ return function(input, ctx)
     end
   end
   local notes = {}
+  local pending_uris = {}
 
   for _, id in ipairs(bucket_order) do
     local bucket = buckets[id]
@@ -1065,9 +1612,10 @@ return function(input, ctx)
     local result, err = client_request(ctx, bucket.client, "workspace/willRenameFiles",
       { files = files_param }, bucket.entries[1].buf, 8000)
     if result and type(result) == "table" and (result.changes or result.documentChanges) then
-      local okap, files = pcall(apply_workspace_edit_and_save, result, bucket.client.offset_encoding)
+      local okap, files, uris = pcall(apply_workspace_edit_and_save, result, bucket.client.offset_encoding, { save = false })
       if okap then
         note_files(files)
+        for _, uri in ipairs(uris or {}) do pending_uris[#pending_uris + 1] = uri end
       else
         notes[#notes + 1] = bucket.client.name .. ": edit returned but failed to apply: " .. tostring(files)
       end
@@ -1088,6 +1636,7 @@ return function(input, ctx)
       failed[#failed + 1] = string.format("%s -> %s: %s", relname(e.from), relname(e.to), tostring(rn_err))
     end
   end
+  if #failed == 0 and #pending_uris > 0 then save_workspace_files(pending_uris) end
 
   for _, id in ipairs(bucket_order) do
     local bucket = buckets[id]
@@ -1170,12 +1719,14 @@ return function(input, ctx)
   end
 
   local edit_note = ""
+  local pending_uris
   if deleter then
     local params = { files = { { uri = vim.uri_from_fname(full) } } }
     local result, err = client_request(ctx, deleter, "workspace/willDeleteFiles", params, buf, 8000)
     if result and type(result) == "table" and (result.changes or result.documentChanges) then
-      local okap, files = pcall(apply_workspace_edit_and_save, result, deleter.offset_encoding)
+      local okap, files, uris = pcall(apply_workspace_edit_and_save, result, deleter.offset_encoding, { save = false })
       if okap then
+        pending_uris = uris
         edit_note = string.format("; server updated %d reference file%s:\n%s",
           #files, #files == 1 and "" or "s", table.concat(files, "\n"))
       else
@@ -1190,6 +1741,7 @@ return function(input, ctx)
   if not ok_rm or succ ~= true then
     return "delete_file: failed to delete: " .. tostring((not ok_rm and succ) or rm_err or "unknown error")
   end
+  if pending_uris then save_workspace_files(pending_uris) end
 
   pcall(function()
     if vim.api.nvim_buf_is_loaded(buf) then vim.cmd("bwipeout! " .. buf) end
@@ -1303,6 +1855,7 @@ return function(input, ctx)
     end
   end
   local notes = {}
+  local pending_uris = {}
 
   for _, id in ipairs(bucket_order) do
     local bucket = buckets[id]
@@ -1313,9 +1866,10 @@ return function(input, ctx)
     local result, err = client_request(ctx, bucket.client, "workspace/willDeleteFiles",
       { files = files_param }, bucket.entries[1].buf, 8000)
     if result and type(result) == "table" and (result.changes or result.documentChanges) then
-      local okap, files = pcall(apply_workspace_edit_and_save, result, bucket.client.offset_encoding)
+      local okap, files, uris = pcall(apply_workspace_edit_and_save, result, bucket.client.offset_encoding, { save = false })
       if okap then
         note_files(files)
+        for _, uri in ipairs(uris or {}) do pending_uris[#pending_uris + 1] = uri end
       else
         notes[#notes + 1] = bucket.client.name .. ": edit returned but failed to apply: " .. tostring(files)
       end
@@ -1339,6 +1893,7 @@ return function(input, ctx)
         .. tostring((not ok_rm and succ) or rm_err or "unknown error")
     end
   end
+  if #failed == 0 and #pending_uris > 0 then save_workspace_files(pending_uris) end
 
   for _, id in ipairs(bucket_order) do
     local bucket = buckets[id]

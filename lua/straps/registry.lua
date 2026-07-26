@@ -118,6 +118,18 @@ function M.define(spec, opts)
     error(("straps.registry.define: %s: kind must be 'tool', 'hook', 'fn' or 'skill' (got %s)")
       :format(spec.name, tostring(spec.kind)))
   end
+  local suffix = spec.name:match("^" .. spec.kind .. "%.(.+)$")
+  if not suffix then
+    error(("straps.registry.define: %s: name must start with '%s.'")
+      :format(spec.name, spec.kind))
+  end
+  if spec.kind == "tool" and not suffix:match("^[%w_%-]+$") then
+    error(("straps.registry.define: %s: tool API name must match ^[A-Za-z0-9_-]+$")
+      :format(spec.name))
+  elseif spec.kind ~= "tool" and not suffix:match("^[%w_][%w_%.%-]*$") then
+    error(("straps.registry.define: %s: invalid %s name")
+      :format(spec.name, spec.kind))
+  end
   if type(spec.source) ~= "string" then
     error(("straps.registry.define: %s: source must be a string"):format(spec.name))
   end

@@ -59,8 +59,8 @@ Nothing registers at `require` time except `registry.lua`'s own module table.
 local registry = require("straps.registry")
 
 registry.define{
-  name = "tool.write_file",     -- namespaced: "tool." | "hook." | "fn."
-  kind = "tool",                -- "tool" | "hook" | "fn"
+  name = "tool.write_file",     -- namespaced: "tool." | "hook." | "fn." | "skill."
+  kind = "tool",                -- "tool" | "hook" | "fn" | "skill"
   doc  = "Write content to a file. Calls hook.after_write when done.",
   input_schema = { ... },       -- JSON Schema as a Lua table; tools only
   source = [==[
@@ -71,12 +71,17 @@ end
 }
 ```
 
-- `define(spec) -> entry`. Validates: `name` (string), `kind` (one of three),
-  `source` (string). Compiles with `load(spec.source, "straps:" .. spec.name)`;
-  the chunk MUST return a function; otherwise `define` raises a descriptive
-  error and the previous entry (if any) is left untouched. Stores
-  `{ name, kind, doc, input_schema, source, fn, version }` where `version`
-  increments on each redefine. After a successful (re)define, if an entry named
+- `define(spec) -> entry`. Validates: `name` (string), `kind` (`tool`, `hook`,
+  `fn`, or `skill`), and `source` (string). `tool.*` API suffixes are restricted
+  to `^[A-Za-z0-9_-]+$` before they can reach a provider request; non-tool
+  suffixes allow dotted registry names. Tools/hooks/fns compile with
+  `load(spec.source, "straps:" .. spec.name)` and the chunk MUST return a
+  function; otherwise `define` raises a descriptive error and the previous entry
+  (if any) is left untouched. Skills store prose source directly and expose a
+  tiny function returning that prose so `call()` remains uniform. Stores
+  `{ name, kind, doc, input_schema, source, fn, version, seq }` where `version`
+  increments on each redefine and first-define `seq` is preserved for append-only
+  tool ordering. After a successful (re)define, if an entry named
   `hook.on_define` exists, call it as `(entry)` inside `pcall` (never let it
   break define).
 - `get(name) -> entry | nil`
@@ -92,7 +97,8 @@ end
   restores the registry. This is the persistence story.
 
 Namespacing convention: tools are `tool.<api_name>` where `<api_name>` (the
-part after `tool.`) is what the LLM sees and must match `^[a-zA-Z0-9_-]+$`.
+part after `tool.`) is what the LLM sees and must match `^[a-zA-Z0-9_-]+$`;
+`skill.<name>` entries are knowledge/prose, not callable capabilities.
 
 ## state.lua — transcript buffer format
 
@@ -415,11 +421,13 @@ pinned in `setup{}`) → the persisted preference file (`fn.provider_pref`,
 `$XDG_CONFIG_HOME/straps/provider`, written by `:StrapsProvider`) → `"anthropic"`.
 `config.provider` defaults to `nil` precisely so the file is the durable
 default; a value in `setup{}` pins it and wins over the file. It calls
-`fn.provider_openai` when the resolved value is `"openai"`, else
-`fn.provider_anthropic`. The loop, tests and the return contract only ever see
-`fn.provider`; each backend is its own redefinable registry entry with the
-identical `(req, ctx) -> { content, stop_reason, usage }` signature and the same
-`ctx.emit` text-streaming / `ctx.on_cancel` behaviour.
+`fn.provider_openai` only when the resolved value is exactly `"openai"`, calls
+`fn.provider_anthropic` for `nil`/`"anthropic"`, and errors on any other value
+instead of silently routing an invalid preference to the wrong backend. The loop,
+tests and the return contract only ever see `fn.provider`; each backend is its
+own redefinable registry entry with the identical `(req, ctx) -> { content,
+stop_reason, usage }` signature and the same `ctx.emit` text-streaming /
+`ctx.on_cancel` behaviour.
 
 `fn.provider_pref(value?)` is the persistence seam: called with no argument it
 reads the first line of `$XDG_CONFIG_HOME/straps/provider`
@@ -485,7 +493,7 @@ Same `(req, ctx)` contract, OpenAI's wire shape. Selected when
   messages. Tools → `[{ type="function", function={ name, description,
   parameters=input_schema } }]`. `max_completion_tokens=config.max_tokens`,
   `stream=true`, `stream_options.include_usage=true`. Model id is
-  `config.openai_model` (falling back to `config.model`).
+  `vim.b[bufnr].straps_openai_model`, then `config.openai_model`, then `"gpt-5"`; it never falls back to the Anthropic `config.model`.
 - **Response translation** (OpenAI SSE `choices[].delta` → blocks): `delta.content`
   → `ctx.emit{type="text_delta"}` accumulated into one text block;
   `delta.tool_calls[].function.arguments` → accumulated per `index` and decoded
@@ -502,11 +510,10 @@ Same `(req, ctx)` contract, OpenAI's wire shape. Selected when
 
 ### Live model discovery (`fn.list_models`)
 
-`fn.list_models() -> models | (nil, err)` — a synchronous `curl GET
-/v1/models` against **the same backend `fn.provider` would use**. It resolves the
-effective provider exactly as `fn.provider` does (`config.provider` → the
-persisted `fn.provider_pref` file → per-session `vim.b straps_provider` on the
-current buffer), so discovery never disagrees with the loop: under the OpenAI
+`fn.list_models(provider?) -> models | (nil, err)` — a synchronous `curl GET
+/v1/models` against an explicit provider (`"anthropic"`/`"openai"`) or **the
+same backend `fn.provider` would use**. It resolves the effective provider exactly as `fn.provider` does (per-session `vim.b straps_provider` on the
+current buffer → `config.provider` → the persisted `fn.provider_pref` file), so discovery never disagrees with the loop: under the OpenAI
 provider it lists GPT models, not Claude ones.
 
 - **Anthropic**: `GET {base_url}/v1/models?limit=1000` with
@@ -523,14 +530,15 @@ provider it lists GPT models, not Claude ones.
   `nil` (reasoning effort is sent as `reasoning_effort` regardless).
 
 It never throws — any failure (no key, curl error, non-2xx, unparseable body)
-returns `(nil, errmsg)` so the picker can fall back to the static `config.models`.
+returns `(nil, errmsg)` so the picker can fall back to the provider-specific static list.
 
-`ui.pick_model` calls it and MERGES the result over `config.models`: configured
-entries keep their curated `label` and lead the list in configured order; any
-live-only model (e.g. a newly released one) is appended with its API
-display_name. The merged list is written back to `config.models` so
-`fn.provider`'s thinking-tag lookup finds discovered models and repeat pickers
-are instant. Fetch failure → notify + the static list; the picker never breaks.
+`ui.pick_model` calls it and MERGES the result over `config.models` for
+Anthropic or `config.openai_models` for OpenAI: configured entries keep their
+curated `label` and lead the list in configured order; any live-only model
+(e.g. a newly released one) is appended with its API display name/id. The
+merged list is written back to that provider's cache so `fn.provider`'s
+Anthropic thinking-tag lookup finds discovered models and repeat pickers are
+instant. Fetch failure → notify + the matching static list; the picker never breaks.
 
 ### Prompt caching (cache_control breakpoints)
 
@@ -671,15 +679,27 @@ mechanics (trigger language in the tool doc itself lifts usage).
 
 API names (registry names prefixed `tool.`):
 
-- `read_file {path, offset?, limit?}` — numbered lines, cap ~2000 lines.
-- `write_file {path, content}` — mkdir -p parent, write; if a buffer holds the
-  file, `:checktime` it; then `registry.try_call("hook.after_write", path, ctx)`
+- `read_file {path, offset?, limit?}` — numbered lines, cap ~2000 lines,
+  read through the target's live Neovim buffer (bufadd+bufload, reusing an
+  already-open buffer), so unsaved user edits are visible to reads just like
+  edit/write paths.
+- `write_file {path, content}` — mkdir -p parent, write through the target's
+  buffer; then `registry.try_call("hook.after_write", path, ctx)`
   and if it returns a string, append it to the tool result. **`hook.after_write`
   ships as the LSP-diagnostics feedback loop** (below) — the canonical seam for
   the "auto-run a linter after writes" idiom, now built by default.
 - `edit_file {path, old_string, new_string, replace_all?}` — exact-match edit;
   error if 0 or (when not replace_all) >1 matches (plain-text find, no
   patterns). Also fires `hook.after_write`.
+- `patch_file {path, hunks}` — structured line-range hunks applied through the
+  same live buffer path as `write_file`/`edit_file`; useful when the agent knows
+  exact line ranges and wants one undoable multi-hunk patch. Optional per-hunk
+  `expected_old_text` guards against stale line ranges in the live buffer.
+- `path_info {paths}` / `tree {path?, max_depth?, max_entries?, hidden?}` —
+  bounded filesystem introspection without shelling out.
+- `fetch_url {url, max_bytes?, timeout_ms?, follow_redirects?}` — bounded curl
+  fetch with config disabled (`curl --disable`), no ambient cookies/credentials,
+  timeout and byte cap; not auto-allowed by the default confirm hook.
 - `bash {command, timeout_ms?}` — `vim.system({"bash","-lc",cmd})` through
   `ctx.await`; returns exit code + stdout + stderr; default timeout 120s.
 - `glob {pattern}` — `vim.fn.glob(pattern, false, true)`, cap 500 entries.
@@ -715,8 +735,10 @@ API names (registry names prefixed `tool.`):
 Default hooks registered here:
 
 - `hook.confirm(name, input, ctx) -> allowed, reason` — auto-allow the
-  read-only set `{read_file, glob, grep, registry_list, registry_get}`;
-  for everything else `vim.fn.confirm("straps: allow <name>?\n<preview of input>", "&Yes\n&No\n&Always this tool", ...)`
+  read-only tools (file/search introspection, registry/skill reads,
+  editor-native LSP/tree-sitter/status lookups, presentation tools, ask_user,
+  code_action list mode, undo_edit history); for everything else
+  `vim.fn.confirm("straps: allow <name>?\n<preview of input>", ...)`
   — "Always" adds the name to an allow-set stored in
   `vim.b[ctx.bufnr].straps_allowed` (buffer state, on theme). Must be called
   on the main loop (wrap in a scheduled await, since we're inside a coroutine
@@ -775,8 +797,10 @@ Written for agent-ability and ecosystem norms; concise, imperative:
   show what failed.
 - Workflow: locate (glob/grep) → read (read_file) before any edit; prefer
   edit_file for surgical changes, write_file for new files; after changing
-  code, verify with bash (tests, build, or running the thing); make the
-  smallest change that solves the problem; match the surrounding code style.
+  code, verify with bash/run_in_terminal/run_quickfix (tests, build, or running
+  the thing); if an LSP-backed operation may help, use `lsp_status` to see
+  whether Neovim has a server for the file; make the smallest change that solves
+  the problem; match the surrounding code style.
 - Editor-agent powers (this is what distinguishes straps from a terminal
   agent): files the user has open may have unsaved changes; writes reload
   their buffers automatically. `eval_lua` runs INSIDE the user's Neovim —
@@ -806,9 +830,10 @@ Written for agent-ability and ecosystem norms; concise, imperative:
 - Self-extension (kept, tightened): every tool/hook/fn is a registry entry;
   registry_list/registry_get to inspect, registry_define to add or redefine;
   redefinitions are immediate, new tools callable next turn; sources are
-  chunks returning `function(input, ctx)`; the hook.after_write linter idiom
-  as the worked example — encode persistent behaviors into hooks instead of
-  remembering to repeat them.
+  chunks returning `function(input, ctx)`; a first project test/build/lint run
+  is a cue to define a tiny session tool for repeated use; the hook.after_write
+  linter idiom remains the worked example — encode persistent behaviors into
+  hooks instead of remembering to repeat them.
 - Project instructions from AGENTS.md/CLAUDE.md, when present, appear in a
   later section and take precedence over general guidance here.
 
@@ -997,10 +1022,12 @@ Existing suites must all still pass.
   cross-session count (loop does a `redrawstatus!` on run start/end so a
   subagent starting in the background updates the parent's statusline).
 - Per-buffer model / effort: `fn.provider` reads `vim.b[bufnr].straps_model`
-  and `vim.b[bufnr].straps_effort` in preference to `config.model` /
-  `config.effort`, so two sessions can run different models at once (and a
-  subagent can differ from its parent — `tool.spawn` accepts `model`/`effort`
-  args and otherwise inherits the parent's override). `ui.pick_model` /
+  for Anthropic, `vim.b[bufnr].straps_openai_model` for OpenAI, and
+  `vim.b[bufnr].straps_effort` in preference to `config.model` /
+  `config.openai_model` / `config.effort`, so two sessions can run different
+  providers/models at once (and a subagent can differ from its parent —
+  `tool.spawn` accepts `provider`/`model`/`effort` args and otherwise inherits
+  the parent's provider-specific override). `ui.pick_model` /
   `ui.pick_effort` write `vim.b` when invoked ON a session buffer, else the
   global config default. `ui.session_status()` renders the effective
   model/effort for the current session buffer (`""` elsewhere), with a trailing
@@ -1101,19 +1128,32 @@ synchronous and need no server, so they are the reliable core. Every tool
 degrades gracefully (no client / no parser → a clear message, never an error).
 Positions: read_file emits 1-based lines; LSP is 0-based — convert at the seam.
 
-- `diagnostics {path?}` — `vim.diagnostic.get` for path's buffer (bufadd+load
-  it) or all loaded straps-relevant buffers when omitted. Returns one line per
-  diagnostic: `file:line:col: SEVERITY message [source]`. (Workstream 3 adds a
-  quickfix option.)
-- `definition {path, line, col}` — load buffer, wait briefly for an LSP client
-  (LspAttach is async), `vim.lsp.buf_request` textDocument/definition, resolve
-  with the location(s) as `file:line:col`. No client → fall back to
-  `taglist(symbol_under_pos)` if a tags file exists, else "no LSP for <ft>".
-- `references {path, line, col}` — textDocument/references, same shape; can feed
-  quickfix (ws3).
+- `diagnostics {path?, quickfix?}` — `vim.diagnostic.get` for path's buffer
+  (bufadd+load it) or all loaded straps-relevant buffers when omitted. Returns
+  one line per diagnostic: `file:line:col: SEVERITY message [source]` and can
+  populate the session findings list.
+- `diagnostic_at {path, line, col}`, `diagnostic_next {path, line, col,
+  direction?, severity?, wrap?}`, and `fix_diagnostic {path, line, col, index?}`
+  — position-oriented diagnostic helpers for the common "fix the issue here / go
+  to the next issue" workflow before listing or applying fixes. `fix_diagnostic`
+  is read-only when listing and write/confirm-gated when applying.
+- `lsp_status {path}` — load buffer, wait briefly for clients, report whether an
+  LSP is attached plus common supported methods. This is the cheap "is LSP
+  enabled for this file?" probe.
+- `declaration` / `definition` / `type_definition` / `implementation`
+  `{path, line, col, quickfix?}` — load buffer, wait briefly for an LSP client
+  (LspAttach is async), issue the matching textDocument request, resolve with
+  location(s) as `file:line:col`, optionally feeding the findings list. No
+  client → clear message; definition/references also try tags where useful.
+- `references {path, line, col, quickfix?}` — textDocument/references, same
+  location shape; can feed the findings list.
 - `symbols {path}` — document outline. Prefer tree-sitter (a locals/@function
   query via `vim.treesitter`) so it works with no LSP; fall back to LSP
   documentSymbol. Returns `name  kind  L<start>-<end>` per symbol.
+- `tree_sitter_status {path}` / `node_at {path, line, col, max_text_bytes?}` /
+  `read_node {path, line, col, ancestor?, max_lines?}` — parser readiness,
+  node/parent-chain inspection, and enclosing-source reads for syntax-structure
+  investigations without requiring a language server.
 - `read_symbol {path, name}` — tree-sitter: find the named function/class node,
   return its source text (targeted read instead of the whole file). Ambiguous
   name → list the matches.
@@ -1140,7 +1180,7 @@ unified-diff renderer that the confirm-dialog edit preview also uses.
   the agent built itself; grep and run_quickfix already fill the list for
   searches and build output, so the doc points there first.
 
-### 2. Native-undo edits (tools.lua: write_file, edit_file)
+### 2. Native-undo edits (tools.lua: write_file, edit_file, patch_file)
 
 Apply agent edits THROUGH the file's buffer so they enter its native undo tree
 — the user reverts with `u` / `:earlier` / undotree, not just git.
@@ -1153,6 +1193,9 @@ Apply agent edits THROUGH the file's buffer so they enter its native undo tree
 - edit_file: exact-match on the buffer's current lines (not a fresh disk read),
   replace via set_text, write. Same 0/1/replace_all error semantics as today.
 - write_file: mkdir parents, set all lines (undoable single step), write.
+- patch_file: validate non-overlapping line ranges and optional
+  `expected_old_text`, apply hunks bottom-up with `nvim_buf_set_lines` as one
+  undoable patch, write.
 - hook.after_write still fires; its return still appends to the result.
 - Already-open buffer with unsaved user changes: the edit stacks on top and the
   write persists the buffer — document this (the agent is editing the live
@@ -1170,13 +1213,14 @@ Apply agent edits THROUGH the file's buffer so they enter its native undo tree
   title (`straps: grep <pattern>`), and still return the text summary. Results
   become `:cnext`/`:cprev` navigable; `hook.on_progress`-independent.
 - `diagnostics`: add `{ quickfix = true }` → also `vim.diagnostic.setqflist`.
-- `bulk_replace {pattern, replacement, flags?}` — NEW write tool. Runs
-  `:cdo s/<pattern>/<replacement>/<flags||ge> | update` across the CURRENT
-  quickfix list (the set grep just made), so it's a native multi-file edit that
-  goes through buffers → undoable (ties into ws2). Empty quickfix → error
-  ("run grep first to populate the quickfix list"). Escape the delimiter in
-  pattern/replacement. Return the count of files changed. Gated by hook.confirm
-  (it writes). Optional `{ dry_run = true }` → report matches without editing.
+- `bulk_replace {pattern, replacement, flags?}` — write tool. Runs a guarded
+  `:cdo`/`:ldo` substitute across the CURRENT findings list (the set grep just
+  made), so it's a native multi-file edit that goes through buffers → undoable
+  (ties into ws2). Empty list → error ("run grep first"). Reject newline/`|` in
+  pattern/replacement, escape the delimiter, and whitelist substitute flags so
+  user input cannot append another Ex command. Return the count of files changed.
+  Gated by hook.confirm (it writes). Optional `{ dry_run = true }` → report
+  targets without editing.
 - Tests: grep populates a non-empty quickfix list with correct file/lnum;
   bulk_replace over a seeded qf list edits the files (undoably) and reports the
   count; empty-qf and dry_run paths.

@@ -52,6 +52,7 @@ end
 
 local render_ns = vim.api.nvim_create_namespace("straps_render")
 local RULE_WIDTH = 52 -- fixed-ish width of the turn rules / card art
+local effective_provider -- defined near picker helpers; session_status uses it earlier
 
 -- byte length of the leading %%[straps:KIND]%% marker token on a line, or nil.
 local function marker_len(line)
@@ -727,9 +728,9 @@ function M.agents_status()
   return ("🤖 %d"):format(top)
 end
 
---- Statusline component for a SESSION buffer: the model and effort that will
---- be used for its next run — the per-buffer override (vim.b straps_model /
---- straps_effort) if set, else the global config default. "" for non-session
+--- Statusline component for a SESSION buffer: the provider-specific model and
+--- effort that will be used for its next run — the per-buffer override
+--- (vim.b straps_model / straps_openai_model / straps_effort) if set, else the global config default. "" for non-session
 --- buffers (so it disappears everywhere else). Format: " model" or
 --- " model · effort" (effort omitted when "off"); a per-buffer override is
 --- marked with a trailing "*" so a session diverging from the global default
@@ -748,19 +749,26 @@ function M.session_status()
   end
   local cfg = straps.config or {}
 
-  local b_model, b_effort
+  local b_model, b_openai_model, b_effort
   pcall(function()
     b_model = vim.b[bufnr].straps_model
+    b_openai_model = vim.b[bufnr].straps_openai_model
     b_effort = vim.b[bufnr].straps_effort
   end)
-  local model = (b_model and b_model ~= "" and b_model) or cfg.model or "?"
+  local provider = effective_provider(straps, bufnr)
+  local model_key = provider == "openai" and "openai_models" or "models"
+  local model = provider == "openai"
+      and ((b_openai_model and b_openai_model ~= "" and b_openai_model) or cfg.openai_model or "gpt-5")
+    or ((b_model and b_model ~= "" and b_model) or cfg.model or "?")
   local effort = (b_effort and b_effort ~= "" and b_effort) or cfg.effort or "off"
-  local overridden = (b_model and b_model ~= "") or (b_effort and b_effort ~= "")
+  local overridden = (provider == "openai" and b_openai_model and b_openai_model ~= "")
+    or (provider ~= "openai" and b_model and b_model ~= "")
+    or (b_effort and b_effort ~= "")
 
-  -- Prefer a short label from config.models over the raw id when one exists.
+  -- Prefer a short label from the provider-specific model list over the raw id.
   local label = model
-  if type(cfg.models) == "table" then
-    for _, m in ipairs(cfg.models) do
+  if type(cfg[model_key]) == "table" then
+    for _, m in ipairs(cfg[model_key]) do
       if type(m) == "table" and m.id == model and m.label and m.label ~= "" then
         label = m.label
         break
@@ -794,12 +802,19 @@ function M.usage_status()
 
   -- Resolve the model's context window: the per-model `context` field, else
   -- config.context_window. nil -> show the raw token count without a percent.
-  local model
-  pcall(function() model = vim.b[bufnr].straps_model end)
-  model = (model and model ~= "" and model) or cfg.model
+  local b_model, b_openai_model
+  pcall(function()
+    b_model = vim.b[bufnr].straps_model
+    b_openai_model = vim.b[bufnr].straps_openai_model
+  end)
+  local provider = effective_provider({ config = cfg }, bufnr)
+  local model_key = provider == "openai" and "openai_models" or "models"
+  local model = provider == "openai"
+      and ((b_openai_model and b_openai_model ~= "" and b_openai_model) or cfg.openai_model)
+    or ((b_model and b_model ~= "" and b_model) or cfg.model)
   local window
-  if type(cfg.models) == "table" then
-    for _, m in ipairs(cfg.models) do
+  if type(cfg[model_key]) == "table" then
+    for _, m in ipairs(cfg[model_key]) do
       if type(m) == "table" and m.id == model then
         window = tonumber(m.context)
         break
@@ -1102,10 +1117,15 @@ local function merge_models(static_list, live_list)
   local function norm(m)
     return type(m) == "table" and m or { id = m }
   end
+  local function copy_model(m)
+    local out = {}
+    for k, v in pairs(m) do out[k] = v end
+    return out
+  end
   for _, m in ipairs(static_list) do
     m = norm(m)
     if type(m.id) == "string" and not by_id[m.id] then
-      by_id[m.id] = { id = m.id, label = m.label, thinking = m.thinking }
+      by_id[m.id] = copy_model(m)
       order[#order + 1] = m.id
     end
   end
@@ -1116,8 +1136,9 @@ local function merge_models(static_list, live_list)
         -- Keep a hand-set label; fill gaps from the live entry.
         existing.label = existing.label or m.label
         if existing.thinking == nil then existing.thinking = m.thinking end
+        if existing.context == nil then existing.context = m.context end
       else
-        by_id[m.id] = { id = m.id, label = m.label, thinking = m.thinking }
+        by_id[m.id] = copy_model(m)
         order[#order + 1] = m.id
       end
     end
@@ -1131,8 +1152,8 @@ end
 M._merge_models = merge_models -- exposed for tests
 
 --- Model / effort selection is per-buffer when invoked ON a session buffer
---- (written to vim.b straps_model / straps_effort, which fn.provider reads in
---- preference to the global config), and sets the global config default
+--- (written to vim.b straps_model or straps_openai_model / straps_effort,
+--- which fn.provider reads in preference to the global config), and sets the global config default
 --- otherwise. These helpers centralize the "session buffer? scope it; else
 --- global" decision and report the effective value for the picker's current-*
 --- marker. Returns the target bufnr or nil (global).
@@ -1145,11 +1166,30 @@ local function session_target_buf()
   return nil
 end
 
---- Effective model for a target (per-buffer override else global config).
+--- Effective provider for a target: per-buffer override, else config.provider
+--- (if pinned in setup), else the persisted file, else "anthropic".
+effective_provider = function(straps, bufnr)
+  if bufnr then
+    local p = vim.b[bufnr].straps_provider
+    if p and p ~= "" then return p end
+  end
+  if straps.config.provider and straps.config.provider ~= "" then
+    return straps.config.provider
+  end
+  local pref = require("straps.registry").try_call("fn.provider_pref")
+  if type(pref) == "string" and pref ~= "" then return pref end
+  return "anthropic"
+end
+
+--- Effective model for a target (per-buffer override else provider-specific global config).
 local function effective_model(straps, bufnr)
   if bufnr then
-    local m = vim.b[bufnr].straps_model
+    local p = effective_provider(straps, bufnr)
+    local m = p == "openai" and vim.b[bufnr].straps_openai_model or vim.b[bufnr].straps_model
     if m and m ~= "" then return m end
+  end
+  if effective_provider(straps, bufnr) == "openai" then
+    return straps.config.openai_model or "gpt-5"
   end
   return straps.config.model
 end
@@ -1176,30 +1216,32 @@ function M.pick_model()
   if not ok or type(straps) ~= "table" then
     return notify_err("straps: config not available (call require('straps').setup() first)")
   end
-  local static_list = type(straps.config.models) == "table" and straps.config.models or {}
+  local target = session_target_buf()
+  local provider = effective_provider(straps, target)
+  local model_key = provider == "openai" and "openai_models" or "models"
+  local static_list = type(straps.config[model_key]) == "table" and straps.config[model_key] or {}
 
-  local live, err = require("straps.registry").try_call("fn.list_models")
+  local live, err = require("straps.registry").try_call("fn.list_models", provider)
   if type(live) ~= "table" then
     if err then
       vim.notify("straps: live model discovery failed (" .. tostring(err)
-        .. "); showing config.models", vim.log.levels.WARN)
+        .. "); showing config." .. model_key, vim.log.levels.WARN)
     end
     live = nil
   end
   local models = merge_models(static_list, live)
   if #models == 0 then
-    return notify_err("straps: no models available (config.models empty and discovery failed)")
+    return notify_err("straps: no models available (config." .. model_key .. " empty and discovery failed)")
   end
 
-  -- Persist the merged list so fn.provider can look up the thinking tag of a
-  -- newly discovered model (it reads config.models), and repeat pickers are
-  -- instant even offline.
-  straps.config.models = models
+  -- Persist the merged provider-specific list so provider calls can look up
+  -- Anthropic thinking/context metadata and repeat pickers are instant offline.
+  straps.config[model_key] = models
 
-  local target = session_target_buf()
   local current_model = effective_model(straps, target)
   M.pick(models, {
-    prompt = target and "straps: select model (this session)" or "straps: select model (global)",
+    prompt = (target and "straps: select " or "straps: select ")
+      .. provider .. " model" .. (target and " (this session)" or " (global)"),
     format_item = function(m)
       local id = type(m) == "table" and m.id or m
       local label = type(m) == "table" and m.label or nil
@@ -1212,11 +1254,19 @@ function M.pick_model()
     end
     local id = type(choice) == "table" and choice.id or choice
     if target and vim.api.nvim_buf_is_valid(target) then
-      vim.b[target].straps_model = id
-      vim.notify("straps: model = " .. tostring(id) .. " (this session)")
+      if provider == "openai" then
+        vim.b[target].straps_openai_model = id
+      else
+        vim.b[target].straps_model = id
+      end
+      vim.notify("straps: " .. provider .. " model = " .. tostring(id) .. " (this session)")
     else
-      straps.config.model = id
-      vim.notify("straps: model = " .. tostring(id))
+      if provider == "openai" then
+        straps.config.openai_model = id
+      else
+        straps.config.model = id
+      end
+      vim.notify("straps: " .. provider .. " model = " .. tostring(id))
     end
     pcall(vim.cmd, "redrawstatus!")
   end)
@@ -1266,21 +1316,6 @@ function M.pick_effort()
   end)
 end
 
---- Effective provider for a target: per-buffer override, else config.provider
---- (if pinned in setup), else the persisted file, else "anthropic".
-local function effective_provider(straps, bufnr)
-  if bufnr then
-    local p = vim.b[bufnr].straps_provider
-    if p and p ~= "" then return p end
-  end
-  if straps.config.provider and straps.config.provider ~= "" then
-    return straps.config.provider
-  end
-  local pref = require("straps.registry").try_call("fn.provider_pref")
-  if type(pref) == "string" and pref ~= "" then return pref end
-  return "anthropic"
-end
-
 --- Open a picker over the available backends (anthropic / openai). On a session
 --- buffer it sets the provider PER-BUFFER (vim.b straps_provider), session-only
 --- like :StrapsModel. Otherwise it sets the GLOBAL default AND persists it to
@@ -1306,6 +1341,9 @@ function M.pick_provider()
     if target and vim.api.nvim_buf_is_valid(target) then
       vim.b[target].straps_provider = choice
       vim.notify("straps: provider = " .. choice .. " (this session)")
+      vim.schedule(function()
+        vim.notify("straps: run :StrapsModel to pick this session's " .. choice .. " model")
+      end)
     else
       straps.config.provider = choice
       local _, err = require("straps.registry").try_call("fn.provider_pref", choice)
@@ -1315,6 +1353,9 @@ function M.pick_provider()
           vim.log.levels.WARN)
       else
         vim.notify("straps: provider = " .. choice .. " (persisted)")
+        vim.schedule(function()
+          vim.notify("straps: run :StrapsModel to pick the global " .. choice .. " model")
+        end)
       end
     end
     pcall(vim.cmd, "redrawstatus!")

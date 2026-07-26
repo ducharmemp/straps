@@ -496,11 +496,14 @@ Setting `provider` in `setup{}` pins it and wins over the file.
 it on: invoke `:StrapsModel` / `:StrapsEffort` **on a session buffer** and it
 sets that session's model/effort only (stored in `vim.b`, read by
 `fn.provider` in preference to the global config) — so you can run Opus in
-one session and a cheap model in another at the same time. Invoke it anywhere
-else and it sets the global `config.model` / `config.effort` default for new
-sessions. A subagent inherits its parent session's override by default, and
-`spawn` takes explicit `model` / `effort` args to override that (e.g. a Haiku
-research subagent under an Opus main session). The active model/effort shows
+one session and a cheap model in another at the same time. Anthropic and
+OpenAI session model overrides are separate (`b:straps_model` vs
+`b:straps_openai_model`), so switching provider never reuses the other
+provider's id. Invoke it anywhere else and it sets the provider-specific
+global model (`config.model` or `config.openai_model`) / `config.effort`
+default for new sessions. A subagent inherits its parent session's provider
+and matching model override by default, and `spawn` takes explicit `provider`,
+`model`, and `effort` args to override that. The active model/effort shows
 in a window-local **winbar** on each session window (a trailing `*` marks a
 session that diverges from the global default); set `config.session_winbar =
 false` to hide it, or drop `%{%v:lua.require'straps.ui'.session_status()%}`
@@ -509,24 +512,26 @@ into your own statusline.
 The same winbar also shows **live token usage** once the first response
 arrives — the context fill (e.g. `47.0k/200k (24%)`) and the cache hit rate
 (`cache 91%`), read from the last turn's `usage` on `vim.b.straps_usage`. The
-context window comes from the model's `context` field in `config.models` (or
-`config.context_window` as a fallback; an unknown model with neither shows the
-raw token count). `ui.usage_status()` is available for a manual statusline too.
+context window comes from the active provider's model-list `context` field
+(`config.models` or `config.openai_models`), or `config.context_window` as a
+fallback; an unknown model with neither shows the raw token count.
+`ui.usage_status()` is available for a manual statusline too.
 The real token count also drives auto-compaction (`config.auto_compact_tokens`)
 instead of a byte estimate.
 
 `:StrapsModel` performs **live model discovery**: it queries `GET
 /v1/models` (via `fn.list_models`) against **the backend you're actually
 using** — it resolves the effective provider the same way `fn.provider`
-does, so under the OpenAI provider you see GPT models, not Claude ones — and
-merges the result over `config.models`, so the menu reflects what your
+does, so under the OpenAI provider you see GPT models, not Claude ones. It
+merges the result over the provider-specific seed/cache (`config.models` for
+Anthropic, `config.openai_models` for OpenAI), so the menu reflects what your
 account can actually use; new models appear without a config edit. Your
 hand-curated `label`s win; live-only models are appended (Anthropic supplies
 a display name and a `thinking` tag inferred from its capabilities so
 extended thinking still works; OpenAI's catalog has neither, so the id is the
 label). If discovery fails (offline, bad key), it notifies and falls back to
-the static `config.models` — the picker never breaks. The merged list is
-written back to `config.models`.
+the matching static list — the picker never breaks. The merged list is
+written back to that provider's cache.
 
 `:StrapsResume!` (bang) opens the same picker over
 `state.list_sessions()` (newest first) and resumes whichever `*.straps`
@@ -570,6 +575,7 @@ Entries are Lua source strings compiled on define. Every call site does a
 by-name lookup, so redefining an entry changes behavior immediately.
 
 - `:StrapsRegistry` — list all entries; `<CR>` on a line opens it.
+- `:StrapsHelp [tag]` — open in-editor help for straps (default `:help straps`).
 - `:StrapsEdit <name>` — opens `straps://registry/<name>`, a Lua buffer
   containing the entry as an executable `registry.define{...}` chunk. Edit
   it and `:w` to redefine live. Works mid-run.
@@ -583,12 +589,14 @@ by-name lookup, so redefining an entry changes behavior immediately.
 
 The system prompt is layered, and every layer is a registry entry:
 
-- `fn.system_prompt_core` — identity, output norms, workflow, and the
+- `fn.system_prompt_core` — identity, output norms, workflow, editor-native
+  tool nudges (including LSP/status checks before refactors), and the
   self-extension guidance, including the concrete triggers the agent is
   taught to act on: the same manual step done twice means define a tool or
-  hook before the third time, and "always" / "every time" / "from now on"
-  from you means install the behavior in the registry rather than promise
-  to remember it.
+  hook before the third time; running a project's test/build/lint command
+  means defining a tiny session tool for the rest of that session; and
+  "always" / "every time" / "from now on" from you means install the
+  behavior in the registry rather than promise to remember it.
 - `fn.system_prompt_env` — a generated environment block: cwd, platform,
   Neovim version, date, and version control (jj or git, with branch and
   dirty/clean for git).
@@ -689,8 +697,9 @@ internal block shape). Pick it with `:StrapsProvider`, pin it in
 `setup{ provider = "openai" }`, or flip one session with
 `vim.b[bufnr].straps_provider`. The OpenAI backend reads `fn.openai_api_key`
 (`$OPENAI_API_KEY`, then `$XDG_CONFIG_HOME/straps/openai_api_key`), posts to
-`config.openai_base_url`, and uses `config.openai_model` (falling back to
-`config.model`) as the model id.
+`config.openai_base_url`, and uses `config.openai_model` as the model id
+(default `"gpt-5"`; it intentionally does not fall back to the Anthropic
+`config.model`).
 
 Each backend is itself a plain registry entry. To point one at a proxy,
 `:StrapsEdit fn.provider_anthropic` (or `_openai`), change the endpoint, `:w`:
@@ -712,57 +721,76 @@ entries; the defaults try the env var, then
 
 | Tool | Description |
 | --- | --- |
-| `read_file` | Read a file with numbered lines (offset/limit, capped ~2000 lines). |
+| `read_file` | Read a file through its live Neovim buffer with numbered lines (offset/limit, capped ~2000 lines), so unsaved edits are visible just like edit/write paths. |
 | `write_file` | Write a file (creates parent dirs) through its buffer, so the write enters the file's native undo history — revert with `u` / `:earlier` / undotree; fires `hook.after_write`. |
 | `edit_file` | Exact-string replacement applied through the file's buffer as one undoable step (revert with `u` / undotree); matches against the live buffer, so unsaved edits are seen; fires `hook.after_write`. |
-| `bash` | Run a shell command via `bash -lc`; returns exit code, stdout, stderr. |
+| `patch_file` | Structured line-range hunks (`start_line`, `end_line`, `new_text`, optional `expected_old_text`) applied through the live buffer as one undoable patch; use when ranges are known and exact-string matching is awkward. |
+| `path_info` / `tree` | Bounded filesystem metadata and directory-tree inspection without shelling out. |
+| `fetch_url` | Safe bounded http(s) fetch via curl: no ambient credentials, timeout/byte cap, optional redirects. |
+| `bash` | Run a shell command via `bash -lc`; returns exit code, stdout, stderr, and kills output floods after a bounded per-stream capture. |
+| `run_in_terminal` | Run a visible streaming `:terminal` command for long/interesting builds or tests. |
 | `run_quickfix` | Run a build/test/lint command and parse its output into the quickfix list via native `errorformat`; returns a compact exit-code + parsed-locations summary. |
 | `glob` | Expand a glob pattern (capped at 500 entries). |
 | `grep` | Search file contents (`rg` if available, else `grep -rn`); also populates the quickfix list. |
 | `bulk_replace` | Substitute across the current quickfix list via `:cdo` (undoable, confirm-gated, supports `dry_run`). |
 | `registry_list` | List registry entries: name, kind, doc, version. |
 | `registry_get` | Return an entry's full definition as executable Lua. |
-| `registry_define` | Define or redefine any registry entry. The self-extension tool. |
+| `registry_define` | Define or redefine any registry entry. Tool API names are validated before they can reach a provider request. The self-extension tool. |
+| `skill` | List/load prose knowledge entries (`skill.*`), distinct from capability entries (`tool.*`, `hook.*`, `fn.*`). |
 | `eval_lua` | Execute Lua inside Neovim; returns `vim.inspect` of the results. |
+| `help_search` | Search in-editor `:help` tags and excerpt the best match; use before writing Lua against Neovim APIs. |
+| `spawn` / `spawn_wait` | Launch subagents in their own session buffers and collect their final answers. |
 
-`write_file` and `edit_file` apply their change through the target file's
-buffer (loaded or reused if already open) and then write that buffer, so every
-agent edit lands in the file's native undo history — you revert it with `u`,
-`:earlier`, or undotree, right alongside your own edits, and an edit to a file
-you have open with unsaved changes stacks on top of those changes instead of
-clobbering them.
+`write_file`, `edit_file`, and `patch_file` apply their change through the
+target file's buffer (loaded or reused if already open) and then write that
+buffer, so every agent edit lands in the file's native undo history — you revert
+it with `u`, `:earlier`, or undotree, right alongside your own edits, and an edit
+to a file you have open with unsaved changes stacks on top of those changes
+instead of clobbering them.
 
 ### Editor-native tools
 
 These use the editor straps lives in — its LSP clients and tree-sitter
-parsers — instead of shelling out. All are read-only (auto-allowed by
-`hook.confirm`) and degrade to a clear message rather than erroring.
+parsers — instead of shelling out. Most are read-only (auto-allowed by
+`hook.confirm`) and degrade to a clear message rather than erroring; applying a
+`fix_diagnostic` action is a write and is confirm-gated.
 
 | Tool | Description |
 | --- | --- |
-| `diagnostics` | LSP/linter diagnostics for a file (or all loaded buffers) as `file:line:col: SEVERITY message [source]`. |
-| `definition` | Go-to-definition of the symbol at `{path, line, col}` (1-based) via the attached LSP client; returns `file:line:col`. |
-| `references` | All references to the symbol at `{path, line, col}` via the attached LSP client; deduped/sorted `file:line:col`. |
+| `diagnostics` | LSP/linter diagnostics for a file (or all loaded buffers) as `file:line:col: SEVERITY message [source]`; `quickfix=true` loads them into the findings list. |
+| `diagnostic_at` / `diagnostic_next` / `fix_diagnostic` | Position-oriented diagnostic helpers: inspect the diagnostic under a location, find the next/previous diagnostic, or list/apply diagnostic-specific fixes. |
+| `lsp_status` | Report whether an LSP client is attached/enabled for a file, including common supported methods. |
+| `declaration` / `definition` / `type_definition` / `implementation` | Navigate from `{path, line, col}` (1-based) via the attached LSP client; returns `file:line:col`, with `quickfix=true` to load locations into the findings list. |
+| `references` | All references to the symbol at `{path, line, col}` via the attached LSP client; deduped/sorted `file:line:col`, with `quickfix=true` support. |
+| `workspace_symbols` | Project-wide LSP symbol search; can also populate the findings list. |
+| `hover` | Type/documentation hover text at a position. |
 | `symbols` | Document outline of a file: `name  kind  L<start>-<end>` per symbol. |
+| `tree_sitter_status` / `node_at` / `read_node` | Parser, node, parent-chain, and enclosing-source introspection for agent investigations of syntax structure without requiring an LSP server. |
 | `read_symbol` | Read the source of a named function/class from a file (a targeted read, numbered like `read_file`). |
 
-The LSP tools (`definition`, `references`, and the fallback in `symbols`) need
-an attached LSP client for the file's filetype; they wait briefly for one to
-attach, bound every request with a timeout so a wedged server can't hang a run,
-and fall back gracefully (a tags lookup, then a clear "no LSP client" message)
-when none is available. The tree-sitter tools (`symbols`, `read_symbol`) work
-with no server at all — they parse the buffer directly and cover common
-languages, degrading to a clear message for filetypes with no parser.
+The LSP tools (`declaration`, `definition`, `type_definition`,
+`implementation`, `references`, `hover`, `workspace_symbols`, and the fallback
+in `symbols`) need an attached LSP client for the file's filetype; they wait
+briefly for one to attach, bound every request with a timeout so a wedged server
+can't hang a run, and fall back gracefully (a tags lookup where useful, then a
+clear "no LSP client" message) when none is available. `lsp_status` is the quick
+probe when the agent needs to know whether Neovim has a server for a file. The
+tree-sitter tools (`symbols`, `read_symbol`) work with no server at all — they
+parse the buffer directly and cover common languages, degrading to a clear
+message for filetypes with no parser.
 
 Alongside these, a few editor-native tools WRITE and so go through
 `hook.confirm` like `write_file`/`edit_file`: `rename_symbol` (semantic
 rename via `textDocument/rename`), `code_action` (list, then apply by index),
-`format`, and `move_file` — moves/renames a file on disk, and when an LSP
-client is attached and supports `workspace/willRenameFiles`, asks it first
-for a `WorkspaceEdit` fixing up references elsewhere (e.g. import paths)
-before the move, applied through each touched buffer's native undo, then
-notifies the server via `workspace/didRenameFiles` once the move is done.
-The move itself goes through `vim.lsp.util.rename`, so an open buffer on
+`format`, and `move_file`/`delete_file` — moves/renames or deletes a file on
+disk, and when an LSP client is attached and supports the relevant
+`workspace/will*Files` request, asks it first for a `WorkspaceEdit` fixing up
+references elsewhere (e.g. import paths) before the filesystem change. Server
+edits are guarded to stay under the current working
+directory, applied through each touched buffer's native undo, and saved only
+after the filesystem operation succeeds; the server is then notified via
+`workspace/didRenameFiles`. The move itself goes through
+`vim.lsp.util.rename`, so an open buffer on
 the file is renamed in place (undo history intact) rather than orphaned.
 No attached/capable server: a plain filesystem move, never an error.
 `move_files` is the bulk form — one call, an array of `{from, to}` pairs.
@@ -771,6 +799,9 @@ destination is free, no path reused) and nothing moves if any entry is
 invalid, so a single typo in a large batch can't leave a partial move.
 Files sharing a capable LSP client are sent to that server in ONE batched
 `workspace/willRenameFiles` request rather than one request per file.
+`delete_files` is the bulk delete form, with the same whole-batch validation and
+batched LSP notifications; deletion is intentionally not undo-tree reversible,
+so it refuses files with unsaved buffer changes.
 
 ### Presentation tools
 
@@ -863,10 +894,11 @@ for context that isn't tied to one option.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `provider` | unset (`nil`) | Which backend `fn.provider` dispatches to: `"anthropic"` or `"openai"`. `nil` means "not pinned here" — `fn.provider` then reads the choice persisted by `:StrapsProvider` (`~/.config/straps/provider`), falling back to `"anthropic"`. Setting it here pins the provider and wins over that file. Overridable per session buffer with `vim.b[bufnr].straps_provider`. |
-| `model` | `"claude-sonnet-5"` | Model id (Anthropic backend, and the fallback when `openai_model` is unset). |
+| `model` | `"claude-sonnet-5"` | Anthropic model id. |
 | `openai_base_url` | `"https://api.openai.com"` | Endpoint base for the OpenAI backend; point it at any OpenAI-compatible server or proxy. |
-| `openai_model` | unset | Model id sent when `provider = "openai"`; falls back to `model` when unset. |
-| `models` | see below | Static picker choices for `:StrapsModel`: `{ id, label?, thinking? }`. `thinking` is `"adaptive"` or `"budget"` (see Effort below); an unlisted/custom `model` sends no thinking block at all. `:StrapsModel` also does live discovery (`GET /v1/models`) and merges the account's real catalog over this list — so this is a seed of curated labels/overrides, not an exhaustive whitelist. |
+| `openai_model` | `"gpt-5"` | Model id sent when `provider = "openai"`; kept separate from the Anthropic `model` so switching providers never sends a Claude id to OpenAI. |
+| `models` | see below | Anthropic picker seed/cache for `:StrapsModel`: `{ id, label?, thinking? }`. `thinking` is `"adaptive"` or `"budget"` (see Effort below); an unlisted/custom Anthropic `model` sends no thinking block at all. Live discovery merges the account's real Anthropic catalog over this list. |
+| `openai_models` | see below | OpenAI picker seed/cache for `:StrapsModel`, separate from `models` so switching providers never shows stale Claude ids under OpenAI or stale GPT ids under Anthropic. |
 | `effort` | `"off"` | Name of the active entry in `config.efforts`; controls extended thinking. |
 | `efforts` | see below | Picker choices for `:StrapsEffort`: `{ name, level?, budget_tokens? }`. For models tagged `thinking = "adaptive"` (e.g. `claude-sonnet-5`, `claude-opus-4-8`), `level` becomes `output_config.effort` (`"low"`/`"medium"`/`"high"`/`"max"`). For models tagged `thinking = "budget"` (e.g. `claude-haiku-4-5-20251001`, `claude-opus-4-5-20251101`), `budget_tokens` becomes `thinking.budget_tokens`. These two mechanisms are mutually exclusive per model generation — sending the wrong one is a 400 — so pick whichever field applies to your model. `effort = "off"` sends no thinking block. |
 | `max_tokens` | `8192` | `max_tokens` per provider call. |

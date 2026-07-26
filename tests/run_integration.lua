@@ -39,7 +39,7 @@ local demo_path = tmp .. "/demo.txt"
 case("setup registers provider, tools, hooks", function()
   for _, name in ipairs({
     "fn.provider", "fn.build_tools", "fn.system_prompt", "fn.api_key",
-    "tool.write_file", "tool.registry_define", "hook.confirm", "hook.after_write",
+    "tool.write_file", "tool.read_file", "tool.registry_define", "hook.confirm", "hook.after_write",
   }) do
     assert(registry.get(name), "missing " .. name)
   end
@@ -212,6 +212,7 @@ do
   end
 
   case("pick_model sets config.model from a picked entry", function()
+    straps.config.provider = "anthropic"
     with_list_models("return function() return nil, 'stubbed offline' end", function()
       with_stub({ id = "claude-opus-4-8", label = "Opus 4.8" }, function()
         ui.pick_model()
@@ -219,6 +220,30 @@ do
     end)
     assert(straps.config.model == "claude-opus-4-8",
       "config.model is " .. tostring(straps.config.model))
+  end)
+
+  case("pick_model writes config.openai_model and uses only OpenAI models when OpenAI is active", function()
+    straps.config.provider = "openai"
+    straps.config.model = "claude-sonnet-5"
+    straps.config.openai_model = "gpt-5"
+    straps.config.openai_models = { { id = "gpt-5", label = "GPT-5" } }
+    local seen
+    with_list_models("return function(provider) _G.__last_model_provider = provider; return { { id = 'gpt-5-mini', label = 'gpt-5-mini' } } end", function()
+      ui.pick = function(items, opts, on_choice)
+        seen = items
+        on_choice({ id = "gpt-5-mini", label = "gpt-5-mini" })
+      end
+      ui.pick_model()
+      ui.pick = real_pick
+    end)
+    assert(_G.__last_model_provider == "openai", "pick_model did not request the OpenAI catalog")
+    assert(straps.config.openai_model == "gpt-5-mini",
+      "openai_model is " .. tostring(straps.config.openai_model))
+    assert(straps.config.model == "claude-sonnet-5", "OpenAI pick should not overwrite Anthropic config.model")
+    for _, m in ipairs(seen or {}) do
+      assert(not tostring(m.id):find("claude", 1, true), "OpenAI picker leaked Claude model: " .. vim.inspect(m))
+    end
+    straps.config.provider = "anthropic"
   end)
 
   case("pick_model cancel (nil choice) leaves config.model untouched", function()
@@ -262,14 +287,20 @@ end
       for _, m in ipairs(straps.config.models) do
         if m.id == "claude-fable-5" then persisted = m end
       end
+      local sonnet
+      for _, m in ipairs(straps.config.models) do
+        if m.id == "claude-sonnet-5" then sonnet = m end
+      end
       assert(persisted and persisted.thinking == "adaptive",
         "discovered model not persisted with its thinking tag")
+      assert(sonnet and sonnet.context == 200000,
+        "static context metadata was not preserved through merge")
     end)
     straps.config.models = {
-      { id = "claude-opus-4-8", label = "Opus 4.8 — most capable, slowest", thinking = "adaptive" },
-      { id = "claude-sonnet-5", label = "Sonnet 5 — balanced (default)", thinking = "adaptive" },
-      { id = "claude-sonnet-4-6", label = "Sonnet 4.6", thinking = "adaptive" },
-      { id = "claude-haiku-4-5-20251001", label = "Haiku 4.5 — fastest, cheapest", thinking = "budget" },
+      { id = "claude-opus-4-8", label = "Opus 4.8 — most capable, slowest", thinking = "adaptive", context = 200000 },
+      { id = "claude-sonnet-5", label = "Sonnet 5 — balanced (default)", thinking = "adaptive", context = 200000 },
+      { id = "claude-sonnet-4-6", label = "Sonnet 4.6", thinking = "adaptive", context = 200000 },
+      { id = "claude-haiku-4-5-20251001", label = "Haiku 4.5 — fastest, cheapest", thinking = "budget", context = 200000 },
     }
   end)
 
@@ -280,7 +311,7 @@ end
     assert(straps.config.effort == "high", "config.effort is " .. tostring(straps.config.effort))
   end)
 
-  case("pick_model on a session buffer sets it PER-BUFFER, not global", function()
+  case("pick_model on a session buffer sets the provider-specific PER-BUFFER slot", function()
     local sess = state.new_session()
     local prev = vim.api.nvim_get_current_buf()
     vim.api.nvim_set_current_buf(sess)
@@ -290,12 +321,25 @@ end
         ui.pick_model()
       end)
     end)
-    vim.api.nvim_set_current_buf(prev)
     assert(vim.b[sess].straps_model == "claude-fable-5",
-      "per-buffer model not set: " .. tostring(vim.b[sess].straps_model))
+      "per-buffer Anthropic model not set: " .. tostring(vim.b[sess].straps_model))
     assert(straps.config.model == "claude-sonnet-5",
       "global config.model was mutated (" .. tostring(straps.config.model)
         .. ") — should stay put when picking on a session buffer")
+
+    vim.b[sess].straps_provider = "openai"
+    straps.config.openai_model = "gpt-5"
+    with_list_models("return function(provider) _G.__last_session_model_provider = provider; return nil end", function()
+      with_stub({ id = "gpt-5-mini", label = "gpt-5-mini" }, function()
+        ui.pick_model()
+      end)
+    end)
+    vim.api.nvim_set_current_buf(prev)
+    assert(_G.__last_session_model_provider == "openai", "session OpenAI picker did not request OpenAI")
+    assert(vim.b[sess].straps_openai_model == "gpt-5-mini",
+      "per-buffer OpenAI model not set: " .. tostring(vim.b[sess].straps_openai_model))
+    assert(vim.b[sess].straps_model == "claude-fable-5", "OpenAI pick clobbered Anthropic per-buffer model")
+    assert(straps.config.openai_model == "gpt-5", "global openai_model was mutated on a session buffer")
   end)
 
   case("pick_effort on a session buffer sets it PER-BUFFER, not global", function()

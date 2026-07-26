@@ -15,11 +15,12 @@ M.config = {
   -- Overridable per session buffer with vim.b[bufnr].straps_provider, so two
   -- sessions can talk to different backends. "openai" reads fn.openai_api_key
   -- ($OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key), posts to
-  -- openai_base_url, and uses openai_model (falling back to `model`).
+  -- openai_base_url, and uses openai_model.
   provider = nil,
   openai_base_url = "https://api.openai.com",
-  -- Model id sent when provider == "openai"; nil falls back to `model`.
-  openai_model = nil,
+  -- Model id sent when provider == "openai". Keep this separate from the
+  -- Anthropic default `model` so selecting OpenAI never sends a Claude id.
+  openai_model = "gpt-5",
   model = "claude-sonnet-5",
   max_tokens = 8192,
   max_turns = 128,
@@ -87,8 +88,14 @@ M.config = {
     { id = "claude-sonnet-4-6", label = "Sonnet 4.6", thinking = "adaptive", context = 200000 },
     { id = "claude-haiku-4-5-20251001", label = "Haiku 4.5 — fastest, cheapest", thinking = "budget", context = 200000 },
   },
-  -- Fallback context window (tokens) for a model not found in `models` with a
-  -- `context` field — used only to render the winbar's context-fill percentage
+  -- OpenAI model picker seed/cache, kept separate from Anthropic `models` so
+  -- switching providers never shows or reuses the other provider's stale ids.
+  openai_models = {
+    { id = "gpt-5", label = "GPT-5" },
+    { id = "gpt-5-mini", label = "GPT-5 mini" },
+  },
+  -- Fallback context window (tokens) for a model not found in the active
+  -- provider's model list with a `context` field — used only to render the winbar's context-fill percentage
   -- (nothing is sent to the API). nil hides the percentage for unknown models.
   context_window = 200000,
 
@@ -196,11 +203,8 @@ function M.load_project_registry(opts)
     end
   end
 
-  -- Trusted (stored hash, explicit Yes, or trust_all): record the hash so
-  -- this exact content loads silently from now on, then execute it.
-  store[path] = hash
-  write_trust_store(store_path, store)
-
+  -- Trusted (stored hash, explicit Yes, or trust_all): execute first, then
+  -- record the hash only after this exact content successfully loads.
   local chunk, load_err = load(content, "@" .. path)
   if not chunk then
     pcall(vim.notify, "straps: " .. path .. " does not compile: "
@@ -213,6 +217,8 @@ function M.load_project_registry(opts)
       .. tostring(run_err), vim.log.levels.ERROR)
     return false, "error: " .. tostring(run_err)
   end
+  store[path] = hash
+  write_trust_store(store_path, store)
   project_loaded[key] = true
   return true, "loaded: " .. path
 end

@@ -109,12 +109,33 @@ case("model section reports model and effort pairing", function()
 end)
 
 case("API key section present; resolves a key when env is set", function()
-  local saved = vim.env.ANTHROPIC_API_KEY
+  local saved_key = vim.env.ANTHROPIC_API_KEY
+  local saved_provider = straps.config.provider
+  straps.config.provider = "anthropic"
   vim.env.ANTHROPIC_API_KEY = "sk-test-key-for-health"
   local rec = collect()
-  vim.env.ANTHROPIC_API_KEY = saved
-  assert(find(rec, "start", "straps: API key"), "API key section missing")
+  vim.env.ANTHROPIC_API_KEY = saved_key
+  straps.config.provider = saved_provider
+  assert(find(rec, "start", "straps: API key (anthropic)"), "API key section missing")
   assert(find(rec, "ok", "fn.api_key resolves a key"), "key should resolve")
+end)
+
+case("API key health follows the persisted OpenAI provider preference", function()
+  local saved_provider = straps.config.provider
+  local saved_xdg = vim.env.XDG_CONFIG_HOME
+  local saved_oai = vim.env.OPENAI_API_KEY
+  local prefdir = vim.fn.tempname()
+  vim.fn.mkdir(prefdir, "p")
+  vim.env.XDG_CONFIG_HOME = prefdir
+  straps.config.provider = nil
+  require("straps.registry").call("fn.provider_pref", "openai")
+  vim.env.OPENAI_API_KEY = "sk-openai-health"
+  local rec = collect()
+  straps.config.provider = saved_provider
+  vim.env.XDG_CONFIG_HOME = saved_xdg
+  vim.env.OPENAI_API_KEY = saved_oai
+  assert(find(rec, "start", "straps: API key (openai)"), "health did not select OpenAI")
+  assert(find(rec, "ok", "fn.openai_api_key resolves a key"), "OpenAI key should resolve")
 end)
 
 case("curl section present (dependency probe)", function()

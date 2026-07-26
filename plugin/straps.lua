@@ -130,6 +130,22 @@ vim.api.nvim_create_user_command("StrapsRegistry", function()
   require("straps.ui").registry_list()
 end, { desc = "straps: list registry entries" })
 
+vim.api.nvim_create_user_command("StrapsHelp", function(opts)
+  local tag = opts.args ~= "" and opts.args or "straps"
+  vim.cmd("help " .. vim.fn.escape(tag, "\\ |\""))
+end, {
+  nargs = "?",
+  complete = function(arglead)
+    local tags = {
+      "straps", "straps-commands", "straps-session", "straps-config",
+      "straps-registry", "straps-tools", "straps-hooks", "straps-fn",
+      "straps-skills", "straps-subagents", "straps-health",
+    }
+    return vim.tbl_filter(function(tag) return tag:find(arglead, 1, true) == 1 end, tags)
+  end,
+  desc = "straps: open :help straps (or a straps help tag)",
+})
+
 vim.api.nvim_create_user_command("StrapsAgents", function()
   require("straps.ui").pick_agents()
 end, { desc = "straps: pick a running agent/subagent and open its transcript" })
@@ -140,7 +156,7 @@ end, { desc = "straps: execute the current buffer as Lua" })
 
 vim.api.nvim_create_user_command("StrapsModel", function()
   require("straps.ui").pick_model()
-end, { desc = "straps: pick config.model via a picker (snacks.nvim if available)" })
+end, { desc = "straps: pick the provider-specific model via a picker (snacks.nvim if available)" })
 
 vim.api.nvim_create_user_command("StrapsEffort", function()
   require("straps.ui").pick_effort()

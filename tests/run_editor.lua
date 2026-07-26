@@ -28,7 +28,7 @@ require("straps").config.session_dir = vim.fn.tempname()
 
 local registry = require("straps.registry")
 require("straps.tools").register()  -- hook.confirm (with the auto-allow set)
-require("straps.editor").register() -- the five editor tools
+require("straps.editor").register() -- editor-native tools
 
 local unpack = unpack or table.unpack
 local function pack(...) return { n = select("#", ...), ... } end
@@ -74,8 +74,11 @@ end
 
 -- ---------------------------------------------------------------- registration
 
-case("all five tools registered as kind 'tool' with an input_schema", function()
-  for _, n in ipairs({ "diagnostics", "definition", "references", "symbols", "read_symbol" }) do
+case("editor read-only tools registered as kind 'tool' with an input_schema", function()
+  for _, n in ipairs({ "diagnostics", "diagnostic_at", "diagnostic_next", "lsp_status",
+    "declaration", "definition", "type_definition", "implementation", "references",
+    "tree_sitter_status", "node_at", "read_node", "symbols", "read_symbol",
+    "fix_diagnostic" }) do
     local e = registry.get("tool." .. n)
     assert(e, "tool." .. n .. " not registered")
     assert(e.kind == "tool", "tool." .. n .. " wrong kind: " .. tostring(e.kind))
@@ -106,6 +109,33 @@ case("diagnostics with no diagnostics returns 'no diagnostics'", function()
   write_file(path, "clean\n")
   local out = registry.call("tool.diagnostics", { path = path }, { bufnr = 0 })
   assert(out == "no diagnostics", "expected 'no diagnostics', got: " .. tostring(out))
+end)
+
+case("diagnostic_at and diagnostic_next expose position-oriented diagnostics", function()
+  local path = vim.fn.tempname() .. ".txt"
+  write_file(path, "one\ntwo\nthree\n")
+  local buf = vim.fn.bufadd(path)
+  vim.fn.bufload(buf)
+  local ns = vim.api.nvim_create_namespace("straps_test_diag_nav")
+  vim.diagnostic.set(ns, buf, {
+    { lnum = 0, col = 0, end_lnum = 0, end_col = 3, severity = vim.diagnostic.severity.ERROR, message = "first" },
+    { lnum = 2, col = 1, severity = vim.diagnostic.severity.WARN, message = "third" },
+  })
+  local at = registry.call("tool.diagnostic_at", { path = path, line = 1, col = 2 }, { bufnr = 0 })
+  assert(at:find("ERROR first", 1, true), "diagnostic_at missed covering diagnostic: " .. at)
+  local next_out = registry.call("tool.diagnostic_next", { path = path, line = 1, col = 3 }, { bufnr = 0 })
+  assert(next_out:find(":3:2: WARN third", 1, true), "diagnostic_next wrong: " .. next_out)
+  local prev_out = registry.call("tool.diagnostic_next", { path = path, line = 1, col = 1, direction = "prev" }, { bufnr = 0 })
+  assert(prev_out:find("WARN third", 1, true), "diagnostic prev wrap wrong: " .. prev_out)
+end)
+
+case("fix_diagnostic reports no diagnostic before asking LSP", function()
+  local path = vim.fn.tempname() .. ".txt"
+  write_file(path, "clean\n")
+  local out = drive(function(ctx)
+    return registry.call("tool.fix_diagnostic", { path = path, line = 1, col = 1 }, ctx)
+  end)
+  assert(out == "fix_diagnostic: no diagnostic at that position", "unexpected: " .. tostring(out))
 end)
 
 -- --------------------------------------------------------- symbols / read_symbol
@@ -140,6 +170,24 @@ else
     assert(out:find("M.beta", 1, true), "M.beta missing from outline:\n" .. out)
     assert(out:find("function", 1, true), "kind label missing:\n" .. out)
     assert(out:find("L%d+%-%d+"), "line range missing:\n" .. out)
+  end)
+
+  case("tree_sitter_status and node_at expose parser/node details", function()
+    local status = registry.call("tool.tree_sitter_status", { path = lua_path }, { bufnr = 0 })
+    assert(status:find("tree-sitter parser ready", 1, true), "status wrong:\n" .. status)
+    assert(status:find("root=chunk", 1, true) or status:find("root=source_file", 1, true), "root missing:\n" .. status)
+    local node = registry.call("tool.node_at", { path = lua_path, line = 3, col = 16 }, { bufnr = 0 })
+    assert(node:find("function", 1, true) or node:find("identifier", 1, true), "node type missing:\n" .. node)
+    assert(node:find("parents:", 1, true), "parent chain missing:\n" .. node)
+  end)
+
+  case("read_node returns an enclosing tree-sitter node with numbered lines", function()
+    local out = registry.call("tool.read_node", {
+      path = lua_path, line = 4, col = 9, ancestor = "function_declaration",
+    }, { bufnr = 0 })
+    assert(out:find("function_declaration", 1, true), "node header missing:\n" .. out)
+    assert(out:find("local function alpha()", 1, true), "node text missing:\n" .. out)
+    assert(out:match("\n%s*%d+\t"), "numbered lines missing:\n" .. out)
   end)
 
   case("read_symbol returns the body of a named function (numbered)", function()
@@ -178,6 +226,35 @@ case("references with no LSP client returns the graceful fallback", function()
     return registry.call("tool.references", { path = path, line = 1, col = 3 }, ctx)
   end)
   assert(out:find("no LSP client", 1, true), "expected no-client fallback, got: " .. tostring(out))
+end)
+
+case("declaration/type_definition/implementation no-client messages name the method", function()
+  local path = vim.fn.tempname() .. ".py"
+  write_file(path, "z = 3\n")
+  for _, n in ipairs({ "declaration", "type_definition", "implementation" }) do
+    local out = drive(function(ctx)
+      return registry.call("tool." .. n, { path = path, line = 1, col = 1 }, ctx)
+    end)
+    assert(out:find("no LSP client", 1, true), n .. " fallback wrong: " .. tostring(out))
+  end
+end)
+
+case("lsp_status reports no attached client for a file", function()
+  local path = vim.fn.tempname() .. ".py"
+  write_file(path, "z = 3\n")
+  local out = drive(function(ctx)
+    return registry.call("tool.lsp_status", { path = path }, ctx)
+  end)
+  assert(out:find("no LSP client attached", 1, true), "unexpected: " .. tostring(out))
+  assert(out:find("python", 1, true), "should include filetype: " .. tostring(out))
+end)
+
+case("expanded editor read-only tools are auto-allowed by hook.confirm", function()
+  for _, n in ipairs({ "diagnostic_at", "diagnostic_next", "lsp_status", "declaration",
+    "type_definition", "implementation", "tree_sitter_status", "node_at", "read_node" }) do
+    local allowed = registry.call("hook.confirm", n, {}, { bufnr = 0 })
+    assert(allowed == true, n .. " should be auto-allowed")
+  end
 end)
 
 -- ----------------------------------------------------------------- move_file
@@ -468,7 +545,7 @@ end)
 
 -- ----------------------------------------------------- hook.confirm auto-allow
 
-case("the five editor tools are auto-allowed by hook.confirm", function()
+case("core editor tools are auto-allowed by hook.confirm", function()
   for _, n in ipairs({ "diagnostics", "definition", "references", "symbols", "read_symbol" }) do
     local allowed = registry.call("hook.confirm", n, {}, { bufnr = 0 })
     assert(allowed == true, n .. " should be auto-allowed (no prompt), got: " .. tostring(allowed))

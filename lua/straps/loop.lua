@@ -22,6 +22,12 @@ local function get_config()
     -- spinning-catcher; max_turns is only the hard backstop, so it can be
     -- generous. 0 disables the detector (max_turns alone bounds the run).
     stall_limit = cfg.stall_limit or 6,
+    -- A turn that ends (no tool_use) with no visible text after a tool call is
+    -- the "runs a command then goes silent" symptom. Nudge the model up to
+    -- this many times per run to report/continue before ending the run loudly
+    -- with reason "blank". 0 disables the nudge (still ends loudly on the
+    -- first blank turn). max_tokens with no text always ends loudly, no nudge.
+    blank_nudge_limit = cfg.blank_nudge_limit or 1,
     max_tool_result_bytes = cfg.max_tool_result_bytes or 100000,
     -- Auto-compaction thresholds (both nil = off). Prefer auto_compact_tokens:
     -- with prompt caching on, a stable transcript is already cheap (cache
@@ -219,7 +225,8 @@ local function drain_steering(bufnr)
   return true
 end
 
--- Returns the run's ending reason: "ok" | "cancelled" | "max_turns" | "stalled".
+-- Returns the run's ending reason:
+-- "ok" | "cancelled" | "max_turns" | "stalled" | "blank".
 local function run_turns(bufnr, ctx, run)
   local registry = require("straps.registry")
   local state = require("straps.state")
@@ -247,6 +254,10 @@ local function run_turns(bufnr, ctx, run)
   run.stall = 0
   run.seen_calls = {}
   local stall_limit = cfg.stall_limit or 0
+  -- Blank-turn nudges used so far this run (a model that ends its turn with no
+  -- visible text after a tool call gets nudged, bounded by blank_nudge_limit).
+  run.blank_nudges = 0
+  local blank_nudge_limit = cfg.blank_nudge_limit or 0
 
   for turn = 1, max_turns do
     run.turns = turn
@@ -259,9 +270,13 @@ local function run_turns(bufnr, ctx, run)
     -- every turn) when keep_turns content alone already sits above the limit.
     if type(cfg.auto_compact_tokens) == "number" or type(cfg.auto_compact_bytes) == "number" then
       local bytes = vim.api.nvim_buf_get_offset(bufnr, vim.api.nvim_buf_line_count(bufnr))
-      -- Rough proxy: mixed code + JSON transcripts average ~3.5 bytes/token.
-      -- Users tune the threshold, so the divisor need only be in the ballpark.
-      local est_tokens = math.floor(bytes / 3.5)
+      -- Prefer the REAL context fill the API reported last turn (input_tokens
+      -- is the whole replayed prompt the model just saw) over a byte guess.
+      -- Only fall back to bytes/3.5 before the first response, when there is
+      -- no usage yet. Users tune the threshold, so the divisor need only be in
+      -- the ballpark.
+      local real = run.usage and tonumber(run.usage.input_billed)
+      local est_tokens = real or math.floor(bytes / 3.5)
       local over = (type(cfg.auto_compact_tokens) == "number" and est_tokens > cfg.auto_compact_tokens)
         or (type(cfg.auto_compact_bytes) == "number" and bytes > cfg.auto_compact_bytes)
       -- Coarseness guard: after a compaction, require ~20% growth before the
@@ -306,6 +321,29 @@ local function run_turns(bufnr, ctx, run)
       return cancelled_note()
     end
     assert(type(resp) == "table", "straps: fn.provider must return a table")
+
+    -- Thread token usage back into buffer state. The provider captures it per
+    -- response; accumulate it on the run and mirror it to vim.b so the winbar
+    -- and auto-compaction can read a REAL context-fill number instead of a
+    -- bytes/token guess. `input_tokens` is the size of the prompt the model
+    -- just saw (the whole replayed transcript), so it — not a running sum — is
+    -- the current context fill; cache_read/creation are the caching split.
+    if type(resp.usage) == "table" then
+      local u = resp.usage
+      local acc = run.usage or { requests = 0, output_total = 0 }
+      acc.requests = acc.requests + 1
+      acc.input = tonumber(u.input_tokens) or acc.input
+      acc.cache_read = tonumber(u.cache_read_input_tokens) or 0
+      acc.cache_creation = tonumber(u.cache_creation_input_tokens) or 0
+      acc.output = tonumber(u.output_tokens) or 0
+      acc.output_total = acc.output_total + (tonumber(u.output_tokens) or 0)
+      -- The billed input side = fresh input + both cache tiers; the ratio of
+      -- cache_read to that total is the cache hit rate the winbar shows.
+      acc.input_billed = (acc.input or 0) + acc.cache_read + acc.cache_creation
+      run.usage = acc
+      pcall(function() vim.b[bufnr].straps_usage = acc end)
+      pcall(function() vim.cmd("redrawstatus!") end)
+    end
 
     -- Two phases: append EVERY tool_use marker first, THEN execute each and
     -- append its result. The transcript then replays as ONE assistant
@@ -375,9 +413,57 @@ local function run_turns(bufnr, ctx, run)
     end
 
     if resp.stop_reason ~= "tool_use" then
-      -- A steering message typed while the model streamed its final answer
-      -- still gets acted on: drain, and if anything arrived, keep looping.
-      if not drain_steering(bufnr) then
+      -- Blank final turn: the model ended (no tool_use) but produced no
+      -- visible text — the "runs a command then returns silence" symptom. A
+      -- normal end_turn carries an answer; an empty one is an anomaly, not a
+      -- clean success, so it must not read as one. Two causes, handled apart:
+      --   * max_tokens with nothing visible: the response budget (often the
+      --     thinking budget under load) was consumed before any answer — a
+      --     loud, distinct ending, never a silent "ok".
+      --   * blank end_turn: the model just trailed off. Nudge it once (a
+      --     synthetic user turn) to report or continue; only escalate to the
+      --     loud ending if it stays blank past config.blank_nudge_limit.
+      -- A turn that ran tools THIS turn is not silent — it did visible work,
+      -- even if the model reported end_turn without prose. Only a turn with no
+      -- tool calls AND no visible text is the "returns silence" symptom.
+      local has_text = false
+      for _, block in ipairs(resp.content or {}) do
+        local t = (block.type == "text" and block.text)
+          or ((block.type == "thinking" or block.type == "redacted_thinking") and block.thinking)
+        if type(t) == "string" and t:match("%S") then
+          has_text = true
+          break
+        end
+      end
+      if n_calls == 0 and not has_text then
+        if resp.stop_reason == "max_tokens" then
+          state.append(bufnr, "assistant", nil,
+            "[straps: the model hit max_tokens without producing a visible answer"
+              .. " — the response budget (likely the thinking budget) was consumed"
+              .. " before any text. Raise config.max_tokens or lower the effort,"
+              .. " then send a message to continue.]")
+          log(bufnr, { ev = "blank_end", cause = "max_tokens", turn = turn })
+          return "blank"
+        end
+        -- Blank end_turn: nudge, bounded by config.blank_nudge_limit.
+        if run.blank_nudges < blank_nudge_limit then
+          run.blank_nudges = run.blank_nudges + 1
+          state.append(bufnr, "user", nil,
+            "[straps] Your last turn produced no text after the tool call."
+              .. " Report the result of what you just ran, or continue the task.")
+          log(bufnr, { ev = "blank_nudge", turn = turn, attempt = run.blank_nudges })
+          -- fall through to the continue below (do NOT return)
+        else
+          state.append(bufnr, "assistant", nil,
+            ("[straps: the model returned no text after %d nudge(s) — it keeps"
+              .. " ending its turn silently. Send a message to steer, or raise"
+              .. " config.blank_nudge_limit.]"):format(run.blank_nudges))
+          log(bufnr, { ev = "blank_end", cause = "end_turn", turn = turn })
+          return "blank"
+        end
+      elseif not drain_steering(bufnr) then
+        -- A steering message typed while the model streamed its final answer
+        -- still gets acted on: drain, and if anything arrived, keep looping.
         return "ok"
       end
     end
@@ -417,7 +503,7 @@ function M.start(bufnr)
       pcall(state.append, bufnr, "assistant", nil, "straps: run error: " .. tostring(ret))
     end
     -- done fires on every exit; run_turns names its own ending
-    -- ("ok" | "cancelled" | "max_turns" | "stalled"), a crash is "error".
+    -- ("ok" | "cancelled" | "max_turns" | "stalled" | "blank"), crash = "error".
     local reason = ok and (ret or "ok") or "error"
     log(bufnr, { ev = "run_end", reason = reason, turns = run.turns })
     progress(bufnr, ctx, { type = "done", reason = reason }, "")

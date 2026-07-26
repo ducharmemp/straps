@@ -1,0 +1,473 @@
+*straps.txt*	A minimal, redefinable coding-agent harness inside Neovim
+
+Author:  straps.nvim
+License: same as Neovim
+
+==============================================================================
+CONTENTS						*straps* *straps.nvim*
+
+	1. Introduction .......................... |straps-introduction|
+	2. Setup ................................. |straps-setup|
+	3. Commands .............................. |straps-commands|
+	4. The session buffer .................... |straps-session|
+	5. Configuration ......................... |straps-config|
+	6. The registry .......................... |straps-registry|
+	7. Tools ................................. |straps-tools|
+	8. Hooks ................................. |straps-hooks|
+	9. Core functions (fn.*) ................. |straps-fn|
+	10. Skills ............................... |straps-skills|
+	11. Subagents ............................ |straps-subagents|
+	12. Health ............................... |straps-health|
+	13. Highlight groups ..................... |straps-highlights|
+
+==============================================================================
+1. INTRODUCTION						*straps-introduction*
+
+straps.nvim is a small, legible harness for coding agents that live inside
+Neovim. Three invariants govern the whole design:
+
+1. Buffers are state. The conversation transcript IS a buffer in a parseable
+   marker format. Each turn the loop re-parses the buffer to build the API
+   request, so editing history, the system prompt, or an old message is a
+   first-class action — the buffer is canonical.
+
+2. Everything is late-bound and redefinable. Every tool, hook, the provider
+   and the key loop functions are entries in a registry, stored as Lua source
+   strings, compiled on define and looked up by name at every call. A
+   redefinition takes effect on the very next call, even mid-run.
+   See |straps-registry|.
+
+3. The agent can extend itself. The agent has registry introspection and a
+   define tool, and the tool list sent to the API is rebuilt from the registry
+   every call, so a tool the agent defines in one turn is callable the next.
+
+Requirements: Neovim >= 0.11, and `curl` on $PATH. No other dependencies.
+Run |:checkhealth| straps to verify your install — see |straps-health|.
+
+==============================================================================
+2. SETUP						*straps-setup*
+
+						*straps.setup()*
+>lua
+	require("straps").setup({
+	  model = "claude-sonnet-5",
+	  max_tokens = 8192,
+	})
+<
+`setup()` merges your options into |straps-config|, then registers the default
+provider, tools, editor tools and UI. It is idempotent: registration uses
+`define_default`, which skips names that already exist, so a redefinition
+(yours or the agent's) survives a re-run of `setup()`.
+
+The API key is read by |fn.api_key|: `$ANTHROPIC_API_KEY` first, then the
+first line of `$XDG_CONFIG_HOME/straps/api_key` (which must be chmod 600).
+
+The commands work without `setup()` (they `require` lazily), but folding, the
+`gf` mapping and rendering are only fully wired once `setup()` has run.
+
+==============================================================================
+3. COMMANDS						*straps-commands*
+
+							*:Straps*
+:Straps			Open a new session buffer in a split and put the
+			cursor on the trailing user block. See
+			|straps-session|.
+
+							*:StrapsResume*
+:StrapsResume [{name}]	Resume a saved session. No argument resumes the most
+			recent; an argument is a session basename (completed
+			from saved sessions) or a path.
+:StrapsResume!		Open a picker over all saved sessions
+			(|vim.ui.select|, or snacks.nvim when present).
+
+							*:StrapsSend*
+:StrapsSend		Send the current session buffer as-is. If a run is
+			already active, prompt for a steering message
+			(|straps-steering|) instead. Also bound to <CR> in a
+			session buffer. Errors if the trailing user block is
+			empty, or if the transcript ends on an assistant
+			message (unsupported prefill).
+
+							*:StrapsSteer*
+:StrapsSteer {text}	Queue {text} as a steering message on the active run
+			(|straps-steering|).
+
+							*:StrapsStop*
+:StrapsStop		Request cancellation of the active run. The run
+			notices between turns and between tool calls, kills an
+			in-flight request or `bash` process, and ends with a
+			note appended to the transcript.
+
+							*:StrapsCompact*
+:StrapsCompact		Mechanically compact the current transcript — shrink
+			old tool_use/tool_result contents in place — and
+			notify the summary. See |fn.compact|.
+
+							*:StrapsEdit*
+:StrapsEdit {name}	Open registry entry {name} (e.g. `fn.render`,
+			`hook.confirm`, `tool.bash`) as an executable Lua
+			buffer. Writing the buffer (|:w|) re-executes it,
+			redefining the entry. Completion lists every entry.
+			See |straps-registry|.
+
+							*:StrapsRegistry*
+:StrapsRegistry		Open a scratch listing of every registry entry;
+			<CR> on a line opens that entry with |:StrapsEdit|.
+
+							*:StrapsEval*
+:StrapsEval		Execute the current buffer as Lua.
+
+							*:StrapsAgents*
+:StrapsAgents		Picker over running agents and subagents; picking one
+			brings its transcript on-screen to watch or steer.
+			See |straps-subagents|.
+
+							*:StrapsModel*
+:StrapsModel		Pick the model for the current session (or the global
+			default off a non-session buffer). Does live discovery
+			via |fn.list_models| and merges your account catalog
+			over |straps-config| `models`.
+
+							*:StrapsEffort*
+:StrapsEffort		Pick the extended-thinking effort (off/low/medium/high
+			by default) for the current session or globally.
+
+==============================================================================
+4. THE SESSION BUFFER					*straps-session*
+
+A session is a single ordinary buffer — there is no separate compose window.
+You type your message directly under the trailing `%%[straps:user]%%` marker,
+the same buffer the loop reads and appends to. Editing earlier history before
+you send is intentional, not an accident.
+
+Sessions are durable: the buffer is backed by a real file under
+|straps-config| `session_dir` (`*.straps`), persisted at every block boundary,
+so it survives a restart and |:StrapsResume| just reopens it.
+
+Buffer-local mappings (normal mode):
+	<CR>	Send, or prompt to steer if a run is active (|:StrapsSend|).
+	gf	Open the `path:line[:col]` reference under the cursor. Also
+		active in any hand-opened `*.straps` file.
+
+Transcript grammar. Blocks are marker lines `%%[straps:KIND]%%` (with compact
+JSON attrs for tool blocks) followed by content; KIND is one of
+`system user assistant tool_use tool_result`. `fn.render` (|straps-fn|) draws a
+display-only layer of conceal + extmarks + folds over the raw markers; nothing
+mutates the buffer text. `:set conceallevel=0` reveals the raw markers, and
+|straps-config| `render = false` turns the whole layer off.
+
+							*straps-steering*
+Steering. A message sent while a run is active is queued (not started as a new
+run) and drained into the transcript at the next turn boundary, so the model
+acts on it mid-flight. |:StrapsSteer| queues directly; <CR>/|:StrapsSend|
+prompt for the text.
+
+Progress. While a run is active a virtual-text indicator on the last line
+shows the phase, elapsed time, stream liveness and the stop/steer hints. The
+policy is the redefinable |hook.on_progress|.
+
+Winbar. Session windows get a window-local winbar showing the effective model,
+effort and run status, plus live token usage once the first response arrives —
+the context fill (e.g. 47.0k/200k (24%)) and cache hit rate, from
+`ui.usage_status()`. Disable with |straps-config| `session_winbar = false`.
+
+==============================================================================
+5. CONFIGURATION					*straps-config*
+
+Pass these to |straps.setup()|. Defaults shown.
+
+						*straps-config-model*
+model			(string) "claude-sonnet-5". The request model.
+max_tokens		(number) 8192. Response token cap.
+max_turns		(number) 128. Hard backstop on turns per run; a
+			visible note is appended when hit.
+stall_limit		(number) 6. End a run after this many CONSECUTIVE
+			stalled turns (every tool call errored, or a
+			(tool,input) call repeated). 0 disables the detector.
+blank_nudge_limit	(number) 1. Catches a turn that ends with no tool
+			call and no visible text ("runs a command then
+			returns silence"). Nudges the model to report or
+			continue up to this many times, then ends loudly
+			with reason "blank". A blank max_tokens turn ends
+			loudly with no nudge. 0 skips the nudge.
+max_tool_result_bytes	(number) 100000. Tool results larger than this are
+			truncated with a note.
+cache			(boolean) true. Anthropic prompt caching via
+			cache_control breakpoints. Set false for strict
+			servers that reject unknown fields.
+cache_ttl		(string|nil) nil (5-minute default TTL). "1h" opts
+			into the 1-hour extended TTL on every breakpoint.
+compact_keep_turns	(number) 2. Assistant turns |fn.compact| keeps intact.
+after_write_diagnostics	(boolean) true. Default |hook.after_write|: feed the
+			attached LSP's ERROR/WARN diagnostics for a written file
+			back into the tool result. false makes the hook a no-op.
+after_write_diagnostics_ms (number) 800. How long that hook waits for the
+			language server to re-lint before reporting.
+instructions_files	(list) {}. Extra memory files included in the system
+			prompt after AGENTS.md/CLAUDE.md.
+session_dir		(string|nil) nil -> stdpath("data")/straps/sessions.
+			Where `*.straps` transcripts are written.
+auto_compact_tokens	(number|nil) nil (off). Auto-compact when the estimated
+auto_compact_bytes	context passes this threshold. Both off by default.
+render			(boolean) true. Master switch for the |fn.render|
+			presentation layer.
+tools_expanded		(boolean) false. Fold tool blocks OPEN by default.
+session_winbar		(boolean) true. Window-local winbar on session windows.
+models			(list) 4 curated entries { id, label?, thinking?,
+			context? }. The |:StrapsModel| seed; `thinking` is
+			"adaptive" or "budget" (which extended-thinking
+			mechanism the model speaks) and `context` is its token
+			window (for the winbar's context-fill %). An unlisted
+			model sends no thinking block.
+context_window		(number|nil) 200000. Fallback token window for a model
+			with no `context` in `models`, used only to render the
+			winbar's context-fill percentage. nil hides the %.
+effort			(string) "off". Name of the active |:StrapsEffort|
+			entry.
+efforts			(list) off/low/medium/high, each { name, level?,
+			budget_tokens? }.
+base_url		(string|nil) nil -> https://api.anthropic.com. Prefixes
+			/v1/messages, so a compatible proxy is a config knob.
+provider		(string|nil) nil. Backend for |fn.provider|: "anthropic"
+			or "openai". nil -> the |:StrapsProvider| persisted
+			choice (~/.config/straps/provider) else "anthropic".
+			Per session via b:straps_provider.
+openai_base_url		(string|nil) nil -> https://api.openai.com. Prefixes
+			/v1/chat/completions for the OpenAI backend.
+openai_model		(string|nil) nil. Model id when provider == "openai";
+			falls back to `model`.
+request_timeout_ms	(number) 300000. Idle watchdog: kill a request whose
+			stream is silent this long.
+log_file		(string|nil) nil (off). Structured JSONL event log; see
+			|fn.log|.
+
+Per-session overrides live in buffer variables (b:straps_model,
+b:straps_effort, ...) set by |:StrapsModel| / |:StrapsEffort| on a session
+buffer, so two sessions can run different models at once.
+
+==============================================================================
+6. THE REGISTRY						*straps-registry*
+
+The registry is the heart of the plugin. Every tool, hook and core function is
+an entry: a Lua source string, compiled on define, looked up by name at every
+call site. Names are namespaced `tool.<name>`, `hook.<name>`, `fn.<name>`,
+`skill.<name>`.
+
+Scoping. Entries are global by default. A running session can hold
+session-scoped shadows that override a global entry for that session (and its
+subagents) and vanish when the session closes — the sandbox the agent
+experiments in. `registry.remove` drops global entries only.
+
+Versioning. Redefining an entry bumps its `version`; the first-define `seq` is
+preserved so the API tool array stays append-only (prompt-cache stable). The
+previous source is not retained — there is no built-in rollback; keep your own
+copy, or re-render with |:StrapsEdit|.
+
+Persistence. A trusted `.straps.lua` at the project root is loaded
+automatically at session start (direnv-style sha256 trust; you are prompted,
+defaulting to No, on new or changed content). It is plain Lua:
+`registry.define{...}` calls, which is exactly what `registry.render(name)`
+emits — so appending a |:StrapsEdit| buffer's content to `.straps.lua` keeps
+an entry across restarts. See |straps-health| for the trust state.
+
+Inspect and edit from Lua:
+>lua
+	local reg = require("straps").registry
+	reg.names("tool")          -- list tool names
+	print(reg.render("fn.render"))  -- the entry as executable Lua
+<
+Or from the agent's own tools: `registry_list`, `registry_get`,
+`registry_define` (|straps-tools|).
+
+==============================================================================
+7. TOOLS						*straps-tools*
+
+Tools are what the agent calls. Every one is a registry entry (|:StrapsEdit
+tool.NAME|) and every write goes through |hook.confirm|. The defaults:
+
+File & shell:
+	read_file, write_file, edit_file, glob, grep, bash,
+	run_in_terminal, run_quickfix, move_file(s), delete_file(s)
+
+Editor-native (tree-sitter / LSP, degrade gracefully with no server):
+	diagnostics, definition, references, hover, symbols, read_symbol,
+	workspace_symbols, code_action, rename_symbol, format, bulk_replace
+
+Presentation & interaction:
+	show_user, show_diff, show_buffer, set_quickfix, context, ask_user,
+	undo_edit
+
+Self-extension & orchestration:
+	registry_list, registry_get, registry_define, skill, eval_lua,
+	spawn, spawn_wait (|straps-subagents|)
+
+Writes (write_file/edit_file and the LSP refactors) apply THROUGH the file's
+buffer, so they land in the file's native undo tree — the user reverts with
+|u|, |:earlier| or undotree, and `undo_edit` can revert a specific past edit.
+
+Run |:StrapsRegistry| for the live list with one-line docs, or `registry_list`
+from the agent side.
+
+==============================================================================
+8. HOOKS						*straps-hooks*
+
+Hooks are the "always do X" seams. Each is a registry entry you can redefine
+(|:StrapsEdit hook.NAME|). Redefining "always"-shaped behavior into a hook
+beats remembering to repeat it.
+
+						*hook.confirm*
+hook.confirm(name, input, ctx) -> allowed, reason
+		The permission gate, called before every tool. Default:
+		auto-allow the read-only tools; otherwise prompt (Yes / No /
+		Always this tool / for edits, Always in <dir> / Always all
+		edits), showing a diff for file edits. Grants persist in
+		b:straps_allowed. Never loosen this on the agent's initiative.
+
+						*hook.after_write*
+hook.after_write(path, ctx) -> string|nil
+		Called after write_file / edit_file. If it returns a string it
+		is appended to the tool result. The default feeds the editor's
+		own LSP back to the agent: it waits briefly for the language
+		server to re-lint the just-written file, then returns its
+		ERROR/WARN diagnostics, so the agent sees breakage it caused
+		without being asked. No client on the file, or no new
+		diagnostics, appends nothing. Turn off with
+		|straps-config| `after_write_diagnostics = false`, or redefine
+		it to run an external linter instead.
+
+						*hook.on_run_start*
+						*hook.on_run_end*
+hook.on_run_start(ctx) / hook.on_run_end(ctx)
+		Called when a run starts / ends (always, including error and
+		cancel). No-ops by default; redefine for setup/teardown or
+		notifications.
+
+						*hook.on_progress*
+hook.on_progress(ev, ctx)
+		Progress display policy. Default draws the virt-text indicator
+		on the session buffer. `ev.type` is one of `start` `thinking`
+		(with `turn`, `max`) `tool` (with `name`) `tool_done` (with
+		`name`, `is_error`) `steer_queued` `done` (with `reason`).
+		Redefine to reroute to vim.notify, fidget.nvim, etc.
+
+						*hook.before_tool*
+						*hook.after_tool*
+hook.before_tool(name, input, ctx)
+hook.after_tool(name, input, result, ok, ctx) -> result?
+		Optional seams around each tool call (not registered by
+		default). before_tool runs after confirm; after_tool may
+		transform the result string it returns.
+
+==============================================================================
+9. CORE FUNCTIONS (fn.*)				*straps-fn*
+
+The machinery itself, exposed as redefinable entries.
+
+						*fn.provider*
+fn.provider(req, ctx) -> { content, stop_reason, usage }
+		A DISPATCHER: selects a backend (b:straps_provider ->
+		config `provider` -> |fn.provider_pref| file -> "anthropic")
+		and delegates to |fn.provider_anthropic| or
+		|fn.provider_openai|. See |:StrapsProvider|.
+						*fn.provider_anthropic*
+fn.provider_anthropic(req, ctx)	The Anthropic Messages API over streaming SSE
+		via curl. Prompt caching, extended thinking, idle watchdog,
+		429/529 retry with backoff.
+						*fn.provider_openai*
+fn.provider_openai(req, ctx)	The OpenAI Chat Completions API over streaming
+		SSE via curl. Translates the request/response to and from the
+		same block shape; Bearer auth via |fn.openai_api_key|, endpoint
+		config `openai_base_url`, reasoning_effort from config `efforts`.
+						*fn.provider_pref*
+fn.provider_pref(value?)	Read (no arg) or write (a string) the persisted
+		provider choice at $XDG_CONFIG_HOME/straps/provider. Written by
+		|:StrapsProvider|; read by |fn.provider| as the default.
+						*fn.api_key*
+fn.api_key() -> string		Resolve the Anthropic API key (see |straps-setup|).
+						*fn.openai_api_key*
+fn.openai_api_key() -> string	Resolve the OpenAI API key ($OPENAI_API_KEY,
+		then $XDG_CONFIG_HOME/straps/openai_api_key, chmod 600).
+						*fn.list_models*
+fn.list_models() -> entries	Live GET /v1/models for |:StrapsModel|.
+						*fn.build_tools*
+fn.build_tools() -> tools	Map every tool.* entry to an API tool def.
+						*fn.system_prompt*
+fn.system_prompt()		Compose the system prompt from its layers:
+				fn.system_prompt_core / _env / _project /
+				_skills, each redefinable on its own.
+						*fn.render*
+fn.render(bufnr)		The transcript presentation pass (conceal +
+				extmarks + folds). No-op it for raw markers.
+						*fn.tool_display*
+fn.tool_display(name, input)	Format a tool call as a command-style line.
+						*fn.compact*
+fn.compact(bufnr, opts?)	Mechanically shrink old tool block contents;
+				returns a summary. |:StrapsCompact|.
+						*fn.log*
+fn.log(ev)			Append a JSONL event to |straps-config|
+				`log_file` (no-op when unset).
+						*fn.autocmd_bridge*
+fn.autocmd_bridge(spec)		Bridge a Neovim autocmd back into a session as
+				a user/steering message — the "editor talks to
+				the agent" seam.
+
+==============================================================================
+10. SKILLS						*straps-skills*
+
+A skill is knowledge, not capability: stored prose (a procedure, a subsystem's
+true shape) loaded into the conversation when its trigger matches. Skills are
+`skill.*` registry entries; the agent lists them with the `skill` tool and
+loads one by name. Define one with `registry_define` (kind "skill", source =
+the prose). Contrast with tools/hooks/fns, which add capability.
+
+==============================================================================
+11. SUBAGENTS						*straps-subagents*
+
+`spawn` launches a subagent in its own session buffer and returns immediately
+with a handle; the child runs concurrently. `spawn_wait` blocks on one or more
+handles and returns their final answers — waiting on N children costs the
+slowest, not the sum. Issue N `spawn` calls in one turn to fan out.
+
+A child is a full session: its transcript is a real buffer the user can open
+(`show = true`), watch and steer. It inherits the parent's registry view but
+anything it defines lands in its own scope. Use it to isolate a broad
+investigation so the parent transcript keeps only the conclusion.
+
+|:StrapsAgents| lists running agents and their parents.
+
+==============================================================================
+12. HEALTH						*straps-health*
+
+						*straps-checkhealth*
+>vim
+	:checkhealth straps
+<
+Diagnoses everything that can be wrong before a session runs: the Neovim
+version, `curl` (and optional ripgrep), the API key (including a group/other
+readable key file), a writable `session_dir`, the tree-sitter `straps` parser
+and its queries, the `.straps.lua` trust state, the loaded registry (entry
+counts, redefinitions, missing core entries), the model/effort pairing, and
+any runs still in flight. Every probe is isolated, so the report runs even
+when `setup()` never ran or the data dir is unwritable.
+
+==============================================================================
+13. HIGHLIGHT GROUPS					*straps-highlights*
+
+All groups link by default (`hi default link`) to standard groups, so they
+follow your colorscheme; a user `hi link` wins and survives a re-apply.
+
+	StrapsRoleUser		Function	user turn rule + role tag
+	StrapsRoleAgent		Keyword		assistant (Cinch) rule + tag
+	StrapsRoleSystem	Comment		system tag (dim)
+	StrapsTool		Special		tool glyph + name
+	StrapsToolOk		DiagnosticOk	good result mark
+	StrapsToolError		DiagnosticError	is_error mark
+	StrapsRule		Comment		turn rules
+	StrapsCardBorder	Comment		expanded-tool box art
+	StrapsWinbar		StatusLine	session-window winbar
+	StrapsFileRef		Underlined	path:line references
+
+The `@straps.marker.*` and `@straps.esc` tree-sitter captures mirror these for
+the parser-based highlighting engine.
+
+ vim:tw=78:ts=8:noet:ft=help:norl:

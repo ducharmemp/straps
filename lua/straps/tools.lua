@@ -296,7 +296,10 @@ end
       .. " clearly labeled sections: exit code, stdout, stderr. Never use this"
       .. " tool to search or read files: use the grep tool instead of shell"
       .. " grep/rg (it also populates the user's quickfix list), the glob tool"
-      .. " instead of find/ls, and read_file instead of cat/head/tail."
+      .. " instead of find/ls, and read_file instead of cat/head/tail. For a"
+      .. " build/test/lint command whose output is compiler/linter-style"
+      .. " diagnostics, prefer run_quickfix — it parses them into the user's"
+      .. " quickfix list and returns a compact summary instead of a wall of text."
       .. " Parameters:"
       .. " command (required) — the shell command line to execute; timeout_ms"
       .. " (optional, default 120000) — the process is killed if it runs longer"
@@ -474,6 +477,133 @@ return function(input, ctx)
     .. "\noutput:\n" .. table.concat(out_lines, "\n")
     .. (closed and "\n[terminal split closed]"
       or "\n[terminal split left open — the user can close it with :q]")
+end
+]==],
+  })
+
+  -- ------------------------------------------------------------- run_quickfix
+
+  define({
+    name = "tool.run_quickfix",
+    kind = "tool",
+    doc = "Run a shell command (a build, a test run, a linter, a typecheck) and"
+      .. " parse its output into Neovim's quickfix list through Vim's native"
+      .. " errorformat, then open it — so a failing build lands as :cnext/:cprev"
+      .. " navigable file:line entries in the user's editor instead of a wall of"
+      .. " text in the transcript. Use this instead of bash/run_in_terminal when"
+      .. " the command emits compiler/linter-style diagnostics you want the user"
+      .. " to step through. The result the agent sees is a compact summary: exit"
+      .. " code and the parsed entries as `file:line:col: message` (capped),"
+      .. " which is far smaller than raw output. Parameters: command (required)"
+      .. " — the shell command, run via bash -lc; errorformat (optional) — a Vim"
+      .. " 'errorformat' string describing the output (e.g."
+      .. " \"%f:%l:%c: %m\" for `file:line:col: message`); when omitted, the"
+      .. " editor's current &errorformat is used. title (optional) — quickfix"
+      .. " list title. timeout_ms (optional, default 300000). open (optional,"
+      .. " default true) — open the quickfix window when there are entries.",
+    input_schema = {
+      type = "object",
+      properties = {
+        command = { type = "string", description = "Shell command to run with bash -lc." },
+        errorformat = { type = "string", description = "Vim 'errorformat' describing the command output; omit to use the editor's current &errorformat." },
+        title = { type = "string", description = "Quickfix list title (default: the command)." },
+        timeout_ms = { type = "integer", description = "Timeout in milliseconds (default 300000)." },
+        open = { type = "boolean", description = "Open the quickfix window when there are entries (default true)." },
+      },
+      required = { "command" },
+    },
+    source = [==[
+return function(input, ctx)
+  local cmd = input.command
+  if type(cmd) ~= "string" or cmd == "" then
+    error("run_quickfix: command must be a non-empty string")
+  end
+  local timeout_ms = tonumber(input.timeout_ms) or 300000
+
+  local res = ctx.await(function(resolve)
+    local proc = vim.system(
+      { "bash", "-lc", cmd },
+      { text = true, timeout = timeout_ms },
+      function(out) resolve(out) end)
+    if ctx.on_cancel then
+      ctx.on_cancel(function() pcall(function() proc:kill(9) end) end)
+    end
+  end)
+
+  -- Diagnostics land on either stream (compilers use stderr, many test
+  -- runners stdout); feed both, in that order, to the errorformat parser.
+  local raw = (res.stdout or "") .. (res.stderr or "")
+  local lines = vim.split(raw, "\n", { plain = true })
+  while #lines > 0 and lines[#lines] == "" do
+    table.remove(lines)
+  end
+
+  local title = (type(input.title) == "string" and input.title ~= "" and input.title)
+    or ("straps: " .. cmd)
+  -- Parse with the native errorformat machinery: the given efm, else the
+  -- editor's current &errorformat. getqflist({lines, efm}) never touches the
+  -- real list, so we can filter to valid entries before setting it.
+  local parse_opts = { lines = lines, title = title }
+  if type(input.errorformat) == "string" and input.errorformat ~= "" then
+    parse_opts.efm = input.errorformat
+  end
+  local parsed = vim.fn.getqflist(parse_opts)
+  local all = parsed.items or {}
+  local valid = {}
+  for _, it in ipairs(all) do
+    -- valid==1 means the efm matched a real location; drop noise lines.
+    if it.valid == 1 and (it.bufnr and it.bufnr > 0 or it.filename) then
+      valid[#valid + 1] = it
+    end
+  end
+
+  -- Replace THIS session's findings list with the valid entries (session
+  -- window's location list when on-screen — isolated from other sessions —
+  -- else the global quickfix list). A genuine empty result clears it, so a
+  -- passing build visibly empties a prior failure's list.
+  local open = input.open
+  if open == nil then open = true end
+  local list_kind = "quickfix"
+  do
+    local ok, kind = pcall(function()
+      return require("straps.ui").set_locations(ctx and ctx.bufnr, { title = title, items = valid }, open)
+    end)
+    if ok and kind then list_kind = kind end
+  end
+  local nav = (list_kind == "loclist") and ":lnext/:lprev" or ":cnext/:cprev"
+
+  -- Compact summary for the agent: the exit code and the parsed locations,
+  -- NOT the raw output (which is what the list is for). Cap the listing.
+  local out = { "exit code: " .. tostring(res.code) }
+  if res.code == 124 then
+    out[#out] = out[#out] .. " (killed: exceeded timeout of " .. timeout_ms .. " ms)"
+  end
+  if #valid == 0 then
+    out[#out + 1] = list_kind .. ": no entries parsed (0 diagnostics)"
+    if raw:match("%S") and not (type(input.errorformat) == "string" and input.errorformat ~= "") then
+      out[#out + 1] = "note: output was non-empty but matched no errorformat entry —"
+        .. " pass an explicit `errorformat` describing this command's output."
+    end
+  else
+    out[#out + 1] = ("%s: %d entr%s (%s) — the user can step them with %s")
+      :format(list_kind, #valid, #valid == 1 and "y" or "ies", title, nav)
+    local cap = 100
+    for i = 1, math.min(#valid, cap) do
+      local it = valid[i]
+      local name = it.filename
+      if (not name or name == "") and it.bufnr and it.bufnr > 0 then
+        name = vim.api.nvim_buf_get_name(it.bufnr)
+      end
+      name = name and vim.fn.fnamemodify(name, ":.") or "?"
+      local typ = (it.type and it.type ~= "") and (it.type .. " ") or ""
+      out[#out + 1] = string.format("%s:%d:%d: %s%s",
+        name, it.lnum or 0, it.col or 0, typ, (it.text or ""):gsub("^%s+", ""))
+    end
+    if #valid > cap then
+      out[#out + 1] = ("[... %d more; see the %s list]"):format(#valid - cap, list_kind)
+    end
+  end
+  return table.concat(out, "\n")
 end
 ]==],
   })
@@ -873,8 +1003,14 @@ return function(input, ctx)
   -- dividers, so they fall through this match — only real matches enter the
   -- quickfix list.
   local title = "straps: grep " .. tostring(input.pattern)
+  -- Route to THIS session's findings list (its window's location list when
+  -- on-screen — private to the session — else the global quickfix list).
+  local set_kind = "quickfix"
   local function set_qf(items)
-    pcall(vim.fn.setqflist, {}, " ", { title = title, items = items })
+    local ok, kind = pcall(function()
+      return require("straps.ui").set_locations(ctx and ctx.bufnr, { title = title, items = items }, false)
+    end)
+    if ok and kind then set_kind = kind end
   end
   local function parse_items(text)
     local items = {}
@@ -926,13 +1062,16 @@ end
   define({
     name = "tool.bulk_replace",
     kind = "tool",
-    doc = "Substitute text across the CURRENT quickfix list — the set the grep"
-      .. " tool populates — as a single native multi-file edit. Runs Vim's"
-      .. " `:cdo s/<pattern>/<replacement>/<flags> | update` over every quickfix"
-      .. " entry, editing each file THROUGH its buffer so the changes enter each"
+    doc = "Substitute text across the CURRENT findings list — the set the grep"
+      .. " tool populates for THIS session — as a single native multi-file edit."
+      .. " Runs Vim's `:ldo`/`:cdo s/<pattern>/<replacement>/<flags> | update`"
+      .. " over every entry, editing each file THROUGH its buffer so the changes"
+      .. " enter each"
       .. " file's native undo history (revert with `u`, `:earlier`, or undotree in"
-      .. " that buffer). Populate the quickfix list with the grep tool first; an"
-      .. " empty quickfix list is an error. This is a WRITE tool and prompts for"
+      .. " that buffer). Populate the list with the grep tool first; an"
+      .. " empty list is an error. (Each session has its OWN findings list when"
+      .. " on-screen, so concurrent sessions never edit each other's target set.)"
+      .. " This is a WRITE tool and prompts for"
       .. " confirmation. Parameters: pattern (required) — a Vim :s search pattern"
       .. " (Vim regex, NOT rg/PCRE); replacement (required) — the replacement"
       .. " text (Vim :s syntax, e.g. \\1 backreferences); flags (optional, default"
@@ -961,9 +1100,13 @@ return function(input, ctx)
     error("bulk_replace: replacement must be a string")
   end
 
-  local qf = vim.fn.getqflist()
+  -- Read THIS session's findings list: its window's location list when the
+  -- session is on-screen (private, so concurrent sessions never stomp each
+  -- other's target set), else the global quickfix list.
+  local ui = require("straps.ui")
+  local qf, list_kind = ui.get_locations(ctx and ctx.bufnr)
   if type(qf) ~= "table" or #qf == 0 then
-    return "quickfix list is empty — run grep first to populate it"
+    return "findings list is empty — run grep first to populate it"
   end
 
   -- Distinct files behind the quickfix entries (by resolved buffer number).
@@ -978,8 +1121,8 @@ return function(input, ctx)
 
   if input.dry_run then
     return string.format(
-      "dry_run: would substitute over %d quickfix entr%s across %d file%s (no changes made)",
-      #qf, #qf == 1 and "y" or "ies", #bufs, #bufs == 1 and "" or "s")
+      "dry_run: would substitute over %d %s entr%s across %d file%s (no changes made)",
+      #qf, list_kind, #qf == 1 and "y" or "ies", #bufs, #bufs == 1 and "" or "s")
   end
 
   -- Use '#' as the :s delimiter and escape only that in pattern/replacement, so
@@ -1002,8 +1145,8 @@ return function(input, ctx)
     ticks[b] = vim.api.nvim_buf_get_changedtick(b)
   end
 
-  local ex = string.format("silent cdo s#%s#%s#%s | update", pat, rep, flags)
-  local ok, err = pcall(vim.cmd, ex)
+  local body = string.format("s#%s#%s#%s | update", pat, rep, flags)
+  local ok, err = ui.locations_do(ctx and ctx.bufnr, body)
   if not ok then
     -- Never leak a raw Vim error as the tool result; wrap it clearly.
     return "bulk_replace: substitution failed: " .. tostring(err)
@@ -1019,9 +1162,9 @@ return function(input, ctx)
   end
 
   return string.format(
-    "bulk_replace: applied `s#%s#%s#%s` across the quickfix list; %d file%s changed"
+    "bulk_replace: applied `s#%s#%s#%s` across the %s list; %d file%s changed"
     .. " — undo with u in each buffer",
-    pat, rep, flags, changed, changed == 1 and "" or "s")
+    pat, rep, flags, list_kind, changed, changed == 1 and "" or "s")
 end
 ]==],
   })
@@ -1328,7 +1471,8 @@ end
       .. " the read-only tools (read_file, glob, grep, registry_list,"
       .. " registry_get, diagnostics, definition, references, symbols,"
       .. " read_symbol, hover, workspace_symbols, context, show_user,"
-      .. " help_search, ask_user, code_action in list mode i.e. without"
+      .. " show_diff, show_buffer, set_quickfix, help_search, ask_user,"
+      .. " code_action in list mode i.e. without"
       .. " index, and undo_edit in history mode);"
       .. " otherwise prompt via vim.fn.confirm. For"
       .. " file-editing tools (write_file, edit_file) a unified diff of the"
@@ -1357,6 +1501,9 @@ return function(name, input, ctx)
     symbols = true, read_symbol = true, hover = true,
     workspace_symbols = true, context = true, show_user = true,
     help_search = true,
+    -- presentation tools: they open views / set the quickfix list but change
+    -- no files, exactly like show_user.
+    show_diff = true, show_buffer = true, set_quickfix = true,
     -- ask_user IS user interaction; gating it behind a confirm dialog would
     -- be asking permission to ask a question.
     ask_user = true,
@@ -1548,13 +1695,91 @@ end
     kind = "hook",
     doc = "Called as (path, ctx) after write_file or edit_file completes. If it"
       .. " returns a string, that string is appended to the tool result the"
-      .. " agent sees. Ships as a no-op returning nil. This is the canonical"
-      .. " 'always do X after Y' seam: e.g. redefine it to run a linter on the"
-      .. " written file and return the diagnostics, and every write will"
-      .. " automatically feed lint results back to the agent.",
+      .. " agent sees. The default feeds the editor's own LSP back to the agent:"
+      .. " it waits briefly (bounded, async) for the language server to re-lint"
+      .. " the file it just changed, then returns any ERROR/WARN diagnostics so"
+      .. " the agent sees breakage it caused without having to ask. No LSP client"
+      .. " on the file, or no new diagnostics, returns nil (nothing appended)."
+      .. " Turn it off with config.after_write_diagnostics = false, or redefine"
+      .. " this hook (it is the canonical 'always do X after Y' seam — e.g. run"
+      .. " an external linter instead and return its output).",
     source = [==[
 return function(path, ctx)
-  -- no-op by default; redefine me (e.g. run a linter and return its output)
+  -- Editor-native lint feedback: after the edit (which already sent the LSP a
+  -- didChange via the buffer's on_lines callbacks), wait for diagnostics to
+  -- settle and report the file's ERROR/WARN. Every failure path returns nil so
+  -- a write is never turned into an error by its own feedback loop.
+  local ok, out = pcall(function()
+    local cfg = {}
+    local sok, straps = pcall(require, "straps")
+    if sok and type(straps) == "table" and rawget(straps, "config") then
+      cfg = straps.config
+    end
+    if cfg.after_write_diagnostics == false then return nil end
+
+    local buf = vim.fn.bufnr(path)
+    if buf < 0 or not vim.api.nvim_buf_is_valid(buf)
+      or not vim.api.nvim_buf_is_loaded(buf) then
+      return nil
+    end
+    -- No language server attached -> nothing to report (the file may just be a
+    -- filetype with no server, which is not a problem).
+    local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
+    if #(get_clients({ bufnr = buf }) or {}) == 0 then return nil end
+
+    local timeout = tonumber(cfg.after_write_diagnostics_ms) or 800
+
+    -- Wait for a DiagnosticChanged on this buffer (the server's re-lint), with
+    -- a hard cap. Prefer ctx.await (yields the coroutine, never blocks the UI);
+    -- fall back to vim.wait if the hook is somehow called outside a run.
+    local function settle(finish_after)
+      local settled, aug, tmr = false, nil, nil
+      local function finish()
+        if settled then return end
+        settled = true
+        if aug then pcall(vim.api.nvim_del_autocmd, aug) end
+        if tmr then pcall(function() tmr:stop(); tmr:close() end) end
+        finish_after()
+      end
+      aug = vim.api.nvim_create_autocmd("DiagnosticChanged", {
+        callback = function(args)
+          -- Debounce: diagnostics often arrive in a short burst; take the last.
+          if args.buf == buf then vim.defer_fn(finish, 120) end
+        end,
+      })
+      tmr = vim.defer_fn(finish, timeout)
+      if ctx and ctx.on_cancel then ctx.on_cancel(finish) end
+    end
+
+    if ctx and ctx.await then
+      ctx.await(function(resolve) settle(resolve) end)
+    else
+      local done = false
+      settle(function() done = true end)
+      vim.wait(timeout + 200, function() return done end, 30)
+    end
+
+    if not vim.api.nvim_buf_is_valid(buf) then return nil end
+    local sev = vim.diagnostic.severity
+    local names = { [sev.ERROR] = "ERROR", [sev.WARN] = "WARN" }
+    local diags = vim.diagnostic.get(buf, { severity = { min = sev.WARN } }) or {}
+    if #diags == 0 then return nil end
+    table.sort(diags, function(a, b)
+      if (a.lnum or 0) ~= (b.lnum or 0) then return (a.lnum or 0) < (b.lnum or 0) end
+      return (a.col or 0) < (b.col or 0)
+    end)
+    local rel = vim.fn.fnamemodify(path, ":.")
+    local lines = { ("diagnostics after write (%d):"):format(#diags) }
+    for _, d in ipairs(diags) do
+      local source = (d.source and d.source ~= "") and (" [" .. d.source .. "]") or ""
+      lines[#lines + 1] = string.format("%s:%d:%d: %s %s%s",
+        rel, (d.lnum or 0) + 1, (d.col or 0) + 1,
+        names[d.severity] or "WARN", tostring(d.message or ""), source)
+    end
+    return table.concat(lines, "\n")
+  end)
+  if not ok then return nil end
+  return out
 end
 ]==],
   })

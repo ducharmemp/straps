@@ -258,7 +258,7 @@ case("bulk_replace with an empty quickfix list returns the error string", functi
   vim.fn.setqflist({}, "r") -- empty it
   local out = registry.call("tool.bulk_replace",
     { pattern = "FOO", replacement = "BAR" }, { bufnr = 0 })
-  assert(out == "quickfix list is empty — run grep first to populate it",
+  assert(out == "findings list is empty — run grep first to populate it",
     "unexpected empty-list message: " .. tostring(out))
 end)
 
@@ -267,6 +267,78 @@ case("bulk_replace is NOT in hook.confirm's auto-allow set (it is a write)", fun
   -- fall through to a prompt. Headless, vim.fn.confirm returns 0 -> denied.
   local allowed = registry.call("hook.confirm", "bulk_replace", { pattern = "a", replacement = "b" }, { bufnr = 0 })
   assert(allowed ~= true, "bulk_replace must not be auto-allowed by hook.confirm")
+end)
+
+-- ---------------------------------------------------------- session isolation
+
+-- Two on-screen sessions must not stomp each other's findings list: each
+-- session's grep goes to ITS window's location list, and bulk_replace on that
+-- session edits only that session's files — never the global quickfix list.
+case("concurrent sessions get isolated per-window findings lists", function()
+  local state = require("straps.state")
+  -- Build two files, one per "session".
+  local dir = vim.fn.tempname(); vim.fn.mkdir(dir, "p")
+  local fa, fb = dir .. "/sa.txt", dir .. "/sb.txt"
+  for _, f in ipairs({ fa, fb }) do
+    local h = assert(io.open(f, "w")); h:write("target\ntarget\n"); h:close()
+  end
+
+  -- Two session buffers, each in its own window.
+  vim.cmd("only")
+  local sa = state.new_session()
+  vim.api.nvim_set_current_buf(sa)
+  local wa = vim.api.nvim_get_current_win()
+  vim.cmd("vsplit")
+  local sb = state.new_session()
+  vim.api.nvim_set_current_buf(sb)
+  local wb = vim.api.nvim_get_current_win()
+
+  -- Put a stomping value in the GLOBAL quickfix list — neither session should
+  -- touch it.
+  vim.fn.setqflist({}, " ", { title = "global-untouched",
+    items = { { filename = "/nope", lnum = 1, text = "x" } } })
+
+  local ui = require("straps.ui")
+  assert(ui.session_win(sa) == wa, "session_win(sa) wrong")
+  assert(ui.session_win(sb) == wb, "session_win(sb) wrong")
+
+  -- Each session sets its own findings list (as grep/set_quickfix do).
+  ui.set_locations(sa, { title = "A", items = { { filename = fa, lnum = 1, col = 1, text = "target" } } }, false)
+  ui.set_locations(sb, { title = "B", items = { { filename = fb, lnum = 1, col = 1, text = "target" } } }, false)
+
+  -- Isolation: each window's location list holds only its own file; the global
+  -- quickfix list is untouched.
+  assert(vim.fn.getloclist(wa)[1].bufnr ~= 0, "A loclist empty")
+  assert(vim.fn.getqflist({ title = 1 }).title == "global-untouched",
+    "global quickfix list was stomped by a session")
+  local la = vim.fn.getloclist(wa, { title = 1 }).title
+  local lb = vim.fn.getloclist(wb, { title = 1 }).title
+  assert(la == "A" and lb == "B", "loclists crossed: A=" .. la .. " B=" .. lb)
+
+  -- bulk_replace on session A edits ONLY A's file, reading A's loclist.
+  local out = registry.call("tool.bulk_replace",
+    { pattern = "target", replacement = "HIT" }, { bufnr = sa })
+  assert(out:find("loclist", 1, true), "bulk_replace should report the loclist: " .. out)
+  assert(table.concat(vim.fn.readfile(fa), ","):find("HIT", 1, true), "A's file not edited")
+  assert(not table.concat(vim.fn.readfile(fb), ","):find("HIT", 1, true),
+    "B's file was edited by A's bulk_replace — isolation failed")
+
+  vim.cmd("only")
+end)
+
+-- Windowless session (a subagent): falls back to the global quickfix list,
+-- which is the pre-existing behavior (no worse than before).
+case("windowless session falls back to the global quickfix list", function()
+  local state = require("straps.state")
+  vim.cmd("only")
+  local s = state.new_session()
+  -- Do NOT show it in any window.
+  local ui = require("straps.ui")
+  assert(ui.session_win(s) == nil, "expected no window for the hidden session")
+  local kind = ui.set_locations(s, { title = "fallback",
+    items = { { filename = "/tmp/x", lnum = 1, text = "y" } } }, false)
+  assert(kind == "quickfix", "windowless session should use the global quickfix list")
+  assert(vim.fn.getqflist({ title = 1 }).title == "fallback", "global list not set")
 end)
 
 print(failed and "FAILED" or "ALL PASS")

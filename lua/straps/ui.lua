@@ -429,6 +429,81 @@ function M.open_file_ref()
   return true
 end
 
+-- Per-session findings lists (quickfix isolation) ---------------------------
+-- The quickfix list is GLOBAL to the Neovim instance, so two concurrent
+-- sessions populating it would stomp each other — and bulk_replace, which acts
+-- on "the current list", could then edit another session's files. Fix: when a
+-- session is on-screen, route its findings to that WINDOW's location list
+-- (per-window, private); fall back to the global quickfix list only when the
+-- session has no window (e.g. a windowless subagent), which is the pre-existing
+-- global behavior and no worse than today.
+
+--- The window showing session buffer `bufnr`, or nil. Non-floating, and
+--- deterministic (lowest win id) so a grep and the later bulk_replace on the
+--- same session resolve to the SAME window's location list.
+function M.session_win(bufnr)
+  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
+    return nil
+  end
+  local wins = vim.fn.win_findbuf(bufnr)
+  if type(wins) ~= "table" then
+    return nil
+  end
+  table.sort(wins)
+  for _, w in ipairs(wins) do
+    if vim.api.nvim_win_is_valid(w)
+        and vim.api.nvim_win_get_config(w).relative == "" then
+      return w
+    end
+  end
+  return nil
+end
+
+--- Set this session's findings list. `what` = { title, items }. Uses the
+--- session window's location list when on-screen (isolated per session), else
+--- the global quickfix list. `open` opens the matching list window when there
+--- are entries. Returns "loclist" or "quickfix" (so callers can name the right
+--- :lnext/:cnext navigation).
+function M.set_locations(bufnr, what, open)
+  local win = M.session_win(bufnr)
+  local title = what.title
+  local items = what.items or {}
+  if win then
+    pcall(vim.fn.setloclist, win, {}, " ", { title = title, items = items })
+    if open and #items > 0 then
+      pcall(vim.fn.win_execute, win, "lopen")
+    end
+    return "loclist"
+  end
+  pcall(vim.fn.setqflist, {}, " ", { title = title, items = items })
+  if open and #items > 0 then
+    pcall(function() vim.cmd("botright copen") end)
+  end
+  return "quickfix"
+end
+
+--- Read this session's findings list. Returns items(list), kind, win-or-nil.
+function M.get_locations(bufnr)
+  local win = M.session_win(bufnr)
+  if win then
+    return vim.fn.getloclist(win), "loclist", win
+  end
+  return vim.fn.getqflist(), "quickfix", nil
+end
+
+--- Run an ex substitution across this session's findings list: `:ldo` in its
+--- window (private) when on-screen, else `:cdo` globally. `body` is the part
+--- after the do-command, e.g. "s#a#b#ge | update". Returns ok, err, kind.
+function M.locations_do(bufnr, body)
+  local win = M.session_win(bufnr)
+  if win then
+    local ok, err = pcall(vim.fn.win_execute, win, "silent ldo " .. body)
+    return ok, err, "loclist"
+  end
+  local ok, err = pcall(vim.cmd, "silent cdo " .. body)
+  return ok, err, "quickfix"
+end
+
 -- Buffer-local gf that understands the path:line references straps agents
 -- are prompted to emit (and that grep results carry). Native gf remains the
 -- fallback for plain paths without a :line suffix.
@@ -703,6 +778,61 @@ function M.session_status()
   return out
 end
 
+--- A compact usage segment for a session buffer: context fill and cache hit
+--- rate from the last response's token usage (vim.b.straps_usage, set by the
+--- loop). "" when there is no usage yet or off a session buffer. Kept
+--- self-contained so a manual statusline can use it too.
+function M.usage_status()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local u
+  pcall(function() u = vim.b[bufnr].straps_usage end)
+  if type(u) ~= "table" or not u.input_billed or u.input_billed <= 0 then
+    return ""
+  end
+  local ok, straps = pcall(require, "straps")
+  local cfg = (ok and type(straps) == "table" and straps.config) or {}
+
+  -- Resolve the model's context window: the per-model `context` field, else
+  -- config.context_window. nil -> show the raw token count without a percent.
+  local model
+  pcall(function() model = vim.b[bufnr].straps_model end)
+  model = (model and model ~= "" and model) or cfg.model
+  local window
+  if type(cfg.models) == "table" then
+    for _, m in ipairs(cfg.models) do
+      if type(m) == "table" and m.id == model then
+        window = tonumber(m.context)
+        break
+      end
+    end
+  end
+  window = window or tonumber(cfg.context_window)
+
+  local function human(n)
+    if n >= 1000 then
+      local s = string.format("%.1fk", n / 1000)
+      s = s:gsub("%.0k$", "k")
+      return s
+    end
+    return tostring(n)
+  end
+
+  local seg
+  if window and window > 0 then
+    local pct = math.floor((u.input_billed / window) * 100 + 0.5)
+    seg = string.format("%s/%s (%d%%)", human(u.input_billed), human(window), pct)
+  else
+    seg = human(u.input_billed) .. " ctx"
+  end
+  -- Cache hit rate = cached read / total input side, when caching did anything.
+  local cached = (u.cache_read or 0)
+  if cached > 0 and u.input_billed > 0 then
+    seg = seg .. string.format(" · cache %d%%",
+      math.floor((cached / u.input_billed) * 100 + 0.5))
+  end
+  return seg
+end
+
 --- Winbar for a session window: the active model/effort (session_status) plus
 --- a right-aligned run status (running/idle). Auto-installed on session windows
 --- unless config.session_winbar = false; also usable manually via
@@ -715,8 +845,10 @@ function M.session_winbar()
   local run = "idle"
   pcall(function() run = vim.b[vim.api.nvim_get_current_buf()].straps_status or "idle" end)
   local left = "straps" .. status
+  local usage = M.usage_status()
+  local mid = (usage ~= "") and (usage .. "  ") or ""
   local right = (run == "running") and "● running" or "○ idle"
-  return "%#StrapsWinbar#" .. left .. "%=" .. right .. " "
+  return "%#StrapsWinbar#" .. left .. "%=" .. mid .. right .. " "
 end
 
 -- BufWriteCmd for straps://registry/<name>: execute the buffer as Lua.
@@ -1134,7 +1266,60 @@ function M.pick_effort()
   end)
 end
 
--- Foldexpr for session buffers. A tool_use marker opens a level-1 fold and the
+--- Effective provider for a target: per-buffer override, else config.provider
+--- (if pinned in setup), else the persisted file, else "anthropic".
+local function effective_provider(straps, bufnr)
+  if bufnr then
+    local p = vim.b[bufnr].straps_provider
+    if p and p ~= "" then return p end
+  end
+  if straps.config.provider and straps.config.provider ~= "" then
+    return straps.config.provider
+  end
+  local pref = require("straps.registry").try_call("fn.provider_pref")
+  if type(pref) == "string" and pref ~= "" then return pref end
+  return "anthropic"
+end
+
+--- Open a picker over the available backends (anthropic / openai). On a session
+--- buffer it sets the provider PER-BUFFER (vim.b straps_provider), session-only
+--- like :StrapsModel. Otherwise it sets the GLOBAL default AND persists it to
+--- $XDG_CONFIG_HOME/straps/provider (fn.provider_pref) so the choice survives
+--- restarts — the durable twin of the key files in the same directory.
+function M.pick_provider()
+  local ok, straps = pcall(require, "straps")
+  if not ok or type(straps) ~= "table" then
+    return notify_err("straps: config not available (call require('straps').setup() first)")
+  end
+  local providers = { "anthropic", "openai" }
+  local target = session_target_buf()
+  local current = effective_provider(straps, target)
+  M.pick(providers, {
+    prompt = target and "straps: select provider (this session)" or "straps: select provider (global, persisted)",
+    format_item = function(p)
+      return (p == current and "* " or "  ") .. p
+    end,
+  }, function(choice)
+    if not choice then
+      return
+    end
+    if target and vim.api.nvim_buf_is_valid(target) then
+      vim.b[target].straps_provider = choice
+      vim.notify("straps: provider = " .. choice .. " (this session)")
+    else
+      straps.config.provider = choice
+      local _, err = require("straps.registry").try_call("fn.provider_pref", choice)
+      if err then
+        vim.notify("straps: provider = " .. choice
+          .. " (this Neovim only — could not persist: " .. tostring(err) .. ")",
+          vim.log.levels.WARN)
+      else
+        vim.notify("straps: provider = " .. choice .. " (persisted)")
+      end
+    end
+    pcall(vim.cmd, "redrawstatus!")
+  end)
+end
 -- following tool_result stays inside it, so one tool call collapses to a single
 -- colored summary line (foldtext). The system block also folds (it is long and
 -- rarely re-read): its marker opens a fold that runs until the next marker. Any

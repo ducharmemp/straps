@@ -25,6 +25,11 @@ vim.env.ANTHROPIC_API_KEY = "test-key-not-real"
 local straps = require("straps").setup({})
 -- Hermetic: durable sessions write under a throwaway dir, never the real data dir.
 straps.config.session_dir = vim.fn.tempname()
+-- Hermetic backend: this suite exercises the Anthropic SSE path via run_session;
+-- pin the provider so a developer's persisted ~/.config/straps/provider (which
+-- fn.provider would otherwise consult) can't route these turns to OpenAI. The
+-- OpenAI-specific sections set config.provider = "openai" locally and restore it.
+straps.config.provider = "anthropic"
 local registry = require("straps.registry")
 local state = require("straps.state")
 local loop = require("straps.loop")
@@ -778,9 +783,13 @@ printf '\nSTRAPS_HTTP_STATUS:200\n'
 do
   local saved_path = vim.env.PATH
   local saved_base = straps.config.base_url
+  local saved_provider = straps.config.provider
   vim.env.PATH = tmp .. "/models:" .. real_path
   vim.env.ANTHROPIC_API_KEY = "test-key-not-real"
   straps.config.base_url = "http://straps-models.invalid"
+  -- Pin Anthropic: discovery now follows the effective provider, and the host
+  -- running the tests may have a persisted openai preference or config.
+  straps.config.provider = "anthropic"
 
   local models, err = registry.call("fn.list_models")
 
@@ -808,6 +817,7 @@ do
 
   vim.env.PATH = saved_path
   straps.config.base_url = saved_base
+  straps.config.provider = saved_provider
 end
 
 case("fn.list_models returns (nil, err) on HTTP failure, never throws", function()
@@ -816,15 +826,263 @@ case("fn.list_models returns (nil, err) on HTTP failure, never throws", function
 printf '%s\nSTRAPS_HTTP_STATUS:401\n' '{"error":{"message":"bad key"}}'
 ]])
   local saved_path = vim.env.PATH
+  local saved_provider = straps.config.provider
   vim.env.PATH = tmp .. "/models_500:" .. real_path
   vim.env.ANTHROPIC_API_KEY = "test-key-not-real"
+  straps.config.provider = "anthropic"
   local models, err = registry.call("fn.list_models")
   vim.env.PATH = saved_path
+  straps.config.provider = saved_provider
   assert(models == nil, "HTTP 401 should yield nil, got a list")
   assert(type(err) == "string" and err:find("401", 1, true), "err should mention the status: " .. tostring(err))
 end)
 
+-- Provider-aware discovery: with provider="openai", fn.list_models must hit
+-- the OpenAI /v1/models endpoint with Bearer auth and parse OpenAI's flat
+-- {data:[{id}]} shape (no display_name / thinking capabilities).
+vim.fn.mkdir(tmp .. "/models_openai", "p")
+write_exec(tmp .. "/models_openai/curl", ([[#!/usr/bin/env bash
+D=%q
+printf '%%s\n' "$*" >> "$D/models_openai_argv"
+cat <<'EOF'
+{"object":"list","data":[
+  {"id":"gpt-5","object":"model","owned_by":"openai"},
+  {"id":"gpt-5-mini","object":"model","owned_by":"openai"}
+]}
+EOF
+printf '\nSTRAPS_HTTP_STATUS:200\n'
+]]):format(tmp))
+
+do
+  local saved_path = vim.env.PATH
+  local saved_provider = straps.config.provider
+  local saved_oai_base = straps.config.openai_base_url
+  local saved_oai_key = vim.env.OPENAI_API_KEY
+  vim.env.PATH = tmp .. "/models_openai:" .. real_path
+  straps.config.provider = "openai"
+  straps.config.openai_base_url = "http://straps-openai-models.invalid"
+  vim.env.OPENAI_API_KEY = "openai-test-key"
+
+  local models, err = registry.call("fn.list_models")
+
+  case("fn.list_models (openai) hits openai_base_url/v1/models with Bearer auth", function()
+    local argv = table.concat(vim.fn.readfile(tmp .. "/models_openai_argv"), "\n")
+    assert(argv:find("http://straps-openai-models.invalid/v1/models", 1, true),
+      "openai base_url /v1/models not in argv:\n" .. argv)
+    assert(argv:find("Authorization: Bearer openai-test-key", 1, true),
+      "Bearer auth header missing:\n" .. argv)
+    assert(not argv:find("anthropic-version", 1, true), "anthropic header leaked into openai request")
+  end)
+
+  case("fn.list_models (openai) parses OpenAI's flat catalog, id doubles as label, no thinking", function()
+    assert(type(models) == "table", "expected a model list, got err: " .. tostring(err))
+    assert(#models == 2, "expected 2 models, got " .. #models)
+    assert(models[1].id == "gpt-5" and models[1].label == "gpt-5", "id/label wrong: " .. vim.inspect(models[1]))
+    assert(models[1].thinking == nil, "openai models carry no thinking tag")
+  end)
+
+  vim.env.PATH = saved_path
+  straps.config.provider = saved_provider
+  straps.config.openai_base_url = saved_oai_base
+  vim.env.OPENAI_API_KEY = saved_oai_key
+end
+
 vim.env.ANTHROPIC_API_KEY = saved_key
+
+-- ------------------------------------------------------------ openai backend
+-- Fake curl serving OpenAI Chat Completions SSE. Turn 1 streams a tool_call
+-- (echo via bash), turn 2 streams text. Captures argv + request bodies so we
+-- can assert the translated OpenAI wire shape and the Bearer auth header.
+vim.fn.mkdir(tmp .. "/openai", "p")
+write_exec(tmp .. "/openai/curl", ([[#!/usr/bin/env bash
+D=%q
+N=$(cat "$D/oai_n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/oai_n"
+printf '%%s\n' "$*" >> "$D/oai_argv"
+cat > "$D/oai_body.$N"
+echo "STRAPS_HTTP_STATUS:200" >&2
+if [ "$N" = 1 ]; then
+  printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}\n\n'
+  printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"command\\":\\"echo "}}]}}]}\n\n'
+  printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"openai-e2e-output\\"}"}}]}}]}\n\n'
+  printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+  printf 'data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":1100}}}\n\n'
+  printf 'data: [DONE]\n\n'
+else
+  printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"openai "}}]}\n\n'
+  printf 'data: {"choices":[{"index":0,"delta":{"content":"done"}}]}\n\n'
+  printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+  printf 'data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":5}}\n\n'
+  printf 'data: [DONE]\n\n'
+fi
+]]):format(tmp))
+
+do
+  local saved_provider = straps.config.provider
+  local saved_oai_base = straps.config.openai_base_url
+  vim.env.PATH = tmp .. "/openai:" .. real_path
+  vim.env.OPENAI_API_KEY = "openai-test-key"
+  straps.config.provider = "openai"
+  straps.config.openai_base_url = "http://straps-openai.invalid"
+  straps.config.openai_model = "gpt-5-test"
+
+  local oai_buf, oai_text = run_session("run echo via bash on openai")
+
+  case("openai backend: full tool round-trip completes", function()
+    assert(oai_text:find("openai-e2e-output", 1, true), "bash tool_result missing:\n" .. oai_text:sub(-500))
+    assert(oai_text:find("openai done", 1, true), "final streamed text missing")
+    assert(not loop.running(oai_buf), "run still active")
+  end)
+
+  case("openai backend: hits base_url/v1/chat/completions with Bearer auth", function()
+    local argv = table.concat(vim.fn.readfile(tmp .. "/oai_argv"), "\n")
+    assert(argv:find("http://straps-openai.invalid/v1/chat/completions", 1, true),
+      "custom openai base_url not in argv:\n" .. argv)
+    assert(argv:find("Authorization: Bearer openai-test-key", 1, true),
+      "Bearer auth header missing:\n" .. argv)
+  end)
+
+  case("openai backend: request 1 is translated OpenAI shape (system + tools + model)", function()
+    local body = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/oai_body.1"), "\n"))
+    assert(body.model == "gpt-5-test", "model wrong: " .. tostring(body.model))
+    assert(body.stream == true, "stream should be true")
+    assert(body.messages[1].role == "system", "first message should be the system role")
+    assert(body.messages[2].role == "user", "user message missing")
+    assert(type(body.tools) == "table" and #body.tools > 0, "tools missing")
+    local t1 = body.tools[1]
+    assert(t1.type == "function" and type(t1["function"]) == "table"
+      and type(t1["function"].name) == "string", "tool not in OpenAI function shape")
+    assert(type(t1["function"].parameters) == "table", "tool parameters missing")
+  end)
+
+  case("openai backend: request 2 carries the tool_call + tool result messages", function()
+    local body = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/oai_body.2"), "\n"))
+    local assistant_tc, tool_msg
+    for _, m in ipairs(body.messages) do
+      if m.role == "assistant" and type(m.tool_calls) == "table" then assistant_tc = m end
+      if m.role == "tool" then tool_msg = m end
+    end
+    assert(assistant_tc, "assistant tool_calls message missing")
+    assert(assistant_tc.tool_calls[1]["function"].name == "bash", "tool_call name lost")
+    local args = vim.json.decode(assistant_tc.tool_calls[1]["function"].arguments)
+    assert(args.command and args.command:find("openai-e2e-output", 1, true),
+      "tool_call arguments not a JSON string round-trip: " .. vim.inspect(args))
+    assert(tool_msg, "role=tool result message missing")
+    assert(tool_msg.tool_call_id == "call_1", "tool_call_id not threaded back")
+    assert(tostring(tool_msg.content):find("openai-e2e-output", 1, true),
+      "tool output not sent back in the tool message")
+  end)
+
+  straps.config.provider = saved_provider
+  straps.config.openai_base_url = saved_oai_base
+  straps.config.openai_model = nil
+  vim.env.PATH = real_path
+  vim.env.OPENAI_API_KEY = nil
+end
+
+-- ---------------------------------------------------- provider dispatch pref
+-- fn.provider_pref round-trips the persisted choice, and the dispatcher's
+-- precedence is: vim.b straps_provider > config.provider > file > "anthropic".
+do
+  local saved_xdg = vim.env.XDG_CONFIG_HOME
+  local saved_provider = straps.config.provider
+  local pd = vim.fn.tempname()
+  vim.fn.mkdir(pd, "p")
+  vim.env.XDG_CONFIG_HOME = pd
+
+  case("fn.provider_pref: read returns nil when no file exists", function()
+    straps.config.provider = nil
+    assert(registry.call("fn.provider_pref") == nil, "expected nil with no file")
+  end)
+
+  case("fn.provider_pref: write then read round-trips", function()
+    local w = registry.call("fn.provider_pref", "openai")
+    assert(w == "openai", "write should return the value")
+    assert(registry.call("fn.provider_pref") == "openai", "read-back wrong")
+    assert(vim.trim(vim.fn.readfile(pd .. "/straps/provider")[1]) == "openai", "file content wrong")
+  end)
+
+  -- Snapshot the real backend sources so we can restore them after spying.
+  local real_anthropic = registry.get("fn.provider_anthropic").source
+  local real_openai = registry.get("fn.provider_openai").source
+
+  case("dispatcher: config.provider overrides the persisted file", function()
+    -- File says openai; config pins anthropic -> anthropic wins.
+    registry.call("fn.provider_pref", "openai")
+    straps.config.provider = "anthropic"
+    local picked
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy",
+      source = [[return function() return { content = {}, stop_reason = "end_turn", _who = "a" } end]] })
+    registry.define({ name = "fn.provider_openai", kind = "fn", doc = "spy",
+      source = [[return function() return { content = {}, stop_reason = "end_turn", _who = "o" } end]] })
+    local resp = registry.call("fn.provider", { messages = {} }, { bufnr = nil })
+    picked = resp._who
+    assert(picked == "a", "config anthropic should win over file openai, got " .. tostring(picked))
+  end)
+
+  case("dispatcher: falls back to the file when config.provider is nil", function()
+    registry.call("fn.provider_pref", "openai")
+    straps.config.provider = nil
+    local resp = registry.call("fn.provider", { messages = {} }, { bufnr = nil })
+    assert(resp._who == "o", "file openai should be used when config is nil, got " .. tostring(resp._who))
+  end)
+
+  case("dispatcher: no config and no file -> anthropic", function()
+    vim.fn.delete(pd .. "/straps/provider")
+    straps.config.provider = nil
+    local resp = registry.call("fn.provider", { messages = {} }, { bufnr = nil })
+    assert(resp._who == "a", "default should be anthropic, got " .. tostring(resp._who))
+  end)
+
+  -- Restore the real backends the rest of the suite (and any later run) needs.
+  registry.define({ name = "fn.provider_anthropic", kind = "fn",
+    doc = "restored", source = real_anthropic })
+  registry.define({ name = "fn.provider_openai", kind = "fn",
+    doc = "restored", source = real_openai })
+  vim.env.XDG_CONFIG_HOME = saved_xdg
+  straps.config.provider = saved_provider
+end
+
+-- ---------------------------------------------------------- fn.openai_api_key
+do
+  local saved_oai = vim.env.OPENAI_API_KEY
+  local saved_xdg2 = vim.env.XDG_CONFIG_HOME
+  local kd = vim.fn.tempname()
+  vim.fn.mkdir(kd .. "/straps", "p")
+  vim.env.XDG_CONFIG_HOME = kd
+
+  case("fn.openai_api_key: env var wins over the config file", function()
+    vim.fn.writefile({ "file-oai" }, kd .. "/straps/openai_api_key")
+    vim.fn.setfperm(kd .. "/straps/openai_api_key", "rw-------")
+    vim.env.OPENAI_API_KEY = "env-oai"
+    assert(registry.call("fn.openai_api_key") == "env-oai", "env var should take precedence")
+  end)
+
+  case("fn.openai_api_key: falls back to the config file, trimmed", function()
+    vim.fn.writefile({ "  file-oai  " }, kd .. "/straps/openai_api_key")
+    vim.fn.setfperm(kd .. "/straps/openai_api_key", "rw-------")
+    vim.env.OPENAI_API_KEY = nil
+    assert(registry.call("fn.openai_api_key") == "file-oai", "file fallback wrong")
+  end)
+
+  case("fn.openai_api_key: a group/other-accessible key file is refused", function()
+    vim.fn.writefile({ "leaky-oai" }, kd .. "/straps/openai_api_key")
+    vim.fn.setfperm(kd .. "/straps/openai_api_key", "rw-r--r--")
+    vim.env.OPENAI_API_KEY = nil
+    local ok, err = pcall(registry.call, "fn.openai_api_key")
+    assert(not ok and tostring(err):find("chmod 600", 1, true), "should refuse leaky file: " .. tostring(err))
+    assert(not tostring(err):find("leaky-oai", 1, true), "key must not leak into the error")
+  end)
+
+  case("fn.openai_api_key: no env and no file errors naming OPENAI_API_KEY", function()
+    vim.fn.delete(kd .. "/straps/openai_api_key")
+    vim.env.OPENAI_API_KEY = nil
+    local ok, err = pcall(registry.call, "fn.openai_api_key")
+    assert(not ok and tostring(err):find("OPENAI_API_KEY", 1, true), "wrong error: " .. tostring(err))
+  end)
+
+  vim.env.OPENAI_API_KEY = saved_oai
+  vim.env.XDG_CONFIG_HOME = saved_xdg2
+end
 
 if failed then
   print("FAILED")

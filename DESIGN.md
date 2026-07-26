@@ -33,8 +33,11 @@ lua/straps/state.lua       -- transcript buffer format: create/append/parse
 lua/straps/provider.lua    -- registers fn.provider (Anthropic SSE via curl)
 lua/straps/loop.lua        -- coroutine agent loop
 lua/straps/tools.lua       -- registers all builtin tools + default hooks
+lua/straps/editor.lua      -- editor-native tools (LSP + tree-sitter)
 lua/straps/ui.lua          -- registry edit buffers, listing, keymaps, folds
+lua/straps/health.lua      -- :checkhealth straps (install/environment probes)
 plugin/straps.lua          -- user commands (guarded, no heavy requires at load)
+doc/straps.txt             -- :help straps (vimdoc; tags via :helptags doc)
 syntax/straps.vim          -- legacy syntax highlighting (no-parser fallback)
 ftplugin/straps.lua        -- starts treesitter when the straps parser exists
 queries/straps/            -- highlight + injection queries (markdown/JSON)
@@ -403,9 +406,30 @@ edit.
 - README documents `config.log_file` and a "Long sessions" note: context is
   the transcript, so pruning old tool results is just deleting buffer lines.
 
-## provider.lua — registers `fn.provider` (+ `fn.api_key`, `fn.list_models`, `fn.build_tools`, `fn.system_prompt`)
+## provider.lua — registers `fn.provider` (+ `fn.provider_anthropic`, `fn.provider_openai`, `fn.provider_pref`, `fn.api_key`, `fn.openai_api_key`, `fn.list_models`, `fn.build_tools`, `fn.system_prompt`)
 
-`fn.provider` source: `function(req, ctx) -> { content = blocks, stop_reason = s }`
+`fn.provider` is a thin **dispatcher**: `function(req, ctx) -> { content =
+blocks, stop_reason = s }` that selects a backend and delegates. Resolution
+order: `vim.b[bufnr].straps_provider` (per session) → `config.provider` (when
+pinned in `setup{}`) → the persisted preference file (`fn.provider_pref`,
+`$XDG_CONFIG_HOME/straps/provider`, written by `:StrapsProvider`) → `"anthropic"`.
+`config.provider` defaults to `nil` precisely so the file is the durable
+default; a value in `setup{}` pins it and wins over the file. It calls
+`fn.provider_openai` when the resolved value is `"openai"`, else
+`fn.provider_anthropic`. The loop, tests and the return contract only ever see
+`fn.provider`; each backend is its own redefinable registry entry with the
+identical `(req, ctx) -> { content, stop_reason, usage }` signature and the same
+`ctx.emit` text-streaming / `ctx.on_cancel` behaviour.
+
+`fn.provider_pref(value?)` is the persistence seam: called with no argument it
+reads the first line of `$XDG_CONFIG_HOME/straps/provider`
+(`~/.config/straps/provider`, the same directory as the key files) and returns
+`"anthropic"`/`"openai"` or `nil`; called with a string it writes that value
+there (creating the dir) and returns it. A read miss never throws; a write
+failure returns `(nil, err)` so `:StrapsProvider` can report it. It is not a
+secret, so no mode-600 guard.
+
+### `fn.provider_anthropic` — the Anthropic Messages API backend
 
 - POST `https://api.anthropic.com/v1/messages` with headers `x-api-key`
   (from `registry.call("fn.api_key")`, default entry reads
@@ -443,21 +467,63 @@ edit.
   exit callback: children inheriting stdio can delay it indefinitely). This is
   what prevents an open-but-silent stream from hanging a run forever.
 
+### `fn.provider_openai` — the OpenAI Chat Completions backend
+
+Same `(req, ctx)` contract, OpenAI's wire shape. Selected when
+`config.provider` (or `vim.b straps_provider`) is `"openai"`.
+
+- POST `{config.openai_base_url}/v1/chat/completions` (default
+  `https://api.openai.com`) with `Authorization: Bearer <key>`
+  (from `registry.call("fn.openai_api_key")` — `$OPENAI_API_KEY`, then the
+  first line of `$XDG_CONFIG_HOME/straps/openai_api_key`, same mode-600 and
+  unreadable-file guards as `fn.api_key`) and `content-type: application/json`.
+- **Request translation** (Anthropic-shaped `req` → OpenAI flat messages):
+  `req.system` → a leading `{role="system"}` message; assistant text blocks →
+  the message's `content` string; `tool_use` blocks → `assistant.tool_calls[]`
+  `{ id, type="function", function={ name, arguments=JSON-string(input) } }`;
+  `tool_result` blocks → their own `{ role="tool", tool_call_id, content }`
+  messages. Tools → `[{ type="function", function={ name, description,
+  parameters=input_schema } }]`. `max_completion_tokens=config.max_tokens`,
+  `stream=true`, `stream_options.include_usage=true`. Model id is
+  `config.openai_model` (falling back to `config.model`).
+- **Response translation** (OpenAI SSE `choices[].delta` → blocks): `delta.content`
+  → `ctx.emit{type="text_delta"}` accumulated into one text block;
+  `delta.tool_calls[].function.arguments` → accumulated per `index` and decoded
+  at the end; `finish_reason` → the Anthropic `stop_reason`
+  (`tool_calls`→`tool_use`, `length`→`max_tokens`, `stop`→`end_turn`);
+  `data: [DONE]` finalizes. `usage.prompt_tokens`/`completion_tokens`/
+  `prompt_tokens_details.cached_tokens` are normalized to the
+  `input_tokens`/`output_tokens`/`cache_read_input_tokens` names the loop reads.
+- Reasoning: the active `config.efforts` entry's `level` (when set) becomes
+  `reasoning_effort`; `"off"`/no level sends none.
+- Same idle watchdog and backoff scaffolding; retries 429/500/502/503.
+
 `fn.system_prompt` default source returns the default system prompt (below).
 
 ### Live model discovery (`fn.list_models`)
 
 `fn.list_models() -> models | (nil, err)` — a synchronous `curl GET
-{base_url}/v1/models?limit=1000` (same `x-api-key`/`anthropic-version` headers
-as `fn.provider`, key from `fn.api_key`). Maps each returned model to a picker
-entry `{ id, label = display_name, thinking }`. The `thinking` tag is inferred
-from the API's own `capabilities.thinking.types`:
-`adaptive.supported` → `"adaptive"`, else `enabled.supported` → `"budget"`,
-else `nil` (no thinking block). This is the SAME tag `fn.provider` reads to
-choose between the two incompatible thinking mechanisms, so a discovered model
-gets extended thinking correctly without a hand-written config entry. It never
-throws — any failure (no key, curl error, non-2xx, unparseable body) returns
-`(nil, errmsg)` so the picker can fall back to the static `config.models`.
+/v1/models` against **the same backend `fn.provider` would use**. It resolves the
+effective provider exactly as `fn.provider` does (`config.provider` → the
+persisted `fn.provider_pref` file → per-session `vim.b straps_provider` on the
+current buffer), so discovery never disagrees with the loop: under the OpenAI
+provider it lists GPT models, not Claude ones.
+
+- **Anthropic**: `GET {base_url}/v1/models?limit=1000` with
+  `x-api-key`/`anthropic-version` headers (key from `fn.api_key`). Each model
+  becomes `{ id, label = display_name, thinking }`. The `thinking` tag is
+  inferred from the API's own `capabilities.thinking.types`:
+  `adaptive.supported` → `"adaptive"`, else `enabled.supported` → `"budget"`,
+  else `nil` (no thinking block) — the SAME tag `fn.provider` reads to choose
+  between the two incompatible thinking mechanisms, so a discovered model gets
+  extended thinking correctly without a hand-written config entry.
+- **OpenAI**: `GET {openai_base_url}/v1/models` with `Authorization: Bearer`
+  (key from `fn.openai_api_key`). OpenAI's catalog carries no display name or
+  thinking capabilities, so the id doubles as the label and `thinking` stays
+  `nil` (reasoning effort is sent as `reasoning_effort` regardless).
+
+It never throws — any failure (no key, curl error, non-2xx, unparseable body)
+returns `(nil, errmsg)` so the picker can fall back to the static `config.models`.
 
 `ui.pick_model` calls it and MERGES the result over `config.models`: configured
 entries keep their curated `label` and lead the list in configured order; any
@@ -501,10 +567,15 @@ breakpoints so the replayed prefix becomes a server-side cache hit:
   turn (>20 blocks) would silently miss with only the tail marked. Self-
   limiting: short conversations never accumulate enough blocks to place it.
   Uses the 4th of 4 allowed breakpoints (tools, system, tail, intermediate).
-- Usage visibility: capture `usage` from the `message_start` event
-  (input_tokens, cache_read_input_tokens, cache_creation_input_tokens) and
-  include it in the `fn.log` response event — caching effectiveness must be
-  observable, not vibes.
+- Usage visibility: capture `usage` from the `message_start`/`message_delta`
+  events (input_tokens, output_tokens, cache_read_input_tokens,
+  cache_creation_input_tokens) and return it on `resp.usage`. The loop
+  accumulates it onto `vim.b[bufnr].straps_usage` each turn (input_billed =
+  input + both cache tiers, requests, output_total) and the session winbar
+  renders a context-fill + cache-hit segment (`ui.usage_status`), so caching
+  effectiveness and context pressure are observable, not vibes. It also feeds
+  the `fn.log` response event and — crucially — auto-compaction, which prefers
+  the real `input_billed` over the bytes/3.5 guess once a response has arrived.
 
 ### Compaction (the transcript is the context, so compaction is editing)
 
@@ -533,8 +604,10 @@ breakpoints so the replayed prefix becomes a server-side cache hit:
   bufnr)`, notify the summary.
 - Auto-compaction: `config.auto_compact_tokens` (preferred) or
   `auto_compact_bytes` (default both nil = off). The loop checks size at the
-  top of each turn (already reading the buffer there); token estimate =
-  bytes/3.5. Because each compaction rewrites old message blocks and
+  top of each turn (already reading the buffer there). The token measure is the
+  REAL `input_billed` from last turn's `resp.usage` (the whole prompt the model
+  saw) once a response has arrived; before the first response it falls back to
+  a bytes/3.5 estimate. Because each compaction rewrites old message blocks and
   invalidates the messages cache tier, the trigger is COARSE: a per-run growth
   guard (`run.last_compact_bytes`, require ~20% growth since the last compact)
   stops it re-firing every turn when keep_turns content alone exceeds the
@@ -602,8 +675,8 @@ API names (registry names prefixed `tool.`):
 - `write_file {path, content}` — mkdir -p parent, write; if a buffer holds the
   file, `:checktime` it; then `registry.try_call("hook.after_write", path, ctx)`
   and if it returns a string, append it to the tool result. **`hook.after_write`
-  ships as a no-op returning nil** — this is the canonical seam for the
-  "auto-run a linter after writes" example.
+  ships as the LSP-diagnostics feedback loop** (below) — the canonical seam for
+  the "auto-run a linter after writes" idiom, now built by default.
 - `edit_file {path, old_string, new_string, replace_all?}` — exact-match edit;
   error if 0 or (when not replace_all) >1 matches (plain-text find, no
   patterns). Also fires `hook.after_write`.
@@ -648,8 +721,12 @@ Default hooks registered here:
   `vim.b[ctx.bufnr].straps_allowed` (buffer state, on theme). Must be called
   on the main loop (wrap in a scheduled await, since we're inside a coroutine
   driven from callbacks).
-- `hook.after_write` — no-op (`return function() end` with a doc explaining
-  the linter idiom).
+- `hook.after_write` — default is the editor-native lint feedback loop: after
+  a write, wait (bounded via `ctx.await`, `config.after_write_diagnostics_ms`,
+  default 800ms) for the file's LSP to re-lint, then return its ERROR/WARN
+  diagnostics so they append to the tool result. No client / no diagnostics →
+  nil. `config.after_write_diagnostics = false` makes it a no-op. Redefinable
+  like everything (e.g. to shell out to an external linter instead).
 - `hook.on_run_start` / `hook.on_run_end` — no-ops.
 
 ## System prompt: layered, composed, each layer redefinable
@@ -931,11 +1008,49 @@ Existing suites must all still pass.
   `ui.session_winbar()` wraps it with a running/idle indicator and is
   auto-installed as a window-local `winbar` on session windows
   (`config.session_winbar = false` opts out).
+- `:StrapsProvider` (`ui.pick_provider`) — picks the API backend
+  (anthropic/openai). ON a session buffer it sets `vim.b straps_provider`
+  (session-only, like `:StrapsModel`); otherwise it sets `config.provider` AND
+  persists the choice to `$XDG_CONFIG_HOME/straps/provider` via
+  `fn.provider_pref`, so it survives restarts — the durable twin of the key
+  files in the same directory. `effective_provider` mirrors
+  `effective_model`/`effective_effort` for the picker's current-* marker.
 - Folding for the session buffer: foldexpr folding each `tool_use`/`tool_result`
   block (marker line = fold start, level 1), `foldlevel=0` so results start
   closed. Keep it ~20 lines.
 - plugin/straps.lua defines commands lazily (`require` inside callbacks),
   guards double-load with `vim.g.loaded_straps`.
+
+## health.lua — `:checkhealth straps`
+
+`require("straps.health").check()` is the standard Neovim health entry point
+(dispatched by `:checkhealth straps` because the module is `lua/straps/health.lua`
+and exposes `check()`). It diagnoses everything that can be wrong *before* a
+session runs, so the checks must survive a half-loaded plugin: every probe is
+`pcall`-wrapped and the module reports through `vim.health.{start,ok,warn,error,
+info}` rather than throwing. It runs even when `setup()` never ran (it reports
+that as the error) and when the data dir is unwritable.
+
+Sections: nvim version (>= 0.11), dependencies (curl required, ripgrep
+optional), API key (env, key-file mode 600, and whether `fn.api_key` actually
+resolves), sessions (dir writable + transcript count), transcript rendering
+(tree-sitter `straps` parser + queries, `config.render`), project registry
+(`.straps.lua` trust state against the sha256 store), registry (entry counts,
+redefinitions, missing core entries, `fn.log`), model (model/effort pairing —
+the mismatch that 400s a request), and active runs (a warning that quitting
+cancels in-flight sessions). It is read-only and touches no windows.
+`tests/run_health.lua` stubs `vim.health.*` to collect the report and asserts
+the healthy and broken-state paths (no setup, unwritable dir) both classify
+without throwing.
+
+## doc/straps.txt — vimdoc
+
+`:help straps` reference, tagged so `:help straps-hooks`, `:help hook.confirm`,
+`:help straps-config-model` etc. resolve. Tags are generated with
+`:helptags doc` (the committed `doc/tags` file). The doc mirrors this spec and
+the README but is the in-editor surface; keep the three in sync when behavior
+changes (per AGENTS.md, a behavior change updates DESIGN.md and README.md — and
+now doc/straps.txt — in the same change).
 
 ## init.lua
 
@@ -1007,6 +1122,24 @@ All are read-only except none; `hook.confirm` auto-allows the read-only set
 (add these names to it). Async LSP tools use ctx.await + a timeout so a wedged
 server can't hang the run.
 
+Presentation tools (also lua/straps/editor.lua) turn agent output into real
+Neovim views instead of transcript prose. They change no files — they open
+views / set the quickfix list — so `hook.confirm` auto-allows them like
+show_user, and they never steal the user's focus. A shared PRELUDE helper
+(`new_split_win`, `scratch_buf`, `unified_diff`) keeps them DRY and factors the
+unified-diff renderer that the confirm-dialog edit preview also uses.
+
+- `show_diff {path, content}` (proposed vs current) or `{left, right,
+  filetype?, left_label?, right_label?}` (two texts) — a native `:diffthis`
+  split (new_split_win for the left so the user's buffer is never replaced,
+  rightbelow vsplit for the right), winbar labels, hunk count in the result.
+- `show_buffer {content, filetype?, title?, split?}` — a filetype'd scratch
+  split (`straps://buffer/<title>`) for generated/extracted content.
+- `set_quickfix {items=[{path,line?,col?,text?}], title?, open?}` — load
+  agent-assembled locations into the quickfix list and `copen`. For findings
+  the agent built itself; grep and run_quickfix already fill the list for
+  searches and build output, so the doc points there first.
+
 ### 2. Native-undo edits (tools.lua: write_file, edit_file)
 
 Apply agent edits THROUGH the file's buffer so they enter its native undo tree
@@ -1047,6 +1180,43 @@ Apply agent edits THROUGH the file's buffer so they enter its native undo tree
 - Tests: grep populates a non-empty quickfix list with correct file/lnum;
   bulk_replace over a seeded qf list edits the files (undoably) and reports the
   count; empty-qf and dry_run paths.
+- `run_quickfix {command, errorformat?, title?, timeout_ms?, open?}` — run a
+  build/test/lint command and parse its output into the quickfix list through
+  Vim's NATIVE errorformat (`getqflist({lines, efm})` — the efm given, else the
+  editor's `&errorformat`), keeping only `valid==1` entries, then `botright
+  copen`. A failing build lands as `:cnext`/`:cprev` navigable file:line entries
+  instead of a wall of transcript text; the result the agent sees is a COMPACT
+  summary (exit code + parsed `file:line:col: message`, capped at 100), far
+  smaller than raw output. A clean run empties the list (a passing build clears
+  a prior failure). Both stdout and stderr are fed to the parser (compilers use
+  stderr, many runners stdout). No efm match on non-empty output → a note
+  telling the agent to pass an explicit errorformat. Confirm-gated (it runs
+  commands), like bash. Tests in `tests/run_run_quickfix.lua`: file:line:col
+  parsing + open, clean-run clears, prose-hint, stderr capture, open=false,
+  empty-command error, and the summary cap keeping the full list.
+
+#### Per-session findings-list isolation (quickfix is global!)
+
+The quickfix list is GLOBAL to the Neovim instance (only *location* lists are
+per-window), so if every session wrote its findings there, two concurrent
+sessions would stomp each other — and `bulk_replace`, which acts on the CURRENT
+list, could read another session's set and edit the wrong files (worse for the
+confirm-gated human-paced gap between a grep and its bulk_replace). Fix: route
+each session's findings to ITS window's LOCATION list when the session is
+on-screen (private per window), and fall back to the global quickfix list only
+when the session has no window (a windowless subagent — no worse than the
+pre-existing global behavior). Shared helpers live in `ui.lua`:
+`session_win(bufnr)` (the session's non-floating window, lowest win id so grep
+and the later bulk_replace resolve to the SAME list), `set_locations` /
+`get_locations` (setloclist/getloclist on that window, else set/getqflist),
+and `locations_do(bufnr, body)` (`:ldo <body>` via `win_execute` in the window,
+else global `:cdo <body>`). `grep`, `diagnostics{quickfix}`, `run_quickfix`,
+`set_quickfix` write through `set_locations`; `bulk_replace` reads through
+`get_locations` and edits through `locations_do`, and its result names whichever
+list ("loclist"/"quickfix"). Tools' user-facing summaries say `:lnext/:cnext`
+accordingly. Tested in `run_quickfix.lua`: two on-screen sessions get isolated
+per-window lists (and the global qf list stays untouched), bulk_replace on
+session A edits only A's file, and a windowless session falls back to global.
 
 ## Style
 

@@ -715,5 +715,155 @@ end
   assert(found, "no thinking progress event recorded")
 end)
 
+case("provider usage is accumulated onto vim.b.straps_usage", function()
+  allow_all()
+  define("fn.provider", "fn", "test: provider that reports token usage", [==[
+return function(req, ctx)
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      ctx.emit({ type = "text_delta", text = "hi" })
+      resolve()
+    end, 5)
+  end)
+  return {
+    stop_reason = "end_turn",
+    content = { { type = "text", text = "hi" } },
+    usage = {
+      input_tokens = 12000,
+      output_tokens = 200,
+      cache_read_input_tokens = 8000,
+      cache_creation_input_tokens = 1000,
+    },
+  }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("go")
+  loop.start(bufnr)
+  wait_done(bufnr)
+
+  local u = vim.b[bufnr].straps_usage
+  assert(type(u) == "table", "straps_usage not set on the session buffer")
+  assert(u.input == 12000, "input wrong: " .. tostring(u.input))
+  assert(u.cache_read == 8000, "cache_read wrong: " .. tostring(u.cache_read))
+  -- input_billed = input + cache_read + cache_creation = 21000
+  assert(u.input_billed == 21000, "input_billed wrong: " .. tostring(u.input_billed))
+  assert(u.requests == 1, "requests wrong: " .. tostring(u.requests))
+  assert(u.output_total == 200, "output_total wrong: " .. tostring(u.output_total))
+end)
+
+case("a blank turn after a tool call is nudged, then ends loudly if still blank", function()
+  allow_all()
+  define("tool.ping", "tool", "ping", [[return function() return "pong" end]])
+  local straps = require("straps")
+  local saved = straps.config.blank_nudge_limit
+  straps.config.blank_nudge_limit = 1
+  _G.straps_test_progress = {}
+  define("hook.on_progress", "hook", "test: record events", [[
+return function(ev) _G.straps_test_progress[#_G.straps_test_progress + 1] = ev end
+]])
+  -- Turn 1: run a tool. Turn 2 and beyond: end_turn with NO visible text —
+  -- the "runs a command then returns silence" symptom. With blank_nudge_limit=1
+  -- turn 2 nudges (transcript gains a user block), turn 3 stays blank -> loud
+  -- "blank" ending. So the provider is called exactly 3 times.
+  _G.straps_test_calls = 0
+  define("fn.provider", "fn", "test: tool then silent end_turns", [==[
+return function(req, ctx)
+  _G.straps_test_calls = _G.straps_test_calls + 1
+  local n = _G.straps_test_calls
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  if n == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "p1", name = "ping", input = vim.empty_dict() },
+    } }
+  end
+  -- blank: end_turn, empty content (no text block at all)
+  return { stop_reason = "end_turn", content = {} }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("do a thing")
+  loop.start(bufnr)
+  wait_done(bufnr)
+  straps.config.blank_nudge_limit = saved
+
+  assert(_G.straps_test_calls == 3,
+    "provider called " .. _G.straps_test_calls .. " times, want 3 (tool, nudge, give up)")
+  local text = buf_text(bufnr)
+  assert(text:find("produced no text after the tool call", 1, true),
+    "missing the nudge user block")
+  assert(text:find("ending its turn silently", 1, true),
+    "missing the loud blank ending note")
+
+  local done_ev
+  for _, ev in ipairs(_G.straps_test_progress) do
+    if ev.type == "done" then done_ev = ev end
+  end
+  assert(done_ev and done_ev.reason == "blank",
+    "done reason is " .. tostring(done_ev and done_ev.reason) .. ", want blank")
+end)
+
+case("a blank turn on max_tokens ends loudly with no nudge", function()
+  allow_all()
+  local straps = require("straps")
+  _G.straps_test_progress = {}
+  define("hook.on_progress", "hook", "test: record events", [[
+return function(ev) _G.straps_test_progress[#_G.straps_test_progress + 1] = ev end
+]])
+  _G.straps_test_calls = 0
+  define("fn.provider", "fn", "test: max_tokens with no text", [==[
+return function(req, ctx)
+  _G.straps_test_calls = _G.straps_test_calls + 1
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  return { stop_reason = "max_tokens", content = {} }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("go")
+  loop.start(bufnr)
+  wait_done(bufnr)
+
+  assert(_G.straps_test_calls == 1,
+    "provider called " .. _G.straps_test_calls .. " times, want 1 (no nudge on max_tokens)")
+  local text = buf_text(bufnr)
+  assert(text:find("hit max_tokens", 1, true), "missing the max_tokens blank note")
+
+  local done_ev
+  for _, ev in ipairs(_G.straps_test_progress) do
+    if ev.type == "done" then done_ev = ev end
+  end
+  assert(done_ev and done_ev.reason == "blank",
+    "done reason is " .. tostring(done_ev and done_ev.reason) .. ", want blank")
+end)
+
+case("a normal end_turn WITH text is still a clean ok (no false blank)", function()
+  allow_all()
+  _G.straps_test_progress = {}
+  define("hook.on_progress", "hook", "test: record events", [[
+return function(ev) _G.straps_test_progress[#_G.straps_test_progress + 1] = ev end
+]])
+  define("fn.provider", "fn", "test: end_turn with visible text", [==[
+return function(req, ctx)
+  ctx.await(function(resolve)
+    vim.defer_fn(function() ctx.emit({ type = "text_delta", text = "here is the answer" }) resolve() end, 5)
+  end)
+  return { stop_reason = "end_turn", content = { { type = "text", text = "here is the answer" } } }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("answer me")
+  loop.start(bufnr)
+  wait_done(bufnr)
+
+  local text = buf_text(bufnr)
+  assert(not text:find("produced no text", 1, true), "false blank nudge on a turn that had text")
+  local done_ev
+  for _, ev in ipairs(_G.straps_test_progress) do
+    if ev.type == "done" then done_ev = ev end
+  end
+  assert(done_ev and done_ev.reason == "ok",
+    "done reason is " .. tostring(done_ev and done_ev.reason) .. ", want ok")
+end)
+
 print(failed == 0 and "ALL PASS" or (failed .. " case(s) FAILED"))
 os.exit(failed == 0 and 0 or 1)

@@ -1,9 +1,10 @@
--- straps.provider: registers fn.provider (Anthropic Messages API, streaming
--- SSE via curl + vim.system), plus fn.api_key, fn.build_tools, the layered
--- system prompt (fn.system_prompt_core/_env/_project composed by
--- fn.system_prompt), fn.log and fn.compact. Everything is a registry entry
--- (a Lua source string), so any of it can be inspected and redefined at
--- runtime.
+-- straps.provider: registers fn.provider (a backend DISPATCHER selecting
+-- fn.provider_anthropic — Anthropic Messages API — or fn.provider_openai —
+-- OpenAI Chat Completions — by config.provider), plus fn.api_key /
+-- fn.openai_api_key, fn.build_tools, the layered system prompt
+-- (fn.system_prompt_core/_env/_project composed by fn.system_prompt), fn.log
+-- and fn.compact. Everything is a registry entry (a Lua source string), so any
+-- of it can be inspected and redefined at runtime.
 
 local M = {}
 
@@ -58,22 +59,58 @@ return function()
   local registry = require("straps.registry")
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
-  local base_url = config.base_url or "https://api.anthropic.com"
 
-  local ok_key, api_key = pcall(registry.call, "fn.api_key")
+  -- Discovery must follow the SAME backend the loop would talk to, otherwise
+  -- :StrapsModel shows the wrong catalog (e.g. Claude models while the OpenAI
+  -- provider is active). Resolve the effective provider the way fn.provider
+  -- does — config.provider, else the persisted file, else per-session
+  -- vim.b straps_provider on the current buffer — then hit that API's
+  -- /v1/models with its own auth and response shape.
+  local provider = config.provider
+  if provider == nil or provider == "" then
+    provider = registry.try_call("fn.provider_pref")
+  end
+  pcall(function()
+    local bufnr = vim.api.nvim_get_current_buf()
+    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+      local b = vim.b[bufnr].straps_provider
+      if b and b ~= "" then provider = b end
+    end
+  end)
+
+  local openai = provider == "openai"
+  local base_url, headers, key_fn
+  if openai then
+    base_url = config.openai_base_url or "https://api.openai.com"
+    key_fn = "fn.openai_api_key"
+  else
+    base_url = config.base_url or "https://api.anthropic.com"
+    key_fn = "fn.api_key"
+  end
+
+  local ok_key, api_key = pcall(registry.call, key_fn)
   if not ok_key or type(api_key) ~= "string" or api_key == "" then
     return nil, "no API key (" .. tostring(api_key) .. ")"
   end
 
+  if openai then
+    headers = { "-H", "Authorization: Bearer " .. api_key }
+  else
+    headers = {
+      "-H", "x-api-key: " .. api_key,
+      "-H", "anthropic-version: 2023-06-01",
+    }
+  end
+
   -- Synchronous: the picker blocks briefly on this, which is fine for a
   -- deliberate UI action and avoids threading the loop's async ctx through.
-  local res = vim.system({
-    "curl", "-sS",
-    base_url .. "/v1/models?limit=1000",
-    "-H", "x-api-key: " .. api_key,
-    "-H", "anthropic-version: 2023-06-01",
-    "-w", "\nSTRAPS_HTTP_STATUS:%{http_code}\n",
-  }, { text = true }):wait(15000)
+  -- Anthropic caps the page with ?limit; OpenAI's /v1/models has no such
+  -- param (and returns the full list), so only send it for Anthropic.
+  local url = base_url .. "/v1/models" .. (openai and "" or "?limit=1000")
+  local argv = { "curl", "-sS", url }
+  vim.list_extend(argv, headers)
+  vim.list_extend(argv, { "-w", "\nSTRAPS_HTTP_STATUS:%{http_code}\n" })
+  local res = vim.system(argv, { text = true }):wait(15000)
 
   if not res then
     return nil, "model list request timed out"
@@ -95,18 +132,25 @@ return function()
   local models = {}
   for _, m in ipairs(body.data) do
     if type(m) == "table" and type(m.id) == "string" then
-      local types = (((m.capabilities or {}).thinking or {}).types) or {}
-      local thinking = nil
-      if ((types.adaptive or {}).supported) == true then
-        thinking = "adaptive"
-      elseif ((types.enabled or {}).supported) == true then
-        thinking = "budget"
+      if openai then
+        -- OpenAI's /v1/models entries carry no display name or thinking
+        -- capabilities, so the id doubles as the label and thinking stays nil
+        -- (reasoning effort is sent as reasoning_effort regardless).
+        models[#models + 1] = { id = m.id, label = m.id, thinking = nil }
+      else
+        local types = (((m.capabilities or {}).thinking or {}).types) or {}
+        local thinking = nil
+        if ((types.adaptive or {}).supported) == true then
+          thinking = "adaptive"
+        elseif ((types.enabled or {}).supported) == true then
+          thinking = "budget"
+        end
+        models[#models + 1] = {
+          id = m.id,
+          label = m.display_name or m.id,
+          thinking = thinking,
+        }
       end
-      models[#models + 1] = {
-        id = m.id,
-        label = m.display_name or m.id,
-        thinking = thinking,
-      }
     end
   end
   if #models == 0 then
@@ -207,7 +251,7 @@ return function(ev)
 end
 ]==]
 
-local PROVIDER_SRC = [==[
+local PROVIDER_ANTHROPIC_SRC = [==[
 -- (req, ctx) -> { content = blocks, stop_reason = s }
 -- req = { system?, messages, tools }. Streams SSE from the Anthropic
 -- Messages API via curl; text deltas go out through ctx.emit; the curl
@@ -637,6 +681,528 @@ return function(req, ctx)
 end
 ]==]
 
+local PROVIDER_OPENAI_SRC = [==[
+-- (req, ctx) -> { content = blocks, stop_reason = s }
+-- The OpenAI Chat Completions backend. Same contract as fn.provider_anthropic
+-- (returns { content = blocks, stop_reason, usage } and streams text via
+-- ctx.emit), but speaks OpenAI's wire shape instead of Anthropic's:
+--   auth      Authorization: Bearer <key>            (fn.openai_api_key)
+--   endpoint  {base_url}/v1/chat/completions         (config.openai_base_url)
+--   request   flat role messages + tool_calls        (translated from req)
+--   stream    choices[].delta {content, tool_calls}  (translated back)
+-- fn.provider dispatches here when config.provider (or vim.b straps_provider)
+-- is "openai". 429/500/502/503 retry with backoff, like the Anthropic backend.
+return function(req, ctx)
+  local registry = require("straps.registry")
+  local ok_straps, straps = pcall(require, "straps")
+  local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+
+  local api_key = registry.call("fn.openai_api_key")
+  local base_url = config.openai_base_url or "https://api.openai.com"
+
+  -- Per-buffer overrides (a subagent under a different model/effort), same as
+  -- the Anthropic backend.
+  local b_model, b_effort
+  pcall(function()
+    local bufnr = ctx and ctx.bufnr
+    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+      b_model = vim.b[bufnr].straps_model
+      b_effort = vim.b[bufnr].straps_effort
+    end
+  end)
+  local model_id = b_model or config.openai_model or config.model or "gpt-5"
+
+  -- Translate the Anthropic-shaped req.messages into OpenAI's flat role
+  -- messages. Anthropic content blocks map like so:
+  --   text        -> accumulated into the message's string content
+  --   tool_use    -> an assistant message tool_calls[] entry
+  --   tool_result -> a separate { role = "tool", tool_call_id, content } message
+  local messages = {}
+  if req.system ~= nil and req.system ~= "" then
+    messages[#messages + 1] = { role = "system", content = req.system }
+  end
+  local function block_text(b)
+    -- tool_result content can be a string or an array of {type=text,text=}.
+    if type(b) == "string" then return b end
+    if type(b) == "table" then
+      if type(b.text) == "string" then return b.text end
+      if type(b.content) == "string" then return b.content end
+      if type(b.content) == "table" then
+        local parts = {}
+        for _, p in ipairs(b.content) do
+          if type(p) == "table" and type(p.text) == "string" then
+            parts[#parts + 1] = p.text
+          elseif type(p) == "string" then
+            parts[#parts + 1] = p
+          end
+        end
+        return table.concat(parts, "")
+      end
+    end
+    return ""
+  end
+  for _, m in ipairs(req.messages or {}) do
+    local content = m.content
+    if type(content) == "string" then
+      messages[#messages + 1] = { role = m.role, content = content }
+    elseif type(content) == "table" then
+      if m.role == "assistant" then
+        local text_parts, tool_calls = {}, {}
+        for _, blk in ipairs(content) do
+          if blk.type == "text" then
+            text_parts[#text_parts + 1] = blk.text or ""
+          elseif blk.type == "tool_use" then
+            tool_calls[#tool_calls + 1] = {
+              id = blk.id,
+              type = "function",
+              ["function"] = {
+                name = blk.name,
+                -- OpenAI wants arguments as a JSON string.
+                arguments = vim.json.encode(blk.input or vim.empty_dict()),
+              },
+            }
+          end
+        end
+        local msg = { role = "assistant" }
+        local text = table.concat(text_parts, "")
+        if text ~= "" then msg.content = text end
+        if #tool_calls > 0 then msg.tool_calls = tool_calls end
+        -- An assistant message must carry content or tool_calls; never both nil.
+        if msg.content == nil and msg.tool_calls == nil then msg.content = "" end
+        messages[#messages + 1] = msg
+      else
+        -- user role: split tool_result blocks into their own tool messages,
+        -- and gather any plain text into a single user message.
+        local text_parts = {}
+        for _, blk in ipairs(content) do
+          if blk.type == "tool_result" then
+            messages[#messages + 1] = {
+              role = "tool",
+              tool_call_id = blk.tool_use_id or blk.id,
+              content = block_text(blk),
+            }
+          elseif blk.type == "text" then
+            text_parts[#text_parts + 1] = blk.text or ""
+          else
+            text_parts[#text_parts + 1] = block_text(blk)
+          end
+        end
+        local text = table.concat(text_parts, "")
+        if text ~= "" then
+          messages[#messages + 1] = { role = "user", content = text }
+        end
+      end
+    end
+  end
+
+  local body = {
+    model = model_id,
+    max_completion_tokens = config.max_tokens or 8192,
+    stream = true,
+    stream_options = { include_usage = true },
+    messages = messages,
+  }
+
+  -- Tools -> OpenAI function tools. Empty Lua arrays JSON-encode as {}, so omit.
+  if req.tools and #req.tools > 0 then
+    local tools = {}
+    for _, t in ipairs(req.tools) do
+      tools[#tools + 1] = {
+        type = "function",
+        ["function"] = {
+          name = t.name,
+          description = t.description or "",
+          parameters = t.input_schema or { type = "object" },
+        },
+      }
+    end
+    body.tools = tools
+  end
+
+  -- Reasoning effort: OpenAI's reasoning models take reasoning_effort =
+  -- low|medium|high. Reuse config.efforts' `level` for the active effort; a
+  -- model tagged thinking="budget"/"adaptive" in config.models, or "off"
+  -- effort, or a missing level, sends no reasoning field (safe default).
+  local efforts = type(config.efforts) == "table" and config.efforts or {}
+  local effort_name = b_effort or config.effort or "off"
+  for _, e in ipairs(efforts) do
+    if type(e) == "table" and e.name == effort_name and e.level then
+      body.reasoning_effort = e.level
+      break
+    end
+  end
+
+  local payload = vim.json.encode(body)
+
+  local function start_request(resolve)
+    local content = {}        -- finished blocks in order
+    local text_block = nil    -- the single streamed text block (created lazily)
+    local tool_blocks = {}    -- OpenAI tool_calls index -> { block, order }
+    local tool_order = {}     -- preserves first-seen order of tool_calls
+    local stop_reason = nil
+    local usage = nil
+    local function merge_usage(u)
+      if type(u) ~= "table" then return end
+      usage = usage or {}
+      -- Normalize OpenAI usage names to the Anthropic ones the loop reads.
+      if type(u.prompt_tokens) == "number" then usage.input_tokens = u.prompt_tokens end
+      if type(u.completion_tokens) == "number" then usage.output_tokens = u.completion_tokens end
+      local details = u.prompt_tokens_details
+      if type(details) == "table" and type(details.cached_tokens) == "number" then
+        usage.cache_read_input_tokens = details.cached_tokens
+      end
+    end
+    local line_buf = ""
+    local raw, raw_len = {}, 0
+
+    local proc = nil
+    local idle_ms = tonumber(config.request_timeout_ms) or 300000
+    local stalled = false
+    local watchdog = vim.uv.new_timer()
+    local watchdog_dead = false
+    local function on_stall()
+      stalled = true
+      if proc then pcall(function() proc:kill(9) end) end
+      resolve({
+        ok = false,
+        body = table.concat(raw),
+        err = ("stream stalled: no data from %s for %d ms; request killed."
+          .. " If your endpoint or model is legitimately slow, raise"
+          .. " config.request_timeout_ms."):format(base_url, idle_ms),
+      })
+    end
+    local function watchdog_reset()
+      if not watchdog_dead then
+        pcall(function()
+          watchdog:stop()
+          watchdog:start(idle_ms, 0, on_stall)
+        end)
+      end
+    end
+    local function watchdog_close()
+      if not watchdog_dead then
+        watchdog_dead = true
+        pcall(function()
+          watchdog:stop()
+          watchdog:close()
+        end)
+      end
+    end
+
+    -- OpenAI's finish_reason -> the Anthropic stop_reason the loop expects.
+    local function map_finish(fr)
+      if fr == "tool_calls" then return "tool_use"
+      elseif fr == "length" then return "max_tokens"
+      elseif fr == "stop" then return "end_turn"
+      else return fr end
+    end
+
+    local function handle_choice(choice)
+      local delta = choice.delta or {}
+      if type(delta.content) == "string" and delta.content ~= "" then
+        if not text_block then
+          text_block = { type = "text", text = "" }
+        end
+        text_block.text = text_block.text .. delta.content
+        ctx.emit({ type = "text_delta", text = delta.content })
+      end
+      if type(delta.tool_calls) == "table" then
+        for _, tc in ipairs(delta.tool_calls) do
+          local idx = tc.index or 0
+          local slot = tool_blocks[idx]
+          if not slot then
+            slot = { type = "tool_use", id = tc.id, name = nil, partial = "" }
+            tool_blocks[idx] = slot
+            tool_order[#tool_order + 1] = idx
+          end
+          if tc.id and tc.id ~= "" then slot.id = tc.id end
+          local fn = tc["function"] or {}
+          if fn.name and fn.name ~= "" then slot.name = fn.name end
+          if type(fn.arguments) == "string" then
+            slot.partial = slot.partial .. fn.arguments
+          end
+        end
+      end
+      if choice.finish_reason then
+        stop_reason = map_finish(choice.finish_reason)
+      end
+    end
+
+    local function finalize()
+      -- Emit blocks in stream order: text first (OpenAI streams it before or
+      -- interleaved, but a single message has one assistant text), then tools.
+      if text_block and text_block.text ~= "" then
+        content[#content + 1] = text_block
+      end
+      for _, idx in ipairs(tool_order) do
+        local b = tool_blocks[idx]
+        local ok, input = pcall(vim.json.decode, b.partial ~= "" and b.partial or "{}")
+        b.input = ok and input or vim.empty_dict()
+        b.partial = nil
+        content[#content + 1] = b
+      end
+      resolve({ ok = true, content = content, stop_reason = stop_reason or "end_turn", usage = usage })
+    end
+
+    local function on_data(data)
+      if data == "[DONE]" then
+        finalize()
+        return
+      end
+      local ok, msg = pcall(vim.json.decode, data)
+      if not ok or type(msg) ~= "table" then return end
+      if type(msg.choices) == "table" then
+        for _, choice in ipairs(msg.choices) do
+          pcall(handle_choice, choice)
+        end
+      end
+      -- Usage arrives on its own final chunk (choices empty) with
+      -- stream_options.include_usage, and sometimes on each chunk.
+      merge_usage(msg.usage)
+    end
+
+    local function on_line(line)
+      local data = line:match("^data:%s*(.+)")
+      if data then on_data(data) end
+    end
+
+    local function on_stdout(err, chunk)
+      if err or not chunk then return end
+      watchdog_reset()
+      if ctx.activity then ctx.activity() end
+      if raw_len < 65536 then
+        raw[#raw + 1] = chunk
+        raw_len = raw_len + #chunk
+      end
+      line_buf = line_buf .. chunk
+      while true do
+        local nl = line_buf:find("\n", 1, true)
+        if not nl then break end
+        local line = line_buf:sub(1, nl - 1):gsub("\r$", "")
+        line_buf = line_buf:sub(nl + 1)
+        on_line(line)
+      end
+    end
+
+    proc = vim.system({
+      "curl", "-sS", "--no-buffer",
+      "-X", "POST", base_url .. "/v1/chat/completions",
+      "-H", "Authorization: Bearer " .. api_key,
+      "-H", "content-type: application/json",
+      "-w", "%{stderr}\nSTRAPS_HTTP_STATUS:%{http_code}\n",
+      "--data-binary", "@-",
+    }, { stdin = payload, stdout = on_stdout }, function(res)
+      watchdog_close()
+      if ctx.cancelled() then
+        resolve({ ok = true, cancelled = true, content = {}, stop_reason = "cancelled" })
+        return
+      end
+      if stalled then return end
+      local stderr = res.stderr or ""
+      local status = tonumber(stderr:match("STRAPS_HTTP_STATUS:(%d+)"))
+      if status == 0 then status = nil end
+      -- On a clean stream this loses the race with [DONE]/finalize and is a
+      -- no-op. Reaching it live means curl failed, HTTP was non-2xx (the body
+      -- is plain JSON in `raw`), or the stream died before [DONE].
+      resolve({
+        ok = false,
+        status = status,
+        body = table.concat(raw),
+        err = res.code ~= 0
+          and ("curl exited with code " .. res.code .. ": "
+            .. stderr:gsub("%s*STRAPS_HTTP_STATUS:%d+%s*$", ""))
+          or nil,
+      })
+    end)
+
+    watchdog_reset()
+    ctx.on_cancel(function()
+      pcall(function() proc:kill(9) end)
+    end)
+  end
+
+  for attempt = 1, 3 do
+    pcall(registry.try_call, "fn.log",
+      { ev = "request", bytes = #payload, model = body.model, buf = ctx.bufnr })
+    local t0 = vim.uv.hrtime()
+    local res = ctx.await(start_request)
+    local u = type(res.usage) == "table" and res.usage or {}
+    local function tok(v) return type(v) == "number" and v or nil end
+    pcall(registry.try_call, "fn.log", {
+      ev = "response",
+      ms = math.floor((vim.uv.hrtime() - t0) / 1e6),
+      ok = res.ok == true,
+      status = res.status,
+      stop_reason = res.stop_reason,
+      input_tokens = tok(u.input_tokens),
+      output_tokens = tok(u.output_tokens),
+      cache_read_input_tokens = tok(u.cache_read_input_tokens),
+      buf = ctx.bufnr,
+    })
+    if res.cancelled or ctx.cancelled() then
+      return { content = {}, stop_reason = "cancelled" }
+    end
+    if res.ok then
+      return { content = res.content, stop_reason = res.stop_reason, usage = res.usage }
+    end
+
+    if type(res.err) ~= "table" and res.body and res.body ~= "" then
+      local ok, parsed = pcall(vim.json.decode, res.body)
+      if ok and type(parsed) == "table" and type(parsed.error) == "table" then
+        res.err = parsed.error
+      end
+    end
+    local retryable = res.status == 429 or res.status == 500
+      or res.status == 502 or res.status == 503
+
+    if retryable and attempt < 3 then
+      local delay_ms = 1000 * attempt * attempt
+      ctx.await(function(resolve)
+        vim.defer_fn(function() resolve() end, delay_ms)
+        ctx.on_cancel(function() resolve() end)
+      end)
+      if ctx.cancelled() then
+        return { content = {}, stop_reason = "cancelled" }
+      end
+    else
+      local detail
+      if type(res.err) == "table" then
+        detail = vim.json.encode(res.err)
+      elseif res.err then
+        detail = tostring(res.err)
+      else
+        detail = res.body
+      end
+      if detail and #detail > 2000 then
+        detail = detail:sub(1, 2000) .. "..."
+      end
+      error(("straps provider (openai): request failed (HTTP %s): %s"):format(
+        res.status and tostring(res.status) or "?",
+        (detail and detail ~= "") and detail or "no response body"))
+    end
+  end
+  error("straps provider (openai): retries exhausted")
+end
+]==]
+
+-- The dispatcher: fn.provider selects the backend by, in order,
+-- vim.b straps_provider (per session) -> config.provider (if the user set it in
+-- setup{}) -> the persisted preference file (fn.provider_pref, written by
+-- :StrapsProvider) -> "anthropic". Keeping config.provider nil by default lets
+-- the file be the durable default; setting it in setup{} pins it and wins over
+-- the file. Unknown values fall back to Anthropic rather than erroring mid-run.
+-- Keeping fn.provider as the single loop-facing entry means the loop, tests and
+-- DESIGN contract are unchanged; each backend is its own redefinable entry.
+local PROVIDER_SRC = [==[
+return function(req, ctx)
+  local registry = require("straps.registry")
+  local ok_straps, straps = pcall(require, "straps")
+  local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+
+  local provider = config.provider
+  if provider == nil or provider == "" then
+    -- Persisted default (~/.config/straps/provider). Best-effort — a read error
+    -- or missing file just leaves provider nil and we fall through to Anthropic.
+    provider = registry.try_call("fn.provider_pref")
+  end
+  pcall(function()
+    local bufnr = ctx and ctx.bufnr
+    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+      local b = vim.b[bufnr].straps_provider
+      if b and b ~= "" then provider = b end
+    end
+  end)
+
+  if provider == "openai" then
+    return registry.call("fn.provider_openai", req, ctx)
+  end
+  return registry.call("fn.provider_anthropic", req, ctx)
+end
+]==]
+
+-- Persisted provider preference: (value?) -> value. Called with no argument it
+-- READS the first line of $XDG_CONFIG_HOME/straps/provider (~/.config/straps/
+-- provider by default), returning "anthropic"/"openai" or nil when absent/blank.
+-- Called with a string it WRITES that value there (creating the dir), and
+-- returns it. Mirrors the key-file location convention; unlike the key files
+-- this is not a secret, so no mode-600 guard. Never throws on a read miss;
+-- a write failure surfaces as (nil, err) for the picker to report.
+local PROVIDER_PREF_SRC = [==[
+return function(value)
+  local config_home = vim.env.XDG_CONFIG_HOME
+  if not config_home or config_home == "" then
+    local home = vim.env.HOME
+    config_home = (home and home ~= "") and (home .. "/.config") or nil
+  end
+  if not config_home then
+    if value ~= nil then return nil, "no $XDG_CONFIG_HOME or $HOME to write under" end
+    return nil
+  end
+  local dir = config_home .. "/straps"
+  local path = dir .. "/provider"
+
+  if value ~= nil then
+    if vim.fn.isdirectory(dir) == 0 then
+      local ok = pcall(vim.fn.mkdir, dir, "p")
+      if not ok then return nil, "could not create " .. dir end
+    end
+    local f, err = io.open(path, "w")
+    if not f then return nil, "could not write " .. path .. " (" .. tostring(err) .. ")" end
+    f:write(tostring(value) .. "\n")
+    f:close()
+    return value
+  end
+
+  -- Read.
+  local st = vim.uv.fs_stat(path)
+  if not (st and st.type == "file") then return nil end
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local line = f:read("*l")
+  f:close()
+  line = line and vim.trim(line) or ""
+  if line == "" then return nil end
+  return line
+end
+]==]
+
+local OPENAI_API_KEY_SRC = [==[
+return function()
+  local key = vim.env.OPENAI_API_KEY
+  if key and key ~= "" then
+    return key
+  end
+  local config_home = vim.env.XDG_CONFIG_HOME
+  if not config_home or config_home == "" then
+    local home = vim.env.HOME
+    config_home = (home and home ~= "") and (home .. "/.config") or nil
+  end
+  local path = config_home and (config_home .. "/straps/openai_api_key")
+  local st = path and vim.uv.fs_stat(path)
+  if st and st.type == "file" then
+    -- Refuse a key file group/other can access, like fn.api_key does.
+    if st.mode % 64 ~= 0 then
+      error(("straps: %s is accessible by group/other (mode %03o); "
+        .. "run chmod 600 on it."):format(path, st.mode % 4096))
+    end
+    local f, open_err = io.open(path, "r")
+    if not f then
+      error("straps: " .. path .. " exists but could not be read ("
+        .. tostring(open_err) .. ").")
+    end
+    key = f:read("*l")
+    f:close()
+    key = key and vim.trim(key) or ""
+    if key ~= "" then
+      return key
+    end
+  end
+  error("straps: no OpenAI API key found. Export OPENAI_API_KEY in your shell, "
+    .. "write the key to " .. (path or "$XDG_CONFIG_HOME/straps/openai_api_key")
+    .. ", or redefine fn.openai_api_key to fetch the key from somewhere else.")
+end
+]==]
+
 local COMPACT_SRC = [==[
 -- Default mechanical compaction: (bufnr, opts?) -> summary string.
 -- Free and deterministic -- no LLM call. Shrinks the CONTENTS of old
@@ -903,17 +1469,17 @@ into reply prose:
 
 - One location worth their eyes: show_user.
 - Many locations: the quickfix list. grep already fills it as a side
-  effect — :copen (via eval_lua) hands the user the list it built. An
-  investigation built from read_file / definition / references leaves no
-  list behind — build it yourself: vim.fn.setqflist with a title, then
-  :copen. The absence of a side-effect list is not a signal that the
-  findings are prose-sized.
-- Two versions of anything: a diff split (:diffsplit, or :diffthis on a
-  pair of scratch buffers). Highlighted hunks beat prose describing them.
+  effect, and run_quickfix fills it from build/lint output. For findings
+  you assembled yourself (from read_file / definition / references, which
+  leave no list behind), call set_quickfix with the locations and a title —
+  don't hand-roll setqflist. The absence of a side-effect list is not a
+  signal that the findings are prose-sized.
+- Two versions of anything: show_diff — {path, content} to preview proposed
+  contents against a file, or {left, right} for two texts. A real diff
+  split with highlighted hunks beats prose describing them.
 - Structured or generated content — a report, a table, extracted data:
-  a scratch buffer with the right filetype, so it arrives syntax
-  highlighted and searchable instead of scrolling past in the
-  transcript.
+  show_buffer with a filetype, so it arrives syntax highlighted and
+  searchable instead of scrolling past in the transcript.
 - Notes pinned to particular lines: extmarks / virtual text in your own
   namespace, cleared once the moment has passed.
 - Editor mechanism itself — a statusline/winbar/tabline component, a
@@ -1280,9 +1846,21 @@ function M.register()
     source = API_KEY_SRC,
   })
   define({
+    name = "fn.provider_pref",
+    kind = "fn",
+    doc = "Read/write the persisted provider choice ($XDG_CONFIG_HOME/straps/provider). (value?) -> value: no arg reads, a string writes.",
+    source = PROVIDER_PREF_SRC,
+  })
+  define({
+    name = "fn.openai_api_key",
+    kind = "fn",
+    doc = "Return the OpenAI API key (default: $OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key; the file must be chmod 600).",
+    source = OPENAI_API_KEY_SRC,
+  })
+  define({
     name = "fn.list_models",
     kind = "fn",
-    doc = "GET /v1/models and return picker entries { id, label, thinking } (thinking tag inferred from the API's capabilities); (nil, err) on failure.",
+    doc = "GET /v1/models from the effective backend (Anthropic or OpenAI, per config.provider) and return picker entries { id, label, thinking } (Anthropic infers the thinking tag from capabilities; OpenAI has none); (nil, err) on failure.",
     source = LIST_MODELS_SRC,
   })
   define({
@@ -1304,9 +1882,21 @@ function M.register()
     source = COMPACT_SRC,
   })
   define({
-    name = "fn.provider",
+    name = "fn.provider_anthropic",
     kind = "fn",
     doc = "Anthropic Messages API over streaming SSE via curl. (req, ctx) -> { content, stop_reason }.",
+    source = PROVIDER_ANTHROPIC_SRC,
+  })
+  define({
+    name = "fn.provider_openai",
+    kind = "fn",
+    doc = "OpenAI Chat Completions over streaming SSE via curl. (req, ctx) -> { content, stop_reason }.",
+    source = PROVIDER_OPENAI_SRC,
+  })
+  define({
+    name = "fn.provider",
+    kind = "fn",
+    doc = "Dispatch to fn.provider_openai or fn.provider_anthropic by config.provider (or vim.b straps_provider). (req, ctx) -> { content, stop_reason }.",
     source = PROVIDER_SRC,
   })
 end

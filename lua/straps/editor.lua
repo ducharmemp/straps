@@ -277,6 +277,39 @@ local function get_parser(buf, ft)
   if ok and parser then return parser end
   return nil
 end
+
+-- A window for BRAND-NEW content (a generated buffer, a diff side): always a
+-- fresh split so it never replaces the file the user is reading. Focus is not
+-- moved. Returns the new window id.
+local function new_split_win(cmd)
+  local cur = vim.api.nvim_get_current_win()
+  vim.cmd(cmd or "botright vsplit")
+  local w = vim.api.nvim_get_current_win()
+  pcall(vim.api.nvim_set_current_win, cur)
+  return w
+end
+
+-- A throwaway scratch buffer with content + filetype, named for legibility.
+local function scratch_buf(lines, ft, name)
+  local b = vim.api.nvim_create_buf(false, true)
+  vim.bo[b].buftype = "nofile"
+  vim.bo[b].bufhidden = "wipe"
+  vim.bo[b].swapfile = false
+  if type(ft) == "string" and ft ~= "" then pcall(function() vim.bo[b].filetype = ft end) end
+  vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
+  if type(name) == "string" and name ~= "" then
+    pcall(vim.api.nvim_buf_set_name, b, name)
+  end
+  return b
+end
+
+-- Unified diff between two strings, via vim.text.diff (0.11+) or vim.diff.
+-- Returns the diff text (may be "" when identical).
+local function unified_diff(old, new, ctxlen)
+  local differ = (vim.text and vim.text.diff) or vim.diff
+  local d = differ((old or "") .. "\n", (new or "") .. "\n", { ctxlen = ctxlen or 3 })
+  return type(d) == "string" and d or ""
+end
 ]==]
 
 -- Build a full tool source: the shared prelude followed by the tool body.
@@ -357,10 +390,15 @@ return function(input, ctx)
         }
       end
     end
-    -- Optionally land the reported diagnostics in the quickfix list (a side
-    -- effect for :cnext/:cprev; the returned text below is unchanged).
+    -- Optionally land the reported diagnostics in this session's findings list
+    -- (its window's location list when on-screen — isolated from other
+    -- sessions — else the global quickfix list). A side effect for
+    -- :lnext/:cnext; the returned text below is unchanged.
     if input and input.quickfix then
-      pcall(vim.fn.setqflist, {}, " ", { title = "straps: diagnostics", items = items })
+      pcall(function()
+        require("straps.ui").set_locations(ctx and ctx.bufnr,
+          { title = "straps: diagnostics", items = items }, false)
+      end)
     end
     if #lines == 0 then return "no diagnostics" end
     return table.concat(lines, "\n")
@@ -2258,6 +2296,223 @@ return function(input, ctx)
   return string.format(
     "%s: moved from seq %d to seq %d and saved — redo by calling again with to_seq=%d",
     name, before, after, before)
+end
+]==]),
+  })
+
+  -- --------------------------------------------------------------- show_diff
+
+  define({
+    name = "tool.show_diff",
+    kind = "tool",
+    doc = "Show the user a diff in a real side-by-side diff split (Vim's"
+      .. " :diffthis, so hunks are highlighted natively) — two versions of"
+      .. " something to compare, not prose describing the change. Two modes:"
+      .. " (1) proposed-vs-current: pass {path, content} to diff `content`"
+      .. " against the file's CURRENT contents on disk/buffer (e.g. preview an"
+      .. " edit before making it); (2) arbitrary texts: pass {left, right,"
+      .. " filetype?, left_label?, right_label?} to diff two strings. Opens in"
+      .. " non-session windows without stealing the user's focus. Read-only"
+      .. " (shows a view; changes no files). Returns a one-line confirmation"
+      .. " with the hunk count. Parameters: path + content, OR left + right"
+      .. " (with optional filetype and labels).",
+    input_schema = {
+      type = "object",
+      properties = {
+        path = { type = "string", description = "File to diff `content` against (proposed-vs-current mode)." },
+        content = { type = "string", description = "Proposed new contents for `path`." },
+        left = { type = "string", description = "Left-hand text (arbitrary-texts mode)." },
+        right = { type = "string", description = "Right-hand text (arbitrary-texts mode)." },
+        filetype = { type = "string", description = "Filetype for syntax highlighting in arbitrary-texts mode." },
+        left_label = { type = "string", description = "Window label for the left side." },
+        right_label = { type = "string", description = "Window label for the right side." },
+      },
+      required = {},
+    },
+    source = src([==[
+return function(input, ctx)
+  input = input or {}
+  local left, right, ft, lname, rname
+
+  if type(input.path) == "string" and input.path ~= "" then
+    -- Proposed-vs-current: current contents (buffer if loaded, else disk).
+    local full = vim.fn.fnamemodify(input.path, ":p")
+    local buf = vim.fn.bufadd(full)
+    pcall(vim.fn.bufload, buf)
+    left = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+    right = (type(input.content) == "string" and input.content or ""):gsub("\n$", "")
+    ft = vim.bo[buf].filetype
+    if ft == nil or ft == "" then
+      local m = vim.filetype.match({ filename = full })
+      if m and m ~= "" then ft = m end
+    end
+    lname = input.left_label or (relname(full, buf) .. " (current)")
+    rname = input.right_label or (relname(full, buf) .. " (proposed)")
+  elseif type(input.left) == "string" and type(input.right) == "string" then
+    left, right = input.left, input.right
+    ft = type(input.filetype) == "string" and input.filetype or ""
+    lname = input.left_label or "left"
+    rname = input.right_label or "right"
+  else
+    return "show_diff: pass {path, content} or {left, right}"
+  end
+
+  local hunks = 0
+  local ok, err = pcall(function()
+    local lb = scratch_buf(vim.split(left, "\n", { plain = true }), ft, "straps://diff/" .. lname)
+    local rb = scratch_buf(vim.split(right, "\n", { plain = true }), ft, "straps://diff/" .. rname)
+    -- New content gets its own split so the user's current buffer is never
+    -- replaced; the right side splits beside it.
+    local lw = new_split_win()
+    vim.api.nvim_win_set_buf(lw, lb)
+    local cur = vim.api.nvim_get_current_win()
+    pcall(function()
+      vim.api.nvim_set_current_win(lw)
+      vim.cmd("diffthis")
+      vim.cmd("rightbelow vsplit")
+      local rw = vim.api.nvim_get_current_win()
+      vim.api.nvim_win_set_buf(rw, rb)
+      vim.cmd("diffthis")
+      pcall(function() vim.wo[lw].winbar = lname end)
+      pcall(function() vim.wo[rw].winbar = rname end)
+    end)
+    pcall(vim.api.nvim_set_current_win, cur)
+  end)
+  if not ok then return "show_diff: " .. tostring(err) end
+
+  if left == right then
+    return "show_diff: the two versions are identical (no differences)"
+  end
+  -- Count hunks from the unified diff (for the agent's confirmation line).
+  local diff = unified_diff(left, right, 0)
+  for _ in diff:gmatch("\n@@") do hunks = hunks + 1 end
+  if diff:match("^@@") then hunks = hunks + 1 end
+  return ("show_diff: opened a diff split (%d hunk%s) — %s vs %s")
+    :format(hunks, hunks == 1 and "" or "s", lname, rname)
+end
+]==]),
+  })
+
+  -- ------------------------------------------------------------- show_buffer
+
+  define({
+    name = "tool.show_buffer",
+    kind = "tool",
+    doc = "Show the user generated or extracted content in a filetype'd scratch"
+      .. " split — a report, a table, a data extract, sample code — so it"
+      .. " arrives syntax-highlighted and searchable in their editor instead of"
+      .. " scrolling past in the transcript. Opens in a non-session window"
+      .. " without stealing focus. Read-only (creates a scratch buffer; touches"
+      .. " no files). Returns a one-line confirmation. Parameters: content"
+      .. " (required) — the text to display; filetype (optional) — for"
+      .. " highlighting, e.g. 'markdown', 'lua', 'json'; title (optional) — a"
+      .. " name for the scratch buffer; split (optional) — 'vertical' (default)"
+      .. " or 'horizontal'.",
+    input_schema = {
+      type = "object",
+      properties = {
+        content = { type = "string", description = "Text to display in the scratch buffer." },
+        filetype = { type = "string", description = "Filetype for syntax highlighting." },
+        title = { type = "string", description = "Name for the scratch buffer." },
+        split = { type = "string", description = "'vertical' (default) or 'horizontal'." },
+      },
+      required = { "content" },
+    },
+    source = src([==[
+return function(input, ctx)
+  input = input or {}
+  if type(input.content) ~= "string" then
+    return "show_buffer: content is required"
+  end
+  local ft = type(input.filetype) == "string" and input.filetype or ""
+  local title = type(input.title) == "string" and input.title ~= "" and input.title or nil
+  local name = "straps://buffer/" .. (title or ("scratch-" .. os.time()))
+  local nlines = 0
+  local ok, err = pcall(function()
+    local lines = vim.split(input.content, "\n", { plain = true })
+    nlines = #lines
+    local b = scratch_buf(lines, ft, name)
+    local cmd = (input.split == "horizontal") and "botright split" or "botright vsplit"
+    local win = new_split_win(cmd)
+    vim.api.nvim_win_set_buf(win, b)
+    if title then pcall(function() vim.wo[win].winbar = title end) end
+  end)
+  if not ok then return "show_buffer: " .. tostring(err) end
+  return ("show_buffer: opened %d line%s%s%s")
+    :format(nlines, nlines == 1 and "" or "s",
+      ft ~= "" and (" (" .. ft .. ")") or "",
+      title and (" — " .. title) or "")
+end
+]==]),
+  })
+
+  -- ------------------------------------------------------------ set_quickfix
+
+  define({
+    name = "tool.set_quickfix",
+    kind = "tool",
+    doc = "Load a list of locations into Neovim's quickfix list and open it, so"
+      .. " the user can step through them with :cnext/:cprev. Use this for a set"
+      .. " of file:line findings you assembled yourself (e.g. from reads and"
+      .. " analysis) — grep already fills the quickfix list for searches, and"
+      .. " run_quickfix does it for build/lint output, so reach for those first"
+      .. " when they apply. Read-only with respect to files (only sets the"
+      .. " quickfix list). Parameters: items (required) — an array of"
+      .. " {path, line?, col?, text?}; title (optional) — the list title; open"
+      .. " (optional, default true) — open the quickfix window.",
+    input_schema = {
+      type = "object",
+      properties = {
+        items = {
+          type = "array",
+          description = "Locations to load: {path, line?, col?, text?} objects.",
+          items = {
+            type = "object",
+            properties = {
+              path = { type = "string" },
+              line = { type = "integer" },
+              col = { type = "integer" },
+              text = { type = "string" },
+            },
+            required = { "path" },
+          },
+        },
+        title = { type = "string", description = "Quickfix list title." },
+        open = { type = "boolean", description = "Open the quickfix window (default true)." },
+      },
+      required = { "items" },
+    },
+    source = src([==[
+return function(input, ctx)
+  input = input or {}
+  if type(input.items) ~= "table" then
+    return "set_quickfix: items must be an array of {path, line?, col?, text?}"
+  end
+  local qf = {}
+  for _, it in ipairs(input.items) do
+    if type(it) == "table" and type(it.path) == "string" and it.path ~= "" then
+      qf[#qf + 1] = {
+        filename = vim.fn.fnamemodify(it.path, ":p"),
+        lnum = tonumber(it.line) or 0,
+        col = tonumber(it.col) or 0,
+        text = type(it.text) == "string" and it.text or "",
+      }
+    end
+  end
+  if #qf == 0 then
+    return "set_quickfix: no valid items (each needs a `path`)"
+  end
+  local title = type(input.title) == "string" and input.title ~= "" and input.title
+    or "straps: findings"
+  local open = input.open
+  if open == nil then open = true end
+  -- Route to THIS session's findings list (its window's location list when
+  -- on-screen — isolated from other sessions — else the global quickfix list).
+  local list_kind = require("straps.ui").set_locations(ctx and ctx.bufnr,
+    { title = title, items = qf }, open)
+  local nav = (list_kind == "loclist") and ":lnext/:lprev" or ":cnext/:cprev"
+  return ("set_quickfix: loaded %d entr%s (%s) — the user can step them with %s")
+    :format(#qf, #qf == 1 and "y" or "ies", title, nav)
 end
 ]==]),
   })

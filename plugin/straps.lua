@@ -145,3 +145,7 @@ end, { desc = "straps: pick config.model via a picker (snacks.nvim if available)
 vim.api.nvim_create_user_command("StrapsEffort", function()
   require("straps.ui").pick_effort()
 end, { desc = "straps: pick config.effort (extended-thinking budget) via a picker" })
+
+vim.api.nvim_create_user_command("StrapsProvider", function()
+  require("straps.ui").pick_provider()
+end, { desc = "straps: pick the API backend (anthropic/openai); persists the global choice to ~/.config/straps/provider" })

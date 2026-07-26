@@ -18,6 +18,10 @@ end
 
 local straps = require("straps").setup({})
 straps.config.session_dir = vim.fn.tempname()
+-- Pin the Anthropic backend: this e2e suite points fn.provider at an in-process
+-- Anthropic-shaped server, so a developer's persisted ~/.config/straps/provider
+-- (which fn.provider would otherwise consult) must not route the run to OpenAI.
+straps.config.provider = "anthropic"
 vim.env.ANTHROPIC_API_KEY = "test-key-not-real"
 
 local registry = require("straps.registry")

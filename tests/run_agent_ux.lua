@@ -81,7 +81,8 @@ end
 
 case("new tools registered with schemas; autocmd_bridge registered as fn", function()
   for _, n in ipairs({ "hover", "workspace_symbols", "rename_symbol", "code_action",
-    "format", "context", "show_user", "help_search", "run_in_terminal" }) do
+    "format", "context", "show_user", "help_search", "run_in_terminal",
+    "show_diff", "show_buffer", "set_quickfix" }) do
     local e = registry.get("tool." .. n)
     assert(e, "tool." .. n .. " not registered")
     assert(e.kind == "tool", "tool." .. n .. " wrong kind")
@@ -964,6 +965,112 @@ case("tool.spawn tags the child buffer with parent and task", function()
   assert(vim.b[child].straps_parent == parent, "child parent bufnr wrong")
   assert(vim.b[child].straps_task == "do the thing",
     "task not normalized/stored: " .. tostring(vim.b[child].straps_task))
+end)
+
+-- ------------------------------------------------- presentation tools
+
+case("show_buffer opens a filetype'd scratch split without stealing focus", function()
+  vim.cmd("only")
+  local wins_before = #vim.api.nvim_list_wins()
+  local focus_before = vim.api.nvim_get_current_win()
+  local out = drive(function(ctx)
+    return registry.call("tool.show_buffer",
+      { content = "# Report\n\nrow one\nrow two", filetype = "markdown", title = "findings" }, ctx)
+  end, 5000)
+  assert(out:find("show_buffer: opened 4 lines", 1, true), "summary wrong: " .. out)
+  assert(out:find("markdown", 1, true) and out:find("findings", 1, true), "summary missing ft/title: " .. out)
+  assert(#vim.api.nvim_list_wins() == wins_before + 1, "should have opened one split")
+  assert(vim.api.nvim_get_current_win() == focus_before, "show_buffer stole focus")
+  -- The scratch buffer exists with the right filetype and content.
+  local found
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(b):find("straps://buffer/findings", 1, true) then found = b end
+  end
+  assert(found, "named scratch buffer not created")
+  assert(vim.bo[found].filetype == "markdown", "scratch filetype wrong")
+  vim.cmd("only")
+end)
+
+case("show_buffer requires content", function()
+  local out = drive(function(ctx)
+    return registry.call("tool.show_buffer", { filetype = "lua" }, ctx)
+  end, 5000)
+  assert(out:find("content is required", 1, true), "expected a content-required error: " .. out)
+end)
+
+case("show_diff (arbitrary texts) opens a two-window diff and counts hunks", function()
+  vim.cmd("only")
+  local wins_before = #vim.api.nvim_list_wins()
+  local out = drive(function(ctx)
+    return registry.call("tool.show_diff",
+      { left = "a\nb\nc\n", right = "a\nB\nc\n", filetype = "text",
+        left_label = "old", right_label = "new" }, ctx)
+  end, 5000)
+  assert(out:find("opened a diff split", 1, true), "summary wrong: " .. out)
+  assert(out:find("old vs new", 1, true), "labels missing: " .. out)
+  -- Two windows are now in 'diff' mode.
+  local diffwins = 0
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    if vim.wo[w].diff then diffwins = diffwins + 1 end
+  end
+  assert(diffwins >= 2, "expected two diff windows, got " .. diffwins)
+  assert(#vim.api.nvim_list_wins() >= wins_before + 1, "diff should add at least one window")
+  vim.cmd("windo diffoff")
+  vim.cmd("only")
+end)
+
+case("show_diff reports identical versions", function()
+  vim.cmd("only")
+  local out = drive(function(ctx)
+    return registry.call("tool.show_diff", { left = "same\n", right = "same\n" }, ctx)
+  end, 5000)
+  assert(out:find("identical", 1, true), "expected identical note: " .. out)
+  vim.cmd("windo diffoff")
+  vim.cmd("only")
+end)
+
+case("show_diff without a valid mode returns a usage hint", function()
+  local out = drive(function(ctx)
+    return registry.call("tool.show_diff", { filetype = "lua" }, ctx)
+  end, 5000)
+  assert(out:find("pass {path, content} or {left, right}", 1, true), "usage hint missing: " .. out)
+end)
+
+case("set_quickfix loads locations and opens the quickfix list", function()
+  vim.cmd("only")
+  vim.fn.setqflist({}, "f")
+  local out = drive(function(ctx)
+    return registry.call("tool.set_quickfix", {
+      items = {
+        { path = root .. "/lua/straps/loop.lua", line = 10, col = 2, text = "here" },
+        { path = root .. "/README.md", line = 1, text = "there" },
+        { bogus = true }, -- no path: skipped
+      },
+      title = "straps: my findings",
+    }, ctx)
+  end, 5000)
+  local qf = vim.fn.getqflist()
+  assert(#qf == 2, "expected 2 valid entries, got " .. #qf .. " — " .. out)
+  assert(qf[1].lnum == 10 and qf[1].col == 2, "first entry position wrong")
+  assert(out:find("loaded 2 entries", 1, true), "summary wrong: " .. out)
+  local title = vim.fn.getqflist({ title = 1 }).title
+  assert(title == "straps: my findings", "title not set: " .. tostring(title))
+  vim.cmd("cclose")
+  vim.cmd("only")
+end)
+
+case("set_quickfix with no valid items reports it", function()
+  local out = drive(function(ctx)
+    return registry.call("tool.set_quickfix", { items = { { nope = 1 } } }, ctx)
+  end, 5000)
+  assert(out:find("no valid items", 1, true), "expected no-valid-items note: " .. out)
+end)
+
+case("hook.confirm auto-allows the presentation tools", function()
+  for _, n in ipairs({ "show_diff", "show_buffer", "set_quickfix" }) do
+    local allowed = registry.call("hook.confirm", n, {}, { bufnr = 0 })
+    assert(allowed == true, n .. " should be auto-allowed (read-only view)")
+  end
 end)
 
 print(failed and "FAILED" or "ALL PASS")

@@ -6,6 +6,20 @@
 local M = {}
 
 M.config = {
+  -- Which backend fn.provider dispatches to: "anthropic" (the Anthropic
+  -- Messages API via fn.provider_anthropic) or "openai" (OpenAI Chat
+  -- Completions via fn.provider_openai). nil (the default) means "not pinned
+  -- here" — fn.provider then reads the persisted choice written by
+  -- :StrapsProvider ($XDG_CONFIG_HOME/straps/provider), falling back to
+  -- "anthropic". Setting it here PINS the provider and wins over that file.
+  -- Overridable per session buffer with vim.b[bufnr].straps_provider, so two
+  -- sessions can talk to different backends. "openai" reads fn.openai_api_key
+  -- ($OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key), posts to
+  -- openai_base_url, and uses openai_model (falling back to `model`).
+  provider = nil,
+  openai_base_url = "https://api.openai.com",
+  -- Model id sent when provider == "openai"; nil falls back to `model`.
+  openai_model = nil,
   model = "claude-sonnet-5",
   max_tokens = 8192,
   max_turns = 128,
@@ -17,6 +31,13 @@ M.config = {
   max_tool_result_bytes = 100000,
   cache = true,
   compact_keep_turns = 2,
+  -- Default hook.after_write behaviour: after the agent writes a file, wait
+  -- briefly for the attached LSP to re-lint it and feed any ERROR/WARN
+  -- diagnostics back into the tool result — the editor-native version of
+  -- "run a linter after every write". false turns it off (the hook returns
+  -- nil); after_write_diagnostics_ms caps how long it waits for the server.
+  after_write_diagnostics = true,
+  after_write_diagnostics_ms = 800,
   -- Extra instruction files for fn.system_prompt_project, included verbatim
   -- after the auto-discovered AGENTS.md/CLAUDE.md. Paths, absolute or
   -- relative to cwd; unreadable entries are skipped silently.
@@ -61,11 +82,15 @@ M.config = {
   -- live discovery (fn.list_models -> GET /v1/models) and merges the account's
   -- real catalog over this list, keeping these curated labels/tags on top.
   models = {
-    { id = "claude-opus-4-8", label = "Opus 4.8 — most capable, slowest", thinking = "adaptive" },
-    { id = "claude-sonnet-5", label = "Sonnet 5 — balanced (default)", thinking = "adaptive" },
-    { id = "claude-sonnet-4-6", label = "Sonnet 4.6", thinking = "adaptive" },
-    { id = "claude-haiku-4-5-20251001", label = "Haiku 4.5 — fastest, cheapest", thinking = "budget" },
+    { id = "claude-opus-4-8", label = "Opus 4.8 — most capable, slowest", thinking = "adaptive", context = 200000 },
+    { id = "claude-sonnet-5", label = "Sonnet 5 — balanced (default)", thinking = "adaptive", context = 200000 },
+    { id = "claude-sonnet-4-6", label = "Sonnet 4.6", thinking = "adaptive", context = 200000 },
+    { id = "claude-haiku-4-5-20251001", label = "Haiku 4.5 — fastest, cheapest", thinking = "budget", context = 200000 },
   },
+  -- Fallback context window (tokens) for a model not found in `models` with a
+  -- `context` field — used only to render the winbar's context-fill percentage
+  -- (nothing is sent to the API). nil hides the percentage for unknown models.
+  context_window = 200000,
 
   -- :StrapsEffort picker choices. `level` feeds output_config.effort for
   -- "adaptive" models; `budget_tokens` feeds thinking.budget_tokens for

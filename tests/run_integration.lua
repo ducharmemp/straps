@@ -313,6 +313,58 @@ end
       "global config.effort was mutated — should stay put on a session buffer")
   end)
 
+  -- Provider picker: hermetic XDG so fn.provider_pref writes to a throwaway dir.
+  do
+    local saved_xdg = vim.env.XDG_CONFIG_HOME
+    local saved_provider = straps.config.provider
+    local pdir = vim.fn.tempname()
+    vim.fn.mkdir(pdir, "p")
+    vim.env.XDG_CONFIG_HOME = pdir
+
+    case("pick_provider global sets config.provider AND persists to the file", function()
+      straps.config.provider = nil
+      with_stub("openai", function()
+        ui.pick_provider()
+      end)
+      assert(straps.config.provider == "openai",
+        "config.provider is " .. tostring(straps.config.provider))
+      local line = vim.trim(table.concat(vim.fn.readfile(pdir .. "/straps/provider"), "\n"))
+      assert(line == "openai", "persisted file wrong: " .. line)
+      -- fn.provider_pref reads it back.
+      assert(registry.call("fn.provider_pref") == "openai", "provider_pref read-back wrong")
+    end)
+
+    case("pick_provider cancel (nil) leaves config.provider untouched", function()
+      straps.config.provider = "anthropic"
+      with_stub(nil, function()
+        ui.pick_provider()
+      end)
+      assert(straps.config.provider == "anthropic",
+        "cancel should not change config.provider, got " .. tostring(straps.config.provider))
+    end)
+
+    case("pick_provider on a session buffer sets it PER-BUFFER, no file write", function()
+      local sess = state.new_session()
+      local prev = vim.api.nvim_get_current_buf()
+      vim.api.nvim_set_current_buf(sess)
+      straps.config.provider = nil
+      vim.fn.delete(pdir .. "/straps/provider")
+      with_stub("openai", function()
+        ui.pick_provider()
+      end)
+      vim.api.nvim_set_current_buf(prev)
+      assert(vim.b[sess].straps_provider == "openai",
+        "per-buffer provider not set: " .. tostring(vim.b[sess].straps_provider))
+      assert(straps.config.provider == nil,
+        "global config.provider was mutated on a session buffer")
+      assert(vim.fn.filereadable(pdir .. "/straps/provider") == 0,
+        "session pick should not persist to the global file")
+    end)
+
+    vim.env.XDG_CONFIG_HOME = saved_xdg
+    straps.config.provider = saved_provider
+  end
+
   straps.config.model = "claude-sonnet-5"
   straps.config.effort = "off"
 end
@@ -347,6 +399,68 @@ case("session_status and session_winbar are empty on non-session buffers", funct
   vim.api.nvim_set_current_buf(prev)
   assert(s == "", "session_status should be empty off a session buffer: [" .. s .. "]")
   assert(w == "", "session_winbar should be empty off a session buffer: [" .. w .. "]")
+end)
+
+case("usage_status: empty with no usage, and off a session buffer", function()
+  local ui = require("straps.ui")
+  local sess = state.new_session()
+  local prev = vim.api.nvim_get_current_buf()
+  vim.api.nvim_set_current_buf(sess)
+  assert(ui.usage_status() == "", "no usage yet should be empty")
+  vim.api.nvim_set_current_buf(prev)
+  local scratch = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_current_buf(scratch)
+  assert(ui.usage_status() == "", "usage_status should be empty off a session buffer")
+  vim.api.nvim_set_current_buf(prev)
+end)
+
+case("usage_status: context fill percent and cache rate from vim.b.straps_usage", function()
+  local ui = require("straps.ui")
+  local sess = state.new_session()
+  local prev = vim.api.nvim_get_current_buf()
+  vim.api.nvim_set_current_buf(sess)
+  straps.config.model = "claude-sonnet-5"     -- context = 200000
+  -- 50000 input of which 40000 was a cache read.
+  vim.b[sess].straps_usage = {
+    input = 10000, cache_read = 40000, cache_creation = 0,
+    input_billed = 50000, output = 200,
+  }
+  local out = ui.usage_status()
+  vim.api.nvim_set_current_buf(prev)
+  assert(out:find("50.0k/200k", 1, true) or out:find("50k/200k", 1, true),
+    "context fill missing: " .. out)
+  assert(out:find("(25%)", 1, true), "context percent wrong (want 25%%): " .. out)
+  assert(out:find("cache 80%", 1, true), "cache rate wrong (want 80%%): " .. out)
+end)
+
+case("usage_status: unknown model with no context_window shows raw count", function()
+  local ui = require("straps.ui")
+  local sess = state.new_session()
+  local prev = vim.api.nvim_get_current_buf()
+  vim.api.nvim_set_current_buf(sess)
+  vim.b[sess].straps_model = "some-unlisted-model"
+  local saved = straps.config.context_window
+  straps.config.context_window = nil
+  vim.b[sess].straps_usage = { input_billed = 1234, cache_read = 0 }
+  local out = ui.usage_status()
+  straps.config.context_window = saved
+  vim.api.nvim_set_current_buf(prev)
+  assert(out:find("ctx", 1, true), "expected a raw ctx count: " .. out)
+  assert(not out:find("%%", 1, true), "no percent should show without a window: " .. out)
+end)
+
+case("session_winbar includes the usage segment when usage is present", function()
+  local ui = require("straps.ui")
+  local sess = state.new_session()
+  local prev = vim.api.nvim_get_current_buf()
+  vim.api.nvim_set_current_buf(sess)
+  straps.config.model = "claude-sonnet-5"
+  vim.b[sess].straps_usage = { input_billed = 20000, cache_read = 0 }
+  local w = ui.session_winbar()
+  vim.api.nvim_set_current_buf(prev)
+  assert(w:find("20k/200k", 1, true) or w:find("20.0k/200k", 1, true),
+    "winbar should embed the usage segment: " .. w)
+  assert(w:find("idle", 1, true), "winbar should still show run status: " .. w)
 end)
 
 case("default progress hook cleaned up its extmarks", function()

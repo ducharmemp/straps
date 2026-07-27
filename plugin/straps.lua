@@ -19,26 +19,39 @@ local function resolve_session()
   return target
 end
 
-vim.api.nvim_create_user_command("Straps", function()
-  require("straps.ui").open_session()
-end, { desc = "straps: open a new session (transcript buffer)" })
+-- Turn a command's parsed <mods> into a :split command string, so window
+-- placement modifiers (`:vertical`, `:botright`, `:leftabove`, …) prefixed to
+-- our commands open the session window that way — `:vertical Straps` is a
+-- vsplit. smods.split ("", "botright", "topleft", "belowright", "aboveleft")
+-- is Neovim's parse of the placement; smods.vertical carries `:vertical`.
+-- Anything unset falls through to a plain horizontal "split".
+local function split_cmd_of(smods)
+  local prefix = smods and smods.split ~= "" and smods.split or ""
+  local verb = smods and smods.vertical and "vsplit" or "split"
+  return (prefix ~= "" and (prefix .. " ") or "") .. verb
+end
+
+vim.api.nvim_create_user_command("Straps", function(opts)
+  require("straps.ui").open_session(split_cmd_of(opts.smods))
+end, { desc = "straps: open a new session (transcript buffer; :vertical for a vsplit)" })
 
 vim.api.nvim_create_user_command("StrapsResume", function(opts)
   local ui = require("straps.ui")
   local arg = opts.args
+  local split = split_cmd_of(opts.smods)
   if opts.bang then
     return ui.pick_session() -- picker over all saved sessions
   end
   if arg == "" then
-    return ui.resume_session() -- most recent
+    return ui.resume_session(nil, split) -- most recent
   end
   if vim.fn.filereadable(arg) == 1 then
-    return ui.resume_session(vim.fn.fnamemodify(arg, ":p")) -- explicit path
+    return ui.resume_session(vim.fn.fnamemodify(arg, ":p"), split) -- explicit path
   end
   -- Treat the arg as a session basename and resolve it to a full path.
   for _, s in ipairs(require("straps.state").list_sessions()) do
     if s.name == arg then
-      return ui.resume_session(s.path)
+      return ui.resume_session(s.path, split)
     end
   end
   vim.notify("straps: no such session: " .. arg .. " (try :StrapsResume<Tab>)", vim.log.levels.WARN)

@@ -66,7 +66,10 @@ you (or the agent) redefined at runtime.
 
 1. `:Straps` opens a session: one ordinary buffer in a split, cursor on the
    trailing `%%[straps:user]%%` marker. There is no separate compose buffer —
-   the transcript IS where you type.
+   the transcript IS where you type. The window placement follows the standard
+   command modifiers, so `:vertical Straps` opens a vertical split and
+   `:botright Straps` a full-height one; `:StrapsResume` takes the same
+   modifiers.
 2. Type your message under that marker — as many lines as you like, normal
    vim editing throughout.
 3. Press `<CR>` in normal mode (or run `:StrapsSend`) to send: the loop reads

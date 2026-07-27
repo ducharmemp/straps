@@ -552,13 +552,18 @@ end
 -- transcript bufnr (new_session vs open_session_file).
 --- Public so callers holding a live session bufnr (e.g. the running-agents
 --- picker) can bring it on-screen with the full session wiring.
-function M.show_session(bufnr)
+--- @param bufnr integer session transcript buffer
+--- @param split_cmd string? the :split command to open the window with;
+---   defaults to "split" (horizontal). Pass "vertical split" for a vsplit,
+---   or any modifier chain ("botright vsplit", "leftabove split", ...). The
+---   user commands derive this from <mods>, so `:vertical Straps` just works.
+function M.show_session(bufnr, split_cmd)
   -- Project registry (trusted .straps.lua, if any), so project-defined tools
   -- exist for the session's first request and land after the builtins in seq
   -- order (append-only, cache-safe). pcall: opening a session must never fail
   -- because a project file is broken.
   pcall(require("straps").load_project_registry)
-  vim.cmd("split")
+  vim.cmd(split_cmd and split_cmd ~= "" and split_cmd or "split")
   vim.api.nvim_win_set_buf(0, bufnr)
   -- Don't stomp a live status: a running subagent brought on-screen by the
   -- agents picker is still "running".
@@ -614,27 +619,31 @@ end
 --- trailing (empty) user block. <CR> in normal mode sends it; while a run is
 --- active <CR> prompts to steer instead. Ordinary vim editing works
 --- throughout — including editing earlier history before sending.
-function M.open_session()
+--- @param split_cmd string? split command to open the window with (see
+---   M.show_session); nil/"" → horizontal "split".
+function M.open_session(split_cmd)
   local bufnr = require("straps.state").new_session()
-  return M.show_session(bufnr)
+  return M.show_session(bufnr, split_cmd)
 end
 
 --- Resume a durable session: same as open_session, but the transcript comes
 --- from an existing *.straps file via open_session_file. path nil → the most
 --- recent saved session (state.list_sessions()[1]); no saved sessions →
 --- notify and fall through to a fresh session.
-function M.resume_session(path)
+--- @param split_cmd string? split command to open the window with (see
+---   M.show_session); nil/"" → horizontal "split".
+function M.resume_session(path, split_cmd)
   local state = require("straps.state")
   if not path then
     local sessions = state.list_sessions()
     if not sessions[1] then
       vim.notify("straps: no saved sessions")
-      return M.open_session()
+      return M.open_session(split_cmd)
     end
     path = sessions[1].path
   end
   local bufnr = state.open_session_file(path)
-  return M.show_session(bufnr)
+  return M.show_session(bufnr, split_cmd)
 end
 
 --- Open a picker over state.list_sessions() ({ path, name, mtime }, newest

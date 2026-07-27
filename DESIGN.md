@@ -368,9 +368,11 @@ mutable. It follows directly from invariant 1 (buffers are state): there is
 only one buffer, so there is only one place to look and only one place to
 edit.
 
-- `ui.open_session()` opens the transcript in a single `split`, sets the
-  `<CR>` keymap (send, or prompt to steer if a run is active — see above),
-  and puts the cursor on the last line.
+- `ui.open_session(split_cmd?)` opens the transcript in a single split
+  (the `split_cmd` string, default `"split"`; `:Straps` passes what the
+  invocation's `<mods>` parsed to, so `:vertical Straps` is a vsplit), sets
+  the `<CR>` keymap (send, or prompt to steer if a run is active — see
+  above), and puts the cursor on the last line.
 - Sending (`<CR>` normal mode on the session buffer, or `:StrapsSend` there):
   if a run is active, prompt via `vim.ui.input({prompt = "steer: "})` and
   queue; otherwise `loop.start(bufnr)`, which parses the buffer as-is — the
@@ -1067,7 +1069,13 @@ Existing suites must all still pass.
 ## ui.lua + plugin/straps.lua
 
 - `:Straps` — new session buffer in a split; buffer-local normal-mode `<CR>`
-  → `loop.start`; `q` does NOT get mapped (users own their keys).
+  → `loop.start`; `q` does NOT get mapped (users own their keys). Window
+  placement honors the standard command modifiers (`<mods>`): `:vertical
+  Straps` opens a vsplit, `:botright Straps` / `:leftabove vertical Straps`
+  etc. place the window accordingly, and `:StrapsResume` takes the same
+  modifiers. The plumbing is a `split_cmd` string threaded through
+  `ui.show_session`/`open_session`/`resume_session` (default `"split"`),
+  derived in the command from `opts.smods` — so no config knob is needed.
 - `:StrapsSend` (current straps buffer), `:StrapsStop`.
 - `:StrapsEdit <name>` (completion from `registry.names()`) — opens
   `straps://registry/<name>` scratch-acwrite buffer containing

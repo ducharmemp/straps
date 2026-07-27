@@ -140,9 +140,9 @@ return function(provider_override)
   for _, m in ipairs(body.data) do
     if type(m) == "table" and type(m.id) == "string" then
       if openai then
-        -- OpenAI's /v1/models entries carry no display name or thinking
-        -- capabilities, so the id doubles as the label and thinking stays nil
-        -- (reasoning effort is sent as reasoning_effort regardless).
+        -- OpenAI's /v1/models entries carry no display name or thinking /
+        -- reasoning-effort capabilities, so the id doubles as the label and
+        -- static config must opt a model into reasoning_effort explicitly.
         models[#models + 1] = { id = m.id, label = m.id, thinking = nil }
       else
         local types = (((m.capabilities or {}).thinking or {}).types) or {}
@@ -852,16 +852,26 @@ return function(req, ctx)
     body.tools = tools
   end
 
-  -- Reasoning effort: OpenAI's reasoning models take reasoning_effort =
-  -- low|medium|high. Reuse config.efforts' `level` for the active effort; a
-  -- model tagged thinking="budget"/"adaptive" in config.models, or "off"
-  -- effort, or a missing level, sends no reasoning field (safe default).
-  local efforts = type(config.efforts) == "table" and config.efforts or {}
-  local effort_name = b_effort or config.effort or "off"
-  for _, e in ipairs(efforts) do
-    if type(e) == "table" and e.name == effort_name and e.level then
-      body.reasoning_effort = e.level
+  -- Reasoning effort: only OpenAI reasoning-capable models accept
+  -- reasoning_effort, and OpenAI's /v1/models catalog does not expose that
+  -- capability. Require the configured OpenAI model entry to opt in with
+  -- reasoning = true (or reasoning_effort = true) rather than forcing effort
+  -- onto every OpenAI model and 400ing models that reject it.
+  local reasoning_enabled = false
+  for _, m in ipairs(type(config.openai_models) == "table" and config.openai_models or {}) do
+    if type(m) == "table" and m.id == model_id then
+      reasoning_enabled = (m.reasoning == true or m.reasoning_effort == true)
       break
+    end
+  end
+  if reasoning_enabled then
+    local efforts = type(config.efforts) == "table" and config.efforts or {}
+    local effort_name = b_effort or config.effort or "off"
+    for _, e in ipairs(efforts) do
+      if type(e) == "table" and e.name == effort_name and e.level then
+        body.reasoning_effort = e.level
+        break
+      end
     end
   end
 

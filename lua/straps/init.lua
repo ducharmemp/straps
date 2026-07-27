@@ -100,9 +100,10 @@ M.config = {
   context_window = 200000,
 
   -- :StrapsEffort picker choices. `level` feeds output_config.effort for
-  -- "adaptive" models; `budget_tokens` feeds thinking.budget_tokens for
-  -- "budget" models (fn.provider picks whichever applies to config.model).
-  -- Neither field (or effort = "off") means thinking is disabled.
+  -- "adaptive" Anthropic models, thinking.budget_tokens for "budget"
+  -- Anthropic models, and reasoning_effort only for OpenAI models explicitly
+  -- tagged `reasoning = true` (or `reasoning_effort = true`) in
+  -- config.openai_models. Neither field (or effort = "off") disables it.
   -- config.effort names the currently active entry (by `name`).
   effort = "off",
   efforts = {

@@ -533,8 +533,11 @@ Same `(req, ctx)` contract, OpenAI's wire shape. Selected when
   `data: [DONE]` finalizes. `usage.prompt_tokens`/`completion_tokens`/
   `prompt_tokens_details.cached_tokens` are normalized to the
   `input_tokens`/`output_tokens`/`cache_read_input_tokens` names the loop reads.
-- Reasoning: the active `config.efforts` entry's `level` (when set) becomes
-  `reasoning_effort`; `"off"`/no level sends none. Reasoning deltas
+- Reasoning: OpenAI models receive `reasoning_effort` only when their
+  configured `config.openai_models` entry has `reasoning = true` or
+  `reasoning_effort = true`; the active `config.efforts` entry's `level`
+  supplies the value. Untagged models, `"off"`, or entries with no level send
+  none. Reasoning deltas
   (`delta.reasoning_content`, or `delta.reasoning` on some gateways) are
   streamed to the transcript via `ctx.emit{type="text_delta"}` like the
   Anthropic `thinking_delta` path, but not accumulated into the returned
@@ -561,8 +564,9 @@ provider it lists GPT models, not Claude ones.
   extended thinking correctly without a hand-written config entry.
 - **OpenAI**: `GET {openai_base_url}/v1/models` with `Authorization: Bearer`
   (key from `fn.openai_api_key`). OpenAI's catalog carries no display name or
-  thinking capabilities, so the id doubles as the label and `thinking` stays
-  `nil` (reasoning effort is sent as `reasoning_effort` regardless).
+  thinking/reasoning-effort capabilities, so the id doubles as the label and
+  `thinking` stays `nil`; static `config.openai_models` entries must opt in to
+  `reasoning_effort` with `reasoning = true` (or `reasoning_effort = true`).
 
 It never throws — any failure (no key, curl error, non-2xx, unparseable body)
 returns `(nil, errmsg)` so the picker can fall back to the provider-specific static list.

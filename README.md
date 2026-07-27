@@ -523,6 +523,13 @@ fallback; an unknown model with neither shows the raw token count.
 The real token count also drives auto-compaction (`config.auto_compact_tokens`)
 instead of a byte estimate.
 
+**OpenAI effort is opt-in per model.** Some OpenAI models reject
+`reasoning_effort`, so straps does not send it merely because `config.effort` is
+set. Add `reasoning = true` (or `reasoning_effort = true`) to the matching
+`config.openai_models` entry when that OpenAI model accepts the field; then the
+active `config.efforts` entry's `level` is sent as `reasoning_effort`. Untagged
+OpenAI models receive no effort parameter.
+
 `:StrapsModel` performs **live model discovery**: it queries `GET
 /v1/models` (via `fn.list_models`) against **the backend you're actually
 using** — it resolves the effective provider the same way `fn.provider`
@@ -919,9 +926,9 @@ for context that isn't tied to one option.
 | `openai_base_url` | `"https://api.openai.com"` | Endpoint base for the OpenAI backend; point it at any OpenAI-compatible server or proxy. |
 | `openai_model` | `"gpt-5"` | Model id sent when `provider = "openai"`; kept separate from the Anthropic `model` so switching providers never sends a Claude id to OpenAI. |
 | `models` | see below | Anthropic picker seed/cache for `:StrapsModel`: `{ id, label?, thinking? }`. `thinking` is `"adaptive"` or `"budget"` (see Effort below); an unlisted/custom Anthropic `model` sends no thinking block at all. Live discovery merges the account's real Anthropic catalog over this list. |
-| `openai_models` | see below | OpenAI picker seed/cache for `:StrapsModel`, separate from `models` so switching providers never shows stale Claude ids under OpenAI or stale GPT ids under Anthropic. |
+| `openai_models` | see below | OpenAI picker seed/cache for `:StrapsModel`, separate from `models` so switching providers never shows stale Claude ids under OpenAI or stale GPT ids under Anthropic. Add `reasoning = true` (or `reasoning_effort = true`) only for models that accept OpenAI's `reasoning_effort` request field. |
 | `effort` | `"off"` | Name of the active entry in `config.efforts`; controls extended thinking. |
-| `efforts` | see below | Picker choices for `:StrapsEffort`: `{ name, level?, budget_tokens? }`. For models tagged `thinking = "adaptive"` (e.g. `claude-sonnet-5`, `claude-opus-4-8`), `level` becomes `output_config.effort` (`"low"`/`"medium"`/`"high"`/`"max"`). For models tagged `thinking = "budget"` (e.g. `claude-haiku-4-5-20251001`, `claude-opus-4-5-20251101`), `budget_tokens` becomes `thinking.budget_tokens`. These two mechanisms are mutually exclusive per model generation — sending the wrong one is a 400 — so pick whichever field applies to your model. `effort = "off"` sends no thinking block. |
+| `efforts` | see below | Picker choices for `:StrapsEffort`: `{ name, level?, budget_tokens? }`. For models tagged `thinking = "adaptive"` (e.g. `claude-sonnet-5`, `claude-opus-4-8`), `level` becomes `output_config.effort` (`"low"`/`"medium"`/`"high"`/`"max"`). For models tagged `thinking = "budget"` (e.g. `claude-haiku-4-5-20251001`, `claude-opus-4-5-20251101`), `budget_tokens` becomes `thinking.budget_tokens`. For OpenAI, `level` becomes `reasoning_effort` only when the matching `config.openai_models` entry opts in with `reasoning = true` or `reasoning_effort = true`; untagged OpenAI models receive no effort field. `effort = "off"` sends no thinking/reasoning field. |
 | `max_tokens` | `8192` | `max_tokens` per provider call. |
 | `max_turns` | `128` | Hard ceiling on assistant turns per run — the backstop, not the primary spinning-catcher (that's `stall_limit`), hence generous. |
 | `stall_limit` | `6` | Progress-aware soft stop: end the run after this many *consecutive* stalled turns — a turn is stalled when its every tool call errored, or when every call repeats a `(tool, input)` already made this run (a turn that also makes a new distinct call counts as progress). Catches an agent spinning without progress early and loudly (a distinct note, quoting the last error), instead of waiting for `max_turns`. Set `0` to disable and let `max_turns` alone bound runs. |

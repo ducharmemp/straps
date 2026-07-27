@@ -30,7 +30,7 @@ except `curl` on PATH. No plenary.
 lua/straps/init.lua        -- setup(), config, wires everything together
 lua/straps/registry.lua    -- the late-bound registry (heart of the plugin)
 lua/straps/state.lua       -- transcript buffer format: create/append/parse
-lua/straps/provider.lua    -- registers fn.provider (Anthropic SSE via curl)
+lua/straps/provider.lua    -- registers fn.provider plus Anthropic/OpenAI curl backends
 lua/straps/loop.lua        -- coroutine agent loop
 lua/straps/tools.lua       -- registers all builtin tools + default hooks
 lua/straps/editor.lua      -- editor-native tools (LSP + tree-sitter)
@@ -535,9 +535,9 @@ Same `(req, ctx)` contract, OpenAI's wire shape. Selected when
   `input_tokens`/`output_tokens`/`cache_read_input_tokens` names the loop reads.
 - Reasoning: OpenAI models receive `reasoning_effort` only when their
   configured `config.openai_models` entry has `reasoning = true` or
-  `reasoning_effort = true`; the active `config.efforts` entry's `level`
-  supplies the value. Untagged models, `"off"`, or entries with no level send
-  none. Reasoning deltas
+  `reasoning_effort = true`, the active `config.efforts` entry has a `level`,
+  and the Chat Completions request has no function tools. Untagged models,
+  `"off"`, entries with no level, or tool-bearing requests send none. Reasoning deltas
   (`delta.reasoning_content`, or `delta.reasoning` on some gateways) are
   streamed to the transcript via `ctx.emit{type="text_delta"}` like the
   Anthropic `thinking_delta` path, but not accumulated into the returned

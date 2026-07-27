@@ -71,7 +71,7 @@ M.config = {
 
   -- :StrapsModel picker choices. Each entry is { id, label?, thinking? }.
   -- `thinking` tags which extended-thinking mechanism the model speaks
-  -- (checked against Anthropic's /v1/models capabilities.effort.supported):
+  -- (inferred from Anthropic's /v1/models capabilities.thinking.types):
   --   "adaptive" — thinking={type="adaptive"} + output_config={effort=...}
   --                (newer models: sonnet-5, opus-4-6..4-8, sonnet-4-6, ...)
   --   "budget"   — thinking={type="enabled", budget_tokens=...}
@@ -101,9 +101,9 @@ M.config = {
 
   -- :StrapsEffort picker choices. `level` feeds output_config.effort for
   -- "adaptive" Anthropic models, thinking.budget_tokens for "budget"
-  -- Anthropic models, and reasoning_effort only for OpenAI models explicitly
-  -- tagged `reasoning = true` (or `reasoning_effort = true`) in
-  -- config.openai_models. Neither field (or effort = "off") disables it.
+  -- Anthropic models, and reasoning_effort for OpenAI models only when the
+  -- matching config.openai_models entry opts in, the active effort has a
+  -- level, and no function tools are present.
   -- config.effort names the currently active entry (by `name`).
   effort = "off",
   efforts = {

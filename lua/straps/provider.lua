@@ -837,7 +837,8 @@ return function(req, ctx)
   }
 
   -- Tools -> OpenAI function tools. Empty Lua arrays JSON-encode as {}, so omit.
-  if req.tools and #req.tools > 0 then
+  local has_tools = req.tools and #req.tools > 0
+  if has_tools then
     local tools = {}
     for _, t in ipairs(req.tools) do
       tools[#tools + 1] = {
@@ -855,8 +856,9 @@ return function(req, ctx)
   -- Reasoning effort: only OpenAI reasoning-capable models accept
   -- reasoning_effort, and OpenAI's /v1/models catalog does not expose that
   -- capability. Require the configured OpenAI model entry to opt in with
-  -- reasoning = true (or reasoning_effort = true) rather than forcing effort
-  -- onto every OpenAI model and 400ing models that reject it.
+  -- reasoning = true (or reasoning_effort = true). Chat Completions rejects
+  -- reasoning_effort when function tools are present, so tool-bearing requests
+  -- omit it even for opted-in models.
   local reasoning_enabled = false
   for _, m in ipairs(type(config.openai_models) == "table" and config.openai_models or {}) do
     if type(m) == "table" and m.id == model_id then
@@ -864,7 +866,7 @@ return function(req, ctx)
       break
     end
   end
-  if reasoning_enabled then
+  if reasoning_enabled and not has_tools then
     local efforts = type(config.efforts) == "table" and config.efforts or {}
     local effort_name = b_effort or config.effort or "off"
     for _, e in ipairs(efforts) do
@@ -1960,7 +1962,7 @@ function M.register()
   define({
     name = "fn.build_tools",
     kind = "fn",
-    doc = "Map every tool.* registry entry to an Anthropic API tool definition.",
+    doc = "Map every tool.* registry entry to a provider-agnostic tool definition.",
     source = BUILD_TOOLS_SRC,
   })
   define({

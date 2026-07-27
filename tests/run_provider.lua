@@ -933,7 +933,13 @@ do
   straps.config.openai_model = "gpt-5-test"
 
   local oai_buf, oai_text = run_session("run echo via bash on openai")
-
+  local initial_oai_n = tonumber((vim.fn.readfile(tmp .. "/oai_n")[1] or "0"))
+  local function read_oai_body(n)
+    return vim.json.decode(table.concat(vim.fn.readfile(tmp .. ("/oai_body.%d"):format(n)), "\n"))
+  end
+  local function read_latest_oai_body()
+    return read_oai_body(tonumber((vim.fn.readfile(tmp .. "/oai_n")[1] or "0")))
+  end
   case("openai backend: full tool round-trip completes", function()
     assert(oai_text:find("openai-e2e-output", 1, true), "bash tool_result missing:\n" .. oai_text:sub(-500))
     assert(oai_text:find("openai done", 1, true), "final streamed text missing")
@@ -949,7 +955,7 @@ do
   end)
 
   case("openai backend: request 1 is translated OpenAI shape (system + tools + model)", function()
-    local body = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/oai_body.1"), "\n"))
+    local body = read_oai_body(initial_oai_n - 1)
     assert(body.model == "gpt-5-test", "model wrong: " .. tostring(body.model))
     assert(body.stream == true, "stream should be true")
     assert(body.reasoning_effort == nil,
@@ -964,7 +970,7 @@ do
   end)
 
   case("openai backend: request 2 carries the tool_call + tool result messages", function()
-    local body = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/oai_body.2"), "\n"))
+    local body = read_oai_body(initial_oai_n)
     local assistant_tc, tool_msg
     for _, m in ipairs(body.messages) do
       if m.role == "assistant" and type(m.tool_calls) == "table" then assistant_tc = m end
@@ -986,11 +992,11 @@ do
     state.append_text(oai_buf, "run with a session-specific OpenAI model")
     loop.start(oai_buf)
     vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
-    local body = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/oai_body.3"), "\n"))
+    local body = read_latest_oai_body()
     assert(body.model == "gpt-5-mini-session", "per-buffer OpenAI model ignored: " .. tostring(body.model))
   end)
 
-  case("openai backend: reasoning_effort is opt-in per configured OpenAI model", function()
+  case("openai backend: tool-bearing requests suppress reasoning_effort", function()
     local saved_effort, saved_efforts, saved_openai_models =
       straps.config.effort, straps.config.efforts, straps.config.openai_models
     straps.config.effort = "high"
@@ -998,16 +1004,49 @@ do
     straps.config.openai_models = {
       { id = "gpt-5-mini-session", label = "GPT-5 mini", reasoning = true },
     }
-    state.append_text(oai_buf, "run with OpenAI reasoning effort")
-    loop.start(oai_buf)
-    vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
-    local body = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/oai_body.4"), "\n"))
-    assert(body.model == "gpt-5-mini-session", "reasoning test model wrong: " .. tostring(body.model))
-    assert(body.reasoning_effort == "high",
-      "opted-in OpenAI model should receive reasoning_effort=high, got "
-        .. tostring(body.reasoning_effort))
+    local ok, err = pcall(function()
+      vim.b[oai_buf].straps_openai_model = "gpt-5-mini-session"
+      state.append_text(oai_buf, "run with OpenAI reasoning effort and tools")
+      loop.start(oai_buf)
+      vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
+      local body = read_latest_oai_body()
+      assert(body.model == "gpt-5-mini-session", "reasoning test model wrong: " .. tostring(body.model))
+      assert(type(body.tools) == "table" and #body.tools > 0, "tools should be present")
+      assert(body.reasoning_effort == nil,
+        "tool-bearing OpenAI requests must not receive reasoning_effort: " .. tostring(body.reasoning_effort))
+    end)
     straps.config.effort, straps.config.efforts, straps.config.openai_models =
       saved_effort, saved_efforts, saved_openai_models
+    if not ok then error(err, 0) end
+  end)
+
+  case("openai backend: reasoning_effort is sent for opted-in model without tools", function()
+    local saved_effort, saved_efforts, saved_openai_models =
+      straps.config.effort, straps.config.efforts, straps.config.openai_models
+    local saved_build_tools = registry.get("fn.build_tools").source
+    straps.config.effort = "high"
+    straps.config.efforts = { { name = "high", level = "high" } }
+    straps.config.openai_models = {
+      { id = "gpt-5-mini-session", label = "GPT-5 mini", reasoning = true },
+    }
+    registry.define({ name = "fn.build_tools", kind = "fn", doc = "test: no tools",
+      source = [[return function() return {} end]] })
+    local ok, err = pcall(function()
+      vim.b[oai_buf].straps_openai_model = "gpt-5-mini-session"
+      state.append_text(oai_buf, "run with OpenAI reasoning effort and no tools")
+      loop.start(oai_buf)
+      vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
+      local body = read_latest_oai_body()
+      assert(body.model == "gpt-5-mini-session", "reasoning test model wrong: " .. tostring(body.model))
+      assert(body.tools == nil, "empty tool list should be omitted, got: " .. vim.inspect(body.tools))
+      assert(body.reasoning_effort == "high",
+        "opted-in OpenAI model without tools should receive reasoning_effort=high, got "
+          .. tostring(body.reasoning_effort))
+    end)
+    registry.define({ name = "fn.build_tools", kind = "fn", doc = "restored", source = saved_build_tools })
+    straps.config.effort, straps.config.efforts, straps.config.openai_models =
+      saved_effort, saved_efforts, saved_openai_models
+    if not ok then error(err, 0) end
   end)
 
   case("openai backend: unset openai_model does not fall through to the Claude default", function()
@@ -1017,7 +1056,7 @@ do
     state.append_text(oai_buf, "one more openai turn for model fallback")
     loop.start(oai_buf)
     vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
-    local body = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/oai_body.5"), "\n"))
+    local body = read_latest_oai_body()
     assert(body.model == "gpt-5", "OpenAI fallback model should be gpt-5, got " .. tostring(body.model))
   end)
 

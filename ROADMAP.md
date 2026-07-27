@@ -65,9 +65,46 @@ safety net.
   diff of the two sources), `registry_rollback { name, to }` (redefine from a
   stored source — a new version).
 - `:StrapsHistory <name>` opening the diff in a split.
-- Related gap: `registry.remove` drops GLOBAL entries only — a session-scoped
-  shadow cannot be removed (hit live this session when tool.todo got
-  shadowed). Consider a scope-aware remove at the same time.
+- `registry.remove` is already scope-aware (lua/straps/registry.lua:267): it
+  removes the nearest shadow in the active chain by default, while
+  `opts.scope = "global"` or a buffer number targets a specific scope.
+
+## DAP: let the agent inhabit a paused process
+
+Neovim can host both the agent and a live debugger. With `nvim-dap` present,
+straps could expose the stopped program as another native state surface rather
+than making the agent infer runtime behavior from logs: sessions, threads,
+stack frames, scopes and bounded variable trees as structured summaries and
+scratch buffers; evaluate, breakpoint and execution controls as confirm-gated
+tools.
+
+The interesting composition is **temporal debugging by transcript snapshot**.
+On every DAP stop, append a compact observation — reason, thread, selected
+frame, source location and a bounded locals summary — with a link to the full
+scratch-buffer view. The agent can fork its transcript at that observation, so
+several warm siblings reason independently from the exact same paused stack.
+One may propose stepping into the parser, another a conditional breakpoint,
+another an evaluated invariant. Only one branch gets a visible live-controller
+lease and may alter the debuggee; the others remain proposals until ownership
+is transferred. Every evaluate/step/continue/breakpoint action is recorded, and
+old snapshots are marked historical as soon as execution resumes.
+
+This is not process time travel. The transcript can branch; the process, heap,
+filesystem and network generally cannot. Reverse execution belongs to adapters
+that explicitly provide record/replay. Adapter capabilities also vary — scopes,
+variable mutation and whether evaluation has side effects cannot be promised.
+
+Feasible shape:
+- Optional adapter only: `pcall(require, "dap")`; straps keeps its zero-required-
+  plugin contract. The tools are absent or report unavailable without nvim-dap.
+- Read tools page and cap threads/frames/variables instead of flooding the
+  transcript; full trees live in read-only scratch buffers.
+- Evaluate, continue/step/pause, breakpoint mutation and controller transfer are
+  writes under the normal confirmation policy. The lease is released on
+  termination/disconnect and its holder is visible in the session UI.
+- Listen to nvim-dap lifecycle events for snapshots rather than polling. Keep
+  DAP's own windows optional; windowless agents receive scratch-buffer reports,
+  not invented quickfix semantics.
 
 ## VCS tooling
 
@@ -164,9 +201,9 @@ What it buys, all agent-facing (no human need be watching):
 - **Not `spawn`.** A spawned child starts *cold* — its doc says it sees none of
   the parent conversation, so everything must be re-stated or re-discovered. A
   fork starts *warm*: it inherits all accumulated context and diverges. Branches
-  share a byte-identical prefix, so prompt caching hits and forking is CHEAPER
-  than spawning. `spawn` for breadth on a fresh question; fork for depth on this
-  one.
+  share a byte-identical prefix, which may benefit from provider prompt caching;
+  cost depends on the provider and workload. `spawn` for breadth on a fresh
+  question; fork for depth on this one.
 - **Non-destructive compaction.** `fn.compact` is lossy and permanent. Fork
   first, compact the branch, keep full history at the parent seq.
 - **Counterfactual self-comparison.** N siblings from a byte-identical prior with
@@ -272,11 +309,13 @@ git artifacts.
   each solve the same task in a shadow buffer; each result is committed into the
   real file's undo tree as a **sibling branch off the same base seq**.
 - Each variant is **verified**, not just written: tests/lint run at that seq,
-  results recorded per branch. The handoff is a decision table ("B passes, 40%
-  shorter, no new deps; C passes but adds a dependency; A fails one test") plus
-  `show_diff` between any two seqs.
+  results recorded per branch. The handoff is a decision table ("B passes with
+  fewer lines and no new deps; C passes but adds a dependency; A fails one
+  test") plus `show_diff` between any two seqs.
 - Choosing is `undo_edit { to_seq = N }`; rejecting everything is
-  `to_seq = base`, and the tree is clean because nothing was ever created.
+  `to_seq = base`. The abandoned siblings remain in undo history until normal
+  undo pruning removes them, so rejection changes the current state but does
+  not erase the experiments.
 - The undo tree IS the UI: undotree.nvim, `:earlier`, `g-` all navigate it on
   day one.
 
@@ -426,6 +465,86 @@ LSP server (`vim.lsp.start { cmd = <lua function> }`, verified to answer a real
 `textDocument/hover` round-trip with model-authored markdown, no subprocess).
 That remains the natural transport for the human-facing half, but it is a
 delivery mechanism, not the feature; the extmark anchoring is.
+
+## Counterfactual editor: make competing futures visible in the present
+
+When an edit has several plausible shapes, keep each candidate alive in a
+listed scratch buffer instead of immediately choosing one or committing all of
+them to the real file's undo tree. Each shadow document gets tree-sitter
+parsing, its own diagnostic namespace, agent reasoning as extmarks, and the
+measured results of checks run against that candidate. The user's file remains
+untouched and writable throughout.
+
+Then project the futures back onto the present file:
+- Every candidate changes this region: consensus, shown once.
+- Only one candidate changes it: disputed territory, tagged with that future.
+- Two candidates independently produce the same hunk: extract it as a possible
+  decision-independent change.
+- The user edits an assumption: invalidate only candidates whose anchored
+  regions intersect it; leave unrelated futures alive.
+
+This differs from the multiverse buffer above. Multiverse variants are completed
+implementations committed as sibling branches in the real undo tree. These are
+simultaneously visible shadow documents whose consequences remain overlays
+until one is promoted. A useful handoff is a **weather map for code**: where
+plausible futures agree, where they diverge, and which current lines make each
+future impossible.
+
+Feasibility boundaries:
+- Shadow buffers have no writable project pathname and reject `:write`; applying
+  a winner still goes through the ordinary buffer-edit and confirmation path.
+- Tree-sitter can parse shadows. LSP diagnostics work only when the server
+  accepts their URI/path arrangement; otherwise diagnostics and project tests
+  require materialization. Prefer an isolated temporary project/worktree. A
+  fallback that briefly applies a candidate to real buffers is confirm-gated and
+  must account for watchers, format-on-save and other external side effects
+  before restoring the base. Record which mechanism produced every result.
+  Never label static inspection a test.
+- Correspondence to source uses extmarks plus context hashes and inherits the
+  why-layer's "may be stale" state when re-anchoring is uncertain.
+- Promotion/materialization must force the undo boundaries described below;
+  multi-file candidates are coordinated sets, not one atomic Neovim undo.
+- Collapse identical outcomes and cap the candidate count. This is for genuine
+  forks in the road, not routine edits.
+
+## Living dossiers: let the editor rearrange a codebase around a question
+
+A repository is stored by file because that is how code ships, but an
+investigation rarely has that shape. "Why can this request hang?" may involve
+half a function in the loop, one callback in the provider, two configuration
+fields, a test fixture and a paragraph of design constraints. Today the agent
+serializes those fragments into transcript prose and loses the editor machinery
+attached to their source locations.
+
+Instead, construct a read-only **dossier buffer** whose sections are live portals
+to noncontiguous regions across the project. The agent chooses the regions from
+LSP references, tree-sitter nodes, diagnostics, test failures and its current
+hypothesis. Each section carries its real `path:line`, current source, relevant
+diagnostics and a short statement of why it belongs. Source extmarks keep the
+portal anchored as the human edits the actual files; changed source refreshes
+the dossier and visibly marks the affected claim stale.
+
+The weird composition is a workspace that continuously rearranges itself around
+the question being asked. A failing test can grow a dossier from the assertion
+outward through the executed concepts; removing one suspected cause can make an
+entire section disappear; two agents can publish different dossiers over the
+same files and `show_diff` their *theories of relevance*, not just their patches.
+The code stays in its normal files and the human's motions remain untouched.
+
+Feasible shape:
+- The dossier is generated, searchable and read-only. It never pretends that
+  concatenated fragments form a valid LSP document, and no edits write through
+  implicitly. An explicit action navigates to source or invokes an ordinary
+  confirmation-gated edit tool there.
+- Source regions are extmark-anchored in their original buffers with context-hash
+  recovery after reload. Uncertain recovery is surfaced, never silently accepted.
+- Diagnostics, hover text and test output are copied annotations from the real
+  source buffers; they are not recomputed against the synthetic document.
+- Sections are bounded and collapsible; large variable/reference sets page into
+  separate views. Existing `path:line` navigation and `show_buffer` provide a
+  minimal first version without global mappings or changes to human motions.
+- Persistence stores the dossier recipe — anchors, queries and claims — rather
+  than a stale copy of the source. A one-shot dossier can remain session-local.
 
 ## Cost in dollars
 

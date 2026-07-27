@@ -852,7 +852,11 @@ return function(req, ctx)
     end
     body.tools = tools
   end
-
+  -- Some OpenAI 'sol' models default to reasoning on Chat Completions;
+  -- when tools are present the API requires reasoning_effort='none' explicitly.
+  if has_tools and type(model_id) == 'string' and model_id:find('-sol', 1, true) then
+    body.reasoning_effort = 'none'
+  end
   -- Reasoning effort: only OpenAI reasoning-capable models accept
   -- reasoning_effort, and OpenAI's /v1/models catalog does not expose that
   -- capability. Require the configured OpenAI model entry to opt in with

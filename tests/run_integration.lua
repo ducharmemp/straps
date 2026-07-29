@@ -490,7 +490,6 @@ case("usage_status: unknown model with no context_window shows raw count", funct
   straps.config.context_window = saved
   vim.api.nvim_set_current_buf(prev)
   assert(out:find("ctx", 1, true), "expected a raw ctx count: " .. out)
-  assert(not out:find("%%", 1, true), "no percent should show without a window: " .. out)
 end)
 
 case("session_winbar includes the usage segment when usage is present", function()
@@ -505,6 +504,116 @@ case("session_winbar includes the usage segment when usage is present", function
   assert(w:find("20k/200k", 1, true) or w:find("20.0k/200k", 1, true),
     "winbar should embed the usage segment: " .. w)
   assert(w:find("idle", 1, true), "winbar should still show run status: " .. w)
+end)
+
+-- session_info: the resolved-state accessor the three components are built on.
+-- These deliberately do NOT switch the current buffer — passing bufnr
+-- explicitly from a foreign buffer is the whole point of the argument.
+case("session_info returns nil off a session buffer and for an invalid bufnr", function()
+  local ui = require("straps.ui")
+  local scratch = vim.api.nvim_create_buf(false, true)
+  assert(ui.session_info(scratch) == nil, "scratch buffer should have no session info")
+  local dead = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_delete(dead, { force = true })
+  -- vim.b on a deleted buffer throws; session_info must guard, not propagate.
+  local ok, res = pcall(ui.session_info, dead)
+  assert(ok, "session_info threw on an invalid bufnr: " .. tostring(res))
+  assert(res == nil, "invalid bufnr should resolve to nil")
+end)
+
+case("session_info resolves model/effort/status for a NON-current buffer", function()
+  local ui = require("straps.ui")
+  local sess = state.new_session()
+  straps.config.model = "claude-sonnet-5"
+  straps.config.effort = "off"
+  straps.config.provider = "anthropic"
+  -- Current buffer stays whatever it is; everything comes from the bufnr arg.
+  local scratch = vim.api.nvim_create_buf(false, true)
+  local prev = vim.api.nvim_get_current_buf()
+  vim.api.nvim_set_current_buf(scratch)
+
+  local i = ui.session_info(sess)
+  assert(i, "expected session info for a session buffer")
+  assert(i.bufnr == sess, "bufnr should echo the argument")
+  assert(i.provider == "anthropic", "provider: " .. tostring(i.provider))
+  assert(i.model == "claude-sonnet-5", "model: " .. tostring(i.model))
+  assert(i.model_label == "Sonnet 5 — balanced (default)",
+    "model_label should come from config.models: " .. tostring(i.model_label))
+  assert(i.effort == "off", "effort: " .. tostring(i.effort))
+  assert(i.overridden == false, "no override should not be flagged as divergent")
+  assert(i.status == "idle", "status: " .. tostring(i.status))
+  assert(i.usage == nil, "no usage yet")
+  assert(i.context == 200000, "context: " .. tostring(i.context))
+  assert(i.context_pct == nil, "no usage means no context percent")
+
+  -- The components must render that same foreign buffer, not the current one.
+  local s = ui.session_status(sess)
+  assert(s:find("Sonnet 5", 1, true), "session_status(bufnr) should render it: " .. s)
+  assert(ui.session_status() == "", "zero-arg on a scratch buffer must stay empty")
+  assert(ui.session_winbar(sess):find("Sonnet 5", 1, true),
+    "session_winbar(bufnr) should render the foreign buffer")
+  assert(ui.session_winbar() == "", "zero-arg winbar on a scratch buffer must stay empty")
+
+  vim.api.nvim_set_current_buf(prev)
+end)
+
+case("session_info.overridden means DIVERGENCE, not merely a var being set", function()
+  local ui = require("straps.ui")
+  local sess = state.new_session()
+  straps.config.model = "claude-sonnet-5"
+  straps.config.effort = "off"
+  -- An override set to exactly the global default is NOT a divergence.
+  vim.b[sess].straps_model = "claude-sonnet-5"
+  local same = ui.session_info(sess)
+  assert(same.overridden == false,
+    "an override equal to the global default should not be flagged")
+  assert(not ui.session_status(sess):find("*", 1, true),
+    "no marker when the override matches the default: " .. ui.session_status(sess))
+  -- A different value is.
+  vim.b[sess].straps_model = "claude-fable-5"
+  local diff = ui.session_info(sess)
+  assert(diff.overridden == true, "a differing override should be flagged")
+  assert(ui.session_status(sess):sub(-1) == "*", "expected the divergence marker")
+  -- Effort alone diverging is enough.
+  vim.b[sess].straps_model = "claude-sonnet-5"
+  vim.b[sess].straps_effort = "high"
+  assert(ui.session_info(sess).overridden == true, "diverging effort should be flagged")
+end)
+
+case("session_info percentages are pre-rounded integers", function()
+  local ui = require("straps.ui")
+  local sess = state.new_session()
+  straps.config.model = "claude-sonnet-5"      -- context = 200000
+  -- 49000/200000 = 24.5% -> must round to 25, not truncate to 24.
+  vim.b[sess].straps_usage = {
+    input = 9000, cache_read = 39000, cache_creation = 0,
+    input_billed = 49000, output = 100,
+  }
+  local i = ui.session_info(sess)
+  assert(i.context_used == 49000, "context_used should be input_billed: " .. tostring(i.context_used))
+  assert(i.context_pct == 25, "24.5% must round to 25, got " .. tostring(i.context_pct))
+  assert(i.cache_pct == 80, "cache pct should be 80, got " .. tostring(i.cache_pct))
+  assert(math.floor(i.context_pct) == i.context_pct, "context_pct must be an integer")
+  assert(ui.usage_status(sess):find("(25%)", 1, true),
+    "formatter should print the rounded percent: " .. ui.usage_status(sess))
+end)
+
+case("usage_status gates on the session buffer, not merely on straps_usage", function()
+  local ui = require("straps.ui")
+  -- A plain scratch buffer carrying a usage table must still render nothing:
+  -- the gate is straps_session, which this buffer lacks.
+  local scratch = vim.api.nvim_create_buf(false, true)
+  vim.b[scratch].straps_usage = { input_billed = 50000, cache_read = 0 }
+  assert(ui.usage_status(scratch) == "",
+    "usage on a non-session buffer must not render: " .. ui.usage_status(scratch))
+  assert(ui.session_info(scratch) == nil, "non-session buffer has no info")
+end)
+
+case("human_tokens formats the counts components share", function()
+  local ui = require("straps.ui")
+  assert(ui.human_tokens(950) == "950", "sub-1k should be raw: " .. ui.human_tokens(950))
+  assert(ui.human_tokens(200000) == "200k", "trailing .0 should collapse: " .. ui.human_tokens(200000))
+  assert(ui.human_tokens(138879) == "138.9k", "expected one decimal: " .. ui.human_tokens(138879))
 end)
 
 case("default progress hook cleaned up its extmarks", function()

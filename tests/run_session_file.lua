@@ -172,6 +172,41 @@ case("ui.resume_session(path) rebuilds the stack with the transcript content", f
   assert(text:find("ui-resume-content-xyz", 1, true), "resumed transcript missing its content")
 end)
 
+case("ui.resume_session heals a transcript interrupted mid-tool", function()
+  -- persist() runs at block boundaries, so a session whose Neovim died while a
+  -- tool was in flight is on disk with a tool_use and no tool_result — a shape
+  -- the API rejects. Resuming must repair it, or the resumed session cannot be
+  -- sent at all.
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "resume-heal-content")
+  state.append(bufnr, "tool_use", { id = "z1", name = "bash" }, '{"command":"sleep 99"}')
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  state.persist(bufnr)
+  -- Wipe the buffer so resume_session reloads from the file, as a restart would.
+  vim.api.nvim_buf_delete(bufnr, { force = true })
+
+  local re = require("straps.ui").resume_session(path)
+  local uses, results = 0, 0
+  for _, m in ipairs(state.parse(re).messages) do
+    for _, part in ipairs(m.content) do
+      if part.type == "tool_use" then uses = uses + 1 end
+      if part.type == "tool_result" then results = results + 1 end
+    end
+  end
+  assert(uses == 1 and results == 1,
+    "resumed transcript still unpaired: " .. uses .. " uses, " .. results .. " results")
+  local parsed = state.parse(re)
+  assert(parsed.messages[#parsed.messages].role == "user",
+    "resumed transcript must not end on an assistant message (unsendable)")
+  local text = table.concat(vim.api.nvim_buf_get_lines(re, 0, -1, false), "\n")
+  assert(text:find("resume-heal-content", 1, true), "healing lost the original user message")
+  -- The repair must reach the FILE, not just the buffer: the point is that the
+  -- next restart resumes a sendable transcript, and heal's appends persist.
+  local on_disk = table.concat(vim.fn.readfile(path), "\n")
+  assert(on_disk:find("run interrupted before this tool finished", 1, true),
+    "the healed result was not persisted to the transcript file")
+end)
+
 -- ------------------------------------------------------- ui.pick_session
 case("ui.pick_session offers list_sessions() items and resumes the picked one", function()
   local saved = straps.config.session_dir

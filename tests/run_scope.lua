@@ -591,7 +591,7 @@ case("fn.readonly_policy is the single source of truth for read-only calls", fun
   -- readonly copy are read-only.
   for _, n in ipairs({
     "read_file", "grep", "show_user", "show_diff", "show_buffer",
-    "set_quickfix", "ask_user", "help_search", "definition", "references",
+    "set_findings", "ask_user", "help_search", "definition", "references",
   }) do
     assert(policy(n) == true, n .. " should be read-only")
   end

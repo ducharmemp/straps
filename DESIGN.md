@@ -231,13 +231,32 @@ transcript format is already plain text, so buffer content == file content.
   path (`vim.fn.bufnr(path) ~= -1`), else `bufadd`+`bufload`; apply the
   session buffer setup (buftype="", swapfile=false, filetype=straps,
   straps_session=true); return bufnr. Does not modify content.
+- `state.heal_interrupted(bufnr)` — the cost of persisting at block boundaries:
+  a crash mid-tool leaves a `tool_use` on disk whose `tool_result` was never
+  written, and the API rejects an unpaired `tool_use`, so that saved session
+  would be unsendable forever. Appends an `is_error` result ("run interrupted
+  before this tool finished") per unfinished call, restores the trailing user
+  block, returns the count. It heals only when nothing
+  but tool blocks follows the first orphan — the shape an interrupt leaves.
+  Pairing is per-id, so a partly-finished parallel batch keeps its real results.
+  A hand-mangled transcript (result deleted mid-conversation) is left alone to
+  fail loudly at send, since a result appended at the tail cannot pair a
+  tool_use in the middle. It also returns 0 outright when `loop.running(bufnr)`:
+  a tool in flight is indistinguishable from an interrupted one, and resuming
+  CAN reach a live buffer (open_session_file reuses the loaded buffer for a
+  path, and while a subagent runs the newest saved session is that child — what
+  bare `:StrapsResume` opens), so healing there would report a false failure and
+  then let the real result land, leaving two results for one tool_use_id.
+  Called from `ui.resume_session`, not from the loop.
 
 **ui.lua** — `open_session()` is unchanged in spirit (new_session is now
 durable; the `<CR>` keymap, folding, load_project_registry all stay). Add
 `resume_session(path?)`: same split, but opens the transcript via
 `state.open_session_file` instead of new_session; path nil → most recent from
 list_sessions (none → notify + fall through to a new session). Still runs
-load_project_registry.
+load_project_registry. Runs `state.heal_interrupted` on the reopened buffer and
+notifies when it repaired anything, so a session interrupted mid-tool is
+sendable again rather than permanently rejected by the API.
 
 **plugin/straps.lua** — `:StrapsResume [path]`: resume_session; completion
 lists session basenames (resolve basename → full path); no arg → most recent.
@@ -268,7 +287,9 @@ open_session_file reloads a written transcript into a straps_session buffer
 that parses to the same messages; a wipe→reopen round-trip preserves the
 transcript; new_session with an unwritable session_dir falls back to a usable
 ephemeral buffer without error; persist is a no-op (no error) on a scratch
-buffer; ui.resume_session(path) headless rebuilds the stack with the content.
+buffer; ui.resume_session(path) headless rebuilds the stack with the content;
+ui.resume_session heals a transcript saved mid-tool (unpaired tool_use gets an
+error result, tail is user-role) so the resumed session is sendable.
 
 ## loop.lua — the agent loop
 
@@ -381,8 +402,18 @@ edit.
   than silently doing nothing — both when the conversation is empty and when
   it would leave the transcript ending on an assistant message (newer models
   reject a request ending on an assistant message — unsupported prefill).
-- Target resolution for `:StrapsSend`/`:StrapsSteer`/`:StrapsStop`: current
-  buffer must be a session buffer (`vim.b.straps_session`); else polite error.
+- Target resolution for `:StrapsSend`/`:StrapsSteer`/`:StrapsStop`/
+  `:StrapsContinue`: current buffer must be a session buffer
+  (`vim.b.straps_session`); else polite error.
+- `:StrapsContinue [text]` continues a stopped or interrupted run. It needs no
+  saved run state — invariant 1 again: `loop.stop` already leaves a well-formed
+  transcript (every appended `tool_use` gets a paired result), and the sole
+  obstacle to re-sending it is the assistant-role cancellation note at the tail,
+  which is unsupported prefill. So the command appends a user block (the given
+  text, else a generic continue instruction) and calls `loop.start` on the same
+  buffer. Run-scoped bookkeeping — turn budget, stall counter, blank nudges —
+  starts over; the conversation does not. Distinct from `:StrapsResume`, which
+  reopens a saved transcript from disk.
 
 ### Progress
 
@@ -882,7 +913,7 @@ Written for agent-ability and ecosystem norms; concise, imperative:
   live preview pane when snacks.nvim is installed, labeled splits otherwise).
 - Presentation norms (`# Showing the user`): the editor is the display
   surface — match the medium to the data's shape: show_user for one location,
-  the quickfix list for many (grep already fills it), diff splits for
+  the session's findings list for many (grep already fills it), diff splits for
   comparisons, filetype'd scratch buffers for generated content,
   extmarks/virtual text for line-pinned notes, and for editor MECHANISM
   itself (a statusline/winbar/tabline component, keymap, option, highlight
@@ -1076,7 +1107,7 @@ Existing suites must all still pass.
   modifiers. The plumbing is a `split_cmd` string threaded through
   `ui.show_session`/`open_session`/`resume_session` (default `"split"`),
   derived in the command from `opts.smods` — so no config knob is needed.
-- `:StrapsSend` (current straps buffer), `:StrapsStop`.
+- `:StrapsSend` (current straps buffer), `:StrapsStop`, `:StrapsContinue`.
 - `:StrapsEdit <name>` (completion from `registry.names()`) — opens
   `straps://registry/<name>` scratch-acwrite buffer containing
   `registry.render(name)`, `filetype=lua`; `BufWriteCmd` executes the buffer
@@ -1105,12 +1136,22 @@ Existing suites must all still pass.
   `tool.spawn` accepts `provider`/`model`/`effort` args and otherwise inherits
   the parent's provider-specific override). `ui.pick_model` /
   `ui.pick_effort` write `vim.b` when invoked ON a session buffer, else the
-  global config default. `ui.session_status()` renders the effective
-  model/effort for the current session buffer (`""` elsewhere), with a trailing
-  `*` when a per-buffer override diverges from the global default;
-  `ui.session_winbar()` wraps it with a running/idle indicator and is
-  auto-installed as a window-local `winbar` on session windows
-  (`config.session_winbar = false` opts out).
+  global config default. `ui.session_info(bufnr)` is the single accessor that
+  RESOLVES that whole override -> config chain (returning `nil` off a session
+  buffer, else provider/model/model_label/effort/overridden/status/parent/
+  usage/context_used/context/context_pct/cache_pct, percentages pre-rounded);
+  `ui.session_status()`, `ui.usage_status()` and `ui.session_winbar()` are thin
+  formatters over it, each taking the same optional `bufnr` so a component can
+  render a session from outside its window. `overridden` means the effective
+  provider/model/effort DIVERGES from the global default (an override set to the
+  default value is not a divergence), and drives the trailing `*`.
+  `ui.session_winbar()` adds a running/idle indicator and is auto-installed as a
+  window-local `winbar` on session windows (`config.session_winbar = false` opts
+  out). Exposing resolved state rather than only the raw buffer vars is what
+  lets a user's own statusline/lualine component avoid reimplementing the
+  fallback chain. `ui.redraw_status([all])` pairs `:redrawstatus` with
+  `:redrawtabline` — the former does not cover the tabline — and every status
+  redraw in `loop.lua`/`ui.lua` goes through it.
 - `:StrapsProvider` (`ui.pick_provider`) — picks the API backend
   (anthropic/openai). ON a session buffer it sets `vim.b straps_provider`
   (session-only, like `:StrapsModel`); otherwise it sets `config.provider` AND
@@ -1190,7 +1231,13 @@ Expose `M.registry`, `M.state`, `M.loop` for user config files.
   redefining `tool.ping` between turn 1 and 2 (from inside the stub provider)
   would be picked up... (simpler: redefine `tool.ping` BEFORE the run's second
   ping call in a 3-turn script and assert both results differ). Also test
-  loop.stop mid-await.
+  loop.stop mid-await. Continuing a stopped run and `state.heal_interrupted`
+  live here too, since both are about the loop's cancellation shape: a run
+  stopped mid-tool re-sends and advances its script once a user block is
+  appended (and fails loudly without one); heal pairs an orphaned tool_use with
+  an `is_error` result and restores the trailing user block; pairing is per-id
+  across a partly-finished batch and idempotent; heal declines while a run is
+  live; heal leaves a hand-mangled transcript and a well-formed one untouched.
 
 ## Native Neovim integration
 
@@ -1247,7 +1294,7 @@ so a wedged server can't hang the run.
 
 Presentation tools (also lua/straps/editor.lua) turn agent output into real
 Neovim views instead of transcript prose. They change no files — they open
-views / set the quickfix list — so `hook.confirm` auto-allows them like
+views / set the findings list — so `hook.confirm` auto-allows them like
 show_user, and they never steal the user's focus. A shared PRELUDE helper
 (`new_split_win`, `scratch_buf`, `unified_diff`) keeps them DRY and factors the
 unified-diff renderer that the confirm-dialog edit preview also uses.
@@ -1258,10 +1305,10 @@ unified-diff renderer that the confirm-dialog edit preview also uses.
   rightbelow vsplit for the right), winbar labels, hunk count in the result.
 - `show_buffer {content, filetype?, title?, split?}` — a filetype'd scratch
   split (`straps://buffer/<title>`) for generated/extracted content.
-- `set_quickfix {items=[{path,line?,col?,text?}], title?, open?}` — load
-  agent-assembled locations into the quickfix list and `copen`. For findings
-  the agent built itself; grep and run_quickfix already fill the list for
-  searches and build output, so the doc points there first.
+- `set_findings {items=[{path,line?,col?,text?}], title?, open?}` — load
+  agent-assembled locations into the session's findings list and open it. For
+  findings the agent built itself; grep and run_quickfix already fill the list
+  for searches and build output, so the doc points there first.
 
 ### 2. Native-undo edits (tools.lua: write_file, edit_file, patch_file)
 
@@ -1338,7 +1385,7 @@ and the later bulk_replace resolve to the SAME list), `set_locations` /
 `get_locations` (setloclist/getloclist on that window, else set/getqflist),
 and `locations_do(bufnr, body)` (`:ldo <body>` via `win_execute` in the window,
 else global `:cdo <body>`). `grep`, `diagnostics{quickfix}`, `run_quickfix`,
-`set_quickfix` write through `set_locations`; `bulk_replace` reads through
+`set_findings` write through `set_locations`; `bulk_replace` reads through
 `get_locations` and edits through `locations_do`, and its result names whichever
 list ("loclist"/"quickfix"). Tools' user-facing summaries say `:lnext/:cnext`
 accordingly. Tested in `run_quickfix.lua`: two on-screen sessions get isolated

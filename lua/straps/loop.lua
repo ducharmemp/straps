@@ -407,7 +407,7 @@ local function run_turns(bufnr, ctx, run)
       acc.input_billed = (acc.input or 0) + acc.cache_read + acc.cache_creation
       run.usage = acc
       pcall(function() vim.b[bufnr].straps_usage = acc end)
-      pcall(function() vim.cmd("redrawstatus!") end)
+      pcall(function() require("straps.ui").redraw_status(true) end)
     end
 
     -- Two phases: append EVERY tool_use marker first, THEN execute each and
@@ -628,7 +628,8 @@ function M.start(bufnr)
   local run = { cancelled = false, cancel_fns = {}, await_seq = 0, done = false, turns = 0 }
   runs[bufnr] = run
   pcall(function() vim.b[bufnr].straps_status = "running" end)
-  vim.cmd("redrawstatus!") -- all windows: a subagent run changes the parent's agent count
+  -- all windows: a subagent run changes the parent's agent count
+  pcall(function() require("straps.ui").redraw_status(true) end)
 
   local ctx = new_ctx(bufnr, run)
   run.ctx = ctx
@@ -647,7 +648,8 @@ function M.start(bufnr)
     pcall(state.ensure_trailing_user, bufnr)
     runs[bufnr] = nil
     pcall(function() vim.b[bufnr].straps_status = "idle" end)
-    vim.cmd("redrawstatus!") -- all windows: subagent finishing updates the parent's count
+    -- all windows: subagent finishing updates the parent's count
+    pcall(function() require("straps.ui").redraw_status(true) end)
   end)
 
   -- Initial resume under this buffer's registry scope (see ctx.await for

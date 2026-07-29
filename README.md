@@ -82,7 +82,8 @@ you (or the agent) redefined at runtime.
    <root>" (when a `.git`/`.jj`/`.straps.lua`/`.hg`/`.svn` marker is found
    above the file), and "Always all edits" — pick the project scope to stop
    re-approving edits directory by directory across the repo.
-6. `:StrapsStop` cancels a run in flight.
+6. `:StrapsStop` cancels a run in flight; `:StrapsContinue` picks it back up
+   (see [Continuing a stopped or interrupted run](#continuing-a-stopped-or-interrupted-run)).
 
 Editing history is a feature, not a bug: the buffer is the canonical state,
 so you can revise an earlier message, delete a tool call, or fix a typo
@@ -99,6 +100,40 @@ is the request, so the model simply sees them as the latest user message. A
 message queued while the model is streaming its final answer still gets
 acted on: the loop notices the queue before finishing and makes one more
 provider call.
+
+### Continuing a stopped or interrupted run
+
+`:StrapsStop` ends a run; `:StrapsContinue` starts it again where it left
+off. There is no run state to save or restore, because the buffer already is
+the state: cancellation leaves a well-formed transcript (every `tool_use`
+that got appended has a paired `tool_result` — the loop stubs "run cancelled
+before this tool executed" for calls it never ran), and the only reason you
+can't just press `<CR>` is that the transcript now ends on the assistant-role
+`[straps: run cancelled]` note, which no current model accepts as a prefill.
+So `:StrapsContinue` appends a user block and sends — `:StrapsContinue focus
+on the parser instead` to redirect while resuming, or bare for a generic
+"continue where you left off". What restarts is the *run* bookkeeping, not the
+conversation: a fresh `max_turns` budget, a fresh stall counter, fresh
+blank-turn nudges.
+
+A crash is the harder case. Transcripts persist at block boundaries, so if
+Neovim dies while a tool is in flight, the file on disk holds a `tool_use`
+whose `tool_result` was never written — and the API rejects an unpaired
+`tool_use`, which would make that saved session permanently unsendable.
+`:StrapsResume` therefore heals it on open (`state.heal_interrupted`): each
+unfinished call gets an `is_error` result reading "run interrupted before this
+tool finished", the trailing user block is restored, and it notifies you how
+many calls it marked. Healing is deliberately narrow — it only fires when
+nothing but tool blocks follows the orphan, which is exactly the shape an
+interrupt leaves. A transcript you hand-edited into inconsistency (a
+`tool_result` deleted from the middle of a conversation) is left untouched and
+still fails loudly on send, because appending a result at the end would not
+pair it anyway. And a session with a *live* run is never healed: a tool in
+flight looks identical on disk to an interrupted one, and resuming can reach a
+running buffer — while a subagent works, the newest saved session is that
+child, which is exactly what bare `:StrapsResume` opens — so healing there
+would tell the model a tool failed while it was still working, and the real
+result would land afterwards.
 
 ### Progress
 
@@ -522,7 +557,9 @@ arrives — the context fill (e.g. `47.0k/200k (24%)`) and the cache hit rate
 context window comes from the active provider's model-list `context` field
 (`config.models` or `config.openai_models`), or `config.context_window` as a
 fallback; an unknown model with neither shows the raw token count.
-`ui.usage_status()` is available for a manual statusline too.
+`ui.usage_status()` is available for a manual statusline too, and
+`ui.session_info()` hands you the same numbers unformatted (see
+[Statusline](#statusline)).
 The real token count also drives auto-compaction (`config.auto_compact_tokens`)
 instead of a byte estimate.
 
@@ -761,10 +798,10 @@ entries; the defaults try the env var, then
 | `fetch_url` | Safe bounded http(s) fetch via curl: no ambient credentials, timeout/byte cap, optional redirects. Refuses internal/loopback/link-local hosts (SSRF guard) and pins redirects to http(s). |
 | `bash` | Run a shell command via `bash -lc`; returns exit code, stdout, stderr, and kills output floods after a bounded per-stream capture. |
 | `run_in_terminal` | Run a visible streaming `:terminal` command for long/interesting builds or tests. |
-| `run_quickfix` | Run a build/test/lint command and parse its output into the quickfix list via native `errorformat`; returns a compact exit-code + parsed-locations summary. |
+| `run_quickfix` | Run a build/test/lint command and parse its output into the session's findings list via native `errorformat`; returns a compact exit-code + parsed-locations summary. |
 | `glob` | Expand a glob pattern (capped at 500 entries). |
-| `grep` | Search file contents (`rg` if available, else `grep -rn`); also populates the quickfix list. |
-| `bulk_replace` | Substitute across the current quickfix list via `:cdo` (undoable, confirm-gated, supports `dry_run`). |
+| `grep` | Search file contents (`rg` if available, else `grep -rn`); also populates the session's findings list. |
+| `bulk_replace` | Substitute across the session's current findings list via `:ldo`/`:cdo` (undoable, confirm-gated, supports `dry_run`). |
 | `registry_list` | List registry entries: name, kind, doc, version. |
 | `registry_get` | Return an entry's full definition as executable Lua. |
 | `registry_define` | Define or redefine any registry entry. Tool API names are validated before they can reach a provider request. The self-extension tool. |
@@ -839,25 +876,26 @@ so it refuses files with unsaved buffer changes.
 
 The editor is straps's display surface, so a few tools hand the user a real
 Neovim view instead of flattening everything into transcript prose. All three
-change no files — they open views or set the quickfix list — and so are
+change no files — they open views or set the findings list — and so are
 auto-allowed by `hook.confirm`, like `show_user`. They never steal focus.
 
 | Tool | Description |
 | --- | --- |
 | `show_diff` | Open a real side-by-side **diff split** (`:diffthis`, native hunk highlighting). Either `{path, content}` to preview proposed contents against a file's current state, or `{left, right, filetype?}` to compare two arbitrary texts. |
 | `show_buffer` | Open a **filetype'd scratch split** for generated or extracted content — a report, a table, sample code — so it arrives syntax-highlighted and searchable. `{content, filetype?, title?, split?}`. |
-| `set_quickfix` | Load an agent-assembled list of `{path, line?, col?, text?}` locations into the **quickfix list** and open it (`:cnext`/`:cprev`). For findings you built yourself; `grep` and `run_quickfix` already fill the list for searches and build output. |
+| `set_findings` | Load an agent-assembled list of `{path, line?, col?, text?}` locations into the **findings list** (see below) and open it. For findings you built yourself; `grep` and `run_quickfix` already fill the list for searches and build output. |
 
 These are the tools behind the system prompt's guidance to match the medium to
 the data's shape (a diff for two versions, a scratch buffer for a report, the
-quickfix list for many locations) — the agent now has a tool for each instead
+findings list for many locations) — the agent now has a tool for each instead
 of hand-building the view with `eval_lua`.
 
-### Quickfix
+### The findings list
 
-straps wires its search tools into Neovim's own quickfix list, so results are
-navigable with `:cnext`/`:cprev` and editable in bulk with native Vim
-machinery.
+straps wires its search tools into Neovim's own list machinery — a location
+list per session, with the quickfix list as fallback — so results are
+navigable with `:lnext`/`:lprev` (or `:cnext`/`:cprev`) and editable in bulk
+with native Vim machinery.
 
 **Per-session isolation.** The quickfix list is *global* to a Neovim instance,
 so if straps wrote every session's findings there, two concurrent sessions
@@ -904,7 +942,8 @@ results name whichever applies.
   tool, so `hook.confirm` prompts before it runs. Pass `{ dry_run = true }` to
   report how many entries and files *would* be edited without touching
   anything. A typical flow: `grep` for the old name, eyeball the matches with
-  `:copen`, then `bulk_replace` to rename across all of them at once.
+  `:lopen` (or `:copen`), then `bulk_replace` to rename across all of them at
+  once.
 
 ### Design choices with previews (`ask_user`)
 
@@ -978,6 +1017,58 @@ Or in lualine:
 { function() return vim.b.straps_status or "" end }
 ```
 
+### Rolling your own component
+
+The buffer variables above are *raw* state: a per-session override is often
+unset, so reading `b:straps_model` alone tells you nothing about what the
+session will actually use. `require("straps.ui").session_info(bufnr)` resolves
+the whole override → global-config chain for you and returns everything the
+built-in winbar renders, unformatted — or `nil` when `bufnr` is not a session
+buffer (`bufnr` defaults to the current buffer):
+
+```lua
+local info = require("straps.ui").session_info()  -- nil off a session buffer
+-- {
+--   bufnr = 7,
+--   provider = "anthropic",
+--   model = "claude-sonnet-5",
+--   model_label = "Sonnet 5 — balanced (default)",  -- config label, else the id
+--   effort = "off",
+--   overridden = false,   -- true when provider/model/effort DIVERGE from config
+--   status = "running",   -- "running" | "idle"
+--   parent = nil,         -- parent session bufnr, for a subagent
+--   usage = { input_billed = 138879, cache_read = 137582, ... },  -- nil until the first response
+--   context_used = 138879,  -- billed input tokens = the current context fill
+--   context = 200000,       -- resolved window; nil when unknown
+--   context_pct = 69,       -- pre-rounded ints; nil when not computable
+--   cache_pct = 99,
+-- }
+```
+
+So a lualine component showing model and context fill:
+
+```lua
+{ function()
+    local info = require("straps.ui").session_info(vim.api.nvim_get_current_buf())
+    if not info then return "" end
+    return ("%s %s"):format(info.model_label, info.context_pct and info.context_pct .. "%%" or "")
+  end }
+```
+
+`ui.human_tokens(n)` formats a token count the way the winbar does (`138879` →
+`"138.9k"`), so a hand-written component does not have to reinvent it.
+
+The three built-in components — `session_status()`, `usage_status()` and
+`session_winbar()` — each take the same optional `bufnr`, so they work from
+outside the target window too.
+
+**Which buffer?** A window-local `statusline` or `winbar` resolves the right
+session implicitly, so zero-arg calls do the right thing there. A **global
+tabline** does not: `%{}` in a tabline (and `bufnr()` inside it) evaluates in
+the *current* window's context, so a session's model vanishes from the tabline
+as soon as you focus another window. For a tabline, either use a Lua component
+framework that knows which window it is rendering (lualine, heirline) and pass
+the bufnr explicitly, or show the buffer-independent `agents_status()` below.
 ### Running agents
 
 `vim.b.straps_status` is per-buffer — it says whether _this_ session is

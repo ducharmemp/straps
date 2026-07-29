@@ -125,6 +125,27 @@ vim.api.nvim_create_user_command("StrapsStop", function()
   require("straps.loop").stop(bufnr)
 end, { desc = "straps: cancel the active run in this session" })
 
+-- Continuing a STOPPED run, as opposed to :StrapsResume, which reopens a saved
+-- transcript from disk. Nothing to restore: :StrapsStop already leaves the
+-- transcript sendable (every tool_use paired), it just ends on an assistant
+-- block, which the loop refuses to send. Appending a user block is the whole
+-- mechanism — the buffer IS the run state.
+vim.api.nvim_create_user_command("StrapsContinue", function(opts)
+  local bufnr = resolve_session()
+  if not bufnr then
+    return
+  end
+  local loop = require("straps.loop")
+  if loop.running(bufnr) then
+    vim.notify("straps: a run is already active — :StrapsStop it first, or :StrapsSteer it",
+      vim.log.levels.WARN)
+    return
+  end
+  require("straps.state").append(bufnr, "user", nil,
+    opts.args ~= "" and opts.args or "[straps] Continue where you left off.")
+  loop.start(bufnr)
+end, { nargs = "?", desc = "straps: continue a stopped/interrupted run (optional instruction)" })
+
 vim.api.nvim_create_user_command("StrapsCompact", function()
   local bufnr = resolve_session()
   if not bufnr then

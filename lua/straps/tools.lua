@@ -429,11 +429,11 @@ end
     doc = "Run a shell command via `bash -lc` and return its result with"
       .. " clearly labeled sections: exit code, stdout, stderr. Never use this"
       .. " tool to search, read, or inspect files: use the grep tool instead of shell"
-      .. " grep/rg (it also populates the user's quickfix list), tree/path_info/glob"
+      .. " grep/rg (it also populates this session's findings list), tree/path_info/glob"
       .. " instead of find/ls, and read_file instead of cat/head/tail. For a"
       .. " build/test/lint command whose output is compiler/linter-style"
-      .. " diagnostics, prefer run_quickfix — it parses them into the user's"
-      .. " quickfix list and returns a compact summary instead of a wall of text."
+      .. " diagnostics, prefer run_quickfix — it parses them into this session's"
+      .. " findings list and returns a compact summary instead of a wall of text."
       .. " Parameters:"
       .. " command (required) — the shell command line to execute; timeout_ms"
       .. " (optional, default 120000) — the process is killed if it runs longer"
@@ -465,7 +465,7 @@ return function(input, ctx)
       or trimmed:match("^sed%s+%-n%s") then
       redirect = "tool.read_file (supports offset/limit, gives line numbers)"
     elseif trimmed:match("^grep%s+%S") or trimmed:match("^rg%s+%S") then
-      redirect = "tool.grep (regex search, also populates the user's quickfix list)"
+      redirect = "tool.grep (regex search, also populates this session's findings list)"
     elseif trimmed == "ls" or trimmed:match("^ls%s")
       or trimmed:match("^find%s+%S") or trimmed:match("^fd%s+%S") then
       redirect = "tool.tree or tool.glob (bounded file listings)"
@@ -659,9 +659,11 @@ end
     name = "tool.run_quickfix",
     kind = "tool",
     doc = "Run a shell command (a build, a test run, a linter, a typecheck) and"
-      .. " parse its output into Neovim's quickfix list through Vim's native"
-      .. " errorformat, then open it — so a failing build lands as :cnext/:cprev"
-      .. " navigable file:line entries in the user's editor instead of a wall of"
+      .. " parse its output into this session's findings list (the session"
+      .. " window's location list when on-screen, else the global quickfix list)"
+      .. " through Vim's native errorformat, then open it — so a failing build"
+      .. " lands as :lnext/:lprev (or :cnext/:cprev when it fell back) navigable"
+      .. " file:line entries in the user's editor instead of a wall of"
       .. " text in the transcript. Use this instead of bash/run_in_terminal when"
       .. " the command emits compiler/linter-style diagnostics you want the user"
       .. " to step through. The result the agent sees is a compact summary: exit"
@@ -670,17 +672,17 @@ end
       .. " — the shell command, run via bash -lc; errorformat (optional) — a Vim"
       .. " 'errorformat' string describing the output (e.g."
       .. " \"%f:%l:%c: %m\" for `file:line:col: message`); when omitted, the"
-      .. " editor's current &errorformat is used. title (optional) — quickfix"
+      .. " editor's current &errorformat is used. title (optional) — findings"
       .. " list title. timeout_ms (optional, default 300000). open (optional,"
-      .. " default true) — open the quickfix window when there are entries.",
+      .. " default true) — open the findings list window when there are entries.",
     input_schema = {
       type = "object",
       properties = {
         command = { type = "string", description = "Shell command to run with bash -lc." },
         errorformat = { type = "string", description = "Vim 'errorformat' describing the command output; omit to use the editor's current &errorformat." },
-        title = { type = "string", description = "Quickfix list title (default: the command)." },
+        title = { type = "string", description = "Findings list title (default: the command)." },
         timeout_ms = { type = "integer", description = "Timeout in milliseconds (default 300000)." },
-        open = { type = "boolean", description = "Open the quickfix window when there are entries (default true)." },
+        open = { type = "boolean", description = "Open the findings list window when there are entries (default true)." },
       },
       required = { "command" },
     },
@@ -1247,9 +1249,11 @@ end
     doc = "Search file contents for a regular-expression pattern. Uses ripgrep"
       .. " (rg) when installed, otherwise falls back to `grep -rn`. Returns"
       .. " matching lines as file:line:text, capped at 100000 bytes with a"
-      .. " truncation note. As a side effect it also populates Neovim's quickfix"
-      .. " list (title 'straps: grep <pattern>'), so the user can jump through the"
-      .. " matches with :cnext/:cprev and bulk-edit them with the bulk_replace"
+      .. " truncation note. As a side effect it also populates this session's"
+      .. " findings list (the session window's location list when on-screen, else"
+      .. " the global quickfix list; title 'straps: grep <pattern>'), so the user"
+      .. " can jump through the matches with :lnext/:lprev (or :cnext/:cprev when"
+      .. " it fell back) and bulk-edit them with the bulk_replace"
       .. " tool. Parameters: pattern (required) — regex in rg/grep syntax; path"
       .. " (optional, default '.') — file or directory to search; glob (optional)"
       .. " — only search files matching this glob, e.g. '*.lua'; case_insensitive"
@@ -1307,13 +1311,13 @@ return function(input, ctx)
   end)
   local out = res.stdout or ""
 
-  -- Populate the quickfix list from the matches so the user can :cnext/:cprev
-  -- and bulk_replace over them. This is a pure side effect: the text summary
+  -- Populate the session's findings list from the matches so the user can step
+  -- them and bulk_replace over them. This is a pure side effect: the text summary
   -- returned below is unchanged. rg/grep emit `file:line:text`; parse that
   -- (also tolerate an optional `file:line:col:text` if a column is present).
   -- Context lines (from the context param) use `-` separators and `--` group
   -- dividers, so they fall through this match — only real matches enter the
-  -- quickfix list.
+  -- findings list.
   local title = "straps: grep " .. tostring(input.pattern)
   -- Route to THIS session's findings list (its window's location list when
   -- on-screen — private to the session — else the global quickfix list).
@@ -1345,15 +1349,15 @@ return function(input, ctx)
   if out == "" then
     -- Both rg and grep exit 1 on "no matches"; anything else is a real error.
     if res.code == 1 or res.code == 0 then
-      -- A genuine zero-match search: reflect it by clearing the quickfix list.
+      -- A genuine zero-match search: reflect it by clearing the findings list.
       set_qf({})
       return "no matches"
     end
-    -- A real failure: leave any existing quickfix list untouched.
+    -- A real failure: leave any existing findings list untouched.
     return string.format("grep failed (exit %d): %s", res.code, res.stderr or "")
   end
 
-  -- Only replace the quickfix list when parsing actually yielded entries, so a
+  -- Only replace the findings list when parsing actually yielded entries, so a
   -- parse hiccup on a non-empty result can't clobber a good existing list.
   local items = parse_items(out)
   if #items > 0 then
@@ -1389,7 +1393,7 @@ end
       .. " text (Vim :s syntax, e.g. \\1 backreferences); flags (optional, default"
       .. " 'ge') — :s flags; the 'e' flag is always ensured so a file in the list"
       .. " with no match does not abort the run; dry_run (optional) — when true,"
-      .. " report how many quickfix entries and distinct files WOULD be edited"
+      .. " report how many findings-list entries and distinct files WOULD be edited"
       .. " without changing anything. Returns the number of files changed.",
     input_schema = {
       type = "object",
@@ -1421,7 +1425,7 @@ return function(input, ctx)
     return "findings list is empty — run grep first to populate it"
   end
 
-  -- Distinct files behind the quickfix entries (by resolved buffer number).
+  -- Distinct files behind the findings-list entries (by resolved buffer number).
   local bufs, seen = {}, {}
   for _, e in ipairs(qf) do
     local b = e.bufnr
@@ -1909,9 +1913,9 @@ return function(name, input)
     read_node = true, hover = true,
     workspace_symbols = true, context = true, show_user = true,
     help_search = true,
-    -- presentation tools: they open views / set the quickfix list but change
+    -- presentation tools: they open views / set the findings list but change
     -- no files, exactly like show_user.
-    show_diff = true, show_buffer = true, set_quickfix = true,
+    show_diff = true, show_buffer = true, set_findings = true,
     -- ask_user IS user interaction; gating it behind a confirm dialog would
     -- be asking permission to ask a question.
     ask_user = true,
@@ -1948,7 +1952,7 @@ end
       .. " declaration, definition, type_definition, implementation, references,"
       .. " symbols, read_symbol, tree_sitter_status, node_at, read_node, hover,"
       .. " workspace_symbols, context, show_user,"
-      .. " show_diff, show_buffer, set_quickfix, help_search, ask_user,"
+      .. " show_diff, show_buffer, set_findings, help_search, ask_user,"
       .. " code_action/fix_diagnostic in list mode i.e. without"
       .. " index, and undo_edit in history mode);"
       .. " otherwise prompt via vim.fn.confirm. For"

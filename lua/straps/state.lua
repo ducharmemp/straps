@@ -433,6 +433,74 @@ function M.ensure_trailing_user(bufnr)
   M.append(bufnr, "user", nil, "") -- appends + persists
 end
 
+--- Repair a transcript that was interrupted mid-tool (Neovim killed, or the
+--- process died, while a tool was in flight): persist() runs at block
+--- boundaries, so the file can hold a tool_use whose tool_result was never
+--- appended, and the API rejects an unpaired tool_use. Appends an error
+--- tool_result for each such block so the transcript is sendable again, then
+--- restores the trailing user block (the tail was a tool marker, so there was
+--- nowhere to type). Returns the number of results appended.
+---
+--- Only a TRAILING orphan run is healed — one where nothing but tool blocks
+--- follows the first unpaired tool_use, which is exactly the shape an interrupt
+--- leaves. An orphan with later user/assistant conversation after it is a
+--- hand-mangled transcript, not an interrupted one: appending a result at the
+--- end would not pair it (the result must sit in the user message immediately
+--- following its tool_use), so it is left alone to fail loudly at send.
+--- A session with a live run is likewise left alone; see the guard below.
+function M.heal_interrupted(bufnr)
+  -- Never heal a session that is still RUNNING: a tool in flight looks exactly
+  -- like an interrupted one (its tool_use is written, its result is not), and
+  -- resuming can land on a live buffer — open_session_file reuses the loaded
+  -- buffer for a path, and while a subagent runs the newest saved session is
+  -- that running child, which is what bare :StrapsResume picks. Healing there
+  -- would tell the model a tool failed while it is still working, and the real
+  -- result lands afterwards, leaving two results for one tool_use_id.
+  local ok_loop, loop = pcall(require, "straps.loop")
+  if ok_loop and loop.running(bufnr) then
+    return 0
+  end
+  local blocks = M.list_blocks(bufnr)
+  local paired = {} -- tool_use id -> true once a tool_result answers it
+  for _, b in ipairs(blocks) do
+    local id = b.attrs and b.attrs.id
+    if id and b.kind == "tool_result" then
+      paired[id] = true
+    end
+  end
+  -- First unpaired tool_use, and whether only tool blocks follow it.
+  local first_orphan
+  for i, b in ipairs(blocks) do
+    local id = b.attrs and b.attrs.id
+    if b.kind == "tool_use" and id and not paired[id] then
+      first_orphan = i
+      break
+    end
+  end
+  if not first_orphan then
+    return 0
+  end
+  for i = first_orphan, #blocks do
+    local kind = blocks[i].kind
+    if kind ~= "tool_use" and kind ~= "tool_result" then
+      return 0 -- conversation resumed after the orphan: not an interrupt
+    end
+  end
+  local n = 0
+  for i = first_orphan, #blocks do
+    local b = blocks[i]
+    local id = b.attrs and b.attrs.id
+    if b.kind == "tool_use" and id and not paired[id] then
+      M.append(bufnr, "tool_result", { id = id, is_error = true },
+        "run interrupted before this tool finished")
+      paired[id] = true
+      n = n + 1
+    end
+  end
+  M.ensure_trailing_user(bufnr)
+  return n
+end
+
 --- Content of the trailing user block, or nil if the last block isn't user.
 function M.last_user_text(bufnr)
   local blocks = parse_blocks(bufnr)

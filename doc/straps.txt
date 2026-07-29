@@ -76,7 +76,9 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 							*:StrapsResume*
 :StrapsResume [{name}]	Resume a saved session. No argument resumes the most
 			recent; an argument is a session basename (completed
-			from saved sessions) or a path.
+			from saved sessions) or a path. This reopens a
+			transcript from disk; it does not restart a run — for
+			that see |:StrapsContinue|.
 :StrapsResume!		Open a picker over all saved sessions. Each row shows
 			the session's durable title (see |:StrapsRename|) or,
 			absent one, its first user prompt, plus a relative age
@@ -107,7 +109,8 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			(|straps-steering|) instead. Also bound to <CR> in a
 			session buffer. Errors if the trailing user block is
 			empty, or if the transcript ends on an assistant
-			message (unsupported prefill).
+			message (unsupported prefill) — which is what a
+			stopped run leaves, so use |:StrapsContinue| there.
 
 							*:StrapsSteer*
 :StrapsSteer {text}	Queue {text} as a steering message on the active run
@@ -117,7 +120,25 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 :StrapsStop		Request cancellation of the active run. The run
 			notices between turns and between tool calls, kills an
 			in-flight request or `bash` process, and ends with a
-			note appended to the transcript.
+			note appended to the transcript. To pick the work back
+			up, see |:StrapsContinue|.
+
+							*:StrapsContinue*
+:StrapsContinue [{text}]
+			Continue a run that was stopped (|:StrapsStop|) or
+			interrupted, in the current session. There is no run
+			state to restore — the buffer IS the state — so this
+			just appends a user block ({text}, or a generic
+			"continue where you left off") and sends: the stopped
+			transcript is already well-formed, it merely ends on an
+			assistant block, which cannot be sent as-is. The
+			continued run gets a fresh |straps-config| `max_turns`
+			budget, a fresh stall counter and fresh blank-turn
+			nudges; the conversation itself is unaffected. Errors
+			if a run is already active — |:StrapsStop| it first, or
+			|:StrapsSteer| it instead. Distinct from
+			|:StrapsResume|, which reopens a saved transcript from
+			disk.
 
 							*:StrapsCompact*
 :StrapsCompact		Mechanically compact the current transcript — shrink
@@ -169,6 +190,17 @@ Sessions are durable: the buffer is backed by a real file under
 |straps-config| `session_dir` (`*.straps`), persisted at every block boundary,
 so it survives a restart and |:StrapsResume| just reopens it.
 
+Because persistence happens at block boundaries, a session whose Neovim died
+while a tool was still running is saved with a `tool_use` block that never got
+its `tool_result` — a shape the API rejects. |:StrapsResume| repairs that on
+open: each unfinished tool call gets an error result ("run interrupted before
+this tool finished") and the trailing user block is restored, so the resumed
+session can be sent. |:StrapsContinue| then picks the work back up. Two things
+are deliberately left alone: a session that still has a run in flight (a
+running tool is indistinguishable from an interrupted one, so repairing it
+would report a false failure), and a transcript whose tool blocks were
+hand-edited into an inconsistent state — that still fails loudly when sent.
+
 Buffer-local mappings (normal mode):
 	<CR>	Send, or prompt to steer if a run is active (|:StrapsSend|).
 	gf	Open the `path:line[:col]` reference under the cursor. Also
@@ -195,6 +227,18 @@ Winbar. Session windows get a window-local winbar showing the effective model,
 effort and run status, plus live token usage once the first response arrives —
 the context fill (e.g. 47.0k/200k (24%)) and cache hit rate, from
 `ui.usage_status()`. Disable with |straps-config| `session_winbar = false`.
+
+Own components. `ui.session_info(bufnr)` returns the session's RESOLVED state
+(provider, model, model_label, effort, overridden, status, parent, usage,
+context_used, context, context_pct, cache_pct), or nil when bufnr is not a
+session buffer; bufnr defaults to the current buffer. The buffer variables are
+raw — an unset override says nothing about the effective value — so build
+statusline/winbar components on session_info rather than on b:straps_model.
+`ui.session_status()`, `ui.usage_status()` and `ui.session_winbar()` all take
+the same optional bufnr, and `ui.human_tokens(n)` formats a token count.
+Note a GLOBAL tabline cannot resolve the session implicitly: %{} there (and
+bufnr() inside it) evaluates in the current window's context. Pass a bufnr
+from a Lua component framework, or use `ui.agents_status()`.
 
 ==============================================================================
 5. CONFIGURATION					*straps-config*
@@ -328,7 +372,7 @@ Editor-native (tree-sitter / LSP, degrade gracefully with no server):
 	format, bulk_replace
 
 Presentation & interaction:
-	show_user, show_diff, show_buffer, set_quickfix, context, ask_user,
+	show_user, show_diff, show_buffer, set_findings, context, ask_user,
 	help_search, undo_edit
 
 Self-extension & orchestration:

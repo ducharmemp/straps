@@ -314,7 +314,7 @@ case("concurrent sessions get isolated per-window findings lists", function()
   assert(ui.session_win(sa) == wa, "session_win(sa) wrong")
   assert(ui.session_win(sb) == wb, "session_win(sb) wrong")
 
-  -- Each session sets its own findings list (as grep/set_quickfix do).
+  -- Each session sets its own findings list (as grep/set_findings do).
   ui.set_locations(sa, { title = "A", items = { { filename = fa, lnum = 1, col = 1, text = "target" } } }, false)
   ui.set_locations(sb, { title = "B", items = { { filename = fb, lnum = 1, col = 1, text = "target" } } }, false)
 

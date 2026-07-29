@@ -1,6 +1,7 @@
 :Straps	straps.txt	/*:Straps*
 :StrapsAgents	straps.txt	/*:StrapsAgents*
 :StrapsCompact	straps.txt	/*:StrapsCompact*
+:StrapsContinue	straps.txt	/*:StrapsContinue*
 :StrapsEdit	straps.txt	/*:StrapsEdit*
 :StrapsEffort	straps.txt	/*:StrapsEffort*
 :StrapsEval	straps.txt	/*:StrapsEval*

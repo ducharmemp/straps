@@ -945,5 +945,291 @@ end
   assert(#body % 2 == 0, "cut landed mid-character (odd byte length): " .. #body)
 end)
 
+-- ------------------------------------------ continuing a stopped run
+-- :StrapsContinue is "append a user block, loop.start the same buffer". The
+-- buffer IS the run state, so a stopped run resumes with no restore step; what
+-- these cases pin down is that the transcript loop.stop leaves behind is
+-- actually sendable, and that the model sees the turns it already completed.
+case("a stopped run continues from where it left off", function()
+  allow_all()
+  define("tool.slow", "tool", "test: a tool that takes a while", [[
+return function(input, ctx)
+  ctx.await(function(resolve) vim.defer_fn(resolve, 300) end)
+  return "slow-done-" .. tostring(input.n)
+end
+]])
+  -- Turns 1-2 call tool.slow, turn 3 answers. The counter is module-global, so
+  -- the continued run advances the script instead of restarting it.
+  _G.straps_test_calls = 0
+  define("fn.provider", "fn", "test: two tool turns then an answer", [==[
+return function(req, ctx)
+  _G.straps_test_calls = _G.straps_test_calls + 1
+  local n = _G.straps_test_calls
+  _G.straps_test_messages = #req.messages
+  -- Emit before resolve, like the real provider's stdout callbacks, so the
+  -- delta lands in the assistant block instead of after the run's tail.
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      if n > 2 then ctx.emit({ type = "text_delta", text = "continued-answer" }) end
+      resolve()
+    end, 5)
+  end)
+  if n <= 2 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "s" .. n, name = "slow", input = { n = n } } } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "continued-answer" } } }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("do the multi-turn thing")
+  loop.start(bufnr)
+  -- Stop while turn 1's tool.slow is still in flight.
+  assert(vim.wait(2000, function() return buf_text(bufnr):find("straps:tool_use", 1, true) ~= nil end, 10),
+    "first tool_use never appeared")
+  loop.stop(bufnr)
+  wait_done(bufnr)
+  local stopped = buf_text(bufnr)
+  assert(stopped:find("[straps: run cancelled]", 1, true), "missing cancellation note")
+  assert(not stopped:find("continued-answer", 1, true), "run should have stopped before the answer")
+  local turns_at_stop = _G.straps_test_calls
+
+  -- Sending as-is is exactly what :StrapsSend does, and it must fail: the
+  -- transcript ends on the assistant-role cancellation note (no prefill). This
+  -- is the whole reason :StrapsContinue has to append a user block.
+  pcall(loop.start, bufnr)
+  assert(vim.wait(2000, function() return not loop.running(bufnr) end, 10), "bare send did not settle")
+  assert(buf_text(bufnr):find("transcript ends with an assistant message", 1, true),
+    "sending a stopped transcript as-is should fail loudly")
+
+  -- What :StrapsContinue does: append a user block, start the same buffer.
+  -- Assertions below read only the text appended from here on, so the
+  -- deliberate bare-send error above cannot satisfy or spoil them.
+  local from = vim.api.nvim_buf_line_count(bufnr)
+  state.append(bufnr, "user", nil, "[straps] Continue where you left off.")
+  _G.straps_test_messages = nil -- so the assertion below reads THIS run's value
+  loop.start(bufnr)
+  wait_done(bufnr)
+
+  local text = table.concat(vim.api.nvim_buf_get_lines(bufnr, from, -1, false), "\n")
+  assert(text:find("continued-answer", 1, true), "continued run did not reach the answer")
+  assert(not text:find("run error", 1, true), "continued run hit an error: " .. text:sub(-400))
+  assert(_G.straps_test_calls > turns_at_stop,
+    "the continued run restarted the script instead of advancing it")
+  -- The continued run replayed the pre-stop history, not just the new block.
+  assert(type(_G.straps_test_messages) == "number", "the continued run made no provider call")
+  assert(_G.straps_test_messages > 2,
+    "continued run sent only " .. tostring(_G.straps_test_messages) .. " messages — history was lost")
+end)
+
+case("an interrupted transcript (tool_use, no result) is healed and continues", function()
+  allow_all()
+  -- Exactly the on-disk shape when Neovim dies mid-tool: persist() runs at
+  -- block boundaries, so the tool_use is written and its result never is.
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "run something slow")
+  state.append(bufnr, "tool_use", { id = "k1", name = "slow" }, '{"n":1}')
+
+  local before = state.parse(bufnr).messages
+  assert(before[#before].role == "assistant", "precondition: interrupted tail is assistant-role")
+
+  local healed = state.heal_interrupted(bufnr)
+  assert(healed == 1, "expected 1 healed tool call, got " .. tostring(healed))
+  local uses, results = 0, 0
+  for _, m in ipairs(state.parse(bufnr).messages) do
+    for _, part in ipairs(m.content) do
+      if part.type == "tool_use" then uses = uses + 1 end
+      if part.type == "tool_result" then results = results + 1 end
+    end
+  end
+  assert(uses == 1 and results == 1, "heal left unpaired blocks: " .. uses .. "/" .. results)
+  assert(buf_text(bufnr):find("run interrupted before this tool finished", 1, true),
+    "healed result should say why it is an error")
+  -- is_error is what tells the model the call did not complete: without it the
+  -- model reads "run interrupted..." as the tool's successful output.
+  local healed_error
+  for _, m in ipairs(state.parse(bufnr).messages) do
+    for _, part in ipairs(m.content) do
+      if part.type == "tool_result" then healed_error = part.is_error end
+    end
+  end
+  assert(healed_error == true, "healed result must be flagged is_error, got " .. tostring(healed_error))
+  -- The tail is typeable again (heal restores the trailing user block).
+  assert(last_marker(bufnr):find("straps:user", 1, true), "heal did not restore a trailing user block")
+  assert(state.heal_interrupted(bufnr) == 0, "heal must be idempotent")
+
+  -- And the healed transcript actually sends.
+  define("fn.provider", "fn", "test: answer, rejecting unpaired tool_use like the API", [==[
+return function(req, ctx)
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  for i, m in ipairs(req.messages) do
+    if m.role == "assistant" then
+      for _, p in ipairs(m.content) do
+        if p.type == "tool_use" then
+          local nxt, paired = req.messages[i + 1], false
+          if nxt and nxt.role == "user" then
+            for _, q in ipairs(nxt.content) do
+              if q.type == "tool_result" and q.tool_use_id == p.id then paired = true end
+            end
+          end
+          if not paired then error("simulated API 400: unpaired tool_use " .. tostring(p.id)) end
+        end
+      end
+    end
+  end
+  ctx.emit({ type = "text_delta", text = "healed-answer" })
+  return { stop_reason = "end_turn", content = { { type = "text", text = "healed-answer" } } }
+end
+]==])
+  state.append(bufnr, "user", nil, "[straps] Continue where you left off.")
+  loop.start(bufnr)
+  wait_done(bufnr)
+  local text = buf_text(bufnr)
+  assert(text:find("healed-answer", 1, true), "healed transcript did not send cleanly: " .. text:sub(-400))
+  assert(not text:find("run error", 1, true), "healed transcript still errored: " .. text:sub(-400))
+end)
+
+case("heal pairs only the unfinished calls of an interrupted batch", function()
+  -- A parallel batch interrupted partway: the first call's result persisted, the
+  -- second never did, and the tail is tool blocks only (no trailing user block
+  -- to end the scan early) — so this is what actually exercises the per-id
+  -- pairing bookkeeping rather than the trailing-block guard.
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "read two files")
+  state.append(bufnr, "tool_use", { id = "p1", name = "read_file" }, '{"path":"a"}')
+  state.append(bufnr, "tool_use", { id = "p2", name = "read_file" }, '{"path":"b"}')
+  state.append(bufnr, "tool_result", { id = "p1", is_error = false }, "contents of a")
+
+  local function results_by_id(b)
+    local per_id = {}
+    for _, m in ipairs(state.parse(b).messages) do
+      for _, part in ipairs(m.content) do
+        if part.type == "tool_result" then
+          per_id[part.tool_use_id] = (per_id[part.tool_use_id] or 0) + 1
+        end
+      end
+    end
+    return per_id
+  end
+
+  assert(state.heal_interrupted(bufnr) == 1, "expected exactly the unpaired call to be healed")
+  local per_id = results_by_id(bufnr)
+  assert(per_id.p1 == 1, "already-finished call got " .. tostring(per_id.p1) .. " results")
+  assert(per_id.p2 == 1, "interrupted call got " .. tostring(per_id.p2) .. " results")
+  assert(state.heal_interrupted(bufnr) == 0, "heal must be idempotent on a healed batch")
+  per_id = results_by_id(bufnr)
+  assert(per_id.p1 == 1 and per_id.p2 == 1, "second heal duplicated results")
+
+  -- Same batch with the results in the other order: the orphan comes FIRST and
+  -- an already-answered call follows it. Heal is per-id, not positional, so it
+  -- must still add exactly one result and never duplicate the existing one.
+  local rev = state.new_session()
+  state.append(rev, "user", nil, "read two files")
+  state.append(rev, "tool_use", { id = "r1", name = "read_file" }, '{"path":"a"}')
+  state.append(rev, "tool_use", { id = "r2", name = "read_file" }, '{"path":"b"}')
+  state.append(rev, "tool_result", { id = "r2", is_error = false }, "contents of b")
+  assert(state.heal_interrupted(rev) == 1, "expected one healed call in the reversed batch")
+  local rev_ids = results_by_id(rev)
+  assert(rev_ids.r1 == 1, "orphan-first: r1 got " .. tostring(rev_ids.r1) .. " results")
+  assert(rev_ids.r2 == 1, "orphan-first: answered r2 got " .. tostring(rev_ids.r2) .. " results")
+
+  -- A batch interrupted before ANY result landed: the return value is the count
+  -- resume_session reports to the user, so it must track the work done, not just
+  -- be nonzero. Also pins the trailing-user restore for the batch shape.
+  local both = state.new_session()
+  state.append(both, "user", nil, "read two files")
+  state.append(both, "tool_use", { id = "b1", name = "read_file" }, '{"path":"a"}')
+  state.append(both, "tool_use", { id = "b2", name = "read_file" }, '{"path":"b"}')
+  assert(state.heal_interrupted(both) == 2, "both unfinished calls should be healed")
+  local both_ids = results_by_id(both)
+  assert(both_ids.b1 == 1 and both_ids.b2 == 1,
+    "each orphan needs exactly one result: b1=" .. tostring(both_ids.b1)
+      .. " b2=" .. tostring(both_ids.b2))
+  assert(last_marker(both):find("straps:user", 1, true),
+    "heal did not restore a trailing user block for the batch shape")
+end)
+
+case("heal refuses to touch a session with a live run", function()
+  -- A tool in flight is indistinguishable, on disk, from an interrupted one:
+  -- the tool_use is written, the result is not. Resuming can reach a LIVE
+  -- buffer (open_session_file reuses the loaded buffer for a path, and while a
+  -- subagent runs the newest saved session is that running child — what bare
+  -- :StrapsResume picks), so healing must decline, or the model is told a tool
+  -- failed while it is still working AND the real result lands too.
+  allow_all()
+  define("tool.slow", "tool", "test: still running when we try to heal", [[
+return function(input, ctx)
+  ctx.await(function(resolve) vim.defer_fn(resolve, 600) end)
+  return "the-real-result"
+end
+]])
+  _G.straps_test_calls = 0
+  define("fn.provider", "fn", "test: one slow tool then an answer", [==[
+return function(req, ctx)
+  _G.straps_test_calls = _G.straps_test_calls + 1
+  local n = _G.straps_test_calls
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      if n > 1 then ctx.emit({ type = "text_delta", text = "live-run-done" }) end
+      resolve()
+    end, 5)
+  end)
+  if n == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "L1", name = "slow", input = vim.empty_dict() } } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "live-run-done" } } }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("run something slow")
+  loop.start(bufnr)
+  assert(vim.wait(2000, function() return buf_text(bufnr):find("straps:tool_use", 1, true) ~= nil end, 10),
+    "tool_use marker never appeared")
+  assert(loop.running(bufnr), "precondition: the run must still be active")
+  assert(state.heal_interrupted(bufnr) == 0, "heal must decline while a run is active")
+
+  wait_done(bufnr)
+  local per_id = {}
+  for _, m in ipairs(state.parse(bufnr).messages) do
+    for _, part in ipairs(m.content) do
+      if part.type == "tool_result" then
+        per_id[part.tool_use_id] = (per_id[part.tool_use_id] or 0) + 1
+      end
+    end
+  end
+  assert(per_id.L1 == 1, "the in-flight call ended up with " .. tostring(per_id.L1) .. " results")
+  local text = buf_text(bufnr)
+  assert(text:find("the-real-result", 1, true), "the real tool result is missing")
+  assert(not text:find("run interrupted before this tool finished", 1, true),
+    "heal falsely reported an in-flight tool as interrupted")
+end)
+
+case("heal leaves a hand-mangled transcript alone", function()
+  -- An orphan tool_use with conversation AFTER it is not an interrupt: a result
+  -- appended at the end would not pair it (the result must be in the user
+  -- message right after its tool_use), so heal must not touch it — the loud
+  -- failure in run_scope.lua is the correct behavior and must stay reachable.
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "run a tool")
+  state.append(bufnr, "tool_use", { id = "m1", name = "ping" }, "{}")
+  state.append(bufnr, "user", nil, "and now continue")   -- user deleted the result
+  local before = buf_text(bufnr)
+  assert(state.heal_interrupted(bufnr) == 0, "mid-transcript orphan must not be healed")
+  assert(buf_text(bufnr) == before, "heal modified a hand-mangled transcript")
+end)
+
+case("heal is a no-op on a well-formed transcript", function()
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "hi")
+  state.append(bufnr, "tool_use", { id = "w1", name = "ping" }, "{}")
+  state.append(bufnr, "tool_result", { id = "w1", is_error = false }, "pong")
+  state.append(bufnr, "assistant", nil, "done")
+  state.ensure_trailing_user(bufnr)
+  local before = buf_text(bufnr)
+  assert(state.heal_interrupted(bufnr) == 0, "well-formed transcript should need no healing")
+  assert(buf_text(bufnr) == before, "heal modified a well-formed transcript")
+end)
+
 print(failed == 0 and "ALL PASS" or (failed .. " case(s) FAILED"))
 os.exit(failed == 0 and 0 or 1)

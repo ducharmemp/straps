@@ -371,13 +371,22 @@ function M._attach_render(bufnr)
   })
 end
 
+--- Redraw every surface a straps status component can live on. :redrawstatus
+--- covers statuslines and winbars but NOT the tabline (:help :redrawstatus), so
+--- a hand-rolled tabline component would otherwise render frozen state. `all`
+--- redraws every window's statusline rather than just the current one.
+function M.redraw_status(all)
+  pcall(vim.cmd, all and "redrawstatus!" or "redrawstatus")
+  pcall(vim.cmd, "redrawtabline")
+end
+
 --- Set the per-buffer status flag ("running" | "idle") and redraw the
 --- statusline. The loop calls this (or sets vim.b straps_status directly)
 --- around a run; statuslines read vim.b.straps_status.
 function M.set_status(bufnr, status)
   if vim.api.nvim_buf_is_valid(bufnr) then
     vim.b[bufnr].straps_status = status
-    vim.cmd("redrawstatus")
+    M.redraw_status()
   end
 end
 
@@ -643,6 +652,13 @@ function M.resume_session(path, split_cmd)
     path = sessions[1].path
   end
   local bufnr = state.open_session_file(path)
+  -- A session whose Neovim died mid-tool is on disk with an unpaired tool_use,
+  -- which the API rejects; pair it up so the resumed transcript can be sent.
+  local healed = state.heal_interrupted(bufnr)
+  if healed > 0 then
+    vim.notify(("straps: this session was interrupted mid-run; marked %d unfinished"
+      .. " tool call(s) as interrupted (:StrapsContinue to pick up)"):format(healed))
+  end
   return M.show_session(bufnr, split_cmd)
 end
 
@@ -947,141 +963,95 @@ function M.agents_status()
   return ("🤖 %d"):format(top)
 end
 
---- Statusline component for a SESSION buffer: the provider-specific model and
---- effort that will be used for its next run — the per-buffer override
---- (vim.b straps_model / straps_openai_model / straps_effort) if set, else the global config default. "" for non-session
---- buffers (so it disappears everywhere else). Format: " model" or
---- " model · effort" (effort omitted when "off"); a per-buffer override is
---- marked with a trailing "*" so a session diverging from the global default
---- is visible at a glance. Drop it into a statusline with
---- %{v:lua.require'straps.ui'.session_status()}.
-function M.session_status()
-  local bufnr = vim.api.nvim_get_current_buf()
-  local is_session = false
-  pcall(function() is_session = vim.b[bufnr].straps_session == true end)
-  if not is_session then
-    return ""
+--- Humanize a token count for display: 138879 -> "138.9k", 950 -> "950".
+--- Public because every hand-written status component needs exactly this and
+--- would otherwise reimplement it.
+function M.human_tokens(n)
+  n = tonumber(n) or 0
+  if n >= 1000 then
+    local s = string.format("%.1fk", n / 1000)
+    s = s:gsub("%.0k$", "k")
+    return s
   end
-  local ok, straps = pcall(require, "straps")
-  if not ok or type(straps) ~= "table" then
-    return ""
-  end
-  local cfg = straps.config or {}
+  return tostring(n)
+end
 
-  local b_model, b_openai_model, b_effort
-  pcall(function()
-    b_model = vim.b[bufnr].straps_model
-    b_openai_model = vim.b[bufnr].straps_openai_model
-    b_effort = vim.b[bufnr].straps_effort
-  end)
-  local provider = effective_provider(straps, bufnr)
-  local model_key = provider == "openai" and "openai_models" or "models"
-  local model = provider == "openai"
-      and ((b_openai_model and b_openai_model ~= "" and b_openai_model) or cfg.openai_model or "gpt-5")
-    or ((b_model and b_model ~= "" and b_model) or cfg.model or "?")
-  local effort = (b_effort and b_effort ~= "" and b_effort) or cfg.effort or "off"
-  local overridden = (provider == "openai" and b_openai_model and b_openai_model ~= "")
-    or (provider ~= "openai" and b_model and b_model ~= "")
-    or (b_effort and b_effort ~= "")
-
-  -- Prefer a short label from the provider-specific model list over the raw id.
-  local label = model
-  if type(cfg[model_key]) == "table" then
-    for _, m in ipairs(cfg[model_key]) do
-      if type(m) == "table" and m.id == model and m.label and m.label ~= "" then
-        label = m.label
-        break
-      end
-    end
+--- Format the model/effort segment of a session_info table (see M.session_info).
+--- Shared by session_status and session_winbar so the two never drift.
+local function format_status(info)
+  local out = " " .. info.model_label
+  if info.effort and info.effort ~= "off" then
+    out = out .. " · " .. info.effort
   end
-
-  local out = " " .. label
-  if effort and effort ~= "off" then
-    out = out .. " · " .. effort
-  end
-  if overridden then
+  if info.overridden then
     out = out .. "*"
   end
   return out
 end
 
---- A compact usage segment for a session buffer: context fill and cache hit
---- rate from the last response's token usage (vim.b.straps_usage, set by the
---- loop). "" when there is no usage yet or off a session buffer. Kept
---- self-contained so a manual statusline can use it too.
-function M.usage_status()
-  local bufnr = vim.api.nvim_get_current_buf()
-  local u
-  pcall(function() u = vim.b[bufnr].straps_usage end)
-  if type(u) ~= "table" or not u.input_billed or u.input_billed <= 0 then
+--- Format the usage segment of a session_info table, "" when it has no usage.
+local function format_usage(info)
+  local u = info.usage
+  if not u then
     return ""
   end
-  local ok, straps = pcall(require, "straps")
-  local cfg = (ok and type(straps) == "table" and straps.config) or {}
-
-  -- Resolve the model's context window: the per-model `context` field, else
-  -- config.context_window. nil -> show the raw token count without a percent.
-  local b_model, b_openai_model
-  pcall(function()
-    b_model = vim.b[bufnr].straps_model
-    b_openai_model = vim.b[bufnr].straps_openai_model
-  end)
-  local provider = effective_provider({ config = cfg }, bufnr)
-  local model_key = provider == "openai" and "openai_models" or "models"
-  local model = provider == "openai"
-      and ((b_openai_model and b_openai_model ~= "" and b_openai_model) or cfg.openai_model)
-    or ((b_model and b_model ~= "" and b_model) or cfg.model)
-  local window
-  if type(cfg[model_key]) == "table" then
-    for _, m in ipairs(cfg[model_key]) do
-      if type(m) == "table" and m.id == model then
-        window = tonumber(m.context)
-        break
-      end
-    end
-  end
-  window = window or tonumber(cfg.context_window)
-
-  local function human(n)
-    if n >= 1000 then
-      local s = string.format("%.1fk", n / 1000)
-      s = s:gsub("%.0k$", "k")
-      return s
-    end
-    return tostring(n)
-  end
-
   local seg
-  if window and window > 0 then
-    local pct = math.floor((u.input_billed / window) * 100 + 0.5)
-    seg = string.format("%s/%s (%d%%)", human(u.input_billed), human(window), pct)
+  if info.context and info.context > 0 then
+    seg = string.format("%s/%s (%d%%)",
+      M.human_tokens(info.context_used), M.human_tokens(info.context), info.context_pct)
   else
-    seg = human(u.input_billed) .. " ctx"
+    seg = M.human_tokens(info.context_used) .. " ctx"
   end
-  -- Cache hit rate = cached read / total input side, when caching did anything.
-  local cached = (u.cache_read or 0)
-  if cached > 0 and u.input_billed > 0 then
-    seg = seg .. string.format(" · cache %d%%",
-      math.floor((cached / u.input_billed) * 100 + 0.5))
+  if info.cache_pct then
+    seg = seg .. string.format(" · cache %d%%", info.cache_pct)
   end
   return seg
+end
+
+--- Statusline component for a SESSION buffer: the provider-specific model and
+--- effort that will be used for its next run. "" for non-session buffers (so it
+--- disappears everywhere else). Format: " model" or " model · effort" (effort
+--- omitted when "off"); a trailing "*" marks a session whose effective
+--- provider/model/effort DIVERGES from the global config default. `bufnr`
+--- defaults to the current buffer — pass it explicitly from a component that
+--- runs outside the target window's context (lualine, heirline, a tabline).
+--- Drop it into a statusline with
+--- %{v:lua.require'straps.ui'.session_status()}.
+function M.session_status(bufnr)
+  local info = M.session_info(bufnr)
+  if not info then
+    return ""
+  end
+  return format_status(info)
+end
+
+--- A compact usage segment for a session buffer: context fill and cache hit
+--- rate from the last response's token usage (vim.b.straps_usage, set by the
+--- loop). "" when there is no usage yet or off a session buffer. `bufnr`
+--- defaults to the current buffer. Kept self-contained so a manual statusline
+--- can use it too.
+function M.usage_status(bufnr)
+  local info = M.session_info(bufnr)
+  if not info then
+    return ""
+  end
+  return format_usage(info)
 end
 
 --- Winbar for a session window: the active model/effort (session_status) plus
 --- a right-aligned run status (running/idle). Auto-installed on session windows
 --- unless config.session_winbar = false; also usable manually via
 --- %{%v:lua.require'straps.ui'.session_winbar()%}. "" for non-session buffers.
-function M.session_winbar()
-  local status = M.session_status()
-  if status == "" then
+--- `bufnr` defaults to the current buffer.
+function M.session_winbar(bufnr)
+  local info = M.session_info(bufnr)
+  if not info then
     return ""
   end
-  local run = "idle"
-  pcall(function() run = vim.b[vim.api.nvim_get_current_buf()].straps_status or "idle" end)
-  local left = "straps" .. status
-  local usage = M.usage_status()
+  local left = "straps" .. format_status(info)
+  local usage = format_usage(info)
   local mid = (usage ~= "") and (usage .. "  ") or ""
-  local right = (run == "running") and "● running" or "○ idle"
+  local right = (info.status == "running") and "● running" or "○ idle"
   return "%#StrapsWinbar#" .. left .. "%=" .. mid .. right .. " "
 end
 
@@ -1422,6 +1392,112 @@ local function effective_effort(straps, bufnr)
   return straps.config.effort
 end
 
+--- The entry in the active provider's model list matching `model`, or nil.
+--- One scan shared by the label and context-window lookups, which want
+--- different fields off the same entry.
+local function model_entry(cfg, provider, model)
+  local list = cfg[provider == "openai" and "openai_models" or "models"]
+  if type(list) ~= "table" or not model then
+    return nil
+  end
+  for _, m in ipairs(list) do
+    if type(m) == "table" and m.id == model then
+      return m
+    end
+  end
+  return nil
+end
+
+--- Everything a status component could want about a session buffer, with the
+--- per-buffer-override -> global-config fallback chain ALREADY RESOLVED, so a
+--- caller never has to reimplement it from the raw vim.b vars.
+---
+--- Returns nil when `bufnr` (default: the current buffer) is not a valid
+--- session buffer, so a component can early-out with "". Fields:
+---   bufnr        the buffer this describes
+---   provider     "anthropic" | "openai"
+---   model        effective model id
+---   model_label  its config label if listed, else the raw id (never nil)
+---   effort       effective effort name ("off" when unset)
+---   overridden   true when provider/model/effort DIVERGE from global config
+---   status       "running" | "idle"
+---   parent       parent session bufnr for a subagent, else nil
+---   usage        last turn's token usage table, or nil when none yet
+---   context_used billed input tokens = the current context fill (0 with no usage)
+---   context      resolved context window, or nil when unknown
+---   context_pct  rounded percent of `context` used, nil when context is unknown
+---   cache_pct    rounded cache hit rate, nil when caching did nothing
+---
+--- Percentages are pre-rounded integers so every consumer renders the same
+--- number a "%d" format would otherwise truncate differently.
+function M.session_info(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  -- An external consumer (a lualine component caching a bufnr, a tabline over
+  -- a closed tab) can easily hand us a dead buffer; vim.b on one THROWS, and a
+  -- statusline expression that errors gets the option reset. Guard once here
+  -- instead of pcall-wrapping every read below.
+  if not vim.api.nvim_buf_is_valid(bufnr) or vim.b[bufnr].straps_session ~= true then
+    return nil
+  end
+  local ok, straps = pcall(require, "straps")
+  if not ok or type(straps) ~= "table" or type(straps.config) ~= "table" then
+    return nil
+  end
+  local cfg = straps.config
+
+  local provider = effective_provider(straps, bufnr)
+  -- effective_model can return nil (an unset config.model); the raw-id label
+  -- fallback and the "?" placeholder keep every string field non-nil.
+  local model = effective_model(straps, bufnr) or "?"
+  local effort = effective_effort(straps, bufnr) or "off"
+  local entry = model_entry(cfg, provider, model)
+  local label = (entry and type(entry.label) == "string" and entry.label ~= "") and entry.label or model
+
+  -- Divergence, not mere presence of an override: a per-buffer value equal to
+  -- the global default is not a divergence and gets no marker.
+  local global = { config = cfg }
+  local overridden = provider ~= effective_provider(global, nil)
+    or model ~= (effective_model(global, nil) or "?")
+    or effort ~= (effective_effort(global, nil) or "off")
+
+  local info = {
+    bufnr = bufnr,
+    provider = provider,
+    model = model,
+    model_label = label,
+    effort = effort,
+    overridden = overridden,
+    status = vim.b[bufnr].straps_status or "idle",
+    parent = nil,
+    usage = nil,
+    context_used = 0,
+    context = tonumber(entry and entry.context) or tonumber(cfg.context_window),
+    context_pct = nil,
+    cache_pct = nil,
+  }
+
+  local parent = vim.b[bufnr].straps_parent
+  if type(parent) == "number" and vim.api.nvim_buf_is_valid(parent) then
+    info.parent = parent
+  end
+
+  -- Usage only counts once a response has reported a billed input side; the
+  -- context axis is input_billed (fresh input + both cache tiers), not `input`.
+  local u = vim.b[bufnr].straps_usage
+  if type(u) == "table" and (tonumber(u.input_billed) or 0) > 0 then
+    info.usage = u
+    info.context_used = tonumber(u.input_billed)
+    if info.context and info.context > 0 then
+      info.context_pct = math.floor((info.context_used / info.context) * 100 + 0.5)
+    end
+    local cached = tonumber(u.cache_read) or 0
+    if cached > 0 then
+      info.cache_pct = math.floor((cached / info.context_used) * 100 + 0.5)
+    end
+  end
+
+  return info
+end
 --- Open a picker over the available models; picking one sets the model
 --- PER-BUFFER (vim.b straps_model) when run on a session buffer, else the
 --- global straps.config.model. The list is config.models (the curated static
@@ -1487,7 +1563,7 @@ function M.pick_model()
       end
       vim.notify("straps: " .. provider .. " model = " .. tostring(id))
     end
-    pcall(vim.cmd, "redrawstatus!")
+    M.redraw_status(true)
   end)
 end
 
@@ -1531,7 +1607,7 @@ function M.pick_effort()
       straps.config.effort = choice.name
       vim.notify("straps: effort = " .. tostring(choice.name))
     end
-    pcall(vim.cmd, "redrawstatus!")
+    M.redraw_status(true)
   end)
 end
 
@@ -1577,7 +1653,7 @@ function M.pick_provider()
         end)
       end
     end
-    pcall(vim.cmd, "redrawstatus!")
+    M.redraw_status(true)
   end)
 end
 -- following tool_result stays inside it, so one tool call collapses to a single

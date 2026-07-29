@@ -82,7 +82,7 @@ end
 case("new tools registered with schemas; autocmd_bridge registered as fn", function()
   for _, n in ipairs({ "hover", "workspace_symbols", "rename_symbol", "code_action",
     "format", "context", "show_user", "help_search", "run_in_terminal",
-    "show_diff", "show_buffer", "set_quickfix" }) do
+    "show_diff", "show_buffer", "set_findings" }) do
     local e = registry.get("tool." .. n)
     assert(e, "tool." .. n .. " not registered")
     assert(e.kind == "tool", "tool." .. n .. " wrong kind")
@@ -789,6 +789,9 @@ case("'Always in <dir>' grants the parent directory, not neighbors with the same
   local base = vim.fn.tempname()
   vim.fn.mkdir(base .. "/aa", "p")
   vim.fn.mkdir(base .. "/aab", "p")
+  -- The hook records grants under canonical paths (fs_realpath), so compare
+  -- against the canonical base (on macOS tempname says /var, realpath /private/var).
+  base = vim.uv.fs_realpath(base) or base
   local cbuf = vim.api.nvim_create_buf(true, false)
   local prompts = 0
   local real_confirm = vim.fn.confirm
@@ -871,8 +874,11 @@ end)
 
 case("'Always in this project' grants the whole repo root, covering sibling dirs", function()
   local base = vim.fn.tempname()
+  vim.fn.mkdir(base .. "/.git", "p")
+  -- realpath only works on an existing path, so canonicalize AFTER mkdir
+  -- (on macOS tempname says /var, realpath /private/var — and the hook
+  -- records grants under canonical paths).
   local root = vim.uv.fs_realpath(base) or base
-  vim.fn.mkdir(root .. "/.git", "p")
   vim.fn.mkdir(root .. "/lua/straps", "p")
   vim.fn.mkdir(root .. "/tests", "p")
   local cbuf = vim.api.nvim_create_buf(true, false)
@@ -1122,11 +1128,11 @@ case("show_diff without a valid mode returns a usage hint", function()
   assert(out:find("pass {path, content} or {left, right}", 1, true), "usage hint missing: " .. out)
 end)
 
-case("set_quickfix loads locations and opens the quickfix list", function()
+case("set_findings loads locations and opens the findings list", function()
   vim.cmd("only")
   vim.fn.setqflist({}, "f")
   local out = drive(function(ctx)
-    return registry.call("tool.set_quickfix", {
+    return registry.call("tool.set_findings", {
       items = {
         { path = root .. "/lua/straps/loop.lua", line = 10, col = 2, text = "here" },
         { path = root .. "/README.md", line = 1, text = "there" },
@@ -1145,15 +1151,15 @@ case("set_quickfix loads locations and opens the quickfix list", function()
   vim.cmd("only")
 end)
 
-case("set_quickfix with no valid items reports it", function()
+case("set_findings with no valid items reports it", function()
   local out = drive(function(ctx)
-    return registry.call("tool.set_quickfix", { items = { { nope = 1 } } }, ctx)
+    return registry.call("tool.set_findings", { items = { { nope = 1 } } }, ctx)
   end, 5000)
   assert(out:find("no valid items", 1, true), "expected no-valid-items note: " .. out)
 end)
 
 case("hook.confirm auto-allows the presentation tools", function()
-  for _, n in ipairs({ "show_diff", "show_buffer", "set_quickfix" }) do
+  for _, n in ipairs({ "show_diff", "show_buffer", "set_findings" }) do
     local allowed = registry.call("hook.confirm", n, {}, { bufnr = 0 })
     assert(allowed == true, n .. " should be auto-allowed (read-only view)")
   end

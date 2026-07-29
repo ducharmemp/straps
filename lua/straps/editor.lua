@@ -497,16 +497,18 @@ function M.register()
       .. " diagnostic is one line: 'file:line:col: SEVERITY message [source]'"
       .. " with 1-based line/col and SEVERITY one of ERROR/WARN/INFO/HINT."
       .. " Returns 'no diagnostics' when there are none. With quickfix=true it"
-      .. " also loads the reported diagnostics into Neovim's quickfix list (title"
-      .. " 'straps: diagnostics'), so the user can jump through them with"
-      .. " :cnext/:cprev; the returned text is unchanged. Parameters: path"
+      .. " also loads the reported diagnostics into this session's findings list"
+      .. " (the session window's location list when on-screen, else the global"
+      .. " quickfix list; title 'straps: diagnostics'), so the user can jump"
+      .. " through them with :lnext/:lprev (or :cnext/:cprev when it fell back);"
+      .. " the returned text is unchanged. Parameters: path"
       .. " (optional) — file to inspect; omit to scan all loaded buffers; quickfix"
-      .. " (optional boolean) — also populate the quickfix list.",
+      .. " (optional boolean) — also populate the findings list.",
     input_schema = {
       type = "object",
       properties = {
         path = { type = "string", description = "File to inspect; omit for all loaded buffers." },
-        quickfix = { type = "boolean", description = "Also populate the quickfix list with the diagnostics." },
+        quickfix = { type = "boolean", description = "Also populate this session's findings list with the diagnostics." },
       },
       required = {},
     },
@@ -3035,20 +3037,22 @@ end
 ]==]),
   })
 
-  -- ------------------------------------------------------------ set_quickfix
+  -- ------------------------------------------------------------ set_findings
 
   define({
-    name = "tool.set_quickfix",
+    name = "tool.set_findings",
     kind = "tool",
-    doc = "Load a list of locations into Neovim's quickfix list and open it, so"
-      .. " the user can step through them with :cnext/:cprev. Use this for a set"
+    doc = "Load a list of locations into this session's findings list (the"
+      .. " session window's location list when on-screen, else the global"
+      .. " quickfix list) and open it, so the user can step through them with"
+      .. " :lnext/:lprev (or :cnext/:cprev when it fell back). Use this for a set"
       .. " of file:line findings you assembled yourself (e.g. from reads and"
-      .. " analysis) — grep already fills the quickfix list for searches, and"
+      .. " analysis) — grep already fills the findings list for searches, and"
       .. " run_quickfix does it for build/lint output, so reach for those first"
       .. " when they apply. Read-only with respect to files (only sets the"
-      .. " quickfix list). Parameters: items (required) — an array of"
+      .. " findings list). Parameters: items (required) — an array of"
       .. " {path, line?, col?, text?}; title (optional) — the list title; open"
-      .. " (optional, default true) — open the quickfix window.",
+      .. " (optional, default true) — open the findings list window.",
     input_schema = {
       type = "object",
       properties = {
@@ -3066,8 +3070,8 @@ end
             required = { "path" },
           },
         },
-        title = { type = "string", description = "Quickfix list title." },
-        open = { type = "boolean", description = "Open the quickfix window (default true)." },
+        title = { type = "string", description = "Findings list title." },
+        open = { type = "boolean", description = "Open the findings list window (default true)." },
       },
       required = { "items" },
     },
@@ -3075,7 +3079,7 @@ end
 return function(input, ctx)
   input = input or {}
   if type(input.items) ~= "table" then
-    return "set_quickfix: items must be an array of {path, line?, col?, text?}"
+    return "set_findings: items must be an array of {path, line?, col?, text?}"
   end
   local qf = {}
   for _, it in ipairs(input.items) do
@@ -3089,7 +3093,7 @@ return function(input, ctx)
     end
   end
   if #qf == 0 then
-    return "set_quickfix: no valid items (each needs a `path`)"
+    return "set_findings: no valid items (each needs a `path`)"
   end
   local title = type(input.title) == "string" and input.title ~= "" and input.title
     or "straps: findings"
@@ -3100,7 +3104,7 @@ return function(input, ctx)
   local list_kind = require("straps.ui").set_locations(ctx and ctx.bufnr,
     { title = title, items = qf }, open)
   local nav = (list_kind == "loclist") and ":lnext/:lprev" or ":cnext/:cprev"
-  return ("set_quickfix: loaded %d entr%s (%s) — the user can step them with %s")
+  return ("set_findings: loaded %d entr%s (%s) — the user can step them with %s")
     :format(#qf, #qf == 1 and "y" or "ies", title, nav)
 end
 ]==]),

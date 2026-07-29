@@ -1538,12 +1538,13 @@ the native medium that fits its shape instead of flattening everything
 into reply prose:
 
 - One location worth their eyes: show_user.
-- Many locations: the quickfix list. grep already fills it as a side
-  effect, and run_quickfix fills it from build/lint output. For findings
-  you assembled yourself (from read_file / definition / references, which
-  leave no list behind), call set_quickfix with the locations and a title —
-  don't hand-roll setqflist. The absence of a side-effect list is not a
-  signal that the findings are prose-sized.
+- Many locations: this session's findings list (the session window's
+  location list when on-screen, else the global quickfix list). grep
+  already fills it as a side effect, and run_quickfix fills it from
+  build/lint output. For findings you assembled yourself (from read_file /
+  definition / references, which leave no list behind), call set_findings
+  with the locations and a title — don't hand-roll setloclist. The absence
+  of a side-effect list is not a signal that the findings are prose-sized.
 - Two versions of anything: show_diff — {path, content} to preview proposed
   contents against a file, or {left, right} for two texts. A real diff
   split with highlighted hunks beats prose describing them.

@@ -17,8 +17,9 @@ CONTENTS						*straps* *straps.nvim*
 	9. Core functions (fn.*) ................. |straps-fn|
 	10. Skills ............................... |straps-skills|
 	11. Subagents ............................ |straps-subagents|
-	12. Health ............................... |straps-health|
-	13. Highlight groups ..................... |straps-highlights|
+	12. Multiplayer .......................... |straps-multiplayer|
+	13. Health ............................... |straps-health|
+	14. Highlight groups ..................... |straps-highlights|
 
 ==============================================================================
 1. INTRODUCTION						*straps-introduction*
@@ -51,7 +52,7 @@ Run |:checkhealth| straps to verify your install — see |straps-health|.
 >lua
 	require("straps").setup({
 	  model = "claude-sonnet-5",
-	  max_tokens = 8192,
+	  default_max_tokens = 32000,
 	})
 <
 `setup()` merges your options into |straps-config|, then registers the default
@@ -247,7 +248,17 @@ Pass these to |straps.setup()|. Defaults shown.
 
 						*straps-config-model*
 model			(string) "claude-sonnet-5". The request model.
-max_tokens		(number) 8192. Response token cap.
+max_tokens		(number|nil) nil. Response token cap per call. nil uses
+			the active model's own max output (the matching
+			|models| entry's `max_output`, else
+			`default_max_tokens`). A number pins an explicit hard
+			cap that wins, except a budget-thinking request still
+			bumps above it when it would be <= budget_tokens (the
+			API rejects that). OpenAI: max_tokens else
+			default_max_tokens (no per-model discovery).
+default_max_tokens	(number) 32000. Fallback cap when max_tokens is nil and
+			the model has no known max_output; also the OpenAI
+			default.
 max_turns		(number) 128. Hard backstop on turns per run; a
 			visible note is appended when hit.
 stall_limit		(number) 6. End a run after this many CONSECUTIVE
@@ -283,9 +294,11 @@ render			(boolean) true. Master switch for the |fn.render|
 tools_expanded		(boolean) false. Fold tool blocks OPEN by default.
 session_winbar		(boolean) true. Window-local winbar on session windows.
 models			(list) 4 curated Anthropic entries { id, label?,
-			thinking?, context? }. The |:StrapsModel| Anthropic
-			seed/cache; `thinking` is "adaptive" or "budget" and
-			`context` is its token window. An unlisted Anthropic
+			thinking?, context?, max_output? }. The |:StrapsModel|
+			Anthropic seed/cache; `thinking` is "adaptive" or
+			"budget", `context` is its input window, and
+			`max_output` is its max response tokens (the default
+			max_tokens for that model). An unlisted Anthropic
 			model sends no thinking block.
 openai_models		(list) curated OpenAI entries { id, label? }. The
 			|:StrapsModel| OpenAI seed/cache, separate from
@@ -377,7 +390,15 @@ Presentation & interaction:
 
 Self-extension & orchestration:
 	registry_list, registry_get, registry_define, skill, eval_lua,
-	spawn, spawn_wait (|straps-subagents|)
+	spawn, spawn_wait (|straps-subagents|), agents
+	(|straps-multiplayer|), transcript_excise
+
+`transcript_excise` is context surgery: with no arguments it lists the
+transcript's blocks; with `blocks`/`range` and a required `note` it replaces
+those blocks' contents with a one-line `[excised: ...]` receipt, so a finished
+side quest stops being replayed in later requests. It cannot delete a block,
+cannot write text other than the receipt, and never touches the system block or
+the turn in flight. `session` targets a subagent's transcript instead.
 
 Writes (write_file/edit_file and the LSP refactors) apply THROUGH the file's
 buffer, so they land in the file's native undo tree — the user reverts with
@@ -417,8 +438,10 @@ hook.after_write(path, ctx) -> string|nil
 						*hook.on_run_end*
 hook.on_run_start(ctx) / hook.on_run_end(ctx)
 		Called when a run starts / ends (always, including error and
-		cancel). No-ops by default; redefine for setup/teardown or
-		notifications.
+		cancel). on_run_start posts the multiplayer notice when other
+		agents are running (see |straps-multiplayer|) and does nothing
+		otherwise; on_run_end is a no-op. Redefine either for
+		setup/teardown or notifications.
 
 						*hook.on_progress*
 hook.on_progress(ev, ctx)
@@ -472,9 +495,14 @@ fn.list_models(provider?) -> entries
 						*fn.build_tools*
 fn.build_tools() -> tools	Map every tool.* entry to an API tool def.
 						*fn.system_prompt*
-fn.system_prompt()		Compose the system prompt from its layers:
+fn.system_prompt(opts?)		Compose the system prompt from its layers:
 				fn.system_prompt_core / _env / _project /
-				_skills, each redefinable on its own.
+				_skills, each redefinable on its own. opts
+				(from |tool.spawn| via state.new_session) go
+				to the core layer, which reshapes the prompt
+				for a subagent: no # Subagents section, a
+				# You are a subagent section, readonly /
+				restricted-tool notes.
 						*fn.render*
 fn.render(bufnr)		The transcript presentation pass (conceal +
 				extmarks + folds). No-op it for raw markers.
@@ -500,6 +528,13 @@ true shape) loaded into the conversation when its trigger matches. Skills are
 loads one by name. Define one with `registry_define` (kind "skill", source =
 the prose). Contrast with tools/hooks/fns, which add capability.
 
+Two skills ship as builtins: `skill.showing_user` — the full presentation
+guidance behind the core prompt's `# Showing the user` stub, loaded before
+building a hand-off view — and `skill.multiplayer`, the protocol for working
+alongside another agent in the same Neovim (see |straps-multiplayer|). Both
+are registered with define_default, so redefining them survives re-running
+setup().
+
 ==============================================================================
 11. SUBAGENTS						*straps-subagents*
 
@@ -516,7 +551,46 @@ investigation so the parent transcript keeps only the conclusion.
 |:StrapsAgents| lists running agents and their parents.
 
 ==============================================================================
-12. HEALTH						*straps-health*
+12. MULTIPLAYER						*straps-multiplayer*
+
+Several agents can run in ONE Neovim at once — subagents, or independent
+sessions you started yourself. They share buffers, so a peer's unsaved edits
+are already in the text another agent reads, and the file on disk is a thing
+they both write. Two mechanisms make that workable.
+
+Detection, at the moment of collision: every buffered write stamps the file
+buffer with the writing session, and an edit whose file was last changed by
+ANOTHER session fails with "modified by another agent (session N, task: ...)"
+rather than clobbering it. Re-read the file and reapply if the change still
+applies.
+
+Awareness, before the collision:
+
+						*straps-agents-tool*
+agents		Tool. Lists every other session in this Neovim: running or
+		idle, its relation to the caller (parent/child/sibling/peer),
+		the task it was given, and the files it has written.
+		Read-only and auto-allowed. `fn.peer_agents(bufnr)` is the
+		underlying snapshot.
+
+hook.on_run_start
+		When a run starts while other agents are running, appends one
+		user block naming them and pointing at the agents tool. Silent
+		for a solo session, silent when the same peer set was already
+		announced, and silent on a transcript with nothing else to
+		send. Redefine it to reword or disable the notice.
+
+skill.multiplayer
+		The protocol the notice points at: re-read and reapply after a
+		collision, keep the read-to-write gap short, prefer disjoint
+		files, leave a peer's mid-task work alone, and hand off with
+		`require("straps.loop").steer(bufnr, msg)` rather than racing.
+
+All of this is same-instance only: agents in a DIFFERENT Neovim share nothing
+but disk, where the only signal is a file changing underneath you.
+
+==============================================================================
+13. HEALTH						*straps-health*
 
 						*straps-checkhealth*
 >vim
@@ -531,7 +605,7 @@ any runs still in flight. Every probe is isolated, so the report runs even
 when `setup()` never ran or the data dir is unwritable.
 
 ==============================================================================
-13. HIGHLIGHT GROUPS					*straps-highlights*
+14. HIGHLIGHT GROUPS					*straps-highlights*
 
 All groups link by default (`hi default link`) to standard groups, so they
 follow your colorscheme; a user `hi link` wins and survives a re-apply.

@@ -49,7 +49,9 @@ With lazy.nvim:
     require("straps").setup({
       -- defaults shown; all optional
       model = "claude-sonnet-5",
-      max_tokens = 8192,
+      -- max_tokens defaults to nil = the model's own max output (else
+      -- default_max_tokens); set a number to pin an explicit cap.
+      default_max_tokens = 32000,
       max_turns = 128,
       stall_limit = 6,
       max_tool_result_bytes = 100000,
@@ -202,7 +204,8 @@ return function(input, ctx) ... end
 - Content lines that would collide with the marker syntax are escaped with a
   `%%[[esc]]` prefix; the parser strips it. You will rarely see this.
 - `tool_use` / `tool_result` blocks are folded closed by default
-  (`foldmethod=expr`); open them with `zo` / `zR` as usual.
+  (`foldmethod=expr`); open them with `zo` / `zR` as usual. See
+  [Navigating a session](#navigating-a-session).
 
 ### Rendering
 
@@ -225,6 +228,29 @@ never a wash or a background tint:
   the call rendered command-style by [`fn.tool_display`](#command-style-tool-calls),
   e.g. `▸ $ echo hi  ✓` or `▸ read init.lua  ✓`. Open the fold (`zo`) to see
   the full call inside a card (`╭─ <verb> <args> ─`, a `result` divider, `╰─`).
+
+#### Navigating a session
+
+A long session is a long buffer, so it folds at **two scales** and carries two
+navigation mappings. Nothing here is a new mode — it is ordinary vim motions
+and folds over the ordinary transcript buffer.
+
+- **Level 1 is the conversation.** Each `user` / `assistant` marker opens a
+  fold that runs to the next turn, swallowing the tool calls that turn made.
+  `zM` collapses the whole session to one line per exchange —
+  `▸ you  fix the fold levels · 3 tools · 41 lines` — the role tag colored,
+  the gist of what was said dim. `zR` opens everything again.
+- **Level 2 is the machinery** nested inside a turn: each `tool_use` +
+  `tool_result` pair, and the (long, rarely re-read) system block. The default
+  `foldlevel = 1` shows the conversation with tool calls collapsed; `zo` on one
+  opens the full call.
+- `]]` / `[[` jump to the next / previous turn, counts included (`3]]`), and
+  push the jumplist so `ctrl-o` comes back. Tool blocks are never targets — the
+  motion steps through the conversation, not the machinery.
+- `gO` (the outline key `:help` and `man` already use) loads every turn into
+  the session's [findings list](#the-findings-list) as `<role>  <headline>`, so
+  you can find an exchange by what it was about: `:lnext` / `:lprev` to step,
+  `<CR>` in the list window to jump.
 
 All hues come from the active colorscheme through `hi default link`, so it is
 catppuccin now and any scheme later. The groups (override any of them with your
@@ -253,7 +279,8 @@ Two knobs, both under `setup{}`:
 
 - `render = true` — master switch. `false` skips the rendering wiring
   entirely: you get the raw markers.
-- `tools_expanded = false` — set `true` to fold tool calls open by default.
+- `tools_expanded = false` — set `true` to fold tool calls open by default
+  (`foldlevel = 99` instead of the default `1`).
 
 **Getting the raw markers back** without disabling anything: `:set
 conceallevel=0` in the session window reveals the real marker lines under the
@@ -360,7 +387,9 @@ require("render-markdown").setup({
 The transcript IS the request: every turn re-parses the whole buffer, so a
 long session grows the context sent to the API on each call. To prune, just
 delete old `tool_use` / `tool_result` blocks (or whole exchanges) — it's
-just a buffer, and the next turn sends exactly what remains. `max_turns`
+just a buffer, and the next turn sends exactly what remains. To *read* one,
+`zM` collapses it to a list of exchanges and `gO` outlines it into the findings
+list (see [Navigating a session](#navigating-a-session)). `max_turns`
 caps the number of turns in a single run; a run that hits the cap says so
 in the transcript (`[straps: stopped after N turns ...]`) and stops —
 sending another message continues from where it left off.
@@ -449,6 +478,37 @@ end
 })
 ```
 
+### Context surgery: the agent excising its own dead ends
+
+`fn.compact` shrinks by age. `transcript_excise` lets the agent shrink by
+*judgment* — pointing at the specific blocks that were a side quest or a wrong
+path and taking them out of its own context window, mid-run. Same substrate:
+the transcript buffer IS the request, re-parsed every turn, so a block excised
+now stops being replayed from the next turn onward. The 40k tokens of a dead
+exploration leave; the conclusion the agent wrote in its reply text stays.
+
+It runs in two modes. Called with nothing, it lists the transcript's blocks —
+number, kind, byte size, snippet, and what is locked — which is read-only and
+needs no confirmation. Called with `blocks`/`range` plus a required `note`, it
+replaces those blocks' contents with a one-line receipt and prompts for
+confirmation like any write. With `session = <handle from spawn>` a parent does
+it to a child, including a *running* one.
+
+The safety properties are structural, not policy:
+
+- **It cannot fabricate.** The only text the tool can write is
+  `[excised: was N bytes — <note>]` (a `{"_excised": ...}` JSON stub for a
+  `tool_use` input). There is no parameter for arbitrary replacement text, so
+  an unmarked invented "observation" cannot be implanted — in itself or in a
+  child. The human reading the transcript always sees what was removed and why.
+- **It cannot delete a block**, only empty one, so tool_use/tool_result pairing
+  and role alternation — everything the API requires — survive by construction.
+- **It cannot touch the system block, or the turn in flight** (everything from
+  the last `assistant` block on, which is where its own call lives).
+- **It is one undoable step**: `undo_edit` on the transcript reverts a surgery
+  as a unit, and the transcript is file-backed, so the receipt and the reversal
+  both persist.
+
 ## Project registry: `.straps.lua`
 
 A `.straps.lua` at the project root gives registry investments a place to
@@ -504,6 +564,14 @@ section, present only when skills exist); the body loads on demand via the
 `skill` tool. They follow the same lifecycle as every other entry:
 session-scoped by default, persisted by appending their `registry_get`
 rendering to `.straps.lua`.
+
+Two skills ship as builtins: `skill.showing_user`, the full presentation
+guidance behind the core prompt's short `# Showing the user` stub (loaded
+before building a hand-off view — findings lists, diff splits, live UI
+components), and `skill.multiplayer`, the protocol for working alongside
+another agent in the same Neovim (see [Agents that know about each
+other](#agents-that-know-about-each-other)). Like every default they are
+`define_default`'d, so your own redefinition of either survives `setup()`.
 
 ```lua
 require("straps.registry").define{
@@ -675,9 +743,15 @@ The system prompt is layered, and every layer is a registry entry:
   memory-file convention). Each distinct file is included under a header
   naming its path, capped at 20000 bytes; a path seen twice is included
   once, at its most general position.
-- `fn.system_prompt` — the composer: joins the three layers (environment
-  under `# Environment`, project files under `# Project instructions`)
-  and is what `state.new_session` calls.
+- `fn.system_prompt` — the composer: joins the layers (environment under
+  `# Environment`, skills under `# Skills` when any exist, project files
+  under `# Project instructions`) and is what `state.new_session` calls.
+  For spawned subagents, `tool.spawn` passes options through
+  `state.new_session` to the core layer, which reshapes the prompt for
+  the child: the `# Subagents` guidance is dropped, a `# You are a
+  subagent` section is appended (the parent sees only the final reply),
+  and readonly / restricted-tool children get matching notes instead of
+  instructions about tools they cannot call.
 
 The composed prompt is written into the session's editable system block at
 creation time, so environment and project content are frozen per session —
@@ -809,6 +883,7 @@ entries; the defaults try the env var, then
 | `eval_lua` | Execute Lua inside Neovim; returns `vim.inspect` of the results. |
 | `help_search` | Search in-editor `:help` tags and excerpt the best match; use before writing Lua against Neovim APIs. |
 | `spawn` / `spawn_wait` | Launch subagents in their own session buffers and collect their final answers. |
+| `transcript_excise` | Context surgery: list the transcript's blocks, or excise a side quest / wrong path out of the agent's own context window (or a child's), leaving a visible receipt. |
 
 `write_file`, `edit_file`, and `patch_file` apply their change through the
 target file's buffer (loaded or reused if already open) and then write that
@@ -816,6 +891,13 @@ buffer, so every agent edit lands in the file's native undo history — you reve
 it with `u`, `:earlier`, or undotree, right alongside your own edits, and an edit
 to a file you have open with unsaved changes stacks on top of those changes
 instead of clobbering them.
+
+When agents compete — another Neovim instance or external process writes the
+file on disk, or a concurrent session in the same Neovim edits the shared
+buffer — the edit tools fail with an error that says so (naming the sibling
+session and its task when it is one), telling the agent to re-read and reapply;
+reads get a prepended note instead. Your own hand-edits are exempt: stacking on
+your unsaved changes remains the behavior above, not a conflict.
 
 ### Editor-native tools
 
@@ -956,7 +1038,10 @@ than one-line summaries. With **snacks.nvim** installed, previewed options
 open in snacks' native picker with a live preview pane that follows the
 selection; without it, each preview appears in a labeled split (`1: <option>`)
 alongside the plain `vim.ui.select` prompt, and every window closes the
-moment you answer. A free-text "(other: type your own answer)" entry is
+moment you answer. The question itself is shown in a wrapped float across the
+top of the editor rather than only as the picker's one-line title, so a long
+question stays readable even when the picker covers the transcript. A
+free-text "(other: type your own answer)" entry is
 always appended, and the tool can still show a single shared `content` split
 for context that isn't tied to one option.
 
@@ -968,11 +1053,12 @@ for context that isn't tied to one option.
 | `model` | `"claude-sonnet-5"` | Anthropic model id. |
 | `openai_base_url` | `"https://api.openai.com"` | Endpoint base for the OpenAI backend; point it at any OpenAI-compatible server or proxy. |
 | `openai_model` | `"gpt-5"` | Model id sent when `provider = "openai"`; kept separate from the Anthropic `model` so switching providers never sends a Claude id to OpenAI. |
-| `models` | see below | Anthropic picker seed/cache for `:StrapsModel`: `{ id, label?, thinking? }`. `thinking` is `"adaptive"` or `"budget"` (see Effort below); an unlisted/custom Anthropic `model` sends no thinking block at all. Live discovery merges the account's real Anthropic catalog over this list. |
+| `models` | see below | Anthropic picker seed/cache for `:StrapsModel`: `{ id, label?, thinking?, context?, max_output? }`. `thinking` is `"adaptive"` or `"budget"` (see Effort below); an unlisted/custom Anthropic `model` sends no thinking block at all. `max_output` is the model's maximum response tokens, used as the default `max_tokens` for that model (see `max_tokens` below). Live discovery merges the account's real Anthropic catalog over this list, filling `thinking`/`context`/`max_output` from the API. |
 | `openai_models` | see below | OpenAI picker seed/cache for `:StrapsModel`, separate from `models` so switching providers never shows stale Claude ids under OpenAI or stale GPT ids under Anthropic. Add `reasoning = true` (or `reasoning_effort = true`) only for models that accept OpenAI's `reasoning_effort` request field. |
 | `effort` | `"off"` | Name of the active entry in `config.efforts`; controls extended thinking. |
 | `efforts` | see below | Picker choices for `:StrapsEffort`: `{ name, level?, budget_tokens? }`. For models tagged `thinking = "adaptive"` (e.g. `claude-sonnet-5`, `claude-opus-4-8`), `level` becomes `output_config.effort` (`"low"`/`"medium"`/`"high"`/`"max"`). For models tagged `thinking = "budget"` (e.g. `claude-haiku-4-5-20251001`, `claude-opus-4-5-20251101`), `budget_tokens` becomes `thinking.budget_tokens`. For OpenAI, `level` becomes `reasoning_effort` only when the matching `config.openai_models` entry opts in with `reasoning = true` or `reasoning_effort = true` and the request has no function tools; untagged OpenAI models and tool-bearing requests receive no effort field. `effort = "off"` sends no thinking/reasoning field. |
-| `max_tokens` | `8192` | `max_tokens` per provider call. |
+| `max_tokens` | `nil` | Response token cap per provider call. `nil` (default) uses the active model's own max output — the matching `config.models` entry's `max_output` (seeded, and refreshed by `:StrapsModel` discovery), else `default_max_tokens`. A number pins an explicit hard cap that wins over the per-model value, except that a budget-thinking request still bumps `max_tokens` above the cap when it would otherwise be ≤ `budget_tokens` (the API rejects that). The OpenAI backend has no per-model discovery, so it uses `max_tokens` else `default_max_tokens`. |
+| `default_max_tokens` | `32000` | Fallback response cap used when `max_tokens` is `nil` and the active model has no known `max_output` (an unlisted/custom model, or before `:StrapsModel` discovers it); also the OpenAI default. Output tokens bill only as generated, so a high cap costs nothing unused. |
 | `max_turns` | `128` | Hard ceiling on assistant turns per run — the backstop, not the primary spinning-catcher (that's `stall_limit`), hence generous. |
 | `stall_limit` | `6` | Progress-aware soft stop: end the run after this many *consecutive* stalled turns — a turn is stalled when its every tool call errored, or when every call repeats a `(tool, input)` already made this run (a turn that also makes a new distinct call counts as progress). Catches an agent spinning without progress early and loudly (a distinct note, quoting the last error), instead of waiting for `max_turns`. Set `0` to disable and let `max_turns` alone bound runs. |
 | `max_tool_result_bytes` | `100000` | Tool results larger than this are truncated with a note. |
@@ -986,7 +1072,7 @@ for context that isn't tied to one option.
 | `auto_compact_tokens` | unset | When set, the loop runs `fn.compact` near this estimated token count (bytes ÷ ~3.5), with a growth guard so it fires coarsely rather than every turn. Set it near your model's context window. Unset = off. |
 | `auto_compact_bytes` | unset | Raw-size alternative to `auto_compact_tokens`: compact when the transcript exceeds this many bytes. Unset = off: automatic history rewriting is opt-in. |
 | `render` | `true` | Transcript rendering (`fn.render`): a display-only conceal + extmark + fold layer that gives each block a categorical colored mark and collapses tool calls to a one-line summary. Buffer text, `modified`, parse and persist are never touched. `false` skips the wiring (raw markers). See [Rendering](#rendering). |
-| `tools_expanded` | `false` | Fold `tool_use`/`tool_result` blocks open by default when `true` (closed otherwise). |
+| `tools_expanded` | `false` | Fold `tool_use`/`tool_result` blocks open by default when `true` (`foldlevel = 99`); otherwise the default `foldlevel = 1` keeps them closed with the conversation open. See [Navigating a session](#navigating-a-session). |
 | `session_winbar` | `true` | Show a window-local winbar on each session window with the active model/effort (per-buffer override else global) and run status. `false` hides it; `ui.session_status()` / `ui.session_winbar()` stay usable in a manual statusline either way. |
 
 ## Security
@@ -1094,3 +1180,27 @@ readout is separate:
   was spawned with. Picking one opens that transcript in a split so you can
   watch a subagent's output live and steer it. `require("straps.ui")` also
   exposes `pick_agents()` and the underlying `running_agents()` snapshot.
+
+### Agents that know about each other
+
+Those readouts tell *you* who is working. The agents get the same picture:
+
+- The **`agents` tool** lists every other session in this Neovim — running or
+  idle, how it relates to the caller (parent/child/sibling/peer), the task it
+  was given, and the files it has written (read from the write stamps that
+  power collision detection). It is read-only and auto-allowed.
+- **`hook.on_run_start`** appends one user block to a session's transcript when
+  another agent is running as it starts, pointing at that tool. It stays silent
+  for a solo session, announces a given set of peers only once, and never
+  appends to a transcript that has nothing else to send — so a session working
+  alone is byte-identical to one with no hook at all. Redefine it to change or
+  silence the notice.
+- **`skill.multiplayer`** carries the protocol the notice points at: re-read
+  and reapply after a `modified by another agent` error, keep the read→write
+  gap short, leave a peer's half-finished work alone, and hand work off with
+  `require("straps.loop").steer(<peer bufnr>, "<message>")` rather than racing.
+- `fn.peer_agents(ctx_bufnr)` is the underlying snapshot if you want to build
+  your own view of it.
+
+All of this is **same-instance only**: sessions in a *different* Neovim share
+nothing but disk, where the only signal is the on-disk divergence check.

@@ -108,6 +108,29 @@ case("model section reports model and effort pairing", function()
   assert(find(rec, nil, "effort"), "effort line missing")
 end)
 
+case("nil max_tokens is healthy and reports the resolved model max", function()
+  -- Default config leaves max_tokens nil; sonnet-5 seeds max_output = 128000.
+  assert(straps.config.max_tokens == nil, "test premise: default max_tokens should be nil")
+  local rec = collect()
+  local r = find(rec, "ok", "max_tokens: auto")
+  assert(r, "nil max_tokens should be an OK 'auto' line, not a warning")
+  assert(r.msg:find("model max 128000", 1, true),
+    "auto line should name the resolved model max: " .. r.msg)
+  assert(not find(rec, "warn", "max_tokens"), "nil max_tokens must not warn")
+end)
+
+case("explicit max_tokens reports as an explicit cap; non-positive warns", function()
+  local saved = straps.config.max_tokens
+  straps.config.max_tokens = 50000
+  local rec = collect()
+  assert(find(rec, "ok", "max_tokens: 50000 (explicit cap)"), "explicit cap line missing")
+  straps.config.max_tokens = 0
+  local rec0 = collect()
+  assert(find(rec0, "warn", "max_tokens is set but not a positive number"),
+    "a non-positive explicit cap should warn")
+  straps.config.max_tokens = saved
+end)
+
 case("API key section present; resolves a key when env is set", function()
   local saved_key = vim.env.ANTHROPIC_API_KEY
   local saved_provider = straps.config.provider

@@ -210,6 +210,14 @@ What it buys, all agent-facing (no human need be watching):
   different model/effort (per-buffer overrides already exist) — a controlled
   experiment instead of folklore.
 
+**Partly delivered:** `tool.transcript_excise` (tools.lua, tests/run_excise.lua)
+ships the reclaim half of this — an agent excising a named dead end from its own
+transcript, or a parent doing it to a child's, with a visible receipt per block
+and the system block plus the turn in flight locked. It does not fork: there is
+one timeline, and the reversal channel is the buffer's undo tree
+(`undo_edit`), not addressable branches. Everything below about forking,
+`timelines`, and counterfactual siblings remains open.
+
 Sketch: `fork { note? }` -> seq handle; `rewind { to_seq, keep? }` (the `keep`
 receipt is carried back); `timelines {}`; `timeline_diff { a, b }`.
 `tool.undo_edit` already implements `history` / `to_seq` / `revert_seq` against
@@ -268,6 +276,13 @@ transcript.
 
 **Safety — non-negotiable if this ships.** This is prompt injection with root
 access as a designed feature, and the child has no tamper-evidence.
+(`transcript_excise` sidesteps the whole class rather than managing it: it has no
+parameter for replacement text, so it can only EMPTY a block behind a receipt,
+never rewrite one into a plausible false memory. The "parent -> child only" rule
+below is therefore not what makes it safe, and self-surgery is allowed — an
+agent can excise its own dead ends but cannot implant anything, in itself or in
+a child. Arbitrary-content rewriting, the actual dangerous primitive, is still
+unbuilt and still needs every safeguard listed here.)
 
 - **Provenance always.** Every surgical edit leaves a visible marker (a
   `%%[straps:surgery]%%` block, or attrs on the rewritten block: who, what,

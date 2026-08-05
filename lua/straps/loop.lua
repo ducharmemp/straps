@@ -232,7 +232,7 @@ local PARALLEL_READONLY = {
   implementation = true, references = true,
   symbols = true, read_symbol = true, tree_sitter_status = true, node_at = true,
   read_node = true, hover = true, workspace_symbols = true,
-  context = true, help_search = true,
+  context = true, help_search = true, agents = true,
 }
 
 local function all_parallel_readonly(blocks)
@@ -576,8 +576,8 @@ local function run_turns(bufnr, ctx, run)
           state.append(bufnr, "assistant", nil,
             "[straps: the model hit max_tokens without producing a visible answer"
               .. " — the response budget (likely the thinking budget) was consumed"
-              .. " before any text. Raise config.max_tokens or lower the effort,"
-              .. " then send a message to continue.]")
+              .. " before any text. Set config.max_tokens (a higher explicit cap)"
+              .. " or lower the effort, then send a message to continue.]")
           log(bufnr, { ev = "blank_end", cause = "max_tokens", turn = turn })
           return "blank"
         end

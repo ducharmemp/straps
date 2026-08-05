@@ -580,6 +580,13 @@ end
   local ctext = buf_text(child)
   assert(ctext:find("readonly subagent: write_file is not allowed", 1, true),
     "write should be denied by the child-scope confirm:\n" .. ctext:sub(-400))
+  -- The child's system block is composed for its shape: subagent section in,
+  -- readonly note in, parent-only # Subagents guidance out.
+  assert(ctext:find("# You are a subagent", 1, true),
+    "child system block missing the subagent section")
+  assert(ctext:find("READ%-ONLY"), "child system block missing the readonly note")
+  assert(not ctext:find("\n# Subagents\n", 1, true),
+    "child system block should drop the parent # Subagents section")
   assert(vim.fn.filereadable("/tmp/should-not-exist.txt") == 0, "denied write happened anyway")
 end)
 

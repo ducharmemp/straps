@@ -22,7 +22,23 @@ M.config = {
   -- Anthropic default `model` so selecting OpenAI never sends a Claude id.
   openai_model = "gpt-5",
   model = "claude-sonnet-5",
-  max_tokens = 8192,
+  -- Response token cap per provider call. nil (the default) means "not pinned
+  -- here" — fn.provider then uses the active model's own max output: the
+  -- `max_output` field of the matching config.models entry (seeded below,
+  -- refreshed by :StrapsModel's live /v1/models discovery), else
+  -- default_max_tokens. Setting a number PINS it as an explicit hard cap that
+  -- wins over the per-model value — with one exception: a budget-thinking
+  -- request whose budget_tokens meets or exceeds the cap still bumps above it,
+  -- because the API rejects max_tokens <= budget_tokens. Left nil like
+  -- auto_compact_bytes/session_dir below; vim.tbl_deep_extend ignores the nil.
+  max_tokens = nil,
+  -- Fallback response cap when config.max_tokens is nil AND the active model
+  -- has no known max_output (an unlisted/custom model, or before :StrapsModel
+  -- has discovered it). Also the OpenAI default (that backend has no per-model
+  -- max-output discovery). 8192 was the old fixed default and is tight for
+  -- adaptive thinking; output tokens bill only as generated, so a high cap
+  -- costs nothing unused.
+  default_max_tokens = 32000,
   max_turns = 128,
   -- Soft stop: end a run after this many CONSECUTIVE stalled turns — a turn is
   -- stalled when its every tool call errored, or it repeats a (tool,input)
@@ -69,8 +85,12 @@ M.config = {
   -- stay available for a manual statusline either way.
   session_winbar = true,
 
-  -- :StrapsModel picker choices. Each entry is { id, label?, thinking? }.
-  -- `thinking` tags which extended-thinking mechanism the model speaks
+  -- :StrapsModel picker choices. Each entry is { id, label?, thinking?,
+  -- context?, max_output? }. `max_output` is the model's maximum response
+  -- tokens (Anthropic's /v1/models max_tokens); fn.provider uses it as the
+  -- default max_tokens when config.max_tokens is nil, so a run never starves
+  -- its answer on the old fixed 8192. `context` is the input window (winbar
+  -- fill only). `thinking` tags which extended-thinking mechanism the model speaks
   -- (inferred from Anthropic's /v1/models capabilities.thinking.types):
   --   "adaptive" — thinking={type="adaptive"} + output_config={effort=...}
   --                (newer models: sonnet-5, opus-4-6..4-8, sonnet-4-6, ...)
@@ -83,10 +103,10 @@ M.config = {
   -- live discovery (fn.list_models -> GET /v1/models) and merges the account's
   -- real catalog over this list, keeping these curated labels/tags on top.
   models = {
-    { id = "claude-opus-4-8", label = "Opus 4.8 — most capable, slowest", thinking = "adaptive", context = 200000 },
-    { id = "claude-sonnet-5", label = "Sonnet 5 — balanced (default)", thinking = "adaptive", context = 200000 },
-    { id = "claude-sonnet-4-6", label = "Sonnet 4.6", thinking = "adaptive", context = 200000 },
-    { id = "claude-haiku-4-5-20251001", label = "Haiku 4.5 — fastest, cheapest", thinking = "budget", context = 200000 },
+    { id = "claude-opus-4-8", label = "Opus 4.8 — most capable, slowest", thinking = "adaptive", context = 200000, max_output = 128000 },
+    { id = "claude-sonnet-5", label = "Sonnet 5 — balanced (default)", thinking = "adaptive", context = 200000, max_output = 128000 },
+    { id = "claude-sonnet-4-6", label = "Sonnet 4.6", thinking = "adaptive", context = 200000, max_output = 128000 },
+    { id = "claude-haiku-4-5-20251001", label = "Haiku 4.5 — fastest, cheapest", thinking = "budget", context = 200000, max_output = 64000 },
   },
   -- OpenAI model picker seed/cache, kept separate from Anthropic `models` so
   -- switching providers never shows or reuses the other provider's stale ids.

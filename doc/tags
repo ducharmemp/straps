@@ -36,6 +36,7 @@ hook.on_progress	straps.txt	/*hook.on_progress*
 hook.on_run_end	straps.txt	/*hook.on_run_end*
 hook.on_run_start	straps.txt	/*hook.on_run_start*
 straps	straps.txt	/*straps*
+straps-agents-tool	straps.txt	/*straps-agents-tool*
 straps-checkhealth	straps.txt	/*straps-checkhealth*
 straps-commands	straps.txt	/*straps-commands*
 straps-config	straps.txt	/*straps-config*
@@ -45,6 +46,7 @@ straps-health	straps.txt	/*straps-health*
 straps-highlights	straps.txt	/*straps-highlights*
 straps-hooks	straps.txt	/*straps-hooks*
 straps-introduction	straps.txt	/*straps-introduction*
+straps-multiplayer	straps.txt	/*straps-multiplayer*
 straps-registry	straps.txt	/*straps-registry*
 straps-session	straps.txt	/*straps-session*
 straps-setup	straps.txt	/*straps-setup*

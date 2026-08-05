@@ -26,6 +26,14 @@ local function escape_line(line)
   return line
 end
 
+--- Escape one content line for the transcript, exactly as append does. Public
+--- because writers that bypass append — anything editing block content in
+--- place with nvim_buf_set_lines — must apply the same escaping, or a line
+--- that reads as a marker splits the block it was written into.
+function M.escape_line(line)
+  return escape_line(line)
+end
+
 local function unescape_line(line)
   if vim.startswith(line, ESC_PREFIX) then
     return line:sub(#ESC_PREFIX + 1)
@@ -527,7 +535,10 @@ end
 --- system block + trailing empty user marker, persisted to disk. If the dir
 --- can't be created/written, degrade to an ephemeral nofile buffer
 --- (straps://session/n, notify once) so the harness still runs.
-function M.new_session()
+--- @param opts table? forwarded to fn.system_prompt (e.g. { subagent = true,
+---   readonly = true, tools = {...} } from tool.spawn, so the composed
+---   prompt can adapt to the child's shape).
+function M.new_session(opts)
   session_n = session_n + 1
   local bufnr
   local dir = M.session_dir()
@@ -560,7 +571,7 @@ function M.new_session()
 
   -- fn.system_prompt is registered by provider.register(); fall back so a
   -- bare registry (e.g. in tests) still yields a usable session.
-  local prompt = registry.try_call("fn.system_prompt")
+  local prompt = registry.try_call("fn.system_prompt", opts)
     or "You are Cinch, a coding agent running inside Neovim via straps.nvim."
   M.append(bufnr, "system", nil, prompt) -- persists (block boundary)
   M.ensure_trailing_user(bufnr) -- persists

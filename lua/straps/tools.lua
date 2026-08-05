@@ -15,7 +15,9 @@ function M.register()
     name = "tool.read_file",
     kind = "tool",
     doc = "Read a file through its Neovim buffer, so open unsaved changes are"
-      .. " the source of truth (matching edit/write paths). Returns the content with"
+      .. " the source of truth (matching edit/write paths). A note is prepended"
+      .. " when the file changed on disk since load or was modified by another"
+      .. " session (a competing editor). Returns the content with"
       .. " 1-based line numbers in the form '  N<TAB>line'. Parameters: path"
       .. " (required) — absolute or cwd-relative path of the file to read; offset"
       .. " (optional, default 1) — 1-based line number to start reading from; limit"
@@ -50,15 +52,38 @@ return function(input, ctx)
   if not ok_load then
     error("read_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(load_err))
   end
+
+  -- Concurrent-editor checks: reads surface a competing editor as a NOTE,
+  -- not an error — a safe reload refreshes the content below; a modified
+  -- buffer stays the source of truth and is returned as-is.
+  local registry = require("straps.registry")
+  local notes = {}
+  local st, rerr = registry.call("fn.reconcile_buf", buf)
+  if st == nil then
+    notes[#notes + 1] = "note: " .. input.path .. " " .. tostring(rerr)
+  elseif st == "reloaded" then
+    notes[#notes + 1] = "note: " .. input.path .. " changed on disk since it was"
+      .. " last loaded — an external process or another agent is editing it;"
+      .. " reloaded, this read returns the new content"
+  end
+  local wok, werr = registry.call("fn.check_writer", ctx and ctx.bufnr, buf)
+  if wok == nil then
+    notes[#notes + 1] = "note: " .. input.path .. " " .. tostring(werr)
+  end
+  registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, false)
+
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local total = #lines
   local offset = math.max(1, tonumber(input.offset) or 1)
   local limit = math.min(tonumber(input.limit) or 2000, 2000)
   if offset > total then
-    return string.format("read_file: %s has %d lines; offset %d is past the end", input.path, total, offset)
+    local msg = string.format("read_file: %s has %d lines; offset %d is past the end", input.path, total, offset)
+    if #notes > 0 then msg = table.concat(notes, "\n") .. "\n" .. msg end
+    return msg
   end
   local last = math.min(total, offset + limit - 1)
   local out = {}
+  for _, n in ipairs(notes) do out[#out + 1] = n end
   for i = offset, last do
     out[#out + 1] = string.format("  %d\t%s", i, lines[i])
   end
@@ -83,7 +108,10 @@ end
       .. " unsaved user changes are respected): the whole buffer is replaced in a"
       .. " single undoable step and then written to disk, so the change lands in"
       .. " the file's native undo history — the user can revert it with `u`,"
-      .. " `:earlier`, or undotree. After writing, hook.after_write fires; if it"
+      .. " `:earlier`, or undotree. Fails with a clear error when the file"
+      .. " changed under this session (another agent or external process is"
+      .. " editing it) — re-read the file and reapply the change. After writing,"
+      .. " hook.after_write fires; if it"
       .. " returns a string (e.g. linter output), it is appended to the tool"
       .. " result. Parameters: path (required) — destination file path; content"
       .. " (required) — the complete new file contents.",
@@ -120,6 +148,24 @@ return function(input, ctx)
     error("write_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(lerr))
   end
 
+  -- Concurrent-editor checks: a disk change under the buffer or another
+  -- session's unseen write is an ERROR for the agent to react to (re-read,
+  -- reapply) — never a merge. A safe reload only refreshes what the next
+  -- read returns; this write never lands on content the caller has not seen.
+  local st, rerr = registry.call("fn.reconcile_buf", buf)
+  if st == nil then
+    error("write_file: " .. tostring(path) .. " " .. tostring(rerr))
+  elseif st == "reloaded" then
+    error("write_file: " .. tostring(path) .. " changed on disk since its buffer"
+      .. " was loaded — another agent or external process is editing this file;"
+      .. " the buffer has been reloaded from disk, re-read the file and reapply"
+      .. " your change if it still applies")
+  end
+  local wok, werr = registry.call("fn.check_writer", ctx and ctx.bufnr, buf)
+  if wok == nil then
+    error("write_file: " .. tostring(path) .. " " .. tostring(werr))
+  end
+
   -- Split content into buffer lines. A trailing "\n" in the content maps to the
   -- file's final EOL (the buffer's implicit trailing newline), NOT an extra
   -- blank line; content with no trailing newline is written without one.
@@ -145,8 +191,18 @@ return function(input, ctx)
     end)
   end)
   if not ok then
+    -- E13: the buffer was created for a then-nonexistent file and something
+    -- else created it on disk meanwhile (checktime cannot see never-edited
+    -- buffers). Same competing-editor situation, same guidance.
+    if tostring(err):find("E13", 1, true) then
+      error("write_file: " .. tostring(path) .. " was created on disk by another"
+        .. " agent or external process since this buffer was opened — re-read"
+        .. " the file and reapply your change if it still applies")
+    end
     error("write_file: failed to write " .. tostring(path) .. ": " .. tostring(err))
   end
+
+  registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, true)
 
   local n = vim.api.nvim_buf_line_count(buf)
   local result = string.format(
@@ -172,7 +228,10 @@ end
       .. " include enough surrounding context to make it unique. The edit is"
       .. " applied through the file's buffer as a single undoable step and then"
       .. " written to disk, so it lands in the file's native undo history — the"
-      .. " user can revert it with `u`, `:earlier`, or undotree. hook.after_write"
+      .. " user can revert it with `u`, `:earlier`, or undotree. Fails with a"
+      .. " clear error when the file changed under this session (another agent"
+      .. " or external process is editing it) — re-read and reapply."
+      .. " hook.after_write"
       .. " fires (its string return, if any, is appended to the result)."
       .. " Parameters: path (required); old_string (required) — exact text to"
       .. " replace; new_string (required) — replacement text; replace_all"
@@ -210,6 +269,24 @@ return function(input, ctx)
   if not lok then
     error("edit_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(lerr))
   end
+
+  -- Concurrent-editor checks BEFORE reading the haystack: a disk change or
+  -- another session's unseen write is an ERROR for the agent (re-read,
+  -- reapply) — never a merge; the edit never matches against stale content.
+  local st, rerr = registry.call("fn.reconcile_buf", buf)
+  if st == nil then
+    error("edit_file: " .. tostring(path) .. " " .. tostring(rerr))
+  elseif st == "reloaded" then
+    error("edit_file: " .. tostring(path) .. " changed on disk since its buffer"
+      .. " was loaded — another agent or external process is editing this file;"
+      .. " the buffer has been reloaded from disk, re-read the file and reapply"
+      .. " your change if it still applies")
+  end
+  local wok, werr = registry.call("fn.check_writer", ctx and ctx.bufnr, buf)
+  if wok == nil then
+    error("edit_file: " .. tostring(path) .. " " .. tostring(werr))
+  end
+
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local text = table.concat(lines, "\n")
 
@@ -278,6 +355,8 @@ return function(input, ctx)
     error("edit_file: failed to apply edit to " .. tostring(path) .. ": " .. tostring(err))
   end
 
+  registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, true)
+
   local n = input.replace_all and count or 1
   local result = string.format(
     "edited %s (%d replacement%s) — undo with u in the buffer",
@@ -300,7 +379,9 @@ end
       .. " live Neovim buffer. Each hunk is {start_line, end_line, new_text,"
       .. " expected_old_text?}: 1-based inclusive lines to replace; for insertion,"
       .. " set end_line to start_line-1. Hunks are validated for overlap/staleness,"
-      .. " buffer edit, saved to disk, and hook.after_write fires. This is the"
+      .. " buffer edit, saved to disk, and hook.after_write fires. Fails with a"
+      .. " clear error when the file changed under this session (another agent"
+      .. " or external process is editing it) — re-read and reapply. This is the"
       .. " structured alternative to exact-string edit_file when line ranges are"
       .. " already known. Parameters: path (required); hunks (required array).",
     input_schema = {
@@ -343,6 +424,24 @@ return function(input, ctx)
   if not lok then
     error("patch_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(lerr))
   end
+
+  -- Concurrent-editor checks BEFORE validating ranges: a disk change or
+  -- another session's unseen write is an ERROR for the agent (re-read,
+  -- reapply) — never a merge; hunks never apply to stale line numbers.
+  local st, rerr = registry.call("fn.reconcile_buf", buf)
+  if st == nil then
+    error("patch_file: " .. tostring(path) .. " " .. tostring(rerr))
+  elseif st == "reloaded" then
+    error("patch_file: " .. tostring(path) .. " changed on disk since its buffer"
+      .. " was loaded — another agent or external process is editing this file;"
+      .. " the buffer has been reloaded from disk, re-read the file and reapply"
+      .. " your change if it still applies")
+  end
+  local wok, werr = registry.call("fn.check_writer", ctx and ctx.bufnr, buf)
+  if wok == nil then
+    error("patch_file: " .. tostring(path) .. " " .. tostring(werr))
+  end
+
   local line_count = vim.api.nvim_buf_line_count(buf)
   local hunks, problems = {}, {}
   for i, h in ipairs(input.hunks) do
@@ -412,11 +511,316 @@ return function(input, ctx)
   if not ok then
     error("patch_file: failed to apply patch to " .. tostring(path) .. ": " .. tostring(err))
   end
+  registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, true)
+
   local result = string.format("patched %s (%d hunk%s) — undo with u in the buffer",
     path, #hunks, #hunks == 1 and "" or "s")
   local extra = registry.try_call("hook.after_write", path, ctx)
   if type(extra) == "string" and extra ~= "" then result = result .. "\n" .. extra end
   return result
+end
+]==],
+  })
+
+  -- --------------------------------------------------------- fn.reconcile_buf
+
+  -- Detection primitive for out-of-band DISK changes under a loaded file
+  -- buffer (another Neovim instance, a shell tool, a formatter). The buffered
+  -- write tools call it before editing so a stale buffer is surfaced to the
+  -- agent as an error instead of a W12 prompt or a silent overwrite. The fn
+  -- only detects and refreshes; policy (error vs note) lives at each call
+  -- site. A registry fn rather than a local because tool sources are separate
+  -- compiled chunks (no shared upvalues) and late-binding is the house style.
+  define({
+    name = "fn.reconcile_buf",
+    kind = "fn",
+    doc = "Detect an out-of-band disk change under a loaded file buffer."
+      .. " Called as (buf, opts?) -> status, err: 'clean' (disk unchanged or"
+      .. " nothing to do), 'reloaded' (disk changed, buffer was unmodified,"
+      .. " buffer re-read from disk so subsequent reads see reality), or"
+      .. " nil + error message (conflict: modified buffer, deleted file, or"
+      .. " opts.no_reload suppressing the reload — buffer kept as-is).",
+    source = [==[
+return function(buf, opts)
+  -- Unmodified + changed on disk: reload so later reads see reality, return
+  -- "reloaded" (callers decide whether that is an error), unless
+  -- opts.no_reload — then report a conflict instead (used by undo_edit,
+  -- where a reload would mutate the undo tree it navigates).
+  -- Modified + changed on disk, or file deleted: keep the buffer, nil + err.
+  opts = opts or {}
+  if not vim.api.nvim_buf_is_loaded(buf) then return "clean" end
+  if vim.bo[buf].buftype ~= "" then return "clean" end
+
+  local function conflict_err(deleted)
+    if deleted then
+      return nil, "deleted on disk; its buffer still holds the last-known content"
+    end
+    return nil, "changed on disk"
+      .. (vim.bo[buf].modified and " while its buffer has unsaved changes;"
+        .. " resolve in the buffer (or discard) before editing through it"
+        or "; buffer not reloaded")
+  end
+
+  -- Sticky conflict: Vim CONSUMES the staleness once FileChangedShell has
+  -- handled it — a second :checktime reports nothing — so a detected
+  -- conflict is remembered on the buffer and only cleared when the buffer
+  -- actually re-syncs with disk (re-read or written, via the autocmds
+  -- below, or the safe reload here once the buffer is no longer modified).
+  if vim.b[buf].straps_conflict then
+    local name = vim.api.nvim_buf_get_name(buf)
+    local gone = name == "" or vim.fn.filereadable(name) == 0
+    if gone or vim.bo[buf].modified or opts.no_reload then
+      return conflict_err(gone)
+    end
+    -- No longer modified and reloads are allowed: re-sync from disk. The
+    -- reload lands as a NEW undo state when 'undoreload' permits (default:
+    -- files under 10000 lines), so u usually still works.
+    local okr = pcall(function()
+      vim.api.nvim_buf_call(buf, function() vim.cmd("silent noautocmd edit!") end)
+    end)
+    if not okr then return conflict_err(false) end
+    vim.b[buf].straps_conflict = nil
+    pcall(vim.api.nvim_del_augroup_by_name, "straps_reconcile_" .. buf)
+    return "reloaded"
+  end
+
+  local conflict, reloaded, deleted, benign = false, false, false, false
+  local au = vim.api.nvim_create_autocmd("FileChangedShell", {
+    buffer = buf,
+    callback = function()
+      -- "deleted": fcs_choice=reload does not work for a deleted file; a
+      -- later write would recreate it from buffer content the caller never
+      -- chose to assert — treat as conflict.
+      if vim.v.fcs_reason == "deleted" then
+        vim.v.fcs_choice = "" -- keep buffer, no prompt
+        conflict, deleted = true, true
+      elseif vim.bo[buf].modified or opts.no_reload then
+        vim.v.fcs_choice = "" -- keep buffer, no prompt
+        conflict = true
+      else
+        -- "time" (touch) / "mode" (chmod): content is identical (Vim
+        -- compares before reporting "time"), so the reload below only
+        -- re-syncs Vim's recorded stat — report it as "clean", no error.
+        benign = vim.v.fcs_reason == "time" or vim.v.fcs_reason == "mode"
+        vim.v.fcs_choice = "reload"
+        reloaded = true
+      end
+    end,
+  })
+  -- 'autoread' (on by default) makes checktime reload an unmodified buffer
+  -- WITHOUT firing FileChangedShell — the callback above would never run and
+  -- a real reload would be invisible. Suppress it buffer-locally so the
+  -- autocmd is always the decision point ('autoread' is global-local;
+  -- "setlocal autoread<" restores the global-following state).
+  vim.api.nvim_buf_call(buf, function()
+    vim.cmd("setlocal noautoread")
+    -- checktime with a buffer argument: bare :checktime scans ALL buffers
+    -- and would fire FileChangedShell for buffers we do not own.
+    pcall(vim.cmd, "checktime " .. buf)
+    vim.cmd("setlocal autoread<")
+  end)
+  pcall(vim.api.nvim_del_autocmd, au)
+  if conflict then
+    -- Remember the (now consumed) conflict; clear it when the buffer truly
+    -- re-syncs with disk: re-read (user :e/:e!) or written (user :w!).
+    vim.b[buf].straps_conflict = true
+    local grp = vim.api.nvim_create_augroup("straps_reconcile_" .. buf, { clear = true })
+    vim.api.nvim_create_autocmd({ "BufReadPost", "BufWritePost" }, {
+      group = grp,
+      buffer = buf,
+      callback = function()
+        vim.b[buf].straps_conflict = nil
+        pcall(vim.api.nvim_del_augroup_by_name, "straps_reconcile_" .. buf)
+      end,
+    })
+    return conflict_err(deleted)
+  end
+  if benign then return "clean" end
+  return reloaded and "reloaded" or "clean"
+end
+]==],
+  })
+
+  -- ---------------------------------------------------------- fn.check_writer
+
+  -- Detection primitive for SAME-instance concurrent sessions, which share
+  -- buffers so disk never diverges and fn.reconcile_buf cannot see them.
+  -- Each session records the changedtick it last observed per file buffer
+  -- (vim.b[session].straps_seen_ticks, keyed by file bufnr as a string —
+  -- vim.b tables are msgpack round-tripped); each buffered write stamps the
+  -- file buffer with the writing session (vim.b[file].straps_last_writer).
+  -- A tick change NOT matching a straps write stamp is treated as user
+  -- editing — edit tools deliberately stack on unsaved user changes.
+  define({
+    name = "fn.check_writer",
+    kind = "fn",
+    doc = "Detect a concurrent straps session's write to a file buffer."
+      .. " Called as (ctx_bufnr, buf) -> ok, err: true when this session has"
+      .. " no recorded view of the buffer, the buffer is unchanged since"
+      .. " observed, or the latest change is not another session's stamped"
+      .. " write; nil + error message when another session's write is the"
+      .. " latest change (the message names that session and its task).",
+    source = [==[
+return function(ctx_bufnr, buf)
+  -- Fail open on a missing/invalid session buffer (tests drive tools with
+  -- ctx = { bufnr = 0 }; the real loop always passes the session bufnr).
+  if type(ctx_bufnr) ~= "number" or ctx_bufnr <= 0
+    or not vim.api.nvim_buf_is_valid(ctx_bufnr) then
+    return true
+  end
+  if not vim.api.nvim_buf_is_loaded(buf) then return true end
+  local seen = vim.b[ctx_bufnr].straps_seen_ticks
+  local seen_tick = type(seen) == "table" and seen[tostring(buf)] or nil
+  if seen_tick == nil then return true end -- never observed: no check
+  local tick = vim.b[buf].changedtick
+  if tick == seen_tick then return true end
+  local stamp = vim.b[buf].straps_last_writer
+  if type(stamp) ~= "table" or stamp.tick ~= tick then
+    return true -- latest change is not a stamped straps write: user editing
+  end
+  if stamp.session == ctx_bufnr then return true end
+  local who = "session " .. tostring(stamp.session)
+  if type(stamp.task) == "string" and stamp.task ~= "" then
+    who = who .. ', task: "' .. stamp.task .. '"'
+  end
+  return nil, "modified by another agent (" .. who .. ") since this session"
+    .. " last read it — re-read the file and reapply your change if it still applies"
+end
+]==],
+  })
+
+  -- ------------------------------------------------------------- fn.mark_seen
+
+  -- Bookkeeping counterpart to fn.check_writer, shared by every tool that
+  -- reads or writes through a file buffer (tool sources are separate chunks,
+  -- so shared code lives in the registry). Records the buffer's current
+  -- changedtick in the session's seen-tick map; with wrote=true also stamps
+  -- the file buffer with this session as the last writer.
+  define({
+    name = "fn.mark_seen",
+    kind = "fn",
+    doc = "Record that a session observed (or wrote) a file buffer's current"
+      .. " state. Called as (ctx_bufnr, buf, wrote). Updates the session's"
+      .. " straps_seen_ticks map; when wrote is true, also sets the file"
+      .. " buffer's straps_last_writer stamp {session, tick, task}. Tolerates"
+      .. " an invalid/absent session buffer (no-op).",
+    source = [==[
+return function(ctx_bufnr, buf, wrote)
+  if not vim.api.nvim_buf_is_loaded(buf) then return end
+  -- Fail open on a missing/invalid session buffer (tests drive tools with
+  -- ctx = { bufnr = 0 }): nothing recorded, nothing stamped — an unstamped
+  -- change reads as user editing to other sessions.
+  if type(ctx_bufnr) ~= "number" or ctx_bufnr <= 0
+    or not vim.api.nvim_buf_is_valid(ctx_bufnr) then
+    return
+  end
+  local tick = vim.b[buf].changedtick
+  if wrote then
+    local task = vim.b[ctx_bufnr].straps_task
+    vim.b[buf].straps_last_writer = {
+      session = ctx_bufnr,
+      tick = tick,
+      task = type(task) == "string" and task or nil,
+    }
+  end
+  -- vim.b tables are msgpack round-tripped: string keys, reassign to mutate.
+  local seen = vim.b[ctx_bufnr].straps_seen_ticks
+  if type(seen) ~= "table" then seen = {} end
+  seen[tostring(buf)] = tick
+  vim.b[ctx_bufnr].straps_seen_ticks = seen
+end
+]==],
+  })
+
+  -- ------------------------------------------------------------ fn.peer_agents
+
+  -- The awareness counterpart to fn.check_writer: that fn tells an agent about
+  -- a neighbour at the moment they collide, this one tells it they exist at
+  -- all. Same-instance only — sessions in another Neovim share nothing but
+  -- disk, where the only signal is fn.reconcile_buf's divergence check.
+  define({
+    name = "fn.peer_agents",
+    kind = "fn",
+    doc = "Describe every OTHER straps session in this Neovim. Called as"
+      .. " (ctx_bufnr) -> list of { bufnr, label, running, parent, relation"
+      .. " ('parent'|'child'|'sibling'|'peer'), task, depth, files }, running"
+      .. " sessions first then by bufnr. Sessions are found by scanning buffers"
+      .. " for b:straps_session, so IDLE ones are included (loop.running_sessions"
+      .. " sees only active runs); files are the paths each peer last wrote,"
+      .. " read from the b:straps_last_writer stamps fn.mark_seen leaves.",
+    source = [==[
+return function(ctx_bufnr)
+  -- vim.b on an invalid buffer throws; every read here is pcall-wrapped, the
+  -- same defensive idiom editor.lua's is_session uses.
+  local function bvar(b, name)
+    local ok, v = pcall(function() return vim.b[b][name] end)
+    if ok then return v end
+  end
+  local function valid(b)
+    return type(b) == "number" and b > 0 and vim.api.nvim_buf_is_valid(b)
+  end
+
+  local running = {}
+  pcall(function()
+    for _, b in ipairs(require("straps.loop").running_sessions()) do
+      running[b] = true
+    end
+  end)
+
+  -- Which files each session most recently wrote, from the write stamps
+  -- fn.mark_seen leaves on the FILE buffers. Numbers survive vim.b's msgpack
+  -- round trip (fn.check_writer compares stamp.session to a bufnr the same way).
+  local wrote = {}
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if valid(b) then
+      local stamp = bvar(b, "straps_last_writer")
+      if type(stamp) == "table" and type(stamp.session) == "number" then
+        local name = vim.api.nvim_buf_get_name(b)
+        if name ~= "" then
+          local list = wrote[stamp.session] or {}
+          list[#list + 1] = vim.fn.fnamemodify(name, ":.")
+          wrote[stamp.session] = list
+        end
+      end
+    end
+  end
+
+  local my_parent = valid(ctx_bufnr) and bvar(ctx_bufnr, "straps_parent") or nil
+  if not valid(my_parent) then my_parent = nil end
+
+  local out = {}
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if b ~= ctx_bufnr and valid(b) and bvar(b, "straps_session") == true then
+      local parent = bvar(b, "straps_parent")
+      if not valid(parent) then parent = nil end
+      local relation = "peer"
+      if parent == ctx_bufnr then
+        relation = "child"
+      elseif b == my_parent then
+        relation = "parent"
+      elseif parent ~= nil and parent == my_parent then
+        relation = "sibling"
+      end
+      local label = "buffer " .. tostring(b)
+      pcall(function() label = require("straps.ui").session_label(b) end)
+      local task = bvar(b, "straps_task")
+      out[#out + 1] = {
+        bufnr = b,
+        label = label,
+        running = running[b] == true,
+        parent = parent,
+        relation = relation,
+        task = type(task) == "string" and task or nil,
+        depth = tonumber(bvar(b, "straps_spawn_depth")) or 0,
+        files = wrote[b] or {},
+      }
+    end
+  end
+  table.sort(out, function(a, b)
+    if a.running ~= b.running then return a.running end
+    return a.bufnr < b.bufnr
+  end)
+  return out
 end
 ]==],
   })
@@ -854,7 +1258,13 @@ return function(input, ctx)
       .. ") reached; do this work yourself"
   end
 
-  local child = state.new_session()
+  -- Compose the child's prompt for its actual shape: no # Subagents section,
+  -- a # You are a subagent section, plus readonly / tool-restriction notes.
+  local child = state.new_session({
+    subagent = true,
+    readonly = input.readonly and true or nil,
+    tools = (type(input.tools) == "table" and #input.tools > 0) and input.tools or nil,
+  })
   vim.b[child].straps_spawn_depth = depth + 1
   vim.b[child].straps_max_turns = math.floor(tonumber(input.max_turns) or 24)
   -- Timeout is stored for spawn_wait to enforce (spawn itself returns at once).
@@ -1082,6 +1492,357 @@ return function(input, ctx)
     out[#out + 1] = ("## buffer %d — not a subagent of this session (skipped)"):format(b)
   end
   return table.concat(out, "\n\n")
+end
+]==],
+  })
+
+  -- -------------------------------------------------------- transcript_excise
+
+  -- Context surgery: the transcript buffer IS the request (loop.lua re-parses
+  -- it every turn), so shrinking an old block's content shrinks what the model
+  -- sees from the next turn onward. Same in-place technique as fn.compact —
+  -- blocks are never removed, so tool_use/tool_result pairing and role
+  -- alternation survive — but agent-directed and per-block instead of
+  -- age-based. The tool CANNOT write arbitrary text into the transcript: the
+  -- only thing it can put there is a marked receipt, so no unmarked fabricated
+  -- observation can ever be implanted (in itself or in a child).
+  define({
+    name = "tool.transcript_excise",
+    kind = "tool",
+    doc = "Excise dead weight from a session transcript — your OWN context"
+      .. " window, or a subagent's — reclaiming it from every later request."
+      .. " The transcript buffer IS the request: it is re-parsed every turn, so"
+      .. " a 40k-token side quest or wrong path you excise now stops being"
+      .. " replayed from your next turn on, while the conclusion you keep in"
+      .. " your reply text survives. Use it when a line of investigation is"
+      .. " finished and wrong: state what you learned in your reply FIRST, then"
+      .. " excise the blocks that produced it."
+      .. " Two modes. LIST (no blocks/range): returns the block index —"
+      .. " number, kind, byte size, a snippet, and which blocks are locked."
+      .. " Read-only, so it needs no confirmation; call it first to choose"
+      .. " targets. EXCISE (blocks and/or range, plus a required note):"
+      .. " replaces the CONTENT of those blocks with a one-line receipt"
+      .. " carrying your note and the byte count reclaimed. Blocks are never"
+      .. " deleted and no text of your choosing is written — only the receipt —"
+      .. " so the human reading the transcript always sees what was removed and"
+      .. " why, and the message structure the API requires stays intact."
+      .. " Locked and never excisable: the system block, and everything from"
+      .. " the last assistant block onward (the turn in flight — this very"
+      .. " call's own blocks). Excising is idempotent, one undoable step per"
+      .. " call (revert with undo_edit on the transcript file). Parameters:"
+      .. " session (optional) — a subagent buffer handle from spawn (must be"
+      .. " your own child); omit to operate on your own transcript. blocks"
+      .. " (optional) — array of block numbers from list mode. range (optional)"
+      .. " — {from, to} inclusive block numbers. note (required to excise) — a"
+      .. " short reason, written into the transcript as the receipt.",
+    input_schema = {
+      type = "object",
+      properties = {
+        session = {
+          type = "integer",
+          description = "Subagent buffer handle to operate on; omit for your own transcript.",
+        },
+        blocks = {
+          type = "array",
+          items = { type = "integer" },
+          description = "Block numbers to excise (from list mode).",
+        },
+        range = {
+          type = "object",
+          properties = {
+            from = { type = "integer", description = "First block number (inclusive)." },
+            to = { type = "integer", description = "Last block number (inclusive)." },
+          },
+          required = { "from", "to" },
+          description = "Inclusive block-number range to excise.",
+        },
+        note = {
+          type = "string",
+          description = "Why these blocks are being excised; becomes the visible receipt.",
+        },
+      },
+    },
+    source = [==[
+return function(input, ctx)
+  local state = require("straps.state")
+
+  -- Target: this session's own transcript by default, else a validated
+  -- descendant — same check spawn_wait makes, so an agent can only operate on
+  -- a buffer it spawned, never an arbitrary buffer in the editor.
+  local bufnr, is_child = ctx.bufnr, false
+  if input.session ~= nil then
+    local child = math.floor(tonumber(input.session) or -1)
+    local ok_valid = child >= 0 and vim.api.nvim_buf_is_valid(child)
+    local parent
+    if ok_valid then pcall(function() parent = vim.b[child].straps_parent end) end
+    if not (ok_valid and parent == ctx.bufnr) then
+      error("transcript_excise: buffer " .. tostring(input.session)
+        .. " is not a subagent of this session")
+    end
+    bufnr, is_child = child, true
+  end
+  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
+    error("transcript_excise: no valid session buffer to operate on")
+  end
+
+  local blocks = state.list_blocks(bufnr)
+
+  -- The turn in flight starts at the LAST assistant block: the loop appends an
+  -- empty assistant marker before the provider call, then EVERY tool_use marker
+  -- of the batch before executing any of them, and appends each result after.
+  -- So this very call's tool_use block (and its siblings') sit at or after that
+  -- index; excising one would orphan a tool_result, which the API rejects. The
+  -- same line is what makes editing a RUNNING child safe — the provider streams
+  -- text deltas into the tail block, and the tail is never eligible.
+  local inflight = 0
+  for i = #blocks, 1, -1 do
+    if blocks[i].kind == "assistant" then
+      inflight = i
+      break
+    end
+  end
+
+  local function region_lines(from_lnum, to_lnum)
+    if to_lnum < from_lnum then return {} end
+    return vim.api.nvim_buf_get_lines(bufnr, from_lnum - 1, to_lnum, false)
+  end
+  local function first_nonblank(lines)
+    for _, l in ipairs(lines) do
+      if l:match("%S") then return l end
+    end
+    return ""
+  end
+
+  -- The lines a receipt would replace. For user/assistant/system the marker
+  -- line can carry the block's first content line inline (state.match_marker),
+  -- and that text sits OUTSIDE list_blocks' content range — so those blocks are
+  -- rewritten from the marker line down, with a bare marker restored. Tool
+  -- markers must keep their attrs (id/name) or parse skips the block entirely.
+  local function target_region(b)
+    if b.kind == "tool_use" or b.kind == "tool_result" then
+      return b.first_lnum, b.last_lnum, false
+    end
+    return b.marker_lnum, math.max(b.last_lnum, b.marker_lnum), true
+  end
+
+  -- Bytes the block actually costs: the content lines, plus any inline text on
+  -- a prose marker line (never the marker prefix itself).
+  local function block_bytes(b)
+    local from_lnum, to_lnum, with_marker = target_region(b)
+    local lines = region_lines(from_lnum, to_lnum)
+    if with_marker and lines[1] then
+      lines = vim.deepcopy(lines)
+      lines[1] = lines[1]:gsub("^%%%%%[straps:[a-z_]+%]%%%%%s?", "")
+    end
+    return #table.concat(lines, "\n"), lines
+  end
+
+  local function already_excised(b)
+    local content = region_lines(b.first_lnum, b.last_lnum)
+    if b.kind == "tool_use" then
+      local body = vim.trim(table.concat(content, "\n"))
+      return body == "" or body == "{}" or body:find('"_excised"', 1, true) ~= nil
+    end
+    local first = first_nonblank(content)
+    return first:find("^%[excised") ~= nil or first:find("^%[compacted: was ") ~= nil
+  end
+
+  local function locked(i)
+    local b = blocks[i]
+    if not b then return "no such block" end
+    if b.kind == "system" then return "system prompt" end
+    if inflight == 0 or i >= inflight then return "turn in flight" end
+    return nil
+  end
+
+  -- Collect targets (blocks + range), deduped. Out-of-range numbers are dropped
+  -- here rather than errored: a block number past the end is a stale index from
+  -- an older listing, and the per-block report already says what was skipped.
+  local want, seen = {}, {}
+  local asked = false -- did the caller name ANY target? (list mode if not)
+  local function add(i)
+    asked = true
+    i = math.floor(tonumber(i) or -1)
+    if i >= 1 and i <= #blocks and not seen[i] then
+      seen[i] = true
+      want[#want + 1] = i
+    end
+  end
+  if type(input.blocks) == "table" then
+    for _, i in ipairs(input.blocks) do add(i) end
+  end
+  if type(input.range) == "table" then
+    local from = math.floor(tonumber(input.range.from) or 0)
+    local to = math.floor(tonumber(input.range.to) or 0)
+    if from < 1 or to < from then
+      error("transcript_excise: range must be {from, to} with 1 <= from <= to")
+    end
+    -- Clamp before iterating: an unbounded `to` would otherwise build a table
+    -- of millions of indices before any of them was checked against #blocks.
+    to = math.min(to, #blocks)
+    for i = from, to do add(i) end
+    asked = true -- a range past the end still means "excise", not "list"
+  end
+
+  -- ------------------------------------------------------------- list mode
+  -- Only when the caller named no target at all. A target that filtered out
+  -- (every number past the end of the transcript) is a failed excision and must
+  -- report that, not silently return an index listing.
+  if not asked then
+    local out = {
+      ("transcript buffer %d — %d blocks; the turn in flight starts at block %s")
+        :format(bufnr, #blocks, inflight > 0 and tostring(inflight) or "?"),
+      "   #  kind          bytes  content",
+    }
+    local reclaimable = 0
+    for i, b in ipairs(blocks) do
+      local nbytes = block_bytes(b)
+      local why = locked(i)
+      local tag = ""
+      if why then
+        tag = "[locked: " .. why .. "] "
+      elseif already_excised(b) then
+        tag = "[already excised] "
+      else
+        reclaimable = reclaimable + nbytes
+      end
+      local snippet = first_nonblank(region_lines(b.first_lnum, b.last_lnum))
+        :gsub("%s+", " "):sub(1, 70)
+      out[#out + 1] = ("%4d  %-12s %6d  %s%s"):format(i, b.kind, nbytes, tag, snippet)
+    end
+    out[#out + 1] = ("%d bytes excisable. To excise: transcript_excise with"
+      .. " blocks/range and a note."):format(reclaimable)
+    return table.concat(out, "\n")
+  end
+
+  -- ----------------------------------------------------------- excise mode
+  local note = input.note
+  if type(note) ~= "string" or not note:match("%S") then
+    error("transcript_excise: note is required to excise — it is the receipt left"
+      .. " in the transcript in place of what you removed")
+  end
+  -- A receipt is exactly one line: flattening the note is what keeps a note
+  -- containing a marker-shaped line from splitting the block it lands in.
+  -- Control characters are dropped (a NUL in a buffer line is not writable as
+  -- itself), and the note is capped — a receipt longer than the content it
+  -- replaces would make the transcript grow instead of shrink.
+  note = note:gsub("%c", " "):gsub("%s+", " ")
+  note = vim.trim(note)
+  if #note > 200 then
+    note = note:sub(1, 197) .. "..."
+  end
+
+  table.sort(want)
+  local skipped = {}
+  -- Plan every replacement against ONE snapshot, then apply it as ONE
+  -- set_lines over the whole affected span (untouched lines inside the span are
+  -- copied verbatim). That makes line-number staleness impossible — no second
+  -- edit ever runs against shifted numbers — and the whole surgery is a single
+  -- undoable step, so undo_edit reverts it as a unit.
+  local edits = {}
+  for _, i in ipairs(want) do
+    local b = blocks[i]
+    local why = locked(i)
+    if why then
+      skipped[#skipped + 1] = ("block %d: %s"):format(i, why)
+    elseif already_excised(b) then
+      skipped[#skipped + 1] = ("block %d: already excised"):format(i)
+    else
+      local nbytes = block_bytes(b)
+      if nbytes == 0 then
+        skipped[#skipped + 1] = ("block %d: already empty"):format(i)
+      else
+        -- Staleness assertion: the marker must still be where the snapshot said.
+        -- If it is not, something else wrote to the transcript and every range
+        -- in the snapshot is suspect — refuse rather than eat a neighbour.
+        local marker = vim.api.nvim_buf_get_lines(bufnr,
+          b.marker_lnum - 1, b.marker_lnum, false)[1] or ""
+        if not marker:find("^%%%%%[straps:" .. b.kind .. "%]%%%%") then
+          error(("transcript_excise: the transcript changed underneath us"
+            .. " (block %d is no longer %s) — nothing was excised; list again")
+            :format(i, b.kind))
+        end
+        local from_lnum, to_lnum, with_marker = target_region(b)
+        local repl = {}
+        local content
+        if b.kind == "tool_use" then
+          -- Stays decodable JSON so parse still yields a real input object, and
+          -- the note survives into the request instead of vanishing.
+          content = vim.json.encode({
+            _excised = ("was %d bytes — %s"):format(nbytes, note),
+          })
+        else
+          content = ("[excised%s: was %d bytes — %s]")
+            :format(is_child and " by parent" or "", nbytes, note)
+        end
+        -- What actually prevents a note from injecting a block is the receipt
+        -- FRAME plus the flattening above: the written line always begins with
+        -- "[excised" or '{"_excised"', and is always exactly one line, so it can
+        -- never read as a marker. escape_line is belt-and-braces for a future
+        -- frame change (set_lines bypasses the escaping state.append applies).
+        -- The marker line itself is emitted verbatim — it IS a marker, and
+        -- escaping it would destroy the block.
+        if with_marker then
+          repl[#repl + 1] = "%%[straps:" .. b.kind .. "]%%"
+        end
+        repl[#repl + 1] = state.escape_line(content)
+        -- Keep the blank separator line before the next marker if there was one.
+        local tail = vim.api.nvim_buf_get_lines(bufnr, to_lnum - 1, to_lnum, false)[1]
+        if tail and not tail:match("%S") then
+          repl[#repl + 1] = ""
+        end
+        -- Never grow the transcript: on a block already smaller than its own
+        -- receipt there is nothing to reclaim, and rewriting it would only cost
+        -- bytes (and destroy readable content for no gain).
+        if #table.concat(repl, "\n") >= nbytes then
+          skipped[#skipped + 1] = ("block %d: smaller than its receipt"):format(i)
+        else
+          edits[#edits + 1] = { from = from_lnum, to = to_lnum, lines = repl, bytes = nbytes }
+        end
+      end
+    end
+  end
+
+  local touched, before, after = 0, 0, 0
+  if #edits > 0 then
+    table.sort(edits, function(a, b) return a.from < b.from end)
+    local span_from, span_to = edits[1].from, edits[#edits].to
+    local buf_lines = vim.api.nvim_buf_get_lines(bufnr, span_from - 1, span_to, false)
+    local by_start = {}
+    for _, e in ipairs(edits) do by_start[e.from] = e end
+    local new_lines = {}
+    local lnum = span_from
+    while lnum <= span_to do
+      local e = by_start[lnum]
+      if e then
+        for _, l in ipairs(e.lines) do new_lines[#new_lines + 1] = l end
+        touched = touched + 1
+        before = before + e.bytes
+        after = after + #table.concat(e.lines, "\n")
+        lnum = e.to + 1
+      else
+        new_lines[#new_lines + 1] = buf_lines[lnum - span_from + 1]
+        lnum = lnum + 1
+      end
+    end
+    vim.api.nvim_buf_set_lines(bufnr, span_from - 1, span_to, false, new_lines)
+    state.persist(bufnr) -- file-backed transcripts only; no-op otherwise
+  end
+
+  local out = {}
+  if touched == 0 then
+    out[#out + 1] = "excised nothing"
+  else
+    out[#out + 1] = ("excised %d block(s) from %s: %d -> %d bytes (receipt: %s)")
+      :format(touched, is_child and ("subagent buffer " .. bufnr) or "your transcript",
+        before, after, note)
+    out[#out + 1] = "The excised content is gone from every later request;"
+      .. " the receipts stay visible in the transcript."
+  end
+  for _, s in ipairs(skipped) do
+    out[#out + 1] = "skipped " .. s
+  end
+  return table.concat(out, "\n")
 end
 ]==],
   })
@@ -1885,6 +2646,62 @@ end
 ]==],
   })
 
+  -- ------------------------------------------------------------------- agents
+
+  -- Defined LAST among this file's tools: seq order is append-only for
+  -- prompt-cache stability (see fn.build_tools), so a new tool goes at the end
+  -- of the list rather than into the middle of it.
+  define({
+    name = "tool.agents",
+    kind = "tool",
+    doc = "List the other straps agent sessions running in this Neovim — who"
+      .. " else is working, whether they are running or idle, how they relate to"
+      .. " you (parent/child/sibling), the task they were given, and which files"
+      .. " they have written. Call it when a run starts alongside other agents"
+      .. " (the multiplayer notice points here), before editing a file a peer may"
+      .. " be in, or after an edit tool reports 'modified by another agent'. Peers"
+      .. " share this Neovim's buffers, so their unsaved edits are already in the"
+      .. " files you read. Agents in a DIFFERENT Neovim are invisible here. Read-only."
+      .. " No parameters.",
+    input_schema = {
+      type = "object",
+      properties = vim.empty_dict(),
+      required = {},
+    },
+    source = [==[
+return function(input, ctx)
+  local registry = require("straps.registry")
+  local me = ctx and ctx.bufnr
+  local peers = registry.call("fn.peer_agents", me) or {}
+  local mine = "buffer " .. tostring(me)
+  pcall(function() mine = require("straps.ui").session_label(me) end)
+  if #peers == 0 then
+    return "you are the only straps agent in this Neovim (this session: "
+      .. mine .. "). Note: agents running in a DIFFERENT Neovim instance are"
+      .. " invisible here."
+  end
+  local lines = { ("%d other agent(s) in this Neovim; this session: %s")
+    :format(#peers, mine) }
+  for _, p in ipairs(peers) do
+    local parts = { ("  %s [%s, %s]"):format(p.label, p.relation,
+      p.running and "running" or "idle") }
+    if p.task then parts[#parts + 1] = "task: " .. p.task end
+    if #p.files > 0 then
+      local files = p.files
+      local shown = table.concat(files, ", ", 1, math.min(#files, 5))
+      if #files > 5 then shown = shown .. (", +%d more"):format(#files - 5) end
+      parts[#parts + 1] = "wrote: " .. shown
+    end
+    lines[#lines + 1] = table.concat(parts, "  ·  ")
+  end
+  lines[#lines + 1] = "Buffers are shared: a peer's unsaved edits are already in"
+    .. " what you read, and your edit tools will refuse a file whose latest"
+    .. " change is a peer's write. Load skill.multiplayer for the protocol."
+  return table.concat(lines, "\n")
+end
+]==],
+  })
+
   -- -------------------------------------------------------- fn.readonly_policy
 
   -- Single source of truth for "which tool calls are read-only". Both the
@@ -1897,7 +2714,8 @@ end
     doc = "Return true if the tool call (name, input) is read-only: it opens"
       .. " views or lists things but changes no files. The read-only allowlist"
       .. " plus the list-mode exceptions (code_action/fix_diagnostic without an"
-      .. " index, undo_edit with history=true) live here so hook.confirm and"
+      .. " index, undo_edit with history=true, transcript_excise without"
+      .. " blocks/range) live here so hook.confirm and"
       .. " spawn's readonly-child gate share one policy.",
     source = [==[
 return function(name, input)
@@ -1913,6 +2731,8 @@ return function(name, input)
     read_node = true, hover = true,
     workspace_symbols = true, context = true, show_user = true,
     help_search = true,
+    -- agents only lists other sessions' buffer-local state; it changes nothing.
+    agents = true,
     -- presentation tools: they open views / set the findings list but change
     -- no files, exactly like show_user.
     show_diff = true, show_buffer = true, set_findings = true,
@@ -1935,6 +2755,14 @@ return function(name, input)
     return true
   end
 
+  -- transcript_excise with no blocks/range only lists the transcript's blocks
+  -- (read-only); an actual excision rewrites the transcript, which is the most
+  -- consequential write in the system and always prompts.
+  if name == "transcript_excise" and type(input) == "table"
+    and input.blocks == nil and input.range == nil then
+    return true
+  end
+
   return false
 end
 ]==],
@@ -1952,9 +2780,10 @@ end
       .. " declaration, definition, type_definition, implementation, references,"
       .. " symbols, read_symbol, tree_sitter_status, node_at, read_node, hover,"
       .. " workspace_symbols, context, show_user,"
-      .. " show_diff, show_buffer, set_findings, help_search, ask_user,"
+      .. " show_diff, show_buffer, set_findings, help_search, ask_user, agents,"
       .. " code_action/fix_diagnostic in list mode i.e. without"
-      .. " index, and undo_edit in history mode);"
+      .. " index, undo_edit in history mode, and transcript_excise in list mode"
+      .. " i.e. without blocks/range);"
       .. " otherwise prompt via vim.fn.confirm. For"
       .. " file-editing tools (write_file, edit_file, patch_file) a unified diff of the"
       .. " proposed change is shown in a scratch split while the dialog is up"
@@ -2315,11 +3144,54 @@ end
     name = "hook.on_run_start",
     kind = "hook",
     doc = "Called as (ctx) when an agent run starts, before the first provider"
-      .. " call. No-op by default; redefine for setup, notifications, or"
-      .. " per-run state.",
+      .. " call. Default behavior: when OTHER sessions in this Neovim have"
+      .. " active runs, append one user block telling the agent it is not alone"
+      .. " (it can then call the agents tool and load skill.multiplayer)."
+      .. " Silent when no peer is running, when the same peer set was already"
+      .. " announced to this session, and when the transcript has nothing else"
+      .. " to send — so a solo session's transcript is byte-identical to one"
+      .. " with no hook at all. Redefine for setup, notifications, or per-run"
+      .. " state.",
     source = [==[
 return function(ctx)
-  -- no-op by default
+  local bufnr = ctx and ctx.bufnr
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then return end
+  local registry = require("straps.registry")
+  local state = require("straps.state")
+
+  local peers = registry.try_call("fn.peer_agents", bufnr) or {}
+  local live = {}
+  for _, p in ipairs(peers) do
+    if p.running then live[#live + 1] = p end
+  end
+  if #live == 0 then return end
+
+  -- Announce a peer SET once, not once per run: a long session working
+  -- alongside the same neighbour would otherwise accumulate an identical note
+  -- in its persisted transcript every turn-loop start, and replay all of them.
+  local sig = {}
+  for _, p in ipairs(live) do sig[#sig + 1] = p.bufnr .. ":" .. p.relation end
+  sig = table.concat(sig, ",")
+  local ok_seen, seen = pcall(function() return vim.b[bufnr].straps_peers_noted end)
+  if ok_seen and seen == sig then return end
+
+  -- The note must never be the ONLY thing in the request: on a transcript with
+  -- no other messages it would defeat the loop's "nothing to send" guard and
+  -- spend a real API call announcing the neighbours to no purpose.
+  local ok_parsed, parsed = pcall(state.parse, bufnr)
+  if not ok_parsed or not parsed or #parsed.messages == 0 then return end
+
+  local who = {}
+  for _, p in ipairs(live) do
+    who[#who + 1] = p.label .. " (" .. p.relation
+      .. (p.task and (", " .. p.task) or "") .. ")"
+  end
+  pcall(state.append, bufnr, "user", nil,
+    ("[straps] Multiplayer: %d other agent(s) working in this Neovim right now — %s."
+      .. " You share their buffers. Call the agents tool for what they have"
+      .. " touched, and load skill.multiplayer before editing anything they"
+      .. " might be in."):format(#live, table.concat(who, ", ")))
+  pcall(function() vim.b[bufnr].straps_peers_noted = sig end)
 end
 ]==],
   })

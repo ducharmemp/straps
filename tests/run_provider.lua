@@ -328,6 +328,28 @@ case("config.effort maps to thinking.budget_tokens for a budget-thinking model",
     "max_tokens (" .. tostring(decoded.max_tokens) .. ") must exceed budget_tokens")
 end)
 
+-- Budget-thinking bump when the resolved cap does NOT clear budget_tokens: an
+-- explicit config.max_tokens below the budget is still bumped above it, because
+-- the API rejects max_tokens <= budget_tokens (the one case an explicit cap
+-- does not win). Without the bump the base cap (4096) would stay below 24000.
+vim.fn.delete(tmp .. "/n")
+vim.fn.delete(tmp .. "/body.1")
+vim.fn.delete(tmp .. "/body.2")
+straps.config.model = "claude-haiku-4-5-20251001"
+straps.config.effort = "high"
+straps.config.max_tokens = 4096
+local _, text_bump = run_session("run echo via bash, explicit cap below budget")
+
+case("an explicit max_tokens below budget_tokens is bumped above it", function()
+  assert(text_bump:find("provider done", 1, true), "bump run did not complete")
+  local decoded = vim.json.decode(table.concat(vim.fn.readfile(tmp .. "/body.1"), "\n"))
+  assert(decoded.thinking.budget_tokens == 24000, "budget wrong: " .. tostring(decoded.thinking.budget_tokens))
+  assert(decoded.max_tokens > decoded.thinking.budget_tokens,
+    "explicit cap 4096 should be bumped above budget 24000, got " .. tostring(decoded.max_tokens))
+end)
+
+straps.config.max_tokens = nil
+straps.config.effort = "off"
 straps.config.model = "claude-sonnet-5"
 
 vim.fn.delete(tmp .. "/n")
@@ -344,6 +366,55 @@ case("config.effort = off sends no thinking block", function()
   assert(decoded.output_config == nil, "output_config should be absent when effort is off")
 end)
 
+straps.config.effort = "off"
+
+-- ----------------------------------------------------------- max_tokens resolution
+-- config.max_tokens defaults to nil = the active model's max_output (from its
+-- config.models entry) else config.default_max_tokens. The scripted curl is on
+-- PATH and effort is off (no thinking bump), so body.1's max_tokens is the pure
+-- resolution. Save/restore the config knobs each case touches.
+do
+  local saved_mt = straps.config.max_tokens
+  local saved_dmt = straps.config.default_max_tokens
+  local saved_model = straps.config.model
+
+  local function req_max_tokens(user_text)
+    vim.fn.delete(tmp .. "/n")
+    vim.fn.delete(tmp .. "/body.1")
+    vim.fn.delete(tmp .. "/body.2")
+    local _, txt = run_session(user_text)
+    assert(txt:find("provider done", 1, true), "run did not complete: " .. user_text)
+    local body = table.concat(vim.fn.readfile(tmp .. "/body.1"), "\n")
+    return vim.json.decode(body).max_tokens
+  end
+
+  straps.config.max_tokens = nil
+  straps.config.default_max_tokens = 32000
+  straps.config.model = "claude-sonnet-5" -- seed max_output = 128000
+
+  case("nil max_tokens resolves to the model's max_output", function()
+    assert(req_max_tokens("resolve for a listed model") == 128000,
+      "listed model should send its max_output (128000)")
+  end)
+
+  case("explicit config.max_tokens wins over the model's max_output", function()
+    straps.config.max_tokens = 4096
+    local got = req_max_tokens("resolve with explicit cap")
+    straps.config.max_tokens = nil
+    assert(got == 4096, "explicit cap should win, got " .. tostring(got))
+  end)
+
+  case("an unlisted model falls back to default_max_tokens", function()
+    straps.config.model = "claude-not-in-config"
+    local got = req_max_tokens("resolve for an unlisted model")
+    straps.config.model = "claude-sonnet-5"
+    assert(got == 32000, "unlisted model should use default_max_tokens (32000), got " .. tostring(got))
+  end)
+
+  straps.config.max_tokens = saved_mt
+  straps.config.default_max_tokens = saved_dmt
+  straps.config.model = saved_model
+end
 straps.config.effort = "off"
 
 -- --------------------------------------------------------------- thinking
@@ -767,11 +838,11 @@ D=%q
 printf '%%s\n' "$*" >> "$D/models_argv"
 cat <<'EOF'
 {"data":[
-  {"type":"model","id":"claude-sonnet-5","display_name":"Claude Sonnet 5",
+  {"type":"model","id":"claude-sonnet-5","display_name":"Claude Sonnet 5","max_tokens":128000,"max_input_tokens":1000000,
    "capabilities":{"thinking":{"supported":true,"types":{"enabled":{"supported":false},"adaptive":{"supported":true}}}}},
-  {"type":"model","id":"claude-fable-5","display_name":"Claude Fable 5",
+  {"type":"model","id":"claude-fable-5","display_name":"Claude Fable 5","max_tokens":128000,"max_input_tokens":1000000,
    "capabilities":{"thinking":{"supported":true,"types":{"enabled":{"supported":false},"adaptive":{"supported":true}}}}},
-  {"type":"model","id":"claude-haiku-4-5-20251001","display_name":"Claude Haiku 4.5",
+  {"type":"model","id":"claude-haiku-4-5-20251001","display_name":"Claude Haiku 4.5","max_tokens":64000,"max_input_tokens":200000,
    "capabilities":{"thinking":{"supported":true,"types":{"enabled":{"supported":true},"adaptive":{"supported":false}}}}},
   {"type":"model","id":"claude-legacy-0","display_name":"Legacy",
    "capabilities":{"thinking":{"supported":false}}}
@@ -813,6 +884,19 @@ do
     assert(by["claude-fable-5"].thinking == "adaptive", "fable adaptive not inferred")
     assert(by["claude-haiku-4-5-20251001"].thinking == "budget", "enabled->budget not inferred")
     assert(by["claude-legacy-0"].thinking == nil, "no-thinking model should get nil tag")
+  end)
+
+  case("fn.list_models maps max_tokens->max_output and max_input_tokens->context", function()
+    local by = {}
+    for _, m in ipairs(models) do by[m.id] = m end
+    assert(by["claude-sonnet-5"].max_output == 128000,
+      "sonnet-5 max_output wrong: " .. tostring(by["claude-sonnet-5"].max_output))
+    assert(by["claude-sonnet-5"].context == 1000000,
+      "sonnet-5 context wrong: " .. tostring(by["claude-sonnet-5"].context))
+    assert(by["claude-haiku-4-5-20251001"].max_output == 64000,
+      "haiku max_output wrong: " .. tostring(by["claude-haiku-4-5-20251001"].max_output))
+    assert(by["claude-legacy-0"].max_output == nil,
+      "a catalog entry without max_tokens should leave max_output nil")
   end)
 
   vim.env.PATH = saved_path

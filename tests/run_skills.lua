@@ -31,13 +31,34 @@ local PROSE = "Release steps (found the hard way):\n"
   .. "1. bump version in ]==] rockspec\n"
   .. "2. run `make dist` — plain make skips the manifest\n"
 
-case("no skills: tool.skill lists nothing, prompt has no # Skills section", function()
+case("builtin skill.showing_user ships with provider.register()", function()
+  local e = registry.get("skill.showing_user")
+  assert(e and e.kind == "skill", "builtin skill.showing_user missing")
   local out = registry.call("tool.skill", {}, {})
-  assert(out == "no skills defined", "expected empty listing, got: " .. out)
-  -- The core prompt MENTIONS "# Skills" inline (self-extension section), so
-  -- assert on the section header at line start, not the bare substring.
-  local prompt = registry.call("fn.system_prompt")
-  assert(not prompt:find("\n# Skills\n", 1, true), "prompt should omit # Skills when none exist")
+  assert(out:find("skill.showing_user", 1, true), "builtin skill absent from listing: " .. out)
+end)
+
+case("no skills: tool.skill lists nothing, prompt has no # Skills section", function()
+  -- The builtins make skills non-empty by default; remove them all to test the
+  -- empty state, restore afterwards via their own renderings.
+  local restore = {}
+  for _, name in ipairs(registry.names("skill")) do
+    restore[#restore + 1] = registry.render(name)
+    registry.remove(name, { scope = "global" })
+  end
+  assert(#restore > 0, "expected builtin skills to remove")
+  local ok, err = pcall(function()
+    local out = registry.call("tool.skill", {}, {})
+    assert(out == "no skills defined", "expected empty listing, got: " .. out)
+    -- The core prompt MENTIONS "# Skills" inline (self-extension section), so
+    -- assert on the section header at line start, not the bare substring.
+    local prompt = registry.call("fn.system_prompt")
+    assert(not prompt:find("\n# Skills\n", 1, true), "prompt should omit # Skills when none exist")
+  end)
+  for _, rendered in ipairs(restore) do
+    assert(load(rendered))() -- restore the builtins
+  end
+  assert(ok, err)
 end)
 
 case("registry_define accepts kind=skill with a prose (non-Lua) body", function()

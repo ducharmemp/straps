@@ -85,6 +85,52 @@ local function role_overlay(role)
   }
 end
 
+-- The block kinds that are conversation turns: the units the outline lists and
+-- the level-1 folds cover (system is a header, tool blocks nest inside a turn).
+local TURN_KIND = { user = true, assistant = true }
+
+-- First content line of a block, trimmed and truncated to `max` display cells —
+-- the human-readable gist of a turn, for the outline and the closed-fold text.
+-- Text typed on the marker line itself is content (see state.match_marker), so
+-- it wins; otherwise the first non-blank body line that is not scaffolding
+-- (marker-like or %%[[esc]]-escaped) is used. "" when the block is empty.
+local function block_headline(bufnr, blk, max)
+  max = max or 60
+  local mline = vim.api.nvim_buf_get_lines(bufnr, blk.marker_lnum - 1, blk.marker_lnum, false)[1] or ""
+  local text = vim.trim(mline:match("^%%%%%[straps:[a-z_]+%]%%%% ?(.*)$") or "")
+  if text == "" and blk.first_lnum <= blk.last_lnum then
+    for _, l in ipairs(vim.api.nvim_buf_get_lines(bufnr, blk.first_lnum - 1, blk.last_lnum, false)) do
+      local t = vim.trim(l)
+      if t ~= "" and not t:match("^%%%%%[") then
+        text = t
+        break
+      end
+    end
+  end
+  if vim.fn.strdisplaywidth(text) > max then
+    text = vim.fn.strcharpart(text, 0, max - 1) .. "…"
+  end
+  return text
+end
+
+-- Extent of the level-1 fold a turn block opens: the last line before the next
+-- turn marker (or EOF). A turn owns the tool_use/tool_result blocks that follow
+-- it, so its summary can count them. Returns last_lnum, tool_calls.
+local function turn_extent(blocks, idx)
+  local last, tools = blocks[idx].last_lnum, 0
+  for i = idx + 1, #blocks do
+    local b = blocks[i]
+    if TURN_KIND[b.kind] then
+      break
+    end
+    if b.kind == "tool_use" then
+      tools = tools + 1
+    end
+    last = b.last_lnum
+  end
+  return last, tools
+end
+
 -- Decode a tool_use block's content (pretty-printed JSON of the tool input)
 -- into a Lua table. pcall-safe: returns {} on empty content or decode failure.
 -- Both render surfaces (fold summary + expanded card header) need the input to
@@ -132,10 +178,11 @@ local function paired_result(blocks, idx, id)
 end
 
 --- Build the colored fold-summary chunk list for the fold starting at
---- start_lnum (a tool_use or tool_result marker line). Exposed for headless
---- tests: it needs no window or real fold. Returns {{text, hl}, ...}:
---- a tool_use folds to `▸ <verb> <args>   ✓|✗` (command-style via
---- fn.tool_display — StrapsTool verb, dim StrapsRule args); a dangling
+--- start_lnum (a turn, system, tool_use or tool_result marker line). Exposed
+--- for headless tests: it needs no window or real fold. Returns {{text, hl}, ...}:
+--- a user/assistant turn folds to `▸ you  <headline> · N tools` (role-colored
+--- tag, dim gist); a tool_use folds to `▸ <verb> <args>   ✓|✗` (command-style
+--- via fn.tool_display — StrapsTool verb, dim StrapsRule args); a dangling
 --- tool_result keeps `▸ ⚙ result …`. StrapsToolOk/StrapsToolError on the mark.
 function M._fold_summary(bufnr, start_lnum)
   local blocks = require("straps.state").list_blocks(bufnr)
@@ -145,6 +192,25 @@ function M._fold_summary(bufnr, start_lnum)
       idx, blk = i, b
       break
     end
+  end
+  -- A closed turn fold is the outline made inline: role tag + what was said +
+  -- how much machinery it took, so `zM` reduces the session to its exchanges.
+  if blk and TURN_KIND[blk.kind] then
+    local role = ROLE[blk.kind]
+    local last, tools = turn_extent(blocks, idx)
+    local chunks = {
+      { "▸ ", "StrapsRule" },
+      { role.label, role.hl },
+    }
+    local head = block_headline(bufnr, blk, 60)
+    if head ~= "" then
+      chunks[#chunks + 1] = { "  " .. head, "StrapsRule" }
+    end
+    if tools > 0 then
+      chunks[#chunks + 1] = { (" · %d tool%s"):format(tools, tools == 1 and "" or "s"), "StrapsRule" }
+    end
+    chunks[#chunks + 1] = { (" · %d lines"):format(math.max(0, last - blk.marker_lnum + 1)), "StrapsRule" }
+    return chunks
   end
   -- The system block folds to a plain labelled summary (no ⚙/status), since it
   -- is a long, rarely-re-read prompt rather than a tool call.
@@ -620,6 +686,7 @@ function M.show_session(bufnr, split_cmd)
     end
   end, { buffer = bufnr, desc = "straps: send / steer" })
   M.map_file_refs(bufnr)
+  M.map_navigation(bufnr)
   vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(bufnr), 0 })
   return bufnr
 end
@@ -870,15 +937,18 @@ function M.grep_sessions(pattern)
   return #items
 end
 
--- A short label for a session buffer: its filename tail, or a synthetic name
--- for ephemeral (nofile) sessions.
-local function session_label(bufnr)
+--- A short label for a session buffer: its filename tail, or a synthetic name
+--- for ephemeral (nofile) sessions. Public because fn.peer_agents labels the
+--- same buffers for the agent that running_agents labels for the user — one
+--- naming scheme, not two.
+function M.session_label(bufnr)
   local name = vim.api.nvim_buf_get_name(bufnr)
   if name == "" then
     return "buffer " .. bufnr
   end
   return vim.fn.fnamemodify(name, ":t")
 end
+local session_label = M.session_label
 
 --- Snapshot of every currently-running agent, as
 --- { bufnr, label, parent (bufnr|nil), parent_label (string|nil), depth,
@@ -1326,6 +1396,7 @@ local function merge_models(static_list, live_list)
         existing.label = existing.label or m.label
         if existing.thinking == nil then existing.thinking = m.thinking end
         if existing.context == nil then existing.context = m.context end
+        if existing.max_output == nil then existing.max_output = m.max_output end
       else
         by_id[m.id] = copy_model(m)
         order[#order + 1] = m.id
@@ -1656,25 +1727,127 @@ function M.pick_provider()
     M.redraw_status(true)
   end)
 end
--- following tool_result stays inside it, so one tool call collapses to a single
--- colored summary line (foldtext). The system block also folds (it is long and
--- rarely re-read): its marker opens a fold that runs until the next marker. Any
--- other marker (user / assistant) resets to level 0.
+-- Two fold levels, so one buffer serves both reading scales. Level 1 is the
+-- CONVERSATION: each user/assistant marker opens a fold running to the next
+-- turn, so `zM` (foldlevel=0) collapses the session to a list of exchanges —
+-- `▸ you  <what you asked> · 3 tools · 40 lines`. Level 2 is the MACHINERY
+-- nested inside a turn: each tool_use fold swallows its following tool_result,
+-- so one call collapses to a single colored summary line, and the system block
+-- (long and rarely re-read) folds the same way. The default foldlevel of 1
+-- shows the conversation with tool calls collapsed.
 function M.foldexpr(lnum)
   local kind = vim.fn.getline(lnum):match("^%%%%%[straps:([%w_]+)%]%%%%")
   if kind == "tool_use" or kind == "system" then
-    return ">1"
+    return ">2"
   elseif kind == "tool_result" then
-    return "1"
+    return "2"
   elseif kind then
-    return 0
+    return ">1"
   end
   return "="
 end
 
+--- Jump to the count'th next (dir=1) or previous (dir=-1) conversation turn
+--- marker — the `]]` / `[[` motions on a session buffer. Lands on the marker
+--- line (rendered as the role rule), opening just enough folds to see it, and
+--- pushes the jumplist so ctrl-o comes back. Returns true when it moved.
+function M.goto_turn(dir, count)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local cur = vim.api.nvim_win_get_cursor(0)[1]
+  local marks = {}
+  for _, b in ipairs(require("straps.state").list_blocks(bufnr)) do
+    if TURN_KIND[b.kind] then
+      marks[#marks + 1] = b.marker_lnum
+    end
+  end
+  local target
+  for _ = 1, math.max(1, count or 1) do
+    local from = target or cur
+    local found
+    if dir > 0 then
+      for _, m in ipairs(marks) do
+        if m > from then
+          found = m
+          break
+        end
+      end
+    else
+      for i = #marks, 1, -1 do
+        if marks[i] < from then
+          found = marks[i]
+          break
+        end
+      end
+    end
+    if not found then
+      break
+    end
+    target = found
+  end
+  if not target then
+    return false
+  end
+  vim.cmd("normal! m'") -- jumplist entry, so ctrl-o returns
+  vim.api.nvim_win_set_cursor(0, { target, 0 })
+  pcall(vim.cmd, "normal! zv")
+  return true
+end
+
+--- Outline the transcript: load every conversation turn into this session's
+--- findings list as `<role>  <headline>`, so a long session is navigable by
+--- what was said (:lnext/:cnext, or <CR> in the list window to jump). Bound to
+--- `gO` on a session buffer — the stock outline key in :help/man buffers.
+--- Returns the number of turns listed.
+function M.outline(bufnr)
+  bufnr = (bufnr and bufnr ~= 0) and bufnr or vim.api.nvim_get_current_buf()
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  local blocks = require("straps.state").list_blocks(bufnr)
+  local items = {}
+  for i, b in ipairs(blocks) do
+    if TURN_KIND[b.kind] then
+      local _, tools = turn_extent(blocks, i)
+      local head = block_headline(bufnr, b, 90)
+      local suffix = tools > 0 and ("  · %d tool%s"):format(tools, tools == 1 and "" or "s") or ""
+      items[#items + 1] = {
+        bufnr = (name == "") and bufnr or nil,
+        filename = (name ~= "") and name or nil,
+        lnum = b.marker_lnum,
+        col = 1,
+        text = ("%-6s %s%s"):format(ROLE[b.kind].label, head, suffix),
+      }
+    end
+  end
+  if #items == 0 then
+    vim.notify("straps: no turns to outline")
+    return 0
+  end
+  M.set_locations(bufnr, { title = "straps: outline", items = items }, true)
+  return #items
+end
+
+-- Buffer-local navigation for a session transcript: turn motions and the
+-- outline. `]]`/`[[` are section motions in vim's own idiom (and unused in a
+-- straps buffer); `gO` is the outline key :help and man.vim already use.
+function M.map_navigation(bufnr)
+  local function motion(dir)
+    return function()
+      M.goto_turn(dir, vim.v.count1)
+    end
+  end
+  vim.keymap.set("n", "]]", motion(1), { buffer = bufnr, desc = "straps: next turn" })
+  vim.keymap.set("n", "[[", motion(-1), { buffer = bufnr, desc = "straps: previous turn" })
+  vim.keymap.set("n", "gO", function()
+    M.outline(bufnr)
+  end, { buffer = bufnr, desc = "straps: outline the transcript" })
+end
+
 --- Apply the straps fold options (foldmethod=expr + foldexpr + foldtext +
 --- foldlevel from config.tools_expanded) to every window currently showing
---- bufnr. Folding is window-local, so this must run once the buffer is
+--- bufnr. The default foldlevel is 1: conversation turns open, the level-2
+--- tool calls and system prompt collapsed (`tools_expanded` opens those too).
+--- `zM` from there drops to level 0, the turn-list view of the whole session.
+---
+--- Folding is window-local, so this must run once the buffer is
 --- actually displayed — `vim.opt_local` from a FileType autocmd that fires
 --- before the buffer is ever windowed (state.new_session/open_session_file
 --- set filetype=straps on a still-hidden buffer) has no lasting effect, since
@@ -1690,7 +1863,7 @@ function M.apply_fold_opts(bufnr)
     vim.wo[win].foldmethod = "expr"
     vim.wo[win].foldexpr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
     vim.wo[win].foldtext = "v:lua.require'straps.ui'.foldtext()"
-    vim.wo[win].foldlevel = expanded and 99 or 0
+    vim.wo[win].foldlevel = expanded and 99 or 1
   end
 end
 
@@ -1928,6 +2101,7 @@ function M.setup()
       M.apply_fold_opts(ev.buf)
       M.apply_file_ref_match(ev.buf)
       M.map_file_refs(ev.buf)
+      M.map_navigation(ev.buf)
     end,
   })
 end

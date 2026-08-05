@@ -391,11 +391,44 @@ case("ask_user routes options through vim.ui.select and shows content alongside"
   assert(#seen.items == 3 and seen.items[3]:find("other", 1, true),
     "an 'other' entry should be appended: " .. vim.inspect(seen.items))
   assert(seen.content_visible, "content split not visible while the picker was up")
-  assert(seen.wins == wins_before + 1, "content split window missing at pick time")
+  assert(seen.wins == wins_before + 2, "content split + question banner missing at pick time")
   assert(#vim.api.nvim_list_wins() == wins_before,
     "content split leaked after answering")
 end)
 
+case("ask_user shows the full question in a wrapped float above the picker", function()
+  local long = "Should we hoist the guard into the caller so every entry point shares it,"
+    .. " or keep it at the leaf where the nil actually shows up and accept the duplication?"
+  local wins_before = #vim.api.nvim_list_wins()
+  local real_select, seen = vim.ui.select, {}
+  vim.ui.select = function(items, _, on_choice)
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      local cfg = vim.api.nvim_win_get_config(win)
+      if cfg.relative == "editor" then
+        local text = table.concat(vim.api.nvim_buf_get_lines(
+          vim.api.nvim_win_get_buf(win), 0, -1, false), "\n")
+        if text == long then
+          seen.banner = { wrap = vim.wo[win].wrap, linebreak = vim.wo[win].linebreak,
+            width = cfg.width, height = cfg.height, zindex = cfg.zindex,
+            focusable = cfg.focusable }
+        end
+      end
+    end
+    on_choice(items[1], 1)
+  end
+  local ok, out = pcall(drive, function(ctx)
+    return registry.call("tool.ask_user", { question = long, options = { "hoist", "leaf" } }, ctx)
+  end)
+  vim.ui.select = real_select
+  assert(ok, "ask_user errored: " .. tostring(out))
+  local b = seen.banner
+  assert(b, "the full question was not shown in a float while the picker was up")
+  assert(b.wrap and b.linebreak, "the question float must wrap so long questions stay readable")
+  assert(b.width >= 1 and b.height >= 1, "degenerate float geometry: " .. vim.inspect(b))
+  assert(b.zindex and b.zindex > 100, "the question must sit above picker floats, zindex=" .. tostring(b.zindex))
+  assert(b.focusable == false, "the question float must not steal focus from the picker")
+  assert(#vim.api.nvim_list_wins() == wins_before, "question float leaked after answering")
+end)
 case("ask_user 'other' choice falls through to free-text input", function()
   local real_select, real_input = vim.ui.select, vim.ui.input
   vim.ui.select = function(items, _, on_choice) on_choice(items[#items], #items) end
@@ -473,8 +506,8 @@ case("ask_user structured options without snacks: labeled preview splits + vim.u
   assert(out:find("user chose option 2: Push check down", 1, true), "unexpected: " .. out)
   assert(#seen.items == 3 and seen.items[1] == "Guard clause" and seen.items[2] == "Push check down",
     "labels + 'other' expected in the picker: " .. vim.inspect(seen.items))
-  assert(seen.wins == wins_before + 2,
-    "expected 2 preview splits at pick time, got +" .. (seen.wins - wins_before))
+  assert(seen.wins == wins_before + 3,
+    "expected 2 preview splits + question banner at pick time, got +" .. (seen.wins - wins_before))
   assert(seen.winbars[1] == "1: Guard clause" and seen.winbars[2] == "2: Push check down",
     "winbar labels wrong: " .. vim.inspect(seen.winbars))
   assert(seen.previews["1: Guard clause"]:find("GUARD-SKETCH", 1, true), "option 1 preview not shown")
@@ -556,7 +589,8 @@ case("ask_user snacks dismissal is reported; a snacks failure falls back to vim.
   package.loaded.snacks = real_snacks
   assert(ok, "ask_user errored: " .. tostring(out))
   assert(out:find("user chose option 1: A", 1, true), "unexpected: " .. out)
-  assert(wins_at_pick == wins_before + 2, "fallback preview splits missing after snacks failure")
+  assert(wins_at_pick == wins_before + 3,
+    "fallback preview splits + question banner missing after snacks failure")
   assert(#vim.api.nvim_list_wins() == wins_before, "fallback preview splits leaked")
 end)
 
@@ -588,7 +622,8 @@ case("ask_user snacks 'other' choice falls through to free text; content split c
   assert(ok, "ask_user errored: " .. tostring(out))
   assert(out:find("free text", 1, true) and out:find("hand-rolled answer", 1, true),
     "unexpected: " .. out)
-  assert(wins_at_pick == wins_before + 1, "content split missing while the snacks picker was up")
+  assert(wins_at_pick == wins_before + 2,
+    "content split + question banner missing while the snacks picker was up")
   assert(#vim.api.nvim_list_wins() == wins_before,
     "content split leaked after answering through the snacks picker")
 end)

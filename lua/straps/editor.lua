@@ -2373,6 +2373,8 @@ end
       .. " or outcome looks like in preview, so the user picks between things"
       .. " they can see. Previews render in a live preview pane beside the"
       .. " picker (snacks.nvim) or in labeled splits while the question is up."
+      .. " The question is also shown, wrapped, in a float above the picker, so"
+      .. " it stays readable however long it is."
       .. " An '(other: type your own answer)' entry is always appended (routed"
       .. " through vim.ui.input); without options: a free-text vim.ui.input"
       .. " prompt. content (optional) is displayed in a scratch split while"
@@ -2473,6 +2475,39 @@ return function(input, ctx)
     for _, w in ipairs(wins) do pcall(vim.api.nvim_win_close, w, true) end
     return result
   end
+
+  -- The question itself, in a float above the picker. A picker's title/prompt
+  -- is one truncated line, and the transcript copy of the question is hidden
+  -- under a full-screen picker — so the question is rendered here, wrapped,
+  -- for every path below (snacks picker, vim.ui.select, free-text input).
+  -- zindex 150: Snacks.win.zindex() counts up from 50 and ignores windows at
+  -- or above its max of 100, so this stays on top without pushing picker
+  -- zindexes higher (verified in snacks.nvim lua/snacks/win.lua M.zindex).
+  pcall(function()
+    local qlines = capped_lines(question)
+    local width = math.max(1, math.min(100, vim.o.columns - 4))
+    local rows = 0
+    for _, l in ipairs(qlines) do
+      rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / width))
+    end
+    local height = math.max(1, math.min(rows, math.max(1, math.floor(vim.o.lines / 3))))
+    local qwin = vim.api.nvim_open_win(scratch_buf(qlines), false, {
+      relative = "editor",
+      row = 0,
+      col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+      width = width,
+      height = height,
+      style = "minimal",
+      border = "rounded",
+      focusable = false,
+      noautocmd = true,
+      zindex = 150,
+    })
+    wins[#wins + 1] = qwin
+    vim.wo[qwin].wrap = true
+    vim.wo[qwin].linebreak = true
+    vim.cmd("redraw")
+  end)
 
   -- Optional content split, shown while the question is up (same pattern as
   -- the confirm diff preview) and closed as soon as the user answers.
@@ -2647,7 +2682,9 @@ end
       .. " keeping every later edit applied (git-revert semantics on an undo"
       .. " block: strict patch, refuses with a conflict message if later"
       .. " changes overlap it, and refuses if the buffer has unsaved user"
-      .. " changes). After any change the buffer is saved to disk."
+      .. " changes). Write modes refuse when the file changed on disk or a"
+      .. " sibling session edited the buffer — re-inspect history before"
+      .. " rewinding. After any change the buffer is saved to disk."
       .. " Parameters: path (required); history (optional boolean); steps"
       .. " (optional); to_seq (optional); revert_seq (optional).",
     input_schema = {
@@ -2697,6 +2734,28 @@ return function(input, ctx)
       name, t.seq_cur))
     lines[#lines + 1] = "(to_seq=N jumps to a state; revert_seq=N surgically reverts just that edit)"
     return table.concat(lines, "\n")
+  end
+
+  -- Concurrent-editor checks (write modes only — listing history above stays
+  -- read-only under a conflict). no_reload always: a reload would mutate the
+  -- very undo tree this tool navigates, and error-first semantics mean there
+  -- is nothing to reload for. Errors are returned strings, per convention.
+  local registry = require("straps.registry")
+  local st, rerr = registry.call("fn.reconcile_buf", buf, { no_reload = true })
+  if st == nil then
+    return name .. " " .. tostring(rerr) .. " — another agent or external"
+      .. " process is editing this file; its undo tree does not include that change"
+  end
+  local wok, werr = registry.call("fn.check_writer", ctx and ctx.bufnr, buf)
+  if wok == nil then
+    local stamp = vim.b[buf].straps_last_writer
+    local who = "session " .. tostring(type(stamp) == "table" and stamp.session or "?")
+    if type(stamp) == "table" and type(stamp.task) == "string" and stamp.task ~= "" then
+      who = who .. ', task: "' .. stamp.task .. '"'
+    end
+    return name .. ": another session (" .. who .. ") has edited this buffer"
+      .. " since this session last read it — its states are in the undo tree;"
+      .. " re-read the file and re-inspect history=true before rewinding"
   end
 
   -- revert_seq: surgically reverse ONE undo block, keeping later edits.
@@ -2853,6 +2912,7 @@ return function(input, ctx)
       end)
     end)
     if not oka then return "undo_edit: failed to apply the revert: " .. tostring(aerr) end
+    registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, true)
     return string.format(
       "%s: surgically reverted seq %d (%d hunk%s), later edits kept, saved —"
         .. " the revert is itself one undo block (u reverts it)",
@@ -2884,6 +2944,7 @@ return function(input, ctx)
       "%s: nothing changed (already at seq %d — history=true shows the states)",
       name, before)
   end
+  registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, true)
   return string.format(
     "%s: moved from seq %d to seq %d and saved — redo by calling again with to_seq=%d",
     name, before, after, before)

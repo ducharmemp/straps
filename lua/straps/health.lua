@@ -321,12 +321,23 @@ local function check_model()
   else
     health.ok(("effort: %s  (thinking style: %s)"):format(effort, tostring(tag)))
   end
-  local mt = tonumber(cfg.max_tokens) or 0
-  if mt <= 0 then
-    health.warn("config.max_tokens is not a positive number")
+  -- max_tokens is nil by default (per-model max output, else default_max_tokens);
+  -- that is the healthy state, not a warning. A value set explicitly is a hard
+  -- cap and must be a positive number.
+  local turns_info = "max_turns: " .. tostring(cfg.max_turns)
+    .. ", stall_limit: " .. tostring(cfg.stall_limit)
+  if cfg.max_tokens == nil then
+    local model_max
+    for _, m in ipairs(cfg.models or {}) do
+      if m.id == model then model_max = tonumber(m.max_output) end
+    end
+    local source = model_max and ("model max " .. model_max)
+      or ("default_max_tokens " .. tostring(cfg.default_max_tokens))
+    health.ok("max_tokens: auto (" .. source .. "), " .. turns_info)
+  elseif (tonumber(cfg.max_tokens) or 0) <= 0 then
+    health.warn("config.max_tokens is set but not a positive number")
   else
-    health.ok("max_tokens: " .. mt .. ", max_turns: " .. tostring(cfg.max_turns)
-      .. ", stall_limit: " .. tostring(cfg.stall_limit))
+    health.ok("max_tokens: " .. cfg.max_tokens .. " (explicit cap), " .. turns_info)
   end
 end
 

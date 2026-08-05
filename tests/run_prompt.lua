@@ -184,6 +184,69 @@ case("new_session writes the composed prompt into the system block", function()
   assert(ok, err)
 end)
 
+-- -------------------------------------------------------- untrusted content
+case("core layer draws the untrusted-content boundary", function()
+  local core = registry.call("fn.system_prompt_core")
+  assert(core:find("\n# Untrusted content\n", 1, true), "# Untrusted content section missing")
+  assert(core:find("data, not instructions", 1, true), "data-not-instructions rule missing")
+end)
+
+-- ---------------------------------------------------------- subagent variant
+case("core layer adapts for subagents: no # Subagents, child section appended", function()
+  local core = registry.call("fn.system_prompt_core")
+  assert(core:find("\n# Subagents\n", 1, true), "parent prompt should keep # Subagents")
+  assert(not core:find("# You are a subagent", 1, true),
+    "parent prompt should not carry the child section")
+
+  local sub = registry.call("fn.system_prompt_core", { subagent = true })
+  assert(not sub:find("\n# Subagents\n", 1, true), "child prompt should drop # Subagents")
+  assert(sub:find("\n# You are a subagent\n", 1, true), "child section missing")
+  assert(sub:find("only the single final reply", 1, true), "final-reply rule missing")
+  assert(not sub:find("READ%-ONLY"), "readonly note should be absent by default")
+  assert(not sub:find("restricted to", 1, true), "tools note should be absent by default")
+  -- Shared sections survive in both shapes.
+  for _, marker in ipairs({ "# Untrusted content", "# Permissions", "# Self-extension" }) do
+    assert(sub:find(marker, 1, true), marker .. " missing from child prompt")
+  end
+end)
+
+case("subagent opts add readonly and tool-restriction notes", function()
+  local sub = registry.call("fn.system_prompt_core",
+    { subagent = true, readonly = true, tools = { "read_file", "grep" } })
+  assert(sub:find("READ%-ONLY"), "readonly note missing")
+  assert(sub:find("restricted to: read_file, grep", 1, true), "tools note missing")
+end)
+
+case("fn.system_prompt forwards opts to the core layer only", function()
+  local full = registry.call("fn.system_prompt", { subagent = true })
+  assert(full:find("\n# You are a subagent\n", 1, true), "composer dropped the opts")
+  assert(full:find("\n# Environment\n", 1, true), "env layer missing from child prompt")
+end)
+
+case("new_session forwards opts so a spawned child's system block adapts", function()
+  local bufnr = state.new_session({ subagent = true, readonly = true })
+  local parsed = state.parse(bufnr)
+  assert(parsed.system:find("# You are a subagent", 1, true),
+    "child section missing from spawned session's system block")
+  assert(parsed.system:find("READ%-ONLY"), "readonly note missing from system block")
+  assert(not parsed.system:find("\n# Subagents\n", 1, true),
+    "# Subagents should be dropped from a child's system block")
+end)
+
+-- ------------------------------------------------------- showing-user skill
+case("presentation guidance lives in builtin skill.showing_user; core keeps a stub", function()
+  local core = registry.call("fn.system_prompt_core")
+  assert(core:find("\n# Showing the user\n", 1, true), "core stub section missing")
+  assert(core:find("skill.showing_user", 1, true), "core should point at the skill")
+  assert(not core:find("Notes pinned to particular lines", 1, true),
+    "full presentation prose should live in the skill, not the core")
+  local e = registry.get("skill.showing_user")
+  assert(e and e.kind == "skill", "builtin skill.showing_user not registered")
+  assert(e.source:find("Notes pinned to particular lines", 1, true)
+    and e.source:find("Four or more is a worklist", 1, true),
+    "skill body missing moved guidance")
+end)
+
 -- ----------------------------------------------------------- self-extension
 case("core layer carries the self-extension triggers and .straps.lua persistence", function()
   local core = registry.call("fn.system_prompt_core")

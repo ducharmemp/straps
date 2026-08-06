@@ -232,7 +232,7 @@ local PARALLEL_READONLY = {
   implementation = true, references = true,
   symbols = true, read_symbol = true, tree_sitter_status = true, node_at = true,
   read_node = true, hover = true, workspace_symbols = true,
-  context = true, help_search = true, agents = true,
+  context = true, help_search = true, agents = true, models = true,
 }
 
 local function all_parallel_readonly(blocks)
@@ -327,6 +327,10 @@ local function run_turns(bufnr, ctx, run)
   for turn = 1, max_turns do
     run.turns = turn
     drain_steering(bufnr) -- queued steering becomes user blocks before parse
+    -- Per-turn seam, before the parse that builds this turn's request: the
+    -- default notice tells the agent which model/effort it is running on and
+    -- re-announces a mid-run switch (the pickers write vim.b between turns).
+    registry.try_call("hook.on_turn_start", ctx, turn)
     -- Auto-compaction (off unless a threshold is set): the loop is about to
     -- read the whole buffer anyway, so the size check is cheap. Every compaction
     -- rewrites old message blocks, which invalidates the messages cache tier

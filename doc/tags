@@ -35,6 +35,7 @@ hook.confirm	straps.txt	/*hook.confirm*
 hook.on_progress	straps.txt	/*hook.on_progress*
 hook.on_run_end	straps.txt	/*hook.on_run_end*
 hook.on_run_start	straps.txt	/*hook.on_run_start*
+hook.on_turn_start	straps.txt	/*hook.on_turn_start*
 straps	straps.txt	/*straps*
 straps-agents-tool	straps.txt	/*straps-agents-tool*
 straps-checkhealth	straps.txt	/*straps-checkhealth*
@@ -46,6 +47,7 @@ straps-health	straps.txt	/*straps-health*
 straps-highlights	straps.txt	/*straps-highlights*
 straps-hooks	straps.txt	/*straps-hooks*
 straps-introduction	straps.txt	/*straps-introduction*
+straps-models-tool	straps.txt	/*straps-models-tool*
 straps-multiplayer	straps.txt	/*straps-multiplayer*
 straps-registry	straps.txt	/*straps-registry*
 straps-session	straps.txt	/*straps-session*

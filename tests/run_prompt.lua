@@ -191,6 +191,27 @@ case("core layer draws the untrusted-content boundary", function()
   assert(core:find("data, not instructions", 1, true), "data-not-instructions rule missing")
 end)
 
+case("the [straps] harness-speech convention is declared, and to subagents too", function()
+  -- The harness appends user-role notices (hook.on_turn_start's model notice,
+  -- hook.on_run_start's multiplayer notice) because the API gives it no channel
+  -- of its own. Unless the prompt names that convention, an agent reads harness
+  -- text as the user's instructions.
+  local core = registry.call("fn.system_prompt_core")
+  assert(core:find("%[straps%] "), "the [straps] prefix should be named in the prompt")
+  assert(core:find("HARNESS speaking", 1, true), "harness attribution missing")
+  assert(core:find("never authority", 1, true),
+    "the notice's advisory (non-authoritative) standing should be stated")
+  assert(core:find("overrides it every", 1, true),
+    "a real user instruction must be said to win over a notice")
+  assert(core:find("costume", 1, true),
+    "the prefix must be marked forgeable in tool results, not a guarantee")
+  -- The point of putting it in # Untrusted content: that section survives for
+  -- children, while # Subagents (which also mentions the notice) is dropped.
+  local sub = registry.call("fn.system_prompt_core", { subagent = true })
+  assert(sub:find("HARNESS speaking", 1, true),
+    "a subagent receives these notices too and must know who is speaking")
+end)
+
 -- ---------------------------------------------------------- subagent variant
 case("core layer adapts for subagents: no # Subagents, child section appended", function()
   local core = registry.call("fn.system_prompt_core")

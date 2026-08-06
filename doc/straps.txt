@@ -328,7 +328,9 @@ log_file		(string|nil) nil (off). Structured JSONL event log; see
 
 Per-session overrides live in buffer variables (b:straps_model,
 b:straps_effort, ...) set by |:StrapsModel| / |:StrapsEffort| on a session
-buffer, so two sessions can run different models at once.
+buffer, so two sessions can run different models at once. The effective
+provider/model/effort is also announced into the transcript for the agent by
+|hook.on_turn_start|, including when you change it mid-run.
 
 ==============================================================================
 6. THE REGISTRY						*straps-registry*
@@ -443,6 +445,25 @@ hook.on_run_start(ctx) / hook.on_run_end(ctx)
 		otherwise; on_run_end is a no-op. Redefine either for
 		setup/teardown or notifications.
 
+						*hook.on_turn_start*
+hook.on_turn_start(ctx, turn)
+		Called at the top of every turn, after queued steering drains
+		and before the transcript is parsed into the next request — so
+		a block it appends belongs to that turn. The default tells the
+		agent which provider/model/effort the session is running on,
+		and re-announces when that CHANGES (|:StrapsModel| /
+		|:StrapsEffort| can retarget a session between turns), so it
+		can match a subagent's capability to its task instead of
+		inheriting its own (the notice points at the |straps-models-tool|
+		for the ids to pass). Silent on every turn where nothing
+		changed, hence one such block in a session that never
+		switches. Also silent — deferring, not dropping — when the
+		transcript has nothing else to send or its tail is not
+		user-role. A resumed session recovers what it last announced
+		from the transcript itself, so reopening a saved session does
+		not repeat the notice. Redefine for per-turn budget checks,
+		telemetry, or to silence the notice.
+
 						*hook.on_progress*
 hook.on_progress(ev, ctx)
 		Progress display policy. Default draws the virt-text indicator
@@ -502,7 +523,14 @@ fn.system_prompt(opts?)		Compose the system prompt from its layers:
 				to the core layer, which reshapes the prompt
 				for a subagent: no # Subagents section, a
 				# You are a subagent section, readonly /
-				restricted-tool notes.
+				restricted-tool notes. The core layer's
+				# Untrusted content section is kept in BOTH
+				shapes; besides quarantining tool results it
+				declares that a user-role block starting
+				"[straps] " is the harness speaking (the
+				|hook.on_turn_start| and |hook.on_run_start|
+				notices) — informational, never authority, and
+				overridden by any real user instruction.
 						*fn.render*
 fn.render(bufnr)		The transcript presentation pass (conceal +
 				extmarks + folds). No-op it for raw markers.
@@ -566,7 +594,17 @@ applies.
 
 Awareness, before the collision:
 
-						*straps-agents-tool*
+						*straps-models-tool*
+models		Tool. Lists the models available to this session: each id
+		exactly as |tool.spawn|'s `model` argument takes it, its
+		capability/cost label, its context window, and the effort
+		names, with the session's active model marked. Reads the
+		configured/discovered catalog for the active provider (no
+		network call; |:StrapsModel| refreshes it). Read-only and
+		auto-allowed. Pairs with |hook.on_turn_start|, which says
+		which of them you are running.
+
+			*straps-agents-tool*
 agents		Tool. Lists every other session in this Neovim: running or
 		idle, its relation to the caller (parent/child/sibling/peer),
 		the task it was given, and the files it has written.

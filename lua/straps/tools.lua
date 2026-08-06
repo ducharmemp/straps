@@ -2702,6 +2702,88 @@ end
 ]==],
   })
 
+  -- ------------------------------------------------------------------ models
+
+  -- The other half of model awareness. hook.on_turn_start tells an agent what
+  -- it IS running; without a catalog it still cannot choose a subagent's model,
+  -- because a model id has to be produced exactly and a wrong guess 400s the
+  -- child's first request. The capability labels in config.models were written
+  -- for precisely this comparison and had no reader until now.
+  define({
+    name = "tool.models",
+    kind = "tool",
+    doc = "List the models available to this session, so a subagent's model is"
+      .. " a choice rather than an inherited default. Returns each model's id"
+      .. " (what spawn's `model` argument takes, exactly), its label — which"
+      .. " carries the capability/cost hint, e.g. 'most capable, slowest' vs"
+      .. " 'fastest, cheapest' — and its context window, plus the effort names"
+      .. " spawn's `effort` argument accepts. The session's active model is"
+      .. " marked. Call it before fanning out work: mechanical children"
+      .. " (searching, collecting, reformatting) belong on a cheap fast model,"
+      .. " judgment children on a strong one. Lists the configured and"
+      .. " previously discovered catalog for the ACTIVE provider (no network"
+      .. " call); :StrapsModel refreshes it from the provider's API."
+      .. " Read-only. No parameters.",
+    input_schema = {
+      type = "object",
+      properties = vim.empty_dict(),
+    },
+    source = [==[
+return function(input, ctx)
+  local ok_straps, straps = pcall(require, "straps")
+  if not ok_straps or type(straps) ~= "table" or type(straps.config) ~= "table" then
+    return "straps config not available"
+  end
+  local cfg = straps.config
+
+  -- Resolve the session's own provider/model the same way fn.provider will, so
+  -- the marked entry is the one this session would actually send.
+  local info
+  pcall(function() info = require("straps.ui").session_info(ctx and ctx.bufnr) end)
+  local provider = (info and info.provider)
+    or (cfg.provider ~= "" and cfg.provider)
+    or require("straps.registry").try_call("fn.provider_pref")
+    or "anthropic"
+  local current = info and info.model
+
+  local list = cfg[provider == "openai" and "openai_models" or "models"]
+  if type(list) ~= "table" or #list == 0 then
+    return "no models configured for provider " .. tostring(provider)
+      .. " (run :StrapsModel to discover the account's catalog)"
+  end
+
+  local lines = { ("models available to this session (provider: %s)"):format(provider) }
+  for _, m in ipairs(list) do
+    if type(m) == "table" and type(m.id) == "string" then
+      local parts = { ("  %s%s"):format(m.id == current and "* " or "  ", m.id) }
+      if type(m.label) == "string" and m.label ~= "" and m.label ~= m.id then
+        parts[#parts + 1] = m.label
+      end
+      local ctx_tokens = tonumber(m.context)
+      if ctx_tokens then
+        parts[#parts + 1] = ("context %dk"):format(math.floor(ctx_tokens / 1000))
+      end
+      lines[#lines + 1] = table.concat(parts, "  ·  ")
+    end
+  end
+  lines[#lines + 1] = "(* = this session's active model)"
+
+  local efforts = {}
+  if type(cfg.efforts) == "table" then
+    for _, e in ipairs(cfg.efforts) do
+      if type(e) == "table" and type(e.name) == "string" then efforts[#efforts + 1] = e.name end
+    end
+  end
+  if #efforts > 0 then
+    lines[#lines + 1] = "effort names: " .. table.concat(efforts, ", ")
+      .. ((info and info.effort) and ("  (this session: " .. info.effort .. ")") or "")
+  end
+  lines[#lines + 1] = "Pass an id verbatim as spawn's `model`, and an effort name as"
+    .. " `effort`; omitting them copies this session's."
+  return table.concat(lines, "\n")
+end
+]==],
+  })
   -- -------------------------------------------------------- fn.readonly_policy
 
   -- Single source of truth for "which tool calls are read-only". Both the
@@ -2733,6 +2815,8 @@ return function(name, input)
     help_search = true,
     -- agents only lists other sessions' buffer-local state; it changes nothing.
     agents = true,
+    -- models reads the configured catalog (no network, no writes).
+    models = true,
     -- presentation tools: they open views / set the findings list but change
     -- no files, exactly like show_user.
     show_diff = true, show_buffer = true, set_findings = true,
@@ -3149,9 +3233,8 @@ end
       .. " (it can then call the agents tool and load skill.multiplayer)."
       .. " Silent when no peer is running, when the same peer set was already"
       .. " announced to this session, and when the transcript has nothing else"
-      .. " to send — so a solo session's transcript is byte-identical to one"
-      .. " with no hook at all. Redefine for setup, notifications, or per-run"
-      .. " state.",
+      .. " to send — so a solo session gets no multiplayer notice at all."
+      .. " Redefine for setup, notifications, or per-run state.",
     source = [==[
 return function(ctx)
   local bufnr = ctx and ctx.bufnr
@@ -3192,6 +3275,121 @@ return function(ctx)
       .. " touched, and load skill.multiplayer before editing anything they"
       .. " might be in."):format(#live, table.concat(who, ", ")))
   pcall(function() vim.b[bufnr].straps_peers_noted = sig end)
+end
+]==],
+  })
+
+  -- ------------------------------------------------------ hook.on_turn_start
+
+  -- Model self-awareness. The winbar has always shown the user which model a
+  -- session runs on; the agent itself had no way to know. It cannot live in the
+  -- system prompt: that block is composed ONCE at session creation
+  -- (state.new_session), so :StrapsModel / :StrapsEffort mid-session would make
+  -- it a lie — and tool.spawn composes a child's prompt BEFORE stamping the
+  -- child's model, so a static line would name the wrong model for every
+  -- subagent. Hence a transcript notice, on the multiplayer-notice pattern:
+  -- append when it changes, stay silent when it does not.
+  define({
+    name = "hook.on_turn_start",
+    kind = "hook",
+    doc = "Called as (ctx, turn) at the top of every turn, before the"
+      .. " transcript is parsed for the next request. Default behavior: tell"
+      .. " the agent which provider/model/effort it is running on, and"
+      .. " re-announce when that CHANGES mid-session (the :StrapsModel /"
+      .. " :StrapsEffort pickers can retarget a session between turns) — so an"
+      .. " agent can match a subagent's capability to its task instead of"
+      .. " defaulting to its own. Silent on every turn where the effective"
+      .. " provider/model/effort is unchanged, so a session that never"
+      .. " switches models carries exactly one such block. Also silent when"
+      .. " the transcript has nothing else to send, and when its tail is not"
+      .. " user-role (appending there would mask the loop's 'last turn added"
+      .. " nothing to respond to' diagnostic); both defer the notice rather"
+      .. " than dropping it. Redefine for per-turn budget checks, telemetry,"
+      .. " or to silence the notice.",
+    source = [==[
+return function(ctx, turn)
+  local bufnr = ctx and ctx.bufnr
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then return end
+  local state = require("straps.state")
+
+  -- ui.session_info resolves the vim.b-override -> global-config chain for
+  -- provider/model/effort (the same chain fn.provider uses to build the
+  -- request), and returns nil for a non-session buffer.
+  local ok_info, info = pcall(function() return require("straps.ui").session_info(bufnr) end)
+  if not ok_info or type(info) ~= "table" then return end
+
+  -- The signature IS the description: "provider|model|effort" renders the old
+  -- side of a change notice without a second stored variable.
+  local sig = table.concat({ info.provider, info.model, info.effort }, "|")
+  local prev
+  pcall(function() prev = vim.b[bufnr].straps_model_noted end)
+  if prev == sig then return end -- the common case: no parse, no append
+
+  -- Guard, as in hook.on_run_start: a notice must never be the ONLY thing in
+  -- the request, or it defeats the loop's "nothing to send" guard and spends a
+  -- real API call announcing the model to no purpose.
+  local ok_parsed, parsed = pcall(state.parse, bufnr)
+  if not ok_parsed or not parsed or #parsed.messages == 0 then return end
+  -- And it must not turn an assistant-role tail into a user-role one: the loop
+  -- diagnoses that tail as "the last turn added nothing to respond to", and a
+  -- notice appended over it would convert a caught error into a wasted round
+  -- trip. Like the guard above, this one does NOT record the signature, so the
+  -- notice is deferred to a turn that can carry it, not lost.
+  if parsed.messages[#parsed.messages].role ~= "user" then return end
+
+  -- Resume: vim.b dies with the buffer, but the notice is persisted in the
+  -- session file — so a reopened transcript would announce a second, identical
+  -- time, once per resume, forever. The transcript is the canonical state
+  -- (DESIGN.md's first invariant), so recover the last announced signature FROM
+  -- it when vim.b has none. Both notice shapes end in the same
+  -- "<model> · provider <p> · effort <e>" triple; the change shape carries it
+  -- after the final "-> ", and the first shape may render the model as
+  -- "<label> (<id>)", whose id is the last parenthesized group.
+  if prev == nil then
+    local last
+    for _, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)) do
+      if line:find("^%[straps%] Model") then last = line end
+    end
+    if last then
+      local body = last:match("%-> (.*)$") or last:match("^%[straps%] Model: (.*)$") or ""
+      local m, p, e = body:match("^(.-) · provider (%S+) · effort ([^%s.]+)%.")
+      if m then
+        m = m:match("^.*%s%((.-)%)$") or m -- "<label> (<id>)" -> id
+        prev = table.concat({ p, m, e }, "|")
+        pcall(function() vim.b[bufnr].straps_model_noted = prev end)
+        if prev == sig then return end -- already announced, before this resume
+      end
+    end
+  end
+
+  -- Anchor the OUTER fields and let the model absorb the middle: a custom or
+  -- proxied model id may itself contain the "|" delimiter, and a non-greedy
+  -- split would then report the wrong text on the old side of a change notice.
+  local function describe(s)
+    local p, m, e = s:match("^([^|]*)|(.*)|([^|]*)$")
+    if not m then return s end
+    return ("%s · provider %s · effort %s"):format(m, p, e)
+  end
+
+  local text
+  if prev == nil then
+    local shown = info.model_label ~= info.model
+      and ("%s (%s)"):format(info.model_label, info.model) or info.model
+    text = ("[straps] Model: %s · provider %s · effort %s."):format(
+      shown, info.provider, info.effort)
+  else
+    text = ("[straps] Model changed mid-session: %s -> %s."):format(
+      describe(prev), describe(sig))
+  end
+  -- Carried in the notice, not only in the prompt's # Subagents section: that
+  -- section is dropped for subagents, so a nested spawner would never read it.
+  text = text .. " Subagents inherit this model and effort unless you pass"
+    .. " spawn an explicit model / effort — call the models tool for the ids"
+    .. " you can pass, and match the child's capability to its task rather"
+    .. " than defaulting to your own."
+  pcall(state.append, bufnr, "user", nil, text)
+  pcall(function() vim.b[bufnr].straps_model_noted = sig end)
+  return nil
 end
 ]==],
   })

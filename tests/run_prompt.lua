@@ -192,10 +192,10 @@ case("core layer draws the untrusted-content boundary", function()
 end)
 
 case("the [straps] harness-speech convention is declared, and to subagents too", function()
-  -- The harness appends user-role notices (hook.on_turn_start's model notice,
-  -- hook.on_run_start's multiplayer notice) because the API gives it no channel
-  -- of its own. Unless the prompt names that convention, an agent reads harness
-  -- text as the user's instructions.
+  -- The harness appends user-role notices (hook.on_run_start's multiplayer
+  -- notice) because the API gives it no channel of its own. Unless the prompt
+  -- names that convention, an agent reads harness text as the user's
+  -- instructions.
   local core = registry.call("fn.system_prompt_core")
   assert(core:find("%[straps%] "), "the [straps] prefix should be named in the prompt")
   assert(core:find("HARNESS speaking", 1, true), "harness attribution missing")

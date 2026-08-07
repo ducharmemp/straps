@@ -20,6 +20,7 @@ fn.build_tools	straps.txt	/*fn.build_tools*
 fn.compact	straps.txt	/*fn.compact*
 fn.list_models	straps.txt	/*fn.list_models*
 fn.log	straps.txt	/*fn.log*
+fn.model_note	straps.txt	/*fn.model_note*
 fn.openai_api_key	straps.txt	/*fn.openai_api_key*
 fn.provider	straps.txt	/*fn.provider*
 fn.provider_anthropic	straps.txt	/*fn.provider_anthropic*

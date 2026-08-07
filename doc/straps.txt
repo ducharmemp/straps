@@ -329,8 +329,9 @@ log_file		(string|nil) nil (off). Structured JSONL event log; see
 Per-session overrides live in buffer variables (b:straps_model,
 b:straps_effort, ...) set by |:StrapsModel| / |:StrapsEffort| on a session
 buffer, so two sessions can run different models at once. The effective
-provider/model/effort is also announced into the transcript for the agent by
-|hook.on_turn_start|, including when you change it mid-run.
+provider/model/effort is also told to the agent by |fn.model_note|, a
+"# Model" section appended to each request's system text (never to the
+transcript), so a mid-run change is reflected on the next turn.
 
 ==============================================================================
 6. THE REGISTRY						*straps-registry*
@@ -449,20 +450,22 @@ hook.on_run_start(ctx) / hook.on_run_end(ctx)
 hook.on_turn_start(ctx, turn)
 		Called at the top of every turn, after queued steering drains
 		and before the transcript is parsed into the next request — so
-		a block it appends belongs to that turn. The default tells the
-		agent which provider/model/effort the session is running on,
-		and re-announces when that CHANGES (|:StrapsModel| /
-		|:StrapsEffort| can retarget a session between turns), so it
-		can match a subagent's capability to its task instead of
-		inheriting its own (the notice points at the |straps-models-tool|
-		for the ids to pass). Silent on every turn where nothing
-		changed, hence one such block in a session that never
-		switches. Also silent — deferring, not dropping — when the
-		transcript has nothing else to send or its tail is not
-		user-role. A resumed session recovers what it last announced
-		from the transcript itself, so reopening a saved session does
-		not repeat the notice. Redefine for per-turn budget checks,
-		telemetry, or to silence the notice.
+		a block it appends belongs to that turn. No-op by default;
+		redefine for per-turn budget checks or telemetry.
+
+						*fn.model_note*
+fn.model_note(ctx)
+		Called each turn by the loop after the transcript is parsed;
+		the returned "# Model" section is appended to THAT REQUEST's
+		system text (never to the transcript), naming the session's
+		effective provider/model/effort so the agent can match a
+		subagent's capability to its task instead of inheriting its
+		own (the note points at the |straps-models-tool| for the ids
+		to pass). Resolved fresh per request, so |:StrapsModel| /
+		|:StrapsEffort| retargeting mid-run is reflected on the next
+		turn. Returns nil for a non-session buffer; the loop
+		pcall-wraps the call, so a broken redefinition degrades to a
+		note-less request. Redefine to reshape or silence it.
 
 						*hook.on_progress*
 hook.on_progress(ev, ctx)
@@ -528,8 +531,8 @@ fn.system_prompt(opts?)		Compose the system prompt from its layers:
 				shapes; besides quarantining tool results it
 				declares that a user-role block starting
 				"[straps] " is the harness speaking (the
-				|hook.on_turn_start| and |hook.on_run_start|
-				notices) — informational, never authority, and
+				|hook.on_run_start| multiplayer notice) —
+				informational, never authority, and
 				overridden by any real user instruction.
 						*fn.render*
 fn.render(bufnr)		The transcript presentation pass (conceal +
@@ -601,7 +604,7 @@ models		Tool. Lists the models available to this session: each id
 		names, with the session's active model marked. Reads the
 		configured/discovered catalog for the active provider (no
 		network call; |:StrapsModel| refreshes it). Read-only and
-		auto-allowed. Pairs with |hook.on_turn_start|, which says
+		auto-allowed. Pairs with |fn.model_note|, which says
 		which of them you are running.
 
 			*straps-agents-tool*

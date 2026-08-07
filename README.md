@@ -231,19 +231,16 @@ never a wash or a background tint:
 
 #### Navigating a session
 
-A long session is a long buffer, so it folds at **two scales** and carries two
-navigation mappings. Nothing here is a new mode — it is ordinary vim motions
-and folds over the ordinary transcript buffer.
+A long session is a long buffer, so tool machinery folds away and two
+navigation mappings step through the conversation. Nothing here is a new
+mode — it is ordinary vim motions and folds over the ordinary transcript
+buffer.
 
-- **Level 1 is the conversation.** Each `user` / `assistant` marker opens a
-  fold that runs to the next turn, swallowing the tool calls that turn made.
-  `zM` collapses the whole session to one line per exchange —
-  `▸ you  fix the fold levels · 3 tools · 41 lines` — the role tag colored,
-  the gist of what was said dim. `zR` opens everything again.
-- **Level 2 is the machinery** nested inside a turn: each `tool_use` +
-  `tool_result` pair, and the (long, rarely re-read) system block. The default
-  `foldlevel = 1` shows the conversation with tool calls collapsed; `zo` on one
-  opens the full call.
+- **Only the machinery folds**: each `tool_use` + `tool_result` pair, and the
+  (long, rarely re-read) system block. The default `foldlevel = 0` shows the
+  conversation with tool calls collapsed; `zo` on one opens the full call,
+  `zR` opens everything, `zM` closes the tool calls again. Conversation turns
+  never fold, so closing a fold never hides an exchange.
 - `]]` / `[[` jump to the next / previous turn, counts included (`3]]`), and
   push the jumplist so `ctrl-o` comes back. Tool blocks are never targets — the
   motion steps through the conversation, not the machinery.
@@ -280,7 +277,7 @@ Two knobs, both under `setup{}`:
 - `render = true` — master switch. `false` skips the rendering wiring
   entirely: you get the raw markers.
 - `tools_expanded = false` — set `true` to fold tool calls open by default
-  (`foldlevel = 99` instead of the default `1`).
+  (`foldlevel = 99` instead of the default `0`).
 
 **Getting the raw markers back** without disabling anything: `:set
 conceallevel=0` in the session window reveals the real marker lines under the
@@ -619,13 +616,12 @@ session that diverges from the global default); set `config.session_winbar =
 false` to hide it, or drop `%{%v:lua.require'straps.ui'.session_status()%}`
 into your own statusline.
 
-**The agent is told too.** The winbar informs *you*; `hook.on_turn_start`
-informs the model. At the top of each turn it appends one user block naming the
-session's effective provider/model/effort — and re-announces when you retarget
-a session mid-run with the pickers, since the value can change between turns.
-It is silent on every turn where nothing changed, so a session that never
-switches models carries exactly one such block — and a session you reopen later
-recovers what it already announced from the transcript rather than repeating it.
+**The agent is told too.** The winbar informs *you*; `fn.model_note` informs
+the model. Each turn, the loop appends a `# Model` section to that request's
+system text naming the session's effective provider/model/effort — resolved
+fresh per request, so retargeting a session mid-run with the pickers is
+reflected on the very next turn. The note rides the request only: it is never
+written into the transcript, so the buffer stays exactly the conversation.
 
 Knowing its own model is half the decision; the **`models` tool** is the other
 half. It lists the active provider's catalog — each id exactly as `spawn`'s
@@ -635,7 +631,7 @@ effort names — marking the session's active model. Without it an agent has to
 recall an id from training data, and a wrong guess is a 400 on the child's first
 request. Read-only and auto-allowed; it reads the configured/discovered catalog
 rather than making a network call, so `:StrapsModel` is still what refreshes it. This exists because a model
-that cannot see its own capability cannot choose a subagent's: the notice also
+that cannot see its own capability cannot choose a subagent's: the note also
 carries the reminder that `spawn` inherits the parent's model and effort unless
 given explicit ones, so mechanical work can go to a cheaper child. A static
 prompt line could not do this job — the system block is written once at session
@@ -1103,7 +1099,7 @@ for context that isn't tied to one option.
 | `auto_compact_tokens` | unset | When set, the loop runs `fn.compact` near this estimated token count (bytes ÷ ~3.5), with a growth guard so it fires coarsely rather than every turn. Set it near your model's context window. Unset = off. |
 | `auto_compact_bytes` | unset | Raw-size alternative to `auto_compact_tokens`: compact when the transcript exceeds this many bytes. Unset = off: automatic history rewriting is opt-in. |
 | `render` | `true` | Transcript rendering (`fn.render`): a display-only conceal + extmark + fold layer that gives each block a categorical colored mark and collapses tool calls to a one-line summary. Buffer text, `modified`, parse and persist are never touched. `false` skips the wiring (raw markers). See [Rendering](#rendering). |
-| `tools_expanded` | `false` | Fold `tool_use`/`tool_result` blocks open by default when `true` (`foldlevel = 99`); otherwise the default `foldlevel = 1` keeps them closed with the conversation open. See [Navigating a session](#navigating-a-session). |
+| `tools_expanded` | `false` | Fold `tool_use`/`tool_result` blocks open by default when `true` (`foldlevel = 99`); otherwise the default `foldlevel = 0` keeps them closed (conversation turns never fold). See [Navigating a session](#navigating-a-session). |
 | `session_winbar` | `true` | Show a window-local winbar on each session window with the active model/effort (per-buffer override else global) and run status. `false` hides it; `ui.session_status()` / `ui.session_winbar()` stay usable in a manual statusline either way. |
 
 ## Security
@@ -1226,9 +1222,10 @@ Those readouts tell *you* who is working. The agents get the same picture:
   appends to a transcript that has nothing else to send — so a session working
   alone gets no multiplayer notice at all. Redefine it to change or silence the
   notice.
-- **`hook.on_turn_start`** is the same idea for a session's own configuration
-  rather than its neighbours: once per turn, it tells the agent which
-  provider/model/effort it is running on and re-announces a mid-run switch. See
+- **`fn.model_note`** is the same idea for a session's own configuration
+  rather than its neighbours, but it rides the request instead of the
+  transcript: each turn the loop appends its `# Model` section to that
+  request's system text, naming the effective provider/model/effort. See
   "Per-session model and effort" above.
 - **`skill.multiplayer`** carries the protocol the notice points at: re-read
   and reapply after a `modified by another agent` error, keep the read→write

@@ -365,66 +365,40 @@ case("foldexpr merges a tool_use/tool_result pair into one fold", function()
   })
   vim.wo[win].foldmethod = "expr"
   vim.wo[win].foldexpr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
-  vim.wo[win].foldlevel = 1 -- turns open, tool machinery closed (the default)
+  vim.wo[win].foldlevel = 0 -- tool machinery closed (the default)
   vim.cmd("normal! zx")
   -- The tool_result marker line belongs to the fold opened at the tool_use.
-  assert(vim.fn.foldlevel(LN.tool_use_ok) == 2, "tool_use should open a level-2 fold")
-  assert(vim.fn.foldlevel(LN.tool_result_ok) == 2, "tool_result should stay in the fold")
+  assert(vim.fn.foldlevel(LN.tool_use_ok) == 1, "tool_use should open a level-1 fold")
+  assert(vim.fn.foldlevel(LN.tool_result_ok) == 1, "tool_result should stay in the fold")
   assert(vim.fn.foldclosed(LN.tool_result_ok) == vim.fn.foldclosed(LN.tool_use_ok),
     "tool_use and tool_result are not in the same fold")
   assert(vim.fn.foldclosed(LN.tool_use_ok) == LN.tool_use_ok,
-    "at foldlevel 1 the tool call should be closed")
-  -- ... while the conversation itself stays open at the default level.
-  assert(vim.fn.foldclosed(LN.user_body) == -1, "user turn should be open at foldlevel 1")
+    "at the default foldlevel the tool call should be closed")
+  -- ... while the conversation itself never folds.
+  assert(vim.fn.foldlevel(LN.user_marker) == 0, "user marker must not open a fold")
+  assert(vim.fn.foldlevel(LN.assistant_marker) == 0, "assistant marker must not open a fold")
+  assert(vim.fn.foldclosed(LN.user_body) == -1, "user turn should never be folded")
+  -- zM must not swallow the conversation either: turns have no folds to close.
+  vim.cmd("normal! zM")
+  assert(vim.fn.foldclosed(LN.user_marker) == -1, "zM must not hide the conversation")
   vim.api.nvim_win_close(win, true)
 end)
 
--- Level 1 is the conversation, level 2 the machinery inside a turn: `zM`
--- (foldlevel=0) must collapse the whole session to one line per exchange.
-case("turns are level-1 folds: zM collapses the session to its exchanges", function()
-  local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor", width = 60, height = 20, row = 1, col = 1,
-  })
-  vim.wo[win].foldmethod = "expr"
-  vim.wo[win].foldexpr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
-  vim.wo[win].foldlevel = 0
-  vim.cmd("normal! zx")
-  assert(vim.fn.foldlevel(LN.user_marker) == 1, "user marker should open a level-1 fold")
-  assert(vim.fn.foldlevel(LN.assistant_marker) == 1, "assistant marker should open a level-1 fold")
-  assert(vim.fn.foldclosed(LN.user_marker) == LN.user_marker, "user turn should be closed at level 0")
-  -- An assistant turn OWNS the tool calls that follow it: same closed fold.
-  assert(vim.fn.foldclosed(LN.tool_use_ok) == LN.assistant_marker,
-    "tool calls should collapse into the assistant turn that made them")
-  assert(vim.fn.foldclosed(LN.tool_use_err) == LN.assistant_marker,
-    "every tool call of the turn belongs to it")
-  vim.api.nvim_win_close(win, true)
-end)
-
-case("a closed turn folds to role + headline + tool count", function()
-  local chunks = ui._fold_summary(buf, LN.user_marker)
-  local text, hls = "", {}
-  for _, c in ipairs(chunks) do text = text .. c[1]; hls[c[2]] = true end
-  assert(text:find("you", 1, true), "turn summary missing role label: " .. text)
-  assert(text:find("hello there", 1, true), "turn summary missing headline: " .. text)
-  assert(hls["StrapsRoleUser"], "role label should carry StrapsRoleUser")
-
-  local ac = ui._fold_summary(buf, LN.assistant_marker)
-  local atext = ""
-  for _, c in ipairs(ac) do atext = atext .. c[1] end
-  assert(atext:find("Cinch", 1, true), "assistant summary missing role label: " .. atext)
-  assert(atext:find("I'll run a command.", 1, true), "assistant summary missing headline: " .. atext)
-  assert(atext:find("2 tools", 1, true), "assistant summary should count its tool calls: " .. atext)
-end)
-
-case("headline prefers text typed on the marker line itself", function()
+case("outline headline prefers text typed on the marker line itself", function()
+  -- block_headline feeds M.outline (gO); turns no longer fold, so assert the
+  -- marker-line preference through the outline's loclist text.
   local b = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(b, 0, -1, false, {
     "%%[straps:user]%% typed on the marker", "body line",
   })
-  local text = ""
-  for _, c in ipairs(ui._fold_summary(b, 1)) do text = text .. c[1] end
+  vim.cmd("split")
+  local w = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(w, b)
+  assert(ui.outline(b) == 1, "expected one turn in the outline")
+  local text = vim.fn.getloclist(w)[1].text
   assert(text:find("typed on the marker", 1, true), "inline marker text should be the headline: " .. text)
   assert(not text:find("body line", 1, true), "body should not win over inline text: " .. text)
+  vim.api.nvim_win_close(w, true)
 end)
 
 case("system block folds to a labelled summary (not shown inline in full)", function()
@@ -442,16 +416,11 @@ case("system block folds to a labelled summary (not shown inline in full)", func
   assert(not text:find("⚙", 1, true), "system summary must not look like a tool call")
   -- foldexpr reads the current buffer via getline(), so make it current
   vim.api.nvim_set_current_buf(buf)
-  assert(ui.foldexpr(1) == ">2", "system marker should open a nested (level-2) fold")
-  assert(ui.foldexpr(5) == ">1", "the following user marker should start a turn fold")
+  assert(ui.foldexpr(1) == ">1", "system marker should open a level-1 fold")
+  assert(ui.foldexpr(5) == 0, "the following user marker must not open a fold")
 end)
 
--- The system block sits before the first turn, so its level-2 fold has no
--- level-1 turn fold around it. Setting 'foldlevel' does close such an orphan
--- (verified), but that is the load-bearing detail of moving tools from level 1
--- to level 2: the long system prompt must keep starting collapsed, as it did
--- when it was a level-1 fold.
-case("the system block still starts folded closed", function()
+case("the system block starts folded closed", function()
   local sbuf = vim.api.nvim_create_buf(false, true)
   vim.bo[sbuf].filetype = "straps"
   vim.api.nvim_buf_set_lines(sbuf, 0, -1, false, {
@@ -468,11 +437,11 @@ case("the system block still starts folded closed", function()
   -- It must stay closed as the transcript grows (appends are the normal case).
   vim.api.nvim_buf_set_lines(sbuf, -1, -1, false, { "%%[straps:user]%%", "more" })
   assert(vim.fn.foldclosed(1) == 1, "the system fold should survive an append")
-  -- zR still opens everything, zM still gives the turn-list view.
+  -- zR still opens everything; zM never touches the conversation (no turn folds).
   vim.cmd("normal! zR")
   assert(vim.fn.foldclosed(1) == -1, "zR should open the system fold")
   vim.cmd("normal! zM")
-  assert(vim.fn.foldclosed(5) == 5, "zM should collapse turns too")
+  assert(vim.fn.foldclosed(5) == -1, "zM must not collapse conversation turns")
   vim.api.nvim_win_close(w, true)
 end)
 
@@ -484,8 +453,7 @@ case("a transcript with no system block folds sanely too", function()
   local w = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(w, nbuf)
   ui.apply_fold_opts(nbuf)
-  -- A leading turn is level 1, so the default foldlevel leaves it open — the
-  -- conversation is never collapsed on you at open.
+  -- Turns never fold, so the conversation is never collapsed on you at open.
   assert(vim.fn.foldclosed(1) == -1, "a leading user turn must not start closed")
   vim.api.nvim_win_close(w, true)
 end)
@@ -547,8 +515,8 @@ case("ui.open_session()'s window actually gets fold options and navigation maps"
   assert(w, "open_session should leave the buffer in a window")
   assert(vim.wo[w].foldmethod == "expr", "foldmethod should be expr, got " .. vim.wo[w].foldmethod)
   assert(vim.wo[w].foldexpr ~= "", "foldexpr should be set")
-  assert(vim.wo[w].foldlevel == 1,
-    "tools_expanded defaults false: foldlevel should be 1 (turns open, tools closed), got "
+  assert(vim.wo[w].foldlevel == 0,
+    "tools_expanded defaults false: foldlevel should be 0 (tools closed), got "
     .. vim.wo[w].foldlevel)
   local maps = {}
   for _, m in ipairs(vim.api.nvim_buf_get_keymap(sbuf, "n")) do maps[m.lhs] = true end

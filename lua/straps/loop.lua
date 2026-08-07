@@ -380,12 +380,26 @@ local function run_turns(bufnr, ctx, run)
     log(bufnr, { ev = "turn", turn = turn, messages = #parsed.messages })
     local tools = registry.call("fn.build_tools")
 
+    -- Model awareness rides in the REQUEST's system text, never the
+    -- transcript: parse merges same-role messages, so a user-role notice
+    -- would concatenate with the user's own words (harness text wearing the
+    -- user's voice). fn.model_note re-resolves per request, so a mid-run
+    -- :StrapsModel / :StrapsEffort switch is named on the very next turn.
+    -- parsed is a fresh table each turn; appending here never touches the
+    -- buffer. pcall so a broken redefinition degrades to no note, not a
+    -- failed run.
+    local ok_note, note = pcall(registry.try_call, "fn.model_note", ctx)
+    local system = parsed.system
+    if ok_note and type(note) == "string" and note ~= "" then
+      system = (system and system ~= "") and (system .. "\n\n" .. note) or note
+    end
+
     -- Empty assistant marker first: the provider streams text_delta events
     -- into it via ctx.emit/state.append_text. Empty text is dropped by parse.
     state.append(bufnr, "assistant", nil, "")
     progress(bufnr, ctx, { type = "thinking", turn = turn, max = max_turns }, "thinking")
     local resp = registry.call("fn.provider",
-      { system = parsed.system, messages = parsed.messages, tools = tools }, ctx)
+      { system = system, messages = parsed.messages, tools = tools }, ctx)
     if run.cancelled then
       return cancelled_note()
     end

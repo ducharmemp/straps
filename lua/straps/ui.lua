@@ -85,8 +85,8 @@ local function role_overlay(role)
   }
 end
 
--- The block kinds that are conversation turns: the units the outline lists and
--- the level-1 folds cover (system is a header, tool blocks nest inside a turn).
+-- The block kinds that are conversation turns: the units the outline lists
+-- and the `]]`/`[[` motions land on (turns themselves never fold).
 local TURN_KIND = { user = true, assistant = true }
 
 -- First content line of a block, trimmed and truncated to `max` display cells —
@@ -113,9 +113,9 @@ local function block_headline(bufnr, blk, max)
   return text
 end
 
--- Extent of the level-1 fold a turn block opens: the last line before the next
--- turn marker (or EOF). A turn owns the tool_use/tool_result blocks that follow
--- it, so its summary can count them. Returns last_lnum, tool_calls.
+-- Extent of a conversation turn: the last line before the next turn marker
+-- (or EOF). A turn owns the tool_use/tool_result blocks that follow it, so
+-- the outline can count them. Returns last_lnum, tool_calls.
 local function turn_extent(blocks, idx)
   local last, tools = blocks[idx].last_lnum, 0
   for i = idx + 1, #blocks do
@@ -178,12 +178,12 @@ local function paired_result(blocks, idx, id)
 end
 
 --- Build the colored fold-summary chunk list for the fold starting at
---- start_lnum (a turn, system, tool_use or tool_result marker line). Exposed
---- for headless tests: it needs no window or real fold. Returns {{text, hl}, ...}:
---- a user/assistant turn folds to `▸ you  <headline> · N tools` (role-colored
---- tag, dim gist); a tool_use folds to `▸ <verb> <args>   ✓|✗` (command-style
---- via fn.tool_display — StrapsTool verb, dim StrapsRule args); a dangling
---- tool_result keeps `▸ ⚙ result …`. StrapsToolOk/StrapsToolError on the mark.
+--- start_lnum (a system, tool_use or tool_result marker line — turns never
+--- fold). Exposed for headless tests: it needs no window or real fold.
+--- Returns {{text, hl}, ...}: a tool_use folds to `▸ <verb> <args>   ✓|✗`
+--- (command-style via fn.tool_display — StrapsTool verb, dim StrapsRule
+--- args); a dangling tool_result keeps `▸ ⚙ result …`.
+--- StrapsToolOk/StrapsToolError on the mark.
 function M._fold_summary(bufnr, start_lnum)
   local blocks = require("straps.state").list_blocks(bufnr)
   local idx, blk
@@ -192,25 +192,6 @@ function M._fold_summary(bufnr, start_lnum)
       idx, blk = i, b
       break
     end
-  end
-  -- A closed turn fold is the outline made inline: role tag + what was said +
-  -- how much machinery it took, so `zM` reduces the session to its exchanges.
-  if blk and TURN_KIND[blk.kind] then
-    local role = ROLE[blk.kind]
-    local last, tools = turn_extent(blocks, idx)
-    local chunks = {
-      { "▸ ", "StrapsRule" },
-      { role.label, role.hl },
-    }
-    local head = block_headline(bufnr, blk, 60)
-    if head ~= "" then
-      chunks[#chunks + 1] = { "  " .. head, "StrapsRule" }
-    end
-    if tools > 0 then
-      chunks[#chunks + 1] = { (" · %d tool%s"):format(tools, tools == 1 and "" or "s"), "StrapsRule" }
-    end
-    chunks[#chunks + 1] = { (" · %d lines"):format(math.max(0, last - blk.marker_lnum + 1)), "StrapsRule" }
-    return chunks
   end
   -- The system block folds to a plain labelled summary (no ⚙/status), since it
   -- is a long, rarely-re-read prompt rather than a tool call.
@@ -1727,22 +1708,20 @@ function M.pick_provider()
     M.redraw_status(true)
   end)
 end
--- Two fold levels, so one buffer serves both reading scales. Level 1 is the
--- CONVERSATION: each user/assistant marker opens a fold running to the next
--- turn, so `zM` (foldlevel=0) collapses the session to a list of exchanges —
--- `▸ you  <what you asked> · 3 tools · 40 lines`. Level 2 is the MACHINERY
--- nested inside a turn: each tool_use fold swallows its following tool_result,
--- so one call collapses to a single colored summary line, and the system block
--- (long and rarely re-read) folds the same way. The default foldlevel of 1
--- shows the conversation with tool calls collapsed.
+-- Only the MACHINERY folds: each tool_use fold swallows its following
+-- tool_result, so one call collapses to a single colored summary line, and
+-- the system block (long and rarely re-read) folds the same way. The
+-- conversation itself — user/assistant turns — never folds, so closing one
+-- tool call never hides the exchange around it. The default foldlevel of 0
+-- starts every tool call collapsed.
 function M.foldexpr(lnum)
   local kind = vim.fn.getline(lnum):match("^%%%%%[straps:([%w_]+)%]%%%%")
   if kind == "tool_use" or kind == "system" then
-    return ">2"
-  elseif kind == "tool_result" then
-    return "2"
-  elseif kind then
     return ">1"
+  elseif kind == "tool_result" then
+    return "1"
+  elseif kind then
+    return 0
   end
   return "="
 end
@@ -1843,9 +1822,8 @@ end
 
 --- Apply the straps fold options (foldmethod=expr + foldexpr + foldtext +
 --- foldlevel from config.tools_expanded) to every window currently showing
---- bufnr. The default foldlevel is 1: conversation turns open, the level-2
---- tool calls and system prompt collapsed (`tools_expanded` opens those too).
---- `zM` from there drops to level 0, the turn-list view of the whole session.
+--- bufnr. The default foldlevel is 0: tool calls and the system prompt
+--- collapsed (`tools_expanded` opens them); conversation turns never fold.
 ---
 --- Folding is window-local, so this must run once the buffer is
 --- actually displayed — `vim.opt_local` from a FileType autocmd that fires
@@ -1863,7 +1841,7 @@ function M.apply_fold_opts(bufnr)
     vim.wo[win].foldmethod = "expr"
     vim.wo[win].foldexpr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
     vim.wo[win].foldtext = "v:lua.require'straps.ui'.foldtext()"
-    vim.wo[win].foldlevel = expanded and 99 or 1
+    vim.wo[win].foldlevel = expanded and 99 or 0
   end
 end
 

@@ -44,6 +44,7 @@ queries/straps/            -- highlight + injection queries (markdown/JSON)
 tree-sitter-straps/        -- the transcript grammar (generated src/ committed)
 tests/run_registry_state.lua
 tests/run_loop.lua
+tests/run_agents_buffer.lua
 README.md
 ```
 
@@ -803,11 +804,28 @@ API names (registry names prefixed `tool.`):
   redefinitions of any tool/hook/fn, including the provider and confirm hook.
 - `eval_lua {code}` — `load` + pcall, returns `vim.inspect` of results.
   Dangerous by design; gated by `hook.confirm`.
-- `spawn {task, system?, tools?, readonly?, show?, max_turns?, model?, effort?, timeout_ms?}`
+- `spawn {task, system?, tools?, readonly?, allow?, show?, max_turns?, model?, effort?, timeout_ms?}`
   — creates a child session buffer (`state.new_session`), chains its registry
   scope under the parent (`registry.ensure_scope`), stamps parentage/task/model/
   effort/timeout vim.b vars, seeds the task, `loop.start`s it, and **returns
-  IMMEDIATELY** with the child's buffer handle — it does NOT await. The child
+  IMMEDIATELY** with the child's buffer handle — it does NOT await. `allow`
+  (array of strings) grants the child permission categories: each entry is a
+  grantable category (validated against `fn.capability()`'s grantable list) or
+  a specific tool api name; an unknown entry errors at spawn time, and so does
+  any entry the classifier puts in the `define` category (`"define"` itself or
+  a tool name like `registry_define`) — a define grant could shadow the
+  child's hook.confirm, so the category ceiling holds for name grants too.
+  A tool-name grant otherwise bypasses category ceilings by design
+  (`allow={"eval_lua"}` grants exactly that tool, unprompted).
+  Grants are seeded into `vim.b[child].straps_allowed` as `cap:<category>` /
+  `<toolname>` keys BEFORE the child's loop starts. The child gets a
+  child-scope `hook.confirm` shadow with unified semantics: read-category
+  calls and granted categories/tools run unprompted, EVERYTHING ELSE IS
+  DENIED (with a reason naming the child's grants) — no prompt, so an
+  unattended child never hangs on a dialog. `readonly=true` is now equivalent
+  to `allow = {}` (same shadow; its grant-less deny message is unchanged:
+  "readonly subagent: <name> is not allowed"). `readonly` and `allow`
+  together error (mutually exclusive). The child
   runs concurrently on its own coroutine. This makes N-way parallelism a matter
   of issuing N `spawn` calls (their children all run at once) instead of one
   blocking call per child run serially. `spawn` also registers a
@@ -861,17 +879,36 @@ API names (registry names prefixed `tool.`):
 
 Default hooks registered here:
 
-- `fn.readonly_policy(name, input) -> boolean` — the single source of truth for
-  "is this tool call read-only": the allowlist (file/search introspection,
+- `fn.capability(name, input) -> category` — the single classifier both
+  `fn.readonly_policy` and the grant checks consult. Categories: `read`
+  (everything the old readonly allowlist covered — file/search introspection,
   registry/skill reads, editor-native LSP/tree-sitter/status lookups,
-  presentation tools, ask_user) plus the list-mode exceptions (code_action /
-  fix_diagnostic without an index, undo_edit history, transcript_excise without
-  blocks/range). Both `hook.confirm` and
-  spawn's readonly-child gate consult it, so the two cannot drift.
+  presentation tools, ask_user — including the input-dependent arms:
+  code_action/fix_diagnostic without an index, undo_edit with `history=true`,
+  transcript_excise without blocks/range);
+  `edit` (write_file, edit_file, patch_file, bulk_replace, format,
+  rename_symbol, move_file, move_files, code_action/fix_diagnostic WITH an
+  index, undo_edit non-history); `delete` (delete_file, delete_files —
+  deletion is not undo-reversible, so it is its own category); `exec` (bash,
+  run_in_terminal, run_quickfix); `lua` (eval_lua); `net` (fetch_url);
+  `define` (registry_define); `spawn` (spawn, spawn_wait); `other` (any
+  unknown/agent-defined tool). Called with NO arguments it returns the
+  GRANTABLE list `{edit, delete, exec, lua, net, spawn}`. `read` needs no
+  grant. `define` and `other` are NEVER grantable — a `define` grant would
+  let the agent shadow `hook.confirm` (an everything grant), and unknown
+  tools cannot be classified.
+- `fn.readonly_policy(name, input) -> boolean` — now a thin wrapper:
+  `capability(name, input) == "read"`. Same behavior as before; the
+  classification lives in `fn.capability`. Both `hook.confirm` and spawn's
+  child gate consult these, so they cannot drift.
 - `hook.confirm(name, input, ctx) -> allowed, reason` — auto-allow the
-  read-only tools (via `fn.readonly_policy`); for everything else
+  read-only tools (via `fn.readonly_policy`); honor category grants — a key
+  of the form `cap:<category>` in the per-session allow-set
+  (`vim.b[ctx.bufnr].straps_allowed`) silently permits every call
+  `fn.capability` classifies into that category (cap: keys are written by
+  `:StrapsAuto` and by spawn's `allow`); for everything else
   `vim.fn.confirm("straps: allow <name>?\n<preview of input>", ...)`
-  — "Always this tool" adds the name to an allow-set stored in
+  — "Always this tool" adds the name to the allow-set stored in
   `vim.b[ctx.bufnr].straps_allowed` (buffer state, on theme). File edits
   (write_file/edit_file/patch_file) get path-scoped grants instead of a
   per-tool toggle: "Always in <parent dir>" stores `editdir:<dir>`
@@ -1210,11 +1247,18 @@ Existing suites must all still pass.
   → `loop.start`; `q` does NOT get mapped (users own their keys). Window
   placement honors the standard command modifiers (`<mods>`): `:vertical
   Straps` opens a vsplit, `:botright Straps` / `:leftabove vertical Straps`
-  etc. place the window accordingly, and `:StrapsResume` takes the same
-  modifiers. The plumbing is a `split_cmd` string threaded through
-  `ui.show_session`/`open_session`/`resume_session` (default `"split"`),
-  derived in the command from `opts.smods` — so no config knob is needed.
+  etc. place the window accordingly, and `:StrapsResume` / `:StrapsAgents`
+  take the same modifiers. The plumbing is a `split_cmd` string threaded
+  through `ui.show_session`/`open_session`/`resume_session`/`open_agents`
+  (default `"split"`), derived in the command from `opts.smods` — so no
+  config knob is needed.
 - `:StrapsSend` (current straps buffer), `:StrapsStop`, `:StrapsContinue`.
+- `:StrapsAuto [off|cat,...]` (session buffers only, `ui.auto`) — grants
+  capability categories to the current session by writing `cap:<category>`
+  keys into `vim.b.straps_allowed`: `:StrapsAuto edit,exec` grants those, no
+  arg reports current category grants, `off` clears all cap: keys (leaving
+  editdir:/tool grants intact). Completion offers off plus the grantable
+  categories from `fn.capability()`.
 - `:StrapsEdit <name>` (completion from `registry.names()`) — opens
   `straps://registry/<name>` scratch-acwrite buffer containing
   `registry.render(name)`, `filetype=lua`; `BufWriteCmd` executes the buffer
@@ -1222,15 +1266,43 @@ Existing suites must all still pass.
   sets nomodified. This works generically because render output is executable.
 - `:StrapsRegistry` — scratch listing, `<CR>` on a line opens `:StrapsEdit`.
 - `:StrapsEval` — execute current buffer as Lua (eval-buffer).
-- `:StrapsAgents` — picker over running agents (`ui.pick_agents`). Rows show
-  the session, its parent (`◂ <parent>`, for subagents spawned via
-  `tool.spawn`), and the one-line task; picking one brings that transcript
-  on-screen with `ui.show_session` (the public form of the old
-  `open_session_buffer`), so a running subagent is navigable to watch/steer.
-  Backed by `ui.running_agents()` (a snapshot built from
+- `:StrapsAgents` — opens the **agents buffer** (`straps://agents`), a single
+  ordinary buffer listing ALL sessions in three sections: **running** (an
+  active run), **loaded** (a `straps_session` buffer with no run), and
+  **saved** (a `*.straps` transcript on disk with no loaded buffer). The
+  union is `ui.all_sessions()` → `{ running, loaded, saved }`, each session in
+  exactly one set (running = `ui.running_agents()`; loaded = valid buffers
+  with `vim.b.straps_session` and not `loop.running`; saved =
+  `state.list_sessions()` whose absolute path has no loaded buffer — matched
+  by exact `nvim_buf_get_name`, never `vim.fn.bufnr`, which pattern-matches).
+  The buffer is `buftype=nofile`, `filetype=strapsagents`, nomodifiable
+  (invariant 1: buffers are state). Its content is drawn by `fn.agents_render`,
+  a `define_default` registry fn (invariant 2: redefinable at runtime; the
+  logic lives in `ui._agents_render`, like `fn.render` → `ui._render`). A
+  section with zero rows is omitted; when all are empty a single empty-state
+  line shows; the last line is a keymap footer. A line→entry map
+  (`{ [lnum] = { kind, bufnr?, path? } }`) is a MODULE-LEVEL Lua table keyed
+  by bufnr, NOT `vim.b` (which cannot hold a sparse integer-keyed table
+  through msgpack); it is rebuilt on every render. Highlights are extmarks in
+  a `straps_agents` namespace, cleared before each repopulate (N renders ==
+  1 render's extmarks). Buffer-local normal-mode keymaps: `<CR>` opens
+  (`show_session` for running/loaded, `resume_session` for saved), `x` stops
+  a running run (`loop.stop`), `i` steers it (`vim.ui.input` → `loop.steer`),
+  `r` renames (loaded → `rename_session`, saved → set durable title), `R`
+  refreshes; `q` is NOT mapped. Two refresh seams keep it live: the loop's
+  internal `progress()` calls `ui.agents_refresh()` on any session's progress
+  event (mechanism beside the phase mirror, not the redefinable
+  `hook.on_progress`), and a BufEnter autocmd on the buffer catches
+  saved/idle churn that emits no progress. `agents_refresh()` is a trailing
+  ~100ms debounce over a module-level uv timer whose callback re-renders
+  inside `vim.schedule` (re-checking `nvim_buf_is_valid`, like
+  `schedule_render`); it no-ops when no agents buffer is open. A BufWipeout
+  autocmd stops the timer and clears the line map. The picker
+  `ui.pick_agents()` and `ui.agents_status()` (the statusline component,
+  `""` when idle, `🤖 N` / `🤖 N+M` otherwise) remain exported and
+  unchanged. Backed by `ui.running_agents()` (a snapshot from
   `loop.running_sessions()` + the child's `straps_parent`/`straps_task`
-  buffer vars, which `tool.spawn` sets) and `ui.agents_status()` (the
-  statusline component, `""` when idle, `🤖 N` / `🤖 N+M` otherwise).
+  buffer vars, which `tool.spawn` sets).
 - Statusline hints: `vim.b[bufnr].straps_status` = "running"|"idle" (+ redraw)
   is the PER-buffer state; `ui.agents_status()` is the buffer-independent
   cross-session count (loop does a `redrawstatus!` on run start/end so a

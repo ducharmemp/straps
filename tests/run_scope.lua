@@ -21,6 +21,10 @@ local registry = require("straps.registry")
 local state = require("straps.state")
 local loop = require("straps.loop")
 
+-- Capture the pristine default hook.confirm source before any case shadows it
+-- with allow_all(), so the cap:-grant case can restore real default behavior.
+local DEFAULT_CONFIRM = registry.get("hook.confirm").source
+
 local failed = false
 local function case(name, fn)
   local ok, err = pcall(fn)
@@ -883,5 +887,211 @@ end
   assert(buf_text(bufnr):find("stopped after 2 turns", 1, true), "exhaustion note missing")
 end)
 
+-- --------------------------------------------------- auto mode / capabilities
+
+case("fn.capability classifies every category and its input-split arms", function()
+  local cap = function(name, input)
+    return registry.try_call("fn.capability", name, input)
+  end
+  assert(cap("read_file") == "read", "read_file -> read")
+  assert(cap("write_file") == "edit", "write_file -> edit")
+  assert(cap("delete_file") == "delete", "delete_file -> delete")
+  assert(cap("bash") == "exec", "bash -> exec")
+  assert(cap("eval_lua") == "lua", "eval_lua -> lua")
+  assert(cap("fetch_url") == "net", "fetch_url -> net")
+  assert(cap("registry_define") == "define", "registry_define -> define")
+  assert(cap("spawn") == "spawn", "spawn -> spawn")
+  assert(cap("some_unknown_tool") == "other", "unknown -> other")
+  -- input-split tools, both arms each.
+  assert(cap("code_action", {}) == "read", "code_action list -> read")
+  assert(cap("code_action", { index = 1 }) == "edit", "code_action apply -> edit")
+  assert(cap("fix_diagnostic", {}) == "read", "fix_diagnostic list -> read")
+  assert(cap("fix_diagnostic", { index = 2 }) == "edit", "fix_diagnostic apply -> edit")
+  assert(cap("undo_edit", { history = true }) == "read", "undo history -> read")
+  assert(cap("undo_edit", { steps = 1 }) == "edit", "undo -> edit")
+  -- no-arg: exactly the grantable list, in order.
+  local grantable = registry.try_call("fn.capability")
+  assert(type(grantable) == "table", "no-arg should return a list")
+  local want = { "edit", "delete", "exec", "lua", "net", "spawn" }
+  assert(#grantable == #want, "grantable list wrong length: " .. #grantable)
+  for i, c in ipairs(want) do
+    assert(grantable[i] == c, "grantable[" .. i .. "] = " .. tostring(grantable[i]) .. ", want " .. c)
+  end
+end)
+
+case("spawn allow={edit} grants writes without prompting; ungranted denied", function()
+  allow_all() -- parent-side confirm allows spawn; child scope enforces the grants
+  local orig_confirm = vim.fn.confirm
+  vim.fn.confirm = function() error("confirm prompt reached — grant did not bypass") end
+  local target = vim.fn.tempname()
+  _G.__auto_target = target
+  define("fn.provider", "fn", "test: allow=edit child writes then runs bash", [==[
+return function(req, ctx)
+  local first_user
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" then first_user = p.text; break end
+      end
+      break
+    end
+  end
+  if not (first_user and first_user:find("ACHILD-TASK", 1, true)) then
+    error("unexpected non-child request in allow test")
+  end
+  local n = #req.messages
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      if n >= 5 then ctx.emit({ type = "text_delta", text = "achild-done" }) end
+      resolve()
+    end, 5)
+  end)
+  if n == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "w1", name = "write_file",
+        input = { path = _G.__auto_target, content = "granted-write" } },
+    } }
+  elseif n == 3 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "b1", name = "bash", input = { command = "echo hi" } },
+    } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "achild-done" } } }
+end
+]==])
+
+  local parent = vim.api.nvim_create_buf(true, false)
+  local ok, out = pcall(function()
+    return drive(function(ctx)
+      ctx.bufnr = parent
+      local started = registry.call("tool.spawn",
+        { task = "ACHILD-TASK: write then bash.", allow = { "edit" } }, ctx)
+      local child = tonumber(started:match("buffer (%d+)"))
+      return registry.call("tool.spawn_wait", { buffers = { child } }, ctx)
+    end)
+  end)
+  vim.fn.confirm = orig_confirm
+  assert(ok, "drive errored (confirm prompt reached?): " .. tostring(out))
+  assert(out:find("achild-done", 1, true), "child did not finish: " .. out)
+
+  -- The write ran (grant returned true before any prompt).
+  assert(vim.fn.filereadable(target) == 1, "granted write did not happen")
+  assert(table.concat(vim.fn.readfile(target), "\n") == "granted-write",
+    "granted write has wrong content")
+
+  -- bash was NOT granted: its tool_result is a coverage error.
+  local child
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and buf_text(b):find("ACHILD-TASK", 1, true)
+      and vim.b[b].straps_session then
+      child = b
+    end
+  end
+  assert(child, "allow child buffer not found")
+  local ctext = buf_text(child)
+  assert(ctext:find("is not covered by this child's grants", 1, true),
+    "bash should be denied as not covered:\n" .. ctext:sub(-400))
+end)
+
+case("spawn allow validation rejects bad entries and readonly+allow", function()
+  allow_all()
+  local parent = vim.api.nvim_create_buf(true, false)
+  local function try(input)
+    local ok, err = pcall(function()
+      drive(function(ctx)
+        ctx.bufnr = parent
+        return registry.call("tool.spawn", input, ctx)
+      end)
+    end)
+    return ok, tostring(err)
+  end
+  local ok, err = try({ task = "T", allow = { "define" } })
+  assert(not ok and err:find("not a grantable category", 1, true),
+    "allow=define should error as not grantable: " .. err)
+  ok, err = try({ task = "T", allow = { "nope" } })
+  assert(not ok and err:find("nope", 1, true), "allow=nope should name the bad entry: " .. err)
+  -- registry_define EXISTS as a tool, so it passes the tool-name check; the
+  -- define-category ceiling must still reject it (a define grant would let
+  -- the child shadow its own hook.confirm).
+  ok, err = try({ task = "T", allow = { "registry_define" } })
+  assert(not ok and err:find("define category", 1, true),
+    "allow=registry_define should error via the define-category ceiling: " .. err)
+  ok, err = try({ task = "T", readonly = true, allow = { "edit" } })
+  assert(not ok and err:find("mutually exclusive", 1, true),
+    "readonly+allow should error mutually exclusive: " .. err)
+end)
+
+case("default hook.confirm honors cap: grants and prompts without them", function()
+  local buf = vim.api.nvim_create_buf(true, false)
+  -- Restore the default hook.confirm (allow_all shadowed it globally).
+  define("hook.confirm", "hook", "default", DEFAULT_CONFIRM)
+  local hookc = registry.get("hook.confirm")
+  assert(hookc, "hook.confirm missing")
+  -- With cap:exec granted, bash is allowed without any prompt.
+  vim.b[buf].straps_allowed = { ["cap:exec"] = true }
+  local orig = vim.fn.confirm
+  vim.fn.confirm = function() error("prompt reached despite cap:exec grant") end
+  local ok, allowed = pcall(function()
+    return registry.call("hook.confirm", "bash", { command = "x" }, { bufnr = buf })
+  end)
+  vim.fn.confirm = orig
+  assert(ok and allowed == true, "cap:exec grant should allow bash: " .. tostring(allowed))
+  -- Empty allow-set: falls through to the prompt, which we stub to No (2).
+  vim.b[buf].straps_allowed = {}
+  orig = vim.fn.confirm
+  vim.fn.confirm = function() return 2 end
+  local denied = registry.call("hook.confirm", "bash", { command = "x" }, { bufnr = buf })
+  vim.fn.confirm = orig
+  assert(denied ~= true, "empty allow-set should not auto-allow bash")
+end)
+
+case("ui.auto grants, validates, clears and refuses non-session buffers", function()
+  local ui = require("straps.ui")
+  local notes = {}
+  local orig_notify = vim.notify
+  vim.notify = function(msg) notes[#notes + 1] = tostring(msg) end
+
+  -- Real session buffer, made current.
+  local sess = state.new_session()
+  vim.api.nvim_set_current_buf(sess)
+  assert(vim.b.straps_session == true, "session buffer not current")
+
+  ui.auto("edit,exec")
+  local set = vim.b[sess].straps_allowed
+  assert(type(set) == "table" and set["cap:edit"] and set["cap:exec"],
+    "auto('edit,exec') did not set cap keys")
+
+  -- A bogus token changes nothing and notifies an error.
+  local before = vim.inspect(vim.b[sess].straps_allowed)
+  notes = {}
+  ui.auto("bogus")
+  assert(vim.inspect(vim.b[sess].straps_allowed) == before, "bogus token mutated the grants")
+  assert(#notes > 0 and notes[#notes]:find("bogus", 1, true), "bogus token should notify an error")
+
+  -- off clears cap: keys but leaves a pre-existing non-cap key intact.
+  local seed = {}
+  for k, v in pairs(vim.b[sess].straps_allowed) do seed[k] = v end
+  seed["editdir:/x"] = true
+  vim.b[sess].straps_allowed = seed
+  ui.auto("off")
+  local after = vim.b[sess].straps_allowed
+  assert(after["editdir:/x"] == true, "off cleared a non-cap key")
+  for k in pairs(after) do
+    assert(not k:match("^cap:"), "off left a cap key: " .. k)
+  end
+
+  -- Non-session buffer: notify error, set nothing.
+  local plain = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_set_current_buf(plain)
+  notes = {}
+  ui.auto("edit")
+  assert(vim.b[plain].straps_allowed == nil, "auto set grants on a non-session buffer")
+  assert(#notes > 0 and notes[#notes]:find("not a straps session", 1, true),
+    "non-session auto should notify")
+
+  vim.notify = orig_notify
+end)
+
+print(failed and "FAILED" or "ALL PASS")
 print(failed and "FAILED" or "ALL PASS")
 os.exit(failed and 1 or 0)

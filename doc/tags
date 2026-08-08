@@ -1,5 +1,6 @@
 :Straps	straps.txt	/*:Straps*
 :StrapsAgents	straps.txt	/*:StrapsAgents*
+:StrapsAuto	straps.txt	/*:StrapsAuto*
 :StrapsCompact	straps.txt	/*:StrapsCompact*
 :StrapsContinue	straps.txt	/*:StrapsContinue*
 :StrapsEdit	straps.txt	/*:StrapsEdit*
@@ -17,6 +18,7 @@
 fn.api_key	straps.txt	/*fn.api_key*
 fn.autocmd_bridge	straps.txt	/*fn.autocmd_bridge*
 fn.build_tools	straps.txt	/*fn.build_tools*
+fn.capability	straps.txt	/*fn.capability*
 fn.compact	straps.txt	/*fn.compact*
 fn.list_models	straps.txt	/*fn.list_models*
 fn.log	straps.txt	/*fn.log*
@@ -26,6 +28,7 @@ fn.provider	straps.txt	/*fn.provider*
 fn.provider_anthropic	straps.txt	/*fn.provider_anthropic*
 fn.provider_openai	straps.txt	/*fn.provider_openai*
 fn.provider_pref	straps.txt	/*fn.provider_pref*
+fn.readonly_policy	straps.txt	/*fn.readonly_policy*
 fn.render	straps.txt	/*fn.render*
 fn.system_prompt	straps.txt	/*fn.system_prompt*
 fn.tool_display	straps.txt	/*fn.tool_display*
@@ -38,7 +41,9 @@ hook.on_run_end	straps.txt	/*hook.on_run_end*
 hook.on_run_start	straps.txt	/*hook.on_run_start*
 hook.on_turn_start	straps.txt	/*hook.on_turn_start*
 straps	straps.txt	/*straps*
+straps-agents	straps.txt	/*straps-agents*
 straps-agents-tool	straps.txt	/*straps-agents-tool*
+straps-auto	straps.txt	/*straps-auto*
 straps-checkhealth	straps.txt	/*straps-checkhealth*
 straps-commands	straps.txt	/*straps-commands*
 straps-config	straps.txt	/*straps-config*

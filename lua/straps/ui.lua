@@ -1014,6 +1014,382 @@ function M.agents_status()
   return ("🤖 %d"):format(top)
 end
 
+-- ── the agents buffer (straps://agents) ────────────────────────────────────
+-- A single ordinary buffer listing ALL sessions — running, loaded-but-idle,
+-- and saved-on-disk — with a tiny keymap grammar. Buffers are state
+-- (invariant 1): the content is rendered from live state (all_sessions()) by
+-- a redefinable registry fn (fn.agents_render, invariant 2).
+
+local AGENTS_BUFNAME = "straps://agents"
+local agents_ns = vim.api.nvim_create_namespace("straps_agents")
+local AGENTS_RULE_WIDTH = 52 -- match the transcript renderer's rule width
+
+-- Line -> entry map, keyed by agents bufnr -> { [lnum] = { kind, bufnr?, path? } }.
+-- Module-level (NOT vim.b): vim.b cannot hold a sparse integer-keyed table
+-- (msgpack conversion). Rebuilt on every render.
+local agents_lines = {}
+
+-- A trailing debounce timer for agents_refresh(), following schedule_render's
+-- pattern. Module-level: one agents buffer at a time.
+local agents_timer = nil
+
+--- Every agent session, classified into three disjoint sets:
+---   running — an active run (M.running_agents() rows).
+---   loaded  — a straps_session buffer with no active run.
+---   saved   — a *.straps transcript on disk with no loaded buffer.
+--- A session is in exactly one set. Used by fn.agents_render.
+function M.all_sessions()
+  local loop = require("straps.loop")
+  local state = require("straps.state")
+
+  local running = M.running_agents()
+
+  -- Names of every loaded valid buffer, to exclude their paths from `saved`.
+  -- (Do NOT use vim.fn.bufnr(path): it does substring/pattern matching and
+  -- can false-positive or throw on special chars.)
+  local loaded_names = {}
+  local loaded = {}
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b) then
+      local name = vim.api.nvim_buf_get_name(b)
+      if name ~= "" then
+        loaded_names[vim.fn.fnamemodify(name, ":p")] = true
+      end
+      if vim.b[b].straps_session == true and not loop.running(b) then
+        local file_backed = vim.bo[b].buftype == "" and name ~= ""
+        loaded[#loaded + 1] = {
+          bufnr = b,
+          label = session_label(b),
+          title = file_backed and state.session_title(name) or nil,
+          info = M.session_info(b), -- may be nil when setup never ran
+        }
+      end
+    end
+  end
+
+  local saved = {}
+  for _, s in ipairs(state.list_sessions()) do
+    if not loaded_names[vim.fn.fnamemodify(s.path, ":p")] then
+      saved[#saved + 1] = s
+    end
+  end
+
+  return { running = running, loaded = loaded, saved = saved }
+end
+
+-- One section rule line "━━ <name> ━━━…" at AGENTS_RULE_WIDTH; the leading and
+-- trailing runs get StrapsRule. Returns the text; the caller sets the extmark.
+local function agents_rule(name)
+  local trailing = AGENTS_RULE_WIDTH - 3 - #name - 1
+  return bar(2, "━") .. " " .. name .. " " .. bar(math.max(1, trailing), "━")
+end
+
+-- Implementation of fn.agents_render: rewrite ALL lines of the agents buffer
+-- from live state, then redraw the straps_agents extmarks. Never leaves the
+-- buffer modifiable — the body is pcall'd and modifiable is restored in a
+-- guaranteed path.
+function M._agents_render(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  vim.bo[bufnr].modifiable = true
+  local ok, err = pcall(function()
+    local sets = M.all_sessions()
+    local lines = {}
+    local map = {} -- lnum -> entry
+    -- Deferred highlight ops: { row, col_start, col_end, hl } applied after the
+    -- lines are set (extmarks need the line to exist).
+    local hls = {}
+    local function rule(name)
+      lines[#lines + 1] = agents_rule(name)
+      hls[#hls + 1] = { #lines - 1, 0, -1, "StrapsRule" }
+    end
+
+    local empty = #sets.running == 0 and #sets.loaded == 0 and #sets.saved == 0
+    if empty then
+      lines[#lines + 1] = "no agent sessions — :Straps starts one"
+      hls[#hls + 1] = { 0, 0, -1, "StrapsRule" }
+    else
+      if #sets.running > 0 then
+        rule("running")
+        for _, a in ipairs(sets.running) do
+          local indent = string.rep("  ", a.depth or 0)
+          local info = M.session_info(a.bufnr)
+          local model = (info and info.model_label) or nil
+          local phase = vim.b[a.bufnr].straps_phase
+          if phase == nil or phase == "" then
+            phase = "running"
+          end
+          local glyph_col = #indent
+          local parts = { a.label }
+          if model then parts[#parts + 1] = model end
+          parts[#parts + 1] = phase
+          if a.task and a.task ~= "" then parts[#parts + 1] = a.task end
+          local text = indent .. "▶ " .. table.concat(parts, "  ")
+          lines[#lines + 1] = text
+          local row = #lines - 1
+          map[#lines] = { kind = "running", bufnr = a.bufnr }
+          -- ▶ glyph -> StrapsTool; the label -> StrapsRoleAgent; the metadata
+          -- (model + phase + task) -> dim StrapsRule.
+          local glyph_byte = glyph_col + #"▶"
+          hls[#hls + 1] = { row, glyph_col, glyph_byte, "StrapsTool" }
+          local label_start = glyph_byte + 1 -- past the space
+          local label_end = label_start + #a.label
+          hls[#hls + 1] = { row, label_start, label_end, "StrapsRoleAgent" }
+          hls[#hls + 1] = { row, label_end, -1, "StrapsRule" }
+        end
+      end
+
+      if #sets.loaded > 0 then
+        rule("loaded")
+        for _, l in ipairs(sets.loaded) do
+          local model = (l.info and l.info.model_label) or nil
+          local parts = { l.label }
+          if l.title and l.title ~= "" then parts[#parts + 1] = l.title end
+          if model then parts[#parts + 1] = model end
+          local text = "∙ " .. table.concat(parts, "  ")
+          lines[#lines + 1] = text
+          local row = #lines - 1
+          map[#lines] = { kind = "loaded", bufnr = l.bufnr }
+          hls[#hls + 1] = { row, 0, #"∙", "StrapsTool" }
+          local label_start = #"∙" + 1
+          local label_end = label_start + #l.label
+          hls[#hls + 1] = { row, label_start, label_end, "StrapsRoleAgent" }
+          hls[#hls + 1] = { row, label_end, -1, "StrapsRule" }
+        end
+      end
+
+      if #sets.saved > 0 then
+        rule("saved")
+        for _, s in ipairs(sets.saved) do
+          local label = (s.summary and s.summary ~= "") and s.summary or s.name
+          local text = "  " .. label .. "  " .. relative_time(s.mtime)
+          lines[#lines + 1] = text
+          local row = #lines - 1
+          map[#lines] = { kind = "saved", path = s.path }
+          -- The age tail -> dim StrapsRule.
+          local age_start = #("  " .. label .. "  ")
+          hls[#hls + 1] = { row, age_start, -1, "StrapsRule" }
+        end
+      end
+    end
+
+    lines[#lines + 1] = "<CR> open   x stop   i steer   r rename   R refresh"
+    hls[#hls + 1] = { #lines - 1, 0, -1, "StrapsRule" }
+
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+    -- Idempotent: clear the whole namespace before repopulating, so N renders
+    -- leave exactly one render's worth of extmarks.
+    vim.api.nvim_buf_clear_namespace(bufnr, agents_ns, 0, -1)
+    for _, h in ipairs(hls) do
+      local row, cs, ce, hl = h[1], h[2], h[3], h[4]
+      pcall(vim.api.nvim_buf_set_extmark, bufnr, agents_ns, row, cs, {
+        end_col = ce == -1 and nil or ce,
+        end_row = ce == -1 and (row + 1) or nil,
+        hl_group = hl,
+      })
+    end
+    agents_lines[bufnr] = map
+  end)
+  vim.bo[bufnr].modifiable = false
+  if not ok then
+    error(err)
+  end
+end
+
+-- The agents buffer, or nil: an exact-name match over loaded buffers (never
+-- vim.fn.bufnr, which pattern-matches).
+local function find_agents_buf()
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(b)
+      and vim.api.nvim_buf_get_name(b) == AGENTS_BUFNAME then
+      return b
+    end
+  end
+  return nil
+end
+
+-- Re-render the agents buffer via the registry fn (redefinable).
+local function agents_do_render(bufnr)
+  require("straps.registry").try_call("fn.agents_render", bufnr)
+end
+
+--- Debounced re-render of the agents buffer, if one is open. Called on every
+--- progress event of every run (loop.progress) and on BufEnter — cheap no-op
+--- when no agents buffer exists.
+function M.agents_refresh()
+  local buf = find_agents_buf()
+  if not buf then
+    return
+  end
+  if not agents_timer then
+    agents_timer = vim.uv.new_timer()
+  end
+  agents_timer:stop()
+  agents_timer:start(100, 0, function()
+    -- The timer callback runs in libuv context: schedule the actual render and
+    -- re-check validity inside, exactly like schedule_render does.
+    vim.schedule(function()
+      local b = find_agents_buf()
+      if b and vim.api.nvim_buf_is_valid(b) then
+        agents_do_render(b)
+      end
+    end)
+  end)
+end
+
+-- One INFO notify used by the keymaps when a key does not apply to a row.
+local function agents_notify_not_running()
+  vim.notify("straps: not a running agent", vim.log.levels.INFO)
+end
+
+-- The entry the line map resolves for a 1-based line, or nil. Exposed for tests.
+function M._agents_line(bufnr, lnum)
+  local map = agents_lines[bufnr]
+  return map and map[lnum] or nil
+end
+
+-- The <CR>/x/i/r/R handlers, split out so tests can drive them directly.
+function M._agents_key(bufnr, key)
+  local map = agents_lines[bufnr]
+  local lnum = vim.api.nvim_win_get_cursor(0)[1]
+  local entry = map and map[lnum] or nil
+  if key == "R" then
+    agents_do_render(bufnr)
+    return
+  end
+  if key == "cr" then
+    if not entry then return end
+    -- A row can go stale between the last render and the keypress (the
+    -- session buffer wiped, the transcript deleted): report and re-render
+    -- instead of throwing or loading an empty buffer.
+    if entry.kind == "running" or entry.kind == "loaded" then
+      if not vim.api.nvim_buf_is_valid(entry.bufnr) then
+        vim.notify("straps: that session buffer is gone", vim.log.levels.INFO)
+        agents_do_render(bufnr)
+        return
+      end
+      M.show_session(entry.bufnr)
+    elseif entry.kind == "saved" then
+      if vim.fn.filereadable(entry.path) ~= 1 then
+        vim.notify("straps: transcript no longer exists", vim.log.levels.INFO)
+        agents_do_render(bufnr)
+        return
+      end
+      M.resume_session(entry.path)
+    end
+    M.agents_refresh()
+  elseif key == "x" then
+    if entry and entry.kind == "running" then
+      -- loop.stop notifies its own no-run race itself; do not double-notify.
+      require("straps.loop").stop(entry.bufnr)
+      M.agents_refresh()
+    else
+      agents_notify_not_running()
+    end
+  elseif key == "i" then
+    if entry and entry.kind == "running" then
+      local target = entry.bufnr
+      vim.ui.input({ prompt = "steer: " }, function(txt)
+        if txt and txt ~= "" then
+          require("straps.loop").steer(target, txt)
+        end
+      end)
+    else
+      agents_notify_not_running()
+    end
+  elseif key == "r" then
+    if entry and entry.kind == "loaded" then
+      M.rename_session(entry.bufnr)
+    elseif entry and entry.kind == "saved" then
+      local state = require("straps.state")
+      local path = entry.path
+      vim.ui.input({
+        prompt = "session title: ",
+        default = state.session_title(path) or "",
+      }, function(txt)
+        if txt ~= nil then
+          state.set_session_title(path, txt)
+          M.agents_refresh()
+        end
+      end)
+      return
+    elseif entry and entry.kind == "running" then
+      vim.notify("straps: rename not supported for a running session", vim.log.levels.INFO)
+      return
+    end
+    M.agents_refresh()
+  end
+end
+
+--- Open (or reuse) the straps://agents buffer in a window and render it. The
+--- split placement follows the same <mods>-derived plumbing as show_session.
+function M.open_agents(split_cmd)
+  local bufnr = find_agents_buf()
+  if not bufnr then
+    bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(bufnr, AGENTS_BUFNAME)
+    vim.bo[bufnr].buftype = "nofile"
+    vim.bo[bufnr].bufhidden = "hide"
+    vim.bo[bufnr].swapfile = false
+    vim.bo[bufnr].modifiable = false
+    vim.bo[bufnr].filetype = "strapsagents"
+
+    local function map(lhs, key)
+      vim.keymap.set("n", lhs, function() M._agents_key(bufnr, key) end,
+        { buffer = bufnr, nowait = true, silent = true })
+    end
+    map("<CR>", "cr")
+    map("x", "x")
+    map("i", "i")
+    map("r", "r")
+    map("R", "R")
+
+    local group = vim.api.nvim_create_augroup("StrapsAgentsBuf" .. bufnr, { clear = true })
+    -- BufEnter catches saved/idle churn that emits no progress events.
+    vim.api.nvim_create_autocmd("BufEnter", {
+      group = group,
+      buffer = bufnr,
+      callback = function() M.agents_refresh() end,
+    })
+    -- The agents buffer uses BufWipeout for cleanup because nothing attaches to
+    -- it (render_timers uses buf_attach's detach callback instead).
+    vim.api.nvim_create_autocmd("BufWipeout", {
+      group = group,
+      buffer = bufnr,
+      callback = function()
+        if agents_timer and not agents_timer:is_closing() then
+          pcall(function() agents_timer:stop(); agents_timer:close() end)
+        end
+        agents_timer = nil
+        agents_lines[bufnr] = nil
+      end,
+    })
+  end
+
+  -- Reuse a window already showing it, else open one via the same split
+  -- plumbing as show_session.
+  local win
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_get_buf(w) == bufnr then
+      win = w
+      break
+    end
+  end
+  if win then
+    vim.api.nvim_set_current_win(win)
+  else
+    vim.cmd(split_cmd and split_cmd ~= "" and split_cmd or "split")
+    vim.api.nvim_win_set_buf(0, bufnr)
+  end
+
+  agents_do_render(bufnr)
+  -- Cursor on the first row (line 1 is a section rule or the empty-state line;
+  -- landing on line 1 is fine — no entry there is a no-op for the keymaps).
+  pcall(vim.api.nvim_win_set_cursor, 0, { 1, 0 })
+  return bufnr
+end
+
 --- Humanize a token count for display: 138879 -> "138.9k", 950 -> "950".
 --- Public because every hand-written status component needs exactly this and
 --- would otherwise reimplement it.
@@ -1708,6 +2084,68 @@ function M.pick_provider()
     M.redraw_status(true)
   end)
 end
+
+--- :StrapsAuto — grant permission categories to THIS session (auto mode). A
+--- grant writes a "cap:<category>" key into vim.b straps_allowed, which the
+--- default hook.confirm honors to auto-allow every call fn.capability puts in
+--- that category (no prompt). Must run on a session buffer. arg nil/"" reports
+--- the current cap: grants; "off" clears them (leaving other keys, e.g.
+--- editdir:, intact); otherwise a space/comma list of categories to grant.
+function M.auto(arg)
+  local buf = vim.api.nvim_get_current_buf()
+  if not vim.b.straps_session then
+    return vim.notify("straps: not a straps session buffer", vim.log.levels.ERROR)
+  end
+
+  local function grants_list()
+    local set = vim.b[buf].straps_allowed
+    if type(set) ~= "table" then return nil end
+    local cats = {}
+    for k in pairs(set) do
+      local c = type(k) == "string" and k:match("^cap:(.*)$") or nil
+      if c then cats[#cats + 1] = c end
+    end
+    table.sort(cats)
+    return #cats > 0 and table.concat(cats, ", ") or nil
+  end
+
+  arg = arg or ""
+  if arg == "" then
+    return vim.notify("straps: auto grants: " .. (grants_list() or "none"))
+  end
+
+  -- vim.b tables are snapshots: copy, mutate, assign back (see grant() in
+  -- hook.confirm for the idiom).
+  local set = {}
+  if type(vim.b[buf].straps_allowed) == "table" then
+    for k, v in pairs(vim.b[buf].straps_allowed) do set[k] = v end
+  end
+
+  if arg == "off" then
+    local cleared = grants_list()
+    for k in pairs(set) do
+      if type(k) == "string" and k:match("^cap:") then set[k] = nil end
+    end
+    vim.b[buf].straps_allowed = set
+    return vim.notify("straps: auto grants cleared: " .. (cleared or "none"))
+  end
+
+  local grantable = require("straps.registry").try_call("fn.capability") or {}
+  local is_grantable = {}
+  for _, c in ipairs(grantable) do is_grantable[c] = true end
+  local tokens = {}
+  for tok in arg:gmatch("[^%s,]+") do tokens[#tokens + 1] = tok end
+  for _, tok in ipairs(tokens) do
+    if not is_grantable[tok] then
+      return notify_err("straps: unknown auto category " .. vim.inspect(tok)
+        .. " (valid: " .. table.concat(grantable, ", ") .. ")")
+    end
+  end
+  for _, tok in ipairs(tokens) do set["cap:" .. tok] = true end
+  vim.b[buf].straps_allowed = set
+  vim.notify("straps: auto grants: " .. (grants_list() or "none"))
+end
+
 -- Only the MACHINERY folds: each tool_use fold swallows its following
 -- tool_result, so one call collapses to a single colored summary line, and
 -- the system block (long and rarely re-read) folds the same way. The
@@ -2041,6 +2479,18 @@ function M.setup()
       .. "and collapse tool calls to a summary. Display-only; never mutates "
       .. "buffer text. Redefine to reshape or no-op to show raw markers.",
     source = [[return function(bufnr) return require("straps.ui")._render(bufnr) end]],
+  })
+  -- fn.agents_render IS the whole agents-buffer presentation (the running /
+  -- loaded / saved sections, keymap footer and highlights), redefinable via
+  -- :StrapsEdit fn.agents_render. The logic lives in ui._agents_render (like
+  -- fn.render -> ui._render).
+  require("straps.registry").define_default({
+    name = "fn.agents_render",
+    kind = "fn",
+    doc = "Render the agents buffer (straps://agents): the running / loaded / "
+      .. "saved session sections, keymap footer and highlights, from live "
+      .. "state (ui.all_sessions). Redefine to reshape or restyle the listing.",
+    source = [[return function(bufnr) return require("straps.ui")._agents_render(bufnr) end]],
   })
   -- fn.tool_display: a tool call -> a command-style one-liner (bash as `$ ...`,
   -- reads/writes/greps as terse verbs). Redefinable via :StrapsEdit

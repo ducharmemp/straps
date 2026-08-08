@@ -1114,6 +1114,88 @@ tool" for it. None of this is sandboxing: an approved `bash` or `eval_lua`
 call runs with your full user privileges inside your editor. If you want
 real isolation, run Neovim in a container or sandbox.
 
+### Auto mode: capability grants
+
+Every tool call has a capability category. `fn.capability` is the classifier.
+The categories are `read`, `edit`, `delete`, `exec`, `lua`, `net`, `define`,
+`spawn`, and `other`. Read-only calls (`read`) are always auto-allowed. You can
+grant whole categories so the matching calls run without a prompt. The
+grantable categories are `edit`, `delete`, `exec`, `lua`, `net`, and `spawn`.
+The `define` and `other` categories are never grantable.
+
+`:StrapsAuto` grants categories to the current session:
+
+```vim
+:StrapsAuto edit,exec   " allow edits and shell commands without a prompt
+:StrapsAuto             " report the current category grants
+:StrapsAuto off         " clear all category grants
+```
+
+`off` clears only the category grants. It leaves your `editdir:`/"Always this
+tool" grants intact. Completion offers `off` and the grantable categories.
+
+You can also grant categories to a subagent with `spawn`'s `allow` list. Each
+entry is a grantable category or a specific tool name. A tool-name grant
+covers exactly that tool, even when its category is not granted (for example
+`allow = {"eval_lua"}`). Tools in the `define` category (`registry_define`)
+are the exception: they error at spawn time, because a define grant would let
+the child rewrite its own permission gate.
+
+```lua
+spawn{ task = "refactor the parser and update its tests", allow = {"edit"} }
+```
+
+The child can edit files without a prompt. It cannot run `bash`, because `exec`
+is not in its grants. A subagent runs unattended, so any call outside its
+grants is denied at once. The child never waits on a confirm dialog.
+`readonly = true` is the same as `allow = {}`: the child can only make
+read-only calls. You cannot pass both `readonly` and `allow`.
+
+CAUTION: Category grants are path-unrestricted. `allow = {"edit"}` and
+`:StrapsAuto edit` cover every path, including the project's trusted
+`.straps.lua` and the harness's own source. An `edit` grant to an agent you
+do not watch is a real delegation of write access, not a convenience toggle.
+
+### Finer-grained categories through redefinition
+
+The core gives you whole-category grants. For finer control, redefine
+`fn.capability`. A redefinition must do two things. First, classify the calls
+you care about into a new category. Second, add that category to the grantable
+list that `fn.capability()` returns with no arguments. `:StrapsAuto` and
+`spawn`'s `allow` both validate against that list, so a category missing from
+it cannot be granted anywhere.
+
+This example makes git-only `bash` calls their own `vcs` category:
+
+```lua
+require("straps.registry").define{
+  name = "fn.capability",
+  kind = "fn",
+  doc = "Classify tool calls; git-only bash is its own 'vcs' category.",
+  source = [[
+    -- The chunk runs before the new entry is stored, so this resolves the
+    -- current classifier. Capture it as the base.
+    local base = require("straps.registry").get("fn.capability").fn
+    return function(name, input)
+      if name == nil then
+        local grantable = base()          -- {edit, delete, exec, lua, net, spawn}
+        table.insert(grantable, "vcs")    -- make "vcs" grantable everywhere
+        return grantable
+      end
+      if name == "bash" and type(input) == "table"
+        and type(input.command) == "string"
+        and input.command:match("^git%s") then
+        return "vcs"
+      end
+      return base(name, input)
+    end
+  ]],
+}
+```
+
+After this redefinition, `:StrapsAuto vcs` grants git-only `bash` calls. Other
+`bash` calls still classify as `exec` and still prompt.
+
 ## Statusline
 
 Session buffers carry `vim.b.straps_status`, set to `"idle"` on creation and
@@ -1202,11 +1284,14 @@ readout is separate:
   The loop redraws all statuslines when a run starts or ends, so the count
   updates even while you sit in an unrelated buffer.
 
-- `:StrapsAgents` opens a picker over the running agents, each row showing the
-  session, its parent (`◂ <parent>`, for subagents), and the one-line task it
-  was spawned with. Picking one opens that transcript in a split so you can
-  watch a subagent's output live and steer it. `require("straps.ui")` also
-  exposes `pick_agents()` and the underlying `running_agents()` snapshot.
+- `:StrapsAgents` opens the **agents buffer** — one ordinary buffer listing
+  every session in three sections: **running** (an active run), **loaded** (an
+  idle session buffer), and **saved** (a transcript on disk). A tiny keymap
+  grammar manages them: `<CR>` open   `x` stop   `i` steer   `r` rename
+  `R` refresh. It stays live as runs start, work and finish. Takes the same
+  `<mods>` as `:Straps` (`:vertical StrapsAgents` for a vsplit).
+  `require("straps.ui")` still exposes `pick_agents()` (the old picker) and the
+  `running_agents()` / `all_sessions()` snapshots.
 
 ### Agents that know about each other
 

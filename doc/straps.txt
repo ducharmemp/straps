@@ -18,8 +18,9 @@ CONTENTS						*straps* *straps.nvim*
 	10. Skills ............................... |straps-skills|
 	11. Subagents ............................ |straps-subagents|
 	12. Multiplayer .......................... |straps-multiplayer|
-	13. Health ............................... |straps-health|
-	14. Highlight groups ..................... |straps-highlights|
+	13. Auto mode ............................ |straps-auto|
+	14. Health ............................... |straps-health|
+	15. Highlight groups ..................... |straps-highlights|
 
 ==============================================================================
 1. INTRODUCTION						*straps-introduction*
@@ -141,6 +142,16 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			|:StrapsResume|, which reopens a saved transcript from
 			disk.
 
+							*:StrapsAuto*
+:StrapsAuto [off|{cats}]
+			Grant capability categories to the current session so the
+			matching tool calls run without a confirm prompt (session
+			buffers only). `:StrapsAuto edit,exec` grants those
+			categories, no argument reports the current grants, and
+			`off` clears every category grant (leaving editdir: and
+			per-tool grants intact). Completion offers `off` and the
+			grantable categories. See |straps-auto| and |fn.capability|.
+
 							*:StrapsCompact*
 :StrapsCompact		Mechanically compact the current transcript — shrink
 			old tool_use/tool_result contents in place — and
@@ -164,10 +175,15 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 							*:StrapsEval*
 :StrapsEval		Execute the current buffer as Lua.
 
-							*:StrapsAgents*
-:StrapsAgents		Picker over running agents and subagents; picking one
-			brings its transcript on-screen to watch or steer.
-			See |straps-subagents|.
+							*:StrapsAgents* *straps-agents*
+:StrapsAgents		Open the agents buffer (straps://agents): one ordinary
+			buffer listing every session in three sections —
+			running, loaded (idle), and saved (on disk). Manage them
+			with a small keymap grammar: <CR> open, x stop, i steer,
+			r rename, R refresh. It re-renders as runs start, work
+			and finish. Takes the same |<mods>| as |:Straps|
+			(:vertical StrapsAgents for a vsplit).
+			See |straps-agents| and |straps-subagents|.
 
 							*:StrapsModel*
 :StrapsModel		Pick the provider-specific model for the current session
@@ -420,10 +436,14 @@ beats remembering to repeat it.
 						*hook.confirm*
 hook.confirm(name, input, ctx) -> allowed, reason
 		The permission gate, called before every tool. Default:
-		auto-allow the read-only tools; otherwise prompt (Yes / No /
-		Always this tool / for edits, Always in <dir> / Always all
-		edits), showing a diff for file edits. Grants persist in
-		b:straps_allowed. Never loosen this on the agent's initiative.
+		auto-allow the read-only tools; silently allow any call
+		whose |fn.capability| category has been granted (a
+		`cap:<category>` key in b:straps_allowed, written by
+		|:StrapsAuto| or a subagent `allow`); otherwise prompt
+		(Yes / No / Always this tool / for edits, Always in <dir>
+		/ Always all edits), showing a diff for file edits. Grants
+		persist in b:straps_allowed. Never loosen this on the
+		agent's initiative. See |straps-auto|.
 
 						*hook.after_write*
 hook.after_write(path, ctx) -> string|nil
@@ -518,6 +538,23 @@ fn.list_models(provider?) -> entries
 			"anthropic" or "openai"; omitted means effective provider.
 						*fn.build_tools*
 fn.build_tools() -> tools	Map every tool.* entry to an API tool def.
+						*fn.capability*
+fn.capability(name, input) -> category
+				Classify a tool call into a permission category:
+				`read` (auto-allowed), `edit`, `delete`, `exec`,
+				`lua`, `net`, `define`, `spawn`, or `other`. Called
+				with no arguments it returns the grantable list
+				({edit, delete, exec, lua, net, spawn}); `read`
+				needs no grant, and `define`/`other` are never
+				grantable. |hook.confirm|, |fn.readonly_policy|,
+				|:StrapsAuto|, and subagent `allow` all read it, so
+				redefine it to add a custom category. See
+				|straps-auto|.
+						*fn.readonly_policy*
+fn.readonly_policy(name, input) -> boolean
+				A thin wrapper: `fn.capability(name, input) ==
+				"read"`. The read-only test |hook.confirm| and
+				subagent gates share.
 						*fn.system_prompt*
 fn.system_prompt(opts?)		Compose the system prompt from its layers:
 				fn.system_prompt_core / _env / _project /
@@ -579,7 +616,19 @@ A child is a full session: its transcript is a real buffer the user can open
 anything it defines lands in its own scope. Use it to isolate a broad
 investigation so the parent transcript keeps only the conclusion.
 
-|:StrapsAgents| lists running agents and their parents.
+`spawn` takes `allow` (an array of strings) to grant the child permission
+categories. Each entry is a grantable category (see |fn.capability|) or a
+specific tool name; an unknown entry errors at spawn time, and so does any
+entry in the `define` category (`"define"` or `registry_define`). A tool-name
+grant covers exactly that tool even when its category is not granted. The
+child gets a confirm shadow: read-only calls and granted categories/tools run
+unprompted, and every other call is DENIED at once — a subagent runs
+unattended, so it never waits on a dialog. `readonly = true` is the same as
+`allow = {}` (read-only calls only). `readonly` and `allow` together error.
+See |straps-auto|.
+
+|:StrapsAgents| opens the agents buffer, which lists running sessions (and
+their parents), loaded-but-idle sessions, and saved transcripts on disk.
 
 ==============================================================================
 12. MULTIPLAYER						*straps-multiplayer*
@@ -631,7 +680,51 @@ All of this is same-instance only: agents in a DIFFERENT Neovim share nothing
 but disk, where the only signal is a file changing underneath you.
 
 ==============================================================================
-13. HEALTH						*straps-health*
+13. AUTO MODE						*straps-auto*
+
+Auto mode grants whole permission categories so the matching tool calls run
+without a confirm prompt. |fn.capability| classifies every call into a
+category. The grantable categories are `edit`, `delete`, `exec`, `lua`, `net`,
+and `spawn`. The `read` category is always auto-allowed. The `define` and
+`other` categories are never grantable.
+
+Grant categories to the current session with |:StrapsAuto|: >vim
+	:StrapsAuto edit,exec   " allow edits and shell commands
+	:StrapsAuto             " report current category grants
+	:StrapsAuto off         " clear all category grants
+<
+Grants are stored as `cap:<category>` keys in b:straps_allowed. `off` clears
+only those keys, so editdir: and per-tool grants stay. Grant categories to a
+subagent with `spawn`'s `allow` (see |straps-subagents|). Category grants are
+path-unrestricted: an `edit` grant covers every path, including a trusted
+`.straps.lua`.
+
+For finer-grained policy, redefine |fn.capability|. The redefinition must
+classify the calls you want into a new category AND add that category to the
+grantable list it returns with no arguments — |:StrapsAuto| and `allow`
+validate against that list. For example, classify git-only `bash` as a `vcs`
+category, add `vcs` to the grantable list, then `:StrapsAuto vcs` grants it. >lua
+	require("straps.registry").define{
+	  name = "fn.capability", kind = "fn",
+	  doc = "git-only bash is its own 'vcs' category",
+	  source = [==[
+	    local base = require("straps.registry").get("fn.capability").fn
+	    return function(name, input)
+	      if name == nil then
+	        local g = base(); table.insert(g, "vcs"); return g
+	      end
+	      if name == "bash" and type(input) == "table"
+	        and type(input.command) == "string"
+	        and input.command:match("^git%s") then
+	        return "vcs"
+	      end
+	      return base(name, input)
+	    end
+	  ]==],
+	}
+<
+==============================================================================
+14. HEALTH						*straps-health*
 
 						*straps-checkhealth*
 >vim
@@ -646,7 +739,7 @@ any runs still in flight. Every probe is isolated, so the report runs even
 when `setup()` never ran or the data dir is unwritable.
 
 ==============================================================================
-14. HIGHLIGHT GROUPS					*straps-highlights*
+15. HIGHLIGHT GROUPS					*straps-highlights*
 
 All groups link by default (`hi default link`) to standard groups, so they
 follow your colorscheme; a user `hi link` wins and survives a re-apply.

@@ -82,6 +82,11 @@ local function progress(bufnr, ctx, ev, phase)
   if phase ~= nil then
     pcall(function() vim.b[bufnr].straps_phase = phase end)
   end
+  -- The agents buffer (straps://agents) re-renders on any session's progress.
+  -- This is mechanism, not policy, so it lives here beside the phase mirror
+  -- rather than in the redefinable hook.on_progress. No-ops without an agents
+  -- buffer open; always runs on the main loop.
+  pcall(function() require("straps.ui").agents_refresh() end)
 end
 
 -- fn.log is optional and must never break a run: pcall'd try_call. The

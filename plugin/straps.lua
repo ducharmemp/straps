@@ -195,9 +195,9 @@ end, {
   desc = "straps: open :help straps (or a straps help tag)",
 })
 
-vim.api.nvim_create_user_command("StrapsAgents", function()
-  require("straps.ui").pick_agents()
-end, { desc = "straps: pick a running agent/subagent and open its transcript" })
+vim.api.nvim_create_user_command("StrapsAgents", function(opts)
+  require("straps.ui").open_agents(split_cmd_of(opts.smods))
+end, { desc = "straps: open the agents buffer (running/loaded/saved sessions; :vertical for a vsplit)" })
 
 vim.api.nvim_create_user_command("StrapsEval", function()
   require("straps.ui").eval_buffer()
@@ -214,3 +214,14 @@ end, { desc = "straps: pick config.effort (extended-thinking budget) via a picke
 vim.api.nvim_create_user_command("StrapsProvider", function()
   require("straps.ui").pick_provider()
 end, { desc = "straps: pick the API backend (anthropic/openai); persists the global choice to ~/.config/straps/provider" })
+
+vim.api.nvim_create_user_command("StrapsAuto", function(opts)
+  require("straps.ui").auto(opts.args)
+end, { nargs = "?", complete = function(arglead)
+  local items = { "off", "edit", "delete", "exec", "lua", "net", "spawn" }
+  local out = {}
+  for _, it in ipairs(items) do
+    if it:find(arglead, 1, true) == 1 then out[#out + 1] = it end
+  end
+  return out
+end, desc = "Grant permission categories to this session (auto mode)" })

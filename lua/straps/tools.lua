@@ -1209,7 +1209,12 @@ end
       .. " child backend, inherited from this session/global default when unset; tools (optional array"
       .. " of tool names) — the child sees only these tools; readonly (optional"
       .. " boolean) — the child may use only auto-allowed read-only tools,"
-      .. " every write is denied without prompting; show (optional boolean) —"
+      .. " every write is denied without prompting (equivalent to allow={});"
+      .. " allow (optional array) — grant these permission categories (edit,"
+      .. " delete, exec, lua, net, spawn) or specific tool names to the child:"
+      .. " granted calls run without prompting, everything else is DENIED"
+      .. " (no prompt), readonly and allow are mutually exclusive; show (optional"
+      .. " boolean) —"
       .. " open the child's transcript in a split; max_turns (optional,"
       .. " default 24); model (optional) — run the child on this model id"
       .. " instead of the session's; effort (optional) — extended-thinking"
@@ -1227,6 +1232,11 @@ end
           description = "Restrict the child to these tool names.",
         },
         readonly = { type = "boolean", description = "Read-only child: every write tool is denied." },
+        allow = {
+          type = "array",
+          items = { type = "string" },
+          description = "Grant these permission categories (edit, delete, exec, lua, net, spawn) or specific tool names to the child: granted calls run without prompting; everything else is DENIED (no prompt). readonly=true is equivalent to allow={}.",
+        },
         show = { type = "boolean", description = "Open the child's transcript buffer in a split." },
         max_turns = { type = "integer", description = "Child turn budget (default 24)." },
         model = { type = "string", description = "Model id for the child (default: this session's model)." },
@@ -1244,6 +1254,34 @@ return function(input, ctx)
   local registry = require("straps.registry")
   local state = require("straps.state")
   local loop = require("straps.loop")
+
+  -- allow: grant permission categories or specific tool names to the child.
+  -- readonly is the same mechanism with an empty grant set, so the two are
+  -- mutually exclusive. Validate every entry up front: it must be a grantable
+  -- category or an existing tool, so "define"/"other" (not grantable) and typos
+  -- error here instead of silently granting nothing.
+  if input.readonly and type(input.allow) == "table" then
+    error("spawn: readonly and allow are mutually exclusive (readonly is allow={})")
+  end
+  if type(input.allow) == "table" then
+    local grantable = registry.try_call("fn.capability") or {}
+    local is_grantable = {}
+    for _, c in ipairs(grantable) do is_grantable[c] = true end
+    for _, entry in ipairs(input.allow) do
+      if not (is_grantable[entry] or registry.get("tool." .. tostring(entry)) ~= nil) then
+        error("spawn: allow entry " .. vim.inspect(entry)
+          .. " is not a grantable category (" .. table.concat(grantable, ", ")
+          .. ") or an existing tool")
+      end
+      -- A tool-name grant of a define-category tool (registry_define) would
+      -- let the child shadow its own hook.confirm — an everything grant. The
+      -- category ceiling must hold for name grants too.
+      if registry.try_call("fn.capability", entry) == "define" then
+        error("spawn: allow entry " .. vim.inspect(entry)
+          .. " is in the define category, which is never grantable")
+      end
+    end
+  end
 
   -- Depth guard: subagents do not spawn sub-subagents unless the user
   -- raises config.max_spawn_depth.
@@ -1303,19 +1341,52 @@ return function(input, ctx)
   if type(input.tools) == "table" and #input.tools > 0 then
     vim.b[child].straps_tool_filter = input.tools
   end
-  if input.readonly then
+  if input.readonly or type(input.allow) == "table" then
+    -- Seed the child's per-buffer grant set from allow (readonly => empty).
+    -- vim.b returns copies, so build the whole table then assign once, before
+    -- loop.start so the first tool call already sees it.
+    local grantable = registry.try_call("fn.capability") or {}
+    local is_grantable = {}
+    for _, c in ipairs(grantable) do is_grantable[c] = true end
+    local grants = {}
+    if type(input.allow) == "table" then
+      for _, entry in ipairs(input.allow) do
+        if is_grantable[entry] then
+          grants["cap:" .. entry] = true
+        else
+          grants[entry] = true -- tool-name grant
+        end
+      end
+    end
+    vim.b[child].straps_allowed = grants
+
     registry.define({
       name = "hook.confirm",
       kind = "hook",
-      doc = "spawn: readonly child — allow read-only tools, deny everything else.",
+      doc = "spawn: readonly/allow child — auto-allow read-only calls plus the"
+        .. " granted categories/tools, deny everything else without a prompt."
+        .. " readonly is this with an empty grant set (only reads pass).",
       source = [[
 return function(name, tin, tctx)
-  -- Permit exactly the read-only tool calls (fn.readonly_policy is the shared
-  -- definition; see hook.confirm), deny every write.
-  if require("straps.registry").try_call("fn.readonly_policy", name, tin) then
-    return true
+  local reg = require("straps.registry")
+  local cap = reg.try_call("fn.capability", name, tin)
+  if cap == "read" then return true end
+  local allowed
+  pcall(function()
+    allowed = tctx and tctx.bufnr and vim.b[tctx.bufnr].straps_allowed or nil
+  end)
+  if type(allowed) == "table" then
+    if cap and allowed["cap:" .. tostring(cap)] then return true end
+    if allowed[name] then return true end
   end
-  return false, "readonly subagent: " .. tostring(name) .. " is not allowed"
+  if type(allowed) ~= "table" or next(allowed) == nil then
+    return false, "readonly subagent: " .. tostring(name) .. " is not allowed"
+  end
+  local names = {}
+  for k in pairs(allowed) do names[#names + 1] = k end
+  table.sort(names)
+  return false, "subagent: " .. tostring(name) .. " is not covered by this child's grants ("
+    .. table.concat(names, ", ") .. ")"
 end
 ]],
     }, { scope = child })
@@ -2784,24 +2855,33 @@ return function(input, ctx)
 end
 ]==],
   })
-  -- -------------------------------------------------------- fn.readonly_policy
 
-  -- Single source of truth for "which tool calls are read-only". Both the
-  -- default hook.confirm (to auto-allow them without a prompt) and spawn's
-  -- readonly-child hook (to permit only these) consult it, so the policy
-  -- cannot drift between the two. Called as (name, input) -> boolean.
+  -- ------------------------------------------------------------- fn.capability
+
+  -- Single classifier for "which permission category a tool call falls into".
+  -- Both fn.readonly_policy (read == auto-allowed) and the cap: grant checks in
+  -- hook.confirm and spawn's child gate consult it, so the categories cannot
+  -- drift apart. Called as (name, input) -> category string, or with no args
+  -- to get the list of GRANTABLE categories.
   define({
-    name = "fn.readonly_policy",
+    name = "fn.capability",
     kind = "fn",
-    doc = "Return true if the tool call (name, input) is read-only: it opens"
-      .. " views or lists things but changes no files. The read-only allowlist"
-      .. " plus the list-mode exceptions (code_action/fix_diagnostic without an"
-      .. " index, undo_edit with history=true, transcript_excise without"
-      .. " blocks/range) live here so hook.confirm and"
-      .. " spawn's readonly-child gate share one policy.",
+    doc = "Classify a tool call (name, input) into a permission category, the"
+      .. " single source of truth every permission check consults. Categories:"
+      .. " read (view/list, always auto-allowed), edit (file writes), delete"
+      .. " (not undo-reversible, its own category), exec (shell), lua (eval_lua),"
+      .. " net (fetch_url), define (registry_define — never grantable, a define"
+      .. " grant could shadow hook.confirm), spawn (subagents), and other"
+      .. " (agent-defined tools — never grantable). Called with no args it"
+      .. " returns the array of GRANTABLE categories { edit, delete, exec, lua,"
+      .. " net, spawn }. Redefine it to add custom categories — e.g. classify"
+      .. " bash inputs matching ^git%s into a \"vcs\" category.",
     source = [==[
 return function(name, input)
-  local auto = {
+  local grantable = { "edit", "delete", "exec", "lua", "net", "spawn" }
+  if name == nil then return grantable end
+
+  local read = {
     read_file = true, glob = true, tree = true, path_info = true, grep = true,
     registry_list = true, registry_get = true, skill = true,
     -- editor-native read-only tools (straps.editor)
@@ -2824,30 +2904,72 @@ return function(name, input)
     -- be asking permission to ask a question.
     ask_user = true,
   }
-  if auto[name] then return true end
+  if read[name] then return "read" end
 
   -- code_action / fix_diagnostic without an index only LIST available actions
   -- (read-only); applying one (index set) is a write.
-  if (name == "code_action" or name == "fix_diagnostic")
-    and (type(input) ~= "table" or input.index == nil) then
-    return true
+  if name == "code_action" or name == "fix_diagnostic" then
+    if type(input) ~= "table" or input.index == nil then return "read" end
+    return "edit"
   end
 
   -- undo_edit with history=true only lists the undo states (read-only); an
   -- actual undo is a buffer+file change.
-  if name == "undo_edit" and type(input) == "table" and input.history == true then
-    return true
+  if name == "undo_edit" then
+    if type(input) == "table" and input.history == true then return "read" end
+    return "edit"
   end
 
   -- transcript_excise with no blocks/range only lists the transcript's blocks
   -- (read-only); an actual excision rewrites the transcript, which is the most
-  -- consequential write in the system and always prompts.
+  -- consequential write in the system and always prompts (the "other"
+  -- fallthrough below, never grantable).
   if name == "transcript_excise" and type(input) == "table"
     and input.blocks == nil and input.range == nil then
-    return true
+    return "read"
   end
 
-  return false
+  local edit = {
+    write_file = true, edit_file = true, patch_file = true, bulk_replace = true,
+    format = true, rename_symbol = true, move_file = true, move_files = true,
+  }
+  if edit[name] then return "edit" end
+
+  -- Deletion is not undo-reversible, so it is its own category.
+  if name == "delete_file" or name == "delete_files" then return "delete" end
+
+  if name == "bash" or name == "run_in_terminal" or name == "run_quickfix" then
+    return "exec"
+  end
+  if name == "eval_lua" then return "lua" end
+  if name == "fetch_url" then return "net" end
+  -- registry_define can shadow hook.confirm, so a define grant would be an
+  -- everything grant: it is a category of its own and never grantable.
+  if name == "registry_define" then return "define" end
+  if name == "spawn" or name == "spawn_wait" then return "spawn" end
+
+  -- Agent-defined tools: unknown, never grantable.
+  return "other"
+end
+]==],
+  })
+
+  -- -------------------------------------------------------- fn.readonly_policy
+
+  -- Thin wrapper over fn.capability: read-only == the "read" category. Both the
+  -- default hook.confirm (to auto-allow them without a prompt) and spawn's
+  -- readonly-child hook (to permit only these) consult it, so the policy
+  -- cannot drift. Called as (name, input) -> boolean.
+  define({
+    name = "fn.readonly_policy",
+    kind = "fn",
+    doc = "Return true if the tool call (name, input) is read-only: it opens"
+      .. " views or lists things but changes no files. Classification itself"
+      .. " lives in fn.capability (read-only == the \"read\" category); this is"
+      .. " the boolean wrapper hook.confirm and spawn's readonly-child gate use.",
+    source = [==[
+return function(name, input)
+  return require("straps.registry").try_call("fn.capability", name, input) == "read"
 end
 ]==],
   })
@@ -2881,7 +3003,9 @@ end
       .. " edit anywhere under the detected project root, and 'Always all edits'"
       .. " grants every future write_file/edit_file/patch_file call regardless of path."
       .. " Other tools get Yes / No / 'Always this tool', scoped to the tool name. All"
-      .. " grants persist in vim.b[ctx.bufnr].straps_allowed. Redefine to"
+      .. " grants persist in vim.b[ctx.bufnr].straps_allowed. A cap:<category> key"
+      .. " in that allow-set (written by :StrapsAuto or spawn's allow arg) silently"
+      .. " permits every call fn.capability puts in that category. Redefine to"
       .. " change the policy.",
     source = [==[
 -- NOTE: this hook runs inside the loop coroutine. vim.fn.confirm must run on
@@ -2948,6 +3072,17 @@ return function(name, input, ctx)
     return ctx and ctx.bufnr and vim.b[ctx.bufnr].straps_allowed or nil
   end)
   local have_allowed = ok and type(allowed) == "table"
+
+  -- Category grants: "cap:<category>" keys in the allow-set (written by
+  -- :StrapsAuto or tool.spawn's allow arg) silently permit every call that
+  -- fn.capability classifies into that category. Only grantable categories
+  -- are ever written as cap: keys, so honoring any present key is safe.
+  if have_allowed then
+    local cap = require("straps.registry").try_call("fn.capability", name, input)
+    if cap and allowed["cap:" .. tostring(cap)] then
+      return true
+    end
+  end
 
   if is_edit then
     if have_allowed then

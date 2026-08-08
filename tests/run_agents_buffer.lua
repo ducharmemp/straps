@@ -256,6 +256,40 @@ case("<CR> on a saved row resumes it; on a loaded row shows it", function()
   assert(loaded_shown, "loaded <CR> did not display the session buffer")
 end)
 
+case("<CR> replaces the agents buffer in the current window (oil-style), jumplist set", function()
+  -- A dedicated loaded session and a single window showing only the agents
+  -- buffer, so we can assert reuse-not-split and the <C-o> return jump.
+  local session_buf = state.new_session()
+  vim.cmd("only")
+  local buf = ui.open_agents("")
+  local win = vim.api.nvim_get_current_win()
+  assert(vim.api.nvim_win_get_buf(win) == buf, "agents buffer not in the current window")
+  local wins_before = #vim.api.nvim_list_wins()
+
+  local loaded_lnum
+  for l = 1, vim.api.nvim_buf_line_count(buf) do
+    local e = ui._agents_line(buf, l)
+    if e and e.kind == "loaded" and e.bufnr == session_buf then
+      loaded_lnum = l
+      break
+    end
+  end
+  assert(loaded_lnum, "no loaded row resolving to the new session buffer")
+  vim.api.nvim_win_set_cursor(win, { loaded_lnum, 0 })
+  ui._agents_key(buf, "cr")
+
+  -- Same window count (no split), and that window now shows the session buffer.
+  assert(#vim.api.nvim_list_wins() == wins_before,
+    "<CR> from the agents buffer opened a split instead of reusing the window")
+  assert(vim.api.nvim_win_get_buf(win) == session_buf,
+    "the current window does not show the selected session buffer")
+
+  -- <C-o> steps back to the agents buffer (oil-style jumplist navigation).
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-o>", true, false, true), "nx", false)
+  assert(vim.api.nvim_win_get_buf(win) == buf,
+    "<C-o> did not return to the agents buffer (jumplist entry missing)")
+end)
+
 case("cr on a stale loaded row notifies and re-renders", function()
   -- A fresh loaded session, distinct from loaded_buf used by earlier cases.
   local session_buf = state.new_session()

@@ -180,8 +180,10 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			buffer listing every session in three sections —
 			running, loaded (idle), and saved (on disk). Manage them
 			with a small keymap grammar: <CR> open, x stop, i steer,
-			r rename, R refresh. It re-renders as runs start, work
-			and finish. Takes the same |<mods>| as |:Straps|
+			r rename, R refresh. <CR> replaces the agents buffer in
+			its own window (oil-style), so <C-o>/<C-i> step back to
+			the list and forward again. It re-renders as runs start,
+			work and finish. Takes the same |<mods>| as |:Straps|
 			(:vertical StrapsAgents for a vsplit).
 			See |straps-agents| and |straps-subagents|.
 

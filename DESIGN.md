@@ -1289,7 +1289,12 @@ Existing suites must all still pass.
   (`show_session` for running/loaded, `resume_session` for saved), `x` stops
   a running run (`loop.stop`), `i` steers it (`vim.ui.input` → `loop.steer`),
   `r` renames (loaded → `rename_session`, saved → set durable title), `R`
-  refreshes; `q` is NOT mapped. Two refresh seams keep it live: the loop's
+  refreshes; `q` is NOT mapped. `<CR>` reuses the agents-buffer window
+  (oil-style): `show_session`/`resume_session` take the split_cmd sentinel
+  `"none"`, which swaps the session buffer in via `:buffer` (recording a
+  jumplist entry) instead of opening a split — so `<C-o>`/`<C-i>` step back to
+  the agents buffer and forward again. (Any other split_cmd, e.g. `<mods>`
+  from the user commands, still splits.) Two refresh seams keep it live: the loop's
   internal `progress()` calls `ui.agents_refresh()` on any session's progress
   event (mechanism beside the phase mirror, not the redefinable
   `hook.on_progress`), and a BufEnter autocmd on the buffer catches

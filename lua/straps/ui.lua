@@ -613,14 +613,24 @@ end
 ---   defaults to "split" (horizontal). Pass "vertical split" for a vsplit,
 ---   or any modifier chain ("botright vsplit", "leftabove split", ...). The
 ---   user commands derive this from <mods>, so `:vertical Straps` just works.
+---   The sentinel "none" reuses the current window (oil-style) via :buffer
+---   instead of splitting, recording a jumplist entry so <C-o>/<C-i> navigate
+---   back to the replaced buffer and forward again.
 function M.show_session(bufnr, split_cmd)
   -- Project registry (trusted .straps.lua, if any), so project-defined tools
   -- exist for the session's first request and land after the builtins in seq
   -- order (append-only, cache-safe). pcall: opening a session must never fail
   -- because a project file is broken.
   pcall(require("straps").load_project_registry)
-  vim.cmd(split_cmd and split_cmd ~= "" and split_cmd or "split")
-  vim.api.nvim_win_set_buf(0, bufnr)
+  if split_cmd == "none" then
+    -- Reuse the current window (oil-style): swap the session buffer in via
+    -- :buffer, which records a jumplist entry so <C-o>/<C-i> step back to the
+    -- buffer being replaced (e.g. the agents buffer) and forward again.
+    vim.cmd("buffer " .. bufnr)
+  else
+    vim.cmd(split_cmd and split_cmd ~= "" and split_cmd or "split")
+    vim.api.nvim_win_set_buf(0, bufnr)
+  end
   -- Don't stomp a live status: a running subagent brought on-screen by the
   -- agents picker is still "running".
   if vim.b[bufnr].straps_status == nil then
@@ -1299,14 +1309,14 @@ function M._agents_key(bufnr, key)
         agents_do_render(bufnr)
         return
       end
-      M.show_session(entry.bufnr)
+      M.show_session(entry.bufnr, "none")
     elseif entry.kind == "saved" then
       if vim.fn.filereadable(entry.path) ~= 1 then
         vim.notify("straps: transcript no longer exists", vim.log.levels.INFO)
         agents_do_render(bufnr)
         return
       end
-      M.resume_session(entry.path)
+      M.resume_session(entry.path, "none")
     end
     M.agents_refresh()
   elseif key == "x" then

@@ -1288,7 +1288,9 @@ readout is separate:
   every session in three sections: **running** (an active run), **loaded** (an
   idle session buffer), and **saved** (a transcript on disk). A tiny keymap
   grammar manages them: `<CR>` open   `x` stop   `i` steer   `r` rename
-  `R` refresh. It stays live as runs start, work and finish. Takes the same
+  `R` refresh. `<CR>` replaces the agents buffer in its own window (oil-style),
+  so `<C-o>`/`<C-i>` step back to the list and forward again. It stays live as
+  runs start, work and finish. Takes the same
   `<mods>` as `:Straps` (`:vertical StrapsAgents` for a vsplit).
   `require("straps.ui")` still exposes `pick_agents()` (the old picker) and the
   `running_agents()` / `all_sessions()` snapshots.

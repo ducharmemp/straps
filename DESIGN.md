@@ -1297,7 +1297,15 @@ Existing suites must all still pass.
   ~100ms debounce over a module-level uv timer whose callback re-renders
   inside `vim.schedule` (re-checking `nvim_buf_is_valid`, like
   `schedule_render`); it no-ops when no agents buffer is open. A BufWipeout
-  autocmd stops the timer and clears the line map. The picker
+  autocmd stops the timer and clears the line map. Every row is a single
+  line capped at a fixed 76-cell width (`AGENTS_WIDTH`): variable-length
+  fields (a running row's task, a loaded row's title, a saved row's
+  summary/name) collapse whitespace to one line and truncate with `…`; a
+  saved row's age is right-aligned. The window opens with `nowrap` and
+  `cursorline`, and the cursor lands on the first row rather than line 1, so
+  a split narrower than 76 cells right-clips rows without an ellipsis rather
+  than wrapping into dozens of screen lines. Section headers carry each
+  set's row count (`running (N)`, `loaded (N)`, `saved (N)`). The picker
   `ui.pick_agents()` and `ui.agents_status()` (the statusline component,
   `""` when idle, `🤖 N` / `🤖 N+M` otherwise) remain exported and
   unchanged. Backed by `ui.running_agents()` (a snapshot from

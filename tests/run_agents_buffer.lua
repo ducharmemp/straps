@@ -381,6 +381,42 @@ end
     "progress events did not trigger an agents-buffer render")
 end)
 
+case("rows are capped to one legible line", function()
+  -- A saved transcript whose first user block is ~2000 chars.
+  local b = state.new_session()
+  local long_prompt = string.rep("legibility ", 200)
+  state.append(b, "user", nil, long_prompt)
+  local long_path = vim.api.nvim_buf_get_name(b)
+  vim.cmd("bwipeout! " .. b)
+
+  local buf = ui.open_agents("")
+  local abs = vim.fn.fnamemodify(long_path, ":p")
+  local row_line
+  for lnum = 1, vim.api.nvim_buf_line_count(buf) do
+    local e = ui._agents_line(buf, lnum)
+    if e and e.kind == "saved" and vim.fn.fnamemodify(e.path, ":p") == abs then
+      row_line = lines_of(buf)[lnum]
+      break
+    end
+  end
+  assert(row_line, "no saved row found for the long-prompt transcript")
+  assert(vim.fn.strdisplaywidth(row_line) <= 76,
+    "capped row exceeds 76 cells: " .. vim.fn.strdisplaywidth(row_line))
+  assert(row_line:find("…", 1, true), "capped row missing the truncation ellipsis")
+  assert(row_line:match("just now$") or row_line:match("ago$"),
+    "capped row does not end with the age tail: " .. row_line)
+end)
+
+case("agents window gets list options and cursor on a row", function()
+  local buf = ui.open_agents("")
+  local w = vim.api.nvim_get_current_win()
+  assert(vim.wo[w].wrap == false, "window wrap should be false")
+  assert(vim.wo[w].cursorline == true, "window cursorline should be true")
+  local cursor_lnum = vim.api.nvim_win_get_cursor(w)[1]
+  assert(ui._agents_line(buf, cursor_lnum) ~= nil,
+    "cursor did not land on a row resolving through the line map")
+end)
+
 if failed then
   os.exit(1)
 end

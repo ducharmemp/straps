@@ -1022,7 +1022,7 @@ end
 
 local AGENTS_BUFNAME = "straps://agents"
 local agents_ns = vim.api.nvim_create_namespace("straps_agents")
-local AGENTS_RULE_WIDTH = 52 -- match the transcript renderer's rule width
+local AGENTS_WIDTH = 76 -- one fixed line width for rules and rows (legibility beats matching the transcript rule width; fixed, not window-derived, because the debounce can render a windowless buffer)
 
 -- Line -> entry map, keyed by agents bufnr -> { [lnum] = { kind, bufnr?, path? } }.
 -- Module-level (NOT vim.b): vim.b cannot hold a sparse integer-keyed table
@@ -1077,11 +1077,28 @@ function M.all_sessions()
   return { running = running, loaded = loaded, saved = saved }
 end
 
--- One section rule line "━━ <name> ━━━…" at AGENTS_RULE_WIDTH; the leading and
+-- One section rule line "━━ <name> ━━━…" at AGENTS_WIDTH; the leading and
 -- trailing runs get StrapsRule. Returns the text; the caller sets the extmark.
 local function agents_rule(name)
-  local trailing = AGENTS_RULE_WIDTH - 3 - #name - 1
+  local trailing = AGENTS_WIDTH - 3 - #name - 1
   return bar(2, "━") .. " " .. name .. " " .. bar(math.max(1, trailing), "━")
+end
+
+-- Collapse a field to one line and cap its display width; a capped field ends
+-- with "…". Width math is display cells (strdisplaywidth), never bytes.
+local function fit(text, width)
+  if width < 1 then
+    return ""
+  end
+  text = text:gsub("%s+", " ")
+  if vim.fn.strdisplaywidth(text) <= width then
+    return text
+  end
+  local n = math.min(vim.fn.strchars(text), width)
+  while n > 0 and vim.fn.strdisplaywidth(vim.fn.strcharpart(text, 0, n)) > width - 1 do
+    n = n - 1
+  end
+  return vim.fn.strcharpart(text, 0, n) .. "…"
 end
 
 -- Implementation of fn.agents_render: rewrite ALL lines of the agents buffer
@@ -1111,7 +1128,7 @@ function M._agents_render(bufnr)
       hls[#hls + 1] = { 0, 0, -1, "StrapsRule" }
     else
       if #sets.running > 0 then
-        rule("running")
+        rule("running (" .. #sets.running .. ")")
         for _, a in ipairs(sets.running) do
           local indent = string.rep("  ", a.depth or 0)
           local info = M.session_info(a.bufnr)
@@ -1124,8 +1141,13 @@ function M._agents_render(bufnr)
           local parts = { a.label }
           if model then parts[#parts + 1] = model end
           parts[#parts + 1] = phase
-          if a.task and a.task ~= "" then parts[#parts + 1] = a.task end
           local text = indent .. "▶ " .. table.concat(parts, "  ")
+          if a.task and a.task ~= "" then
+            local remaining = AGENTS_WIDTH - vim.fn.strdisplaywidth(text) - 2
+            if remaining >= 8 then
+              text = text .. "  " .. fit(a.task, remaining)
+            end
+          end
           lines[#lines + 1] = text
           local row = #lines - 1
           map[#lines] = { kind = "running", bufnr = a.bufnr }
@@ -1141,13 +1163,18 @@ function M._agents_render(bufnr)
       end
 
       if #sets.loaded > 0 then
-        rule("loaded")
+        rule("loaded (" .. #sets.loaded .. ")")
         for _, l in ipairs(sets.loaded) do
           local model = (l.info and l.info.model_label) or nil
           local parts = { l.label }
-          if l.title and l.title ~= "" then parts[#parts + 1] = l.title end
           if model then parts[#parts + 1] = model end
           local text = "∙ " .. table.concat(parts, "  ")
+          if l.title and l.title ~= "" then
+            local remaining = AGENTS_WIDTH - vim.fn.strdisplaywidth(text) - 2
+            if remaining >= 8 then
+              text = text .. "  " .. fit(l.title, remaining)
+            end
+          end
           lines[#lines + 1] = text
           local row = #lines - 1
           map[#lines] = { kind = "loaded", bufnr = l.bufnr }
@@ -1160,15 +1187,18 @@ function M._agents_render(bufnr)
       end
 
       if #sets.saved > 0 then
-        rule("saved")
+        rule("saved (" .. #sets.saved .. ")")
         for _, s in ipairs(sets.saved) do
-          local label = (s.summary and s.summary ~= "") and s.summary or s.name
-          local text = "  " .. label .. "  " .. relative_time(s.mtime)
+          local age = relative_time(s.mtime)
+          local raw = (s.summary and s.summary ~= "") and s.summary or s.name
+          local label = fit(raw, AGENTS_WIDTH - 4 - vim.fn.strdisplaywidth(age))
+          local pad = math.max(2, AGENTS_WIDTH - 2 - vim.fn.strdisplaywidth(label) - vim.fn.strdisplaywidth(age))
+          local text = "  " .. label .. string.rep(" ", pad) .. age
           lines[#lines + 1] = text
           local row = #lines - 1
           map[#lines] = { kind = "saved", path = s.path }
           -- The age tail -> dim StrapsRule.
-          local age_start = #("  " .. label .. "  ")
+          local age_start = #text - #age
           hls[#hls + 1] = { row, age_start, -1, "StrapsRule" }
         end
       end
@@ -1383,10 +1413,25 @@ function M.open_agents(split_cmd)
     vim.api.nvim_win_set_buf(0, bufnr)
   end
 
+  local w = vim.api.nvim_get_current_win()
+  vim.wo[w].wrap = false
+  vim.wo[w].cursorline = true
+  vim.wo[w].number = false
+  vim.wo[w].relativenumber = false
+  vim.wo[w].signcolumn = "no"
+  vim.wo[w].foldcolumn = "0"
+
   agents_do_render(bufnr)
-  -- Cursor on the first row (line 1 is a section rule or the empty-state line;
-  -- landing on line 1 is fine — no entry there is a no-op for the keymaps).
-  pcall(vim.api.nvim_win_set_cursor, 0, { 1, 0 })
+  -- Cursor on the first row (the first line that resolves through the line
+  -- map to an entry), not line 1 (a section rule or the empty-state line).
+  local cursor_lnum = 1
+  for lnum = 1, vim.api.nvim_buf_line_count(bufnr) do
+    if M._agents_line(bufnr, lnum) then
+      cursor_lnum = lnum
+      break
+    end
+  end
+  pcall(vim.api.nvim_win_set_cursor, 0, { cursor_lnum, 0 })
   return bufnr
 end
 

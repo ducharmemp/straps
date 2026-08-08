@@ -1276,11 +1276,18 @@ Existing suites must all still pass.
   `state.list_sessions()` whose absolute path has no loaded buffer — matched
   by exact `nvim_buf_get_name`, never `vim.fn.bufnr`, which pattern-matches).
   The buffer is `buftype=nofile`, `filetype=strapsagents`, nomodifiable
-  (invariant 1: buffers are state). Its content is drawn by `fn.agents_render`,
-  a `define_default` registry fn (invariant 2: redefinable at runtime; the
-  logic lives in `ui._agents_render`, like `fn.render` → `ui._render`). A
-  section with zero rows is omitted; when all are empty a single empty-state
-  line shows; the last line is a keymap footer. A line→entry map
+  (invariant 1: buffers are state). Two presentation seams, both
+  `define_default` registry fns (invariant 2: redefinable at runtime): the
+  content is drawn by `fn.agents_render` (logic in `ui._agents_render`, like
+  `fn.render` → `ui._render`), and the window's winbar — the keymap legend,
+  right-aligned — by `fn.agents_winbar` (logic in `ui._agents_winbar`; it
+  must stay cheap, a winbar expression re-evaluates per redraw). The winbar
+  is installed as the `ui.winbar()` dispatcher (below).
+  `config.agents_winbar = false` skips the winbar install and
+  `fn.agents_render` puts the legend on the FIRST buffer line instead
+  (config-derived, never window-derived: the debounce can render a windowless
+  buffer). A section with zero rows is omitted; when all are empty a single
+  empty-state line shows. A line→entry map
   (`{ [lnum] = { kind, bufnr?, path? } }`) is a MODULE-LEVEL Lua table keyed
   by bufnr, NOT `vim.b` (which cannot hold a sparse integer-keyed table
   through msgpack); it is rebuilt on every render. Highlights are extmarks in
@@ -1306,7 +1313,10 @@ Existing suites must all still pass.
   line capped at a fixed 76-cell width (`AGENTS_WIDTH`): variable-length
   fields (a running row's task, a loaded row's title, a saved row's
   summary/name) collapse whitespace to one line and truncate with `…`; a
-  saved row's age is right-aligned. The window opens with `nowrap` and
+  saved row's age is right-aligned. A loaded row also carries its
+  transcript's relative age (file-backed buffers only) and, when the session
+  has non-persisted usage (`vim.b.straps_usage`), a `ctx N%` context-fill
+  field from `ui.session_info().context_pct` — both omitted when absent. The window opens with `nowrap` and
   `cursorline`, and the cursor lands on the first row rather than line 1, so
   a split narrower than 76 cells right-clips rows without an ellipsis rather
   than wrapping into dozens of screen lines. Section headers carry each
@@ -1337,9 +1347,15 @@ Existing suites must all still pass.
   render a session from outside its window. `overridden` means the effective
   provider/model/effort DIVERGES from the global default (an override set to the
   default value is not a divergence), and drives the trailing `*`.
-  `ui.session_winbar()` adds a running/idle indicator and is auto-installed as a
-  window-local `winbar` on session windows (`config.session_winbar = false` opts
-  out). Exposing resolved state rather than only the raw buffer vars is what
+  `ui.session_winbar()` adds a running/idle indicator. Session windows (and the
+  agents window) auto-install the `ui.winbar()` DISPATCHER as a window-local
+  `winbar`: it re-checks the window's current buffer and the config opt-outs
+  on every redraw — agents buffer → `fn.agents_winbar`, session buffer →
+  `session_winbar`, else `""` — so `<CR>` in the agents buffer swapping a
+  session into the same window (the `"none"` sentinel) shows the right bar
+  with no reinstallation, and an opt-out (`config.session_winbar = false` /
+  `config.agents_winbar = false`) holds across those swaps and across a
+  split's inherited window-local `winbar`. Exposing resolved state rather than only the raw buffer vars is what
   lets a user's own statusline/lualine component avoid reimplementing the
   fallback chain. `ui.redraw_status([all])` pairs `:redrawstatus` with
   `:redrawtabline` — the former does not cover the tabline — and every status

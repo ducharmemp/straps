@@ -85,6 +85,11 @@ M.config = {
   -- stay available for a manual statusline either way.
   session_winbar = true,
 
+  -- Agents-buffer winbar (:StrapsAgents): the keymap legend in a window-local
+  -- winbar, so it is visible without scrolling past the saved rows. false
+  -- moves the legend to the first buffer line instead.
+  agents_winbar = true,
+
   -- :StrapsModel picker choices. Each entry is { id, label?, thinking?,
   -- context?, max_output? }. `max_output` is the model's maximum response
   -- tokens (Anthropic's /v1/models max_tokens); fn.provider uses it as the

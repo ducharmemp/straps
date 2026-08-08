@@ -644,12 +644,15 @@ function M.show_session(bufnr, split_cmd)
   -- Window-local winbar: show the session's active model/effort (and run
   -- phase) right on its own window, so "what am I talking to" is always
   -- visible without touching the user's global statusline. config.session_winbar
-  -- = false opts out (some users reserve the winbar or dislike it).
+  -- = false opts out (some users reserve the winbar or dislike it). The
+  -- installed expression is the ui.winbar dispatcher — it re-checks the config
+  -- and the window's CURRENT buffer on every redraw, so a buffer swapped into
+  -- this window (the agents buffer's "none" path) gets the right bar.
   do
     local ok_s, s = pcall(require, "straps")
     local want = not (ok_s and type(s) == "table" and s.config and s.config.session_winbar == false)
     if want then
-      vim.wo[0].winbar = "%{%v:lua.require'straps.ui'.session_winbar()%}"
+      vim.wo[0].winbar = "%{%v:lua.require'straps.ui'.winbar()%}"
     end
   end
   -- Transcript rendering: window-local conceal so the marker overlays show,
@@ -1033,6 +1036,9 @@ end
 local AGENTS_BUFNAME = "straps://agents"
 local agents_ns = vim.api.nvim_create_namespace("straps_agents")
 local AGENTS_WIDTH = 76 -- one fixed line width for rules and rows (legibility beats matching the transcript rule width; fixed, not window-derived, because the debounce can render a windowless buffer)
+-- The keymap legend, shared by the agents winbar and the first-line fallback
+-- (config.agents_winbar = false) so the two can never drift.
+local AGENTS_KEYS = "<CR> open   x stop   i steer   r rename   R refresh"
 
 -- Line -> entry map, keyed by agents bufnr -> { [lnum] = { kind, bufnr?, path? } }.
 -- Module-level (NOT vim.b): vim.b cannot hold a sparse integer-keyed table
@@ -1071,6 +1077,7 @@ function M.all_sessions()
           bufnr = b,
           label = session_label(b),
           title = file_backed and state.session_title(name) or nil,
+          mtime = file_backed and vim.fn.getftime(name) or nil, -- -1 if unreadable
           info = M.session_info(b), -- may be nil when setup never ran
         }
       end
@@ -1132,10 +1139,22 @@ function M._agents_render(bufnr)
       hls[#hls + 1] = { #lines - 1, 0, -1, "StrapsRule" }
     end
 
+    -- The keymap legend lives in the window's winbar (fn.agents_winbar via
+    -- ui.winbar). With config.agents_winbar = false it is the FIRST buffer
+    -- line instead — on screen without scrolling either way. Config-derived,
+    -- never window-derived: the debounce can render a windowless buffer.
+    do
+      local ok_s, s = pcall(require, "straps")
+      if ok_s and type(s) == "table" and s.config and s.config.agents_winbar == false then
+        lines[#lines + 1] = AGENTS_KEYS
+        hls[#hls + 1] = { #lines - 1, 0, -1, "StrapsRule" }
+      end
+    end
+
     local empty = #sets.running == 0 and #sets.loaded == 0 and #sets.saved == 0
     if empty then
       lines[#lines + 1] = "no agent sessions — :Straps starts one"
-      hls[#hls + 1] = { 0, 0, -1, "StrapsRule" }
+      hls[#hls + 1] = { #lines - 1, 0, -1, "StrapsRule" }
     else
       if #sets.running > 0 then
         rule("running (" .. #sets.running .. ")")
@@ -1178,6 +1197,17 @@ function M._agents_render(bufnr)
           local model = (l.info and l.info.model_label) or nil
           local parts = { l.label }
           if model then parts[#parts + 1] = model end
+          -- Short fields before the variable-width title: transcript age and
+          -- context fill. Both render only when present — mtime is nil for an
+          -- ephemeral buffer (and -1 when unreadable), context_pct comes from
+          -- the non-persisted vim.b.straps_usage, so a freshly resumed
+          -- session has neither yet.
+          if l.mtime and l.mtime > 0 then
+            parts[#parts + 1] = relative_time(l.mtime)
+          end
+          if l.info and l.info.context_pct then
+            parts[#parts + 1] = ("ctx %d%%"):format(l.info.context_pct)
+          end
           local text = "∙ " .. table.concat(parts, "  ")
           if l.title and l.title ~= "" then
             local remaining = AGENTS_WIDTH - vim.fn.strdisplaywidth(text) - 2
@@ -1213,9 +1243,6 @@ function M._agents_render(bufnr)
         end
       end
     end
-
-    lines[#lines + 1] = "<CR> open   x stop   i steer   r rename   R refresh"
-    hls[#hls + 1] = { #lines - 1, 0, -1, "StrapsRule" }
 
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
     -- Idempotent: clear the whole namespace before repopulating, so N renders
@@ -1430,6 +1457,20 @@ function M.open_agents(split_cmd)
   vim.wo[w].relativenumber = false
   vim.wo[w].signcolumn = "no"
   vim.wo[w].foldcolumn = "0"
+  -- The keymap legend lives in the winbar (fn.agents_winbar via the ui.winbar
+  -- dispatcher), so it is visible without scrolling past the saved rows.
+  -- config.agents_winbar = false skips it; the render puts the legend on the
+  -- first buffer line instead. A non-empty 'winbar' costs the window a text
+  -- row even when the expression evaluates to "", so the opt-out must also
+  -- gate the install, not just the dispatcher.
+  do
+    local ok_s, s = pcall(require, "straps")
+    local want = not (ok_s and type(s) == "table" and s.config and s.config.agents_winbar == false)
+    -- Explicitly clear on opt-out: a split from a session window inherits the
+    -- window-local 'winbar', and a non-empty option holds the bar row open
+    -- even while the dispatcher evaluates to "".
+    vim.wo[w].winbar = want and "%{%v:lua.require'straps.ui'.winbar()%}" or ""
+  end
 
   agents_do_render(bufnr)
   -- Cursor on the first row (the first line that resolves through the line
@@ -1535,6 +1576,37 @@ function M.session_winbar(bufnr)
   local mid = (usage ~= "") and (usage .. "  ") or ""
   local right = (info.status == "running") and "● running" or "○ idle"
   return "%#StrapsWinbar#" .. left .. "%=" .. mid .. right .. " "
+end
+
+-- Implementation of fn.agents_winbar: the agents-buffer winbar — the keymap
+-- legend, right-aligned. A static string: nothing here may be computed per
+-- redraw (a winbar expression re-evaluates constantly).
+function M._agents_winbar()
+  return "%#StrapsWinbar#straps agents%=" .. AGENTS_KEYS .. " "
+end
+
+--- The one winbar expression installed on straps windows, dispatching on the
+--- window's CURRENT buffer — so `<CR>` in the agents buffer swapping a session
+--- into the same window (the "none" sentinel path) shows the right bar with no
+--- reinstallation, and a split inheriting the window-local 'winbar' stays
+--- correct. The config opt-outs live HERE, not at the install sites, so they
+--- hold across those buffer swaps too. Installed as
+--- %{%v:lua.require'straps.ui'.winbar()%}.
+function M.winbar()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local ok_s, s = pcall(require, "straps")
+  local cfg = (ok_s and type(s) == "table" and type(s.config) == "table") and s.config or {}
+  if vim.api.nvim_buf_get_name(bufnr) == AGENTS_BUFNAME then
+    if cfg.agents_winbar == false then
+      return ""
+    end
+    local wb = require("straps.registry").try_call("fn.agents_winbar")
+    return type(wb) == "string" and wb or ""
+  end
+  if vim.b[bufnr].straps_session == true and cfg.session_winbar ~= false then
+    return M.session_winbar(bufnr)
+  end
+  return ""
 end
 
 -- BufWriteCmd for straps://registry/<name>: execute the buffer as Lua.
@@ -2535,17 +2607,30 @@ function M.setup()
       .. "buffer text. Redefine to reshape or no-op to show raw markers.",
     source = [[return function(bufnr) return require("straps.ui")._render(bufnr) end]],
   })
-  -- fn.agents_render IS the whole agents-buffer presentation (the running /
-  -- loaded / saved sections, keymap footer and highlights), redefinable via
-  -- :StrapsEdit fn.agents_render. The logic lives in ui._agents_render (like
-  -- fn.render -> ui._render).
+  -- fn.agents_render IS the agents-buffer content (the running / loaded /
+  -- saved sections and highlights), redefinable via :StrapsEdit
+  -- fn.agents_render. The logic lives in ui._agents_render (like
+  -- fn.render -> ui._render). The keymap legend is the second presentation
+  -- seam, fn.agents_winbar below.
   require("straps.registry").define_default({
     name = "fn.agents_render",
     kind = "fn",
     doc = "Render the agents buffer (straps://agents): the running / loaded / "
-      .. "saved session sections, keymap footer and highlights, from live "
+      .. "saved session sections and highlights, from live "
       .. "state (ui.all_sessions). Redefine to reshape or restyle the listing.",
     source = [[return function(bufnr) return require("straps.ui")._agents_render(bufnr) end]],
+  })
+  -- fn.agents_winbar: the agents window's winbar (the keymap legend). Must
+  -- return a statusline-format string and stay cheap — a winbar expression
+  -- re-evaluates on every redraw. config.agents_winbar = false moves the
+  -- legend to the first buffer line instead (drawn by fn.agents_render).
+  require("straps.registry").define_default({
+    name = "fn.agents_winbar",
+    kind = "fn",
+    doc = "The agents-buffer winbar: the keymap legend, right-aligned, as a "
+      .. "statusline-format string. Keep it cheap (re-evaluated per redraw). "
+      .. "Redefine to restyle or extend it.",
+    source = [[return function() return require("straps.ui")._agents_winbar() end]],
   })
   -- fn.tool_display: a tool call -> a command-style one-liner (bash as `$ ...`,
   -- reads/writes/greps as terse verbs). Redefinable via :StrapsEdit

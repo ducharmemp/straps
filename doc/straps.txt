@@ -178,9 +178,12 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 							*:StrapsAgents* *straps-agents*
 :StrapsAgents		Open the agents buffer (straps://agents): one ordinary
 			buffer listing every session in three sections —
-			running, loaded (idle), and saved (on disk). Manage them
-			with a small keymap grammar: <CR> open, x stop, i steer,
-			r rename, R refresh. <CR> replaces the agents buffer in
+			running, loaded (idle, with age and context fill when
+			known), and saved (on disk). Manage them with a small
+			keymap grammar: <CR> open, x stop, i steer,
+			r rename, R refresh — shown in the window's winbar
+			(config `agents_winbar = false` puts it on the first
+			line instead). <CR> replaces the agents buffer in
 			its own window (oil-style), so <C-o>/<C-i> step back to
 			the list and forward again. It re-renders as runs start,
 			work and finish. Takes the same |<mods>| as |:Straps|
@@ -311,6 +314,8 @@ render			(boolean) true. Master switch for the |fn.render|
 			presentation layer.
 tools_expanded		(boolean) false. Fold tool blocks OPEN by default.
 session_winbar		(boolean) true. Window-local winbar on session windows.
+agents_winbar		(boolean) true. The agents buffer's keymap legend in a
+			window-local winbar; false = first buffer line instead.
 models			(list) 4 curated Anthropic entries { id, label?,
 			thinking?, context?, max_output? }. The |:StrapsModel|
 			Anthropic seed/cache; `thinking` is "adaptive" or

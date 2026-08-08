@@ -1101,6 +1101,7 @@ for context that isn't tied to one option.
 | `render` | `true` | Transcript rendering (`fn.render`): a display-only conceal + extmark + fold layer that gives each block a categorical colored mark and collapses tool calls to a one-line summary. Buffer text, `modified`, parse and persist are never touched. `false` skips the wiring (raw markers). See [Rendering](#rendering). |
 | `tools_expanded` | `false` | Fold `tool_use`/`tool_result` blocks open by default when `true` (`foldlevel = 99`); otherwise the default `foldlevel = 0` keeps them closed (conversation turns never fold). See [Navigating a session](#navigating-a-session). |
 | `session_winbar` | `true` | Show a window-local winbar on each session window with the active model/effort (per-buffer override else global) and run status. `false` hides it; `ui.session_status()` / `ui.session_winbar()` stay usable in a manual statusline either way. |
+| `agents_winbar` | `true` | Show the agents buffer's keymap legend in a window-local winbar. `false` moves the legend to the first buffer line. |
 
 ## Security
 
@@ -1286,9 +1287,12 @@ readout is separate:
 
 - `:StrapsAgents` opens the **agents buffer** — one ordinary buffer listing
   every session in three sections: **running** (an active run), **loaded** (an
-  idle session buffer), and **saved** (a transcript on disk). A tiny keymap
-  grammar manages them: `<CR>` open   `x` stop   `i` steer   `r` rename
-  `R` refresh. `<CR>` replaces the agents buffer in its own window (oil-style),
+  idle session buffer, with its age and context fill when known), and **saved**
+  (a transcript on disk). A tiny keymap grammar manages them: `<CR>` open
+  `x` stop   `i` steer   `r` rename   `R` refresh — shown in the window's
+  winbar, so it is visible without scrolling (`config.agents_winbar = false`
+  puts it on the first line instead).
+  `<CR>` replaces the agents buffer in its own window (oil-style),
   so `<C-o>`/`<C-i>` step back to the list and forward again. It stays live as
   runs start, work and finish. Takes the same
   `<mods>` as `:Straps` (`:vertical StrapsAgents` for a vsplit).

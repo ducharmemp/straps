@@ -88,7 +88,12 @@ case("zero sessions renders the empty-state line", function()
   local buf = ui.open_agents("")
   assert(buf, "open_agents returned no buffer")
   assert(has_line(buf, "no agent sessions"), "missing empty-state line")
-  assert(has_line(buf, "<CR> open"), "missing footer line")
+  -- The keymap legend lives in the winbar, not the buffer.
+  assert(not has_line(buf, "<CR> open"), "legend leaked into the buffer text")
+  local wb = vim.wo[vim.api.nvim_get_current_win()].winbar
+  assert(wb:find("straps.ui'.winbar", 1, true), "agents window missing the winbar dispatcher: " .. wb)
+  assert(ui.winbar():find("<CR> open", 1, true),
+    "winbar dispatcher does not render the keymap legend in the agents window")
   assert(vim.bo[buf].modifiable == false, "buffer left modifiable")
   -- Counterfactual: the empty-state text is what we assert on.
   local snap = table.concat(lines_of(buf), "\n")
@@ -151,7 +156,7 @@ case("all_sessions classifies each session into exactly one set", function()
     "saved path collided with a loaded buffer")
 end)
 
-case("render shows sections in order, omits empty, footer present, map resolves", function()
+case("render shows sections in order, omits empty, map resolves", function()
   local buf = ui.open_agents("")
   local ls = lines_of(buf)
   local ri = line_index(buf, "━━ running")
@@ -160,7 +165,7 @@ case("render shows sections in order, omits empty, footer present, map resolves"
   assert(ri and li and si, "a section header is missing")
   assert(ri < li and li < si, "sections out of running/loaded/saved order")
   assert(vim.bo[buf].modifiable == false, "buffer left modifiable")
-  assert(ls[#ls]:find("<CR> open", 1, true), "footer not last line")
+  assert(not ls[#ls]:find("<CR> open", 1, true), "legend footer should be gone from the buffer")
 
   -- The line map resolves a known saved row to the right entry.
   local abs = vim.fn.fnamemodify(saved_path, ":p")
@@ -361,7 +366,7 @@ case("x and i on a non-running row notify without error", function()
   local orig = vim.notify
   vim.notify = function() notified = notified + 1 end
   local ok = pcall(function()
-    -- Cursor on the footer line (no entry) — a non-running position.
+    -- Cursor on a saved row (not a running entry) — a non-running position.
     local ls = lines_of(buf)
     vim.api.nvim_win_set_cursor(0, { #ls, 0 })
     ui._agents_key(buf, "x")
@@ -439,6 +444,91 @@ case("rows are capped to one legible line", function()
   assert(row_line:find("…", 1, true), "capped row missing the truncation ellipsis")
   assert(row_line:match("just now$") or row_line:match("ago$"),
     "capped row does not end with the age tail: " .. row_line)
+end)
+
+case("loaded row shows the transcript age", function()
+  local buf = ui.open_agents("")
+  local ls = lines_of(buf)
+  local row
+  for lnum = 1, #ls do
+    local e = ui._agents_line(buf, lnum)
+    if e and e.kind == "loaded" and e.bufnr == loaded_buf then
+      row = ls[lnum]
+      break
+    end
+  end
+  assert(row, "no loaded row for loaded_buf")
+  assert(row:find("just now", 1, true) or row:find("ago", 1, true),
+    "loaded row missing the age field: " .. row)
+end)
+
+case("loaded row shows context fill when usage is present", function()
+  vim.b[loaded_buf].straps_usage = { input_billed = 50000, cache_read = 0 }
+  local buf = ui.open_agents("")
+  registry.try_call("fn.agents_render", buf)
+  local ls = lines_of(buf)
+  local row
+  for lnum = 1, #ls do
+    local e = ui._agents_line(buf, lnum)
+    if e and e.kind == "loaded" and e.bufnr == loaded_buf then
+      row = ls[lnum]
+      break
+    end
+  end
+  assert(row, "no loaded row for loaded_buf")
+  assert(row:find("ctx 25%", 1, true), "loaded row missing ctx fill: " .. row)
+  -- Counterfactual dimension: clear the usage and the field disappears.
+  vim.b[loaded_buf].straps_usage = nil
+  registry.try_call("fn.agents_render", buf)
+  ls = lines_of(buf)
+  for lnum = 1, #ls do
+    local e = ui._agents_line(buf, lnum)
+    if e and e.kind == "loaded" and e.bufnr == loaded_buf then
+      row = ls[lnum]
+      break
+    end
+  end
+  assert(not row:find("ctx ", 1, true), "ctx field should vanish without usage: " .. row)
+end)
+
+case("agents_winbar = false puts the legend on the first line, no winbar", function()
+  straps.config.agents_winbar = false
+  local prev = agents_buf()
+  if prev then vim.cmd("bwipeout! " .. prev) end
+  local ok, err = pcall(function()
+    local buf = ui.open_agents("")
+    local ls = lines_of(buf)
+    assert(ls[1]:find("<CR> open", 1, true), "legend not on the first line: " .. ls[1])
+    assert(vim.wo[vim.api.nvim_get_current_win()].winbar == "",
+      "winbar should be cleared when agents_winbar = false")
+    assert(ui.winbar() == "", "dispatcher should return '' when agents_winbar = false")
+  end)
+  straps.config.agents_winbar = true
+  local buf = agents_buf()
+  if buf then registry.try_call("fn.agents_render", buf) end
+  assert(ok, tostring(err))
+end)
+
+case("ui.winbar dispatches per buffer: session, agents, other", function()
+  -- Session buffer in the current window -> session winbar body.
+  local sess = state.new_session()
+  ui.show_session(sess, "")
+  local wb = ui.winbar()
+  assert(wb:find("straps", 1, true) and wb:find("idle", 1, true),
+    "session dispatch wrong: " .. wb)
+  assert(vim.wo[0].winbar:find("straps.ui'.winbar", 1, true),
+    "session window should install the dispatcher")
+  -- session_winbar = false: dispatcher goes quiet even with the bar installed
+  -- (a swapped-in session must not resurrect an opted-out winbar).
+  straps.config.session_winbar = false
+  local off = ui.winbar()
+  straps.config.session_winbar = true
+  assert(off == "", "session_winbar = false should silence the dispatcher: " .. off)
+  vim.cmd("close")
+  -- Non-straps buffer -> "".
+  local plain = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_current_buf(plain)
+  assert(ui.winbar() == "", "dispatcher should be empty on a plain buffer")
 end)
 
 case("agents window gets list options and cursor on a row", function()

@@ -26,5 +26,9 @@ if ok and added then
   end)
   -- Detach on a filetype change away from straps, or the straps highlighter
   -- (and its injections) keeps painting the buffer under the new filetype.
-  vim.b.undo_ftplugin = "lua vim.treesitter.stop()"
+  -- Use a `:call` command, not `:lua`: undo_ftplugin values are joined with
+  -- `|` (ftplugin.vim runs `exe b:undo_ftplugin`), and `:lua` swallows the
+  -- bar as source, so a clause appended after a `:lua` one fails with E5107.
+  -- `:call` honors the bar, matching core ftplugins (query.lua, markdown.lua).
+  vim.b.undo_ftplugin = "call v:lua.vim.treesitter.stop()"
 end

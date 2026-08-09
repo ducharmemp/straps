@@ -1316,7 +1316,8 @@ Existing suites must all still pass.
   saved row's age is right-aligned. A loaded row also carries its
   transcript's relative age (file-backed buffers only) and, when the session
   has non-persisted usage (`vim.b.straps_usage`), a `ctx N%` context-fill
-  field from `ui.session_info().context_pct` — both omitted when absent. The window opens with `nowrap` and
+  field from `ui.session_info().context_pct` — both omitted when absent.
+  The window opens with `nowrap` and
   `cursorline`, and the cursor lands on the first row rather than line 1, so
   a split narrower than 76 cells right-clips rows without an ellipsis rather
   than wrapping into dozens of screen lines. Section headers carry each
@@ -1355,7 +1356,11 @@ Existing suites must all still pass.
   session into the same window (the `"none"` sentinel) shows the right bar
   with no reinstallation, and an opt-out (`config.session_winbar = false` /
   `config.agents_winbar = false`) holds across those swaps and across a
-  split's inherited window-local `winbar`. Exposing resolved state rather than only the raw buffer vars is what
+  split's inherited window-local `winbar` (`show_session` clears an
+  inherited dispatcher on opt-out — only straps' own string, never a user's
+  winbar — since a non-empty option holds the bar row open even when it
+  evaluates to `""`). Exposing resolved state rather than only the raw
+  buffer vars is what
   lets a user's own statusline/lualine component avoid reimplementing the
   fallback chain. `ui.redraw_status([all])` pairs `:redrawstatus` with
   `:redrawtabline` — the former does not cover the tabline — and every status

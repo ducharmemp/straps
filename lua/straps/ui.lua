@@ -53,6 +53,10 @@ end
 local render_ns = vim.api.nvim_create_namespace("straps_render")
 local RULE_WIDTH = 52 -- fixed-ish width of the turn rules / card art
 local effective_provider -- defined near picker helpers; session_status uses it earlier
+-- The one winbar option value straps installs (the ui.winbar dispatcher). A
+-- constant so both install sites and the opt-out clear in show_session
+-- compare against the same string.
+local WINBAR_EXPR = "%{%v:lua.require'straps.ui'.winbar()%}"
 
 -- byte length of the leading %%[straps:KIND]%% marker token on a line, or nil.
 local function marker_len(line)
@@ -652,7 +656,13 @@ function M.show_session(bufnr, split_cmd)
     local ok_s, s = pcall(require, "straps")
     local want = not (ok_s and type(s) == "table" and s.config and s.config.session_winbar == false)
     if want then
-      vim.wo[0].winbar = "%{%v:lua.require'straps.ui'.winbar()%}"
+      vim.wo[0].winbar = WINBAR_EXPR
+    elseif vim.wo[0].winbar == WINBAR_EXPR then
+      -- Opt-out with the dispatcher already on the window (a session swapped
+      -- into the agents window via the "none" path, or a split inheriting the
+      -- window-local value): clear it, or the non-empty option holds a blank
+      -- bar row open. Only OUR string — never stomp a user's own winbar.
+      vim.wo[0].winbar = ""
     end
   end
   -- Transcript rendering: window-local conceal so the marker overlays show,
@@ -1469,7 +1479,7 @@ function M.open_agents(split_cmd)
     -- Explicitly clear on opt-out: a split from a session window inherits the
     -- window-local 'winbar', and a non-empty option holds the bar row open
     -- even while the dispatcher evaluates to "".
-    vim.wo[w].winbar = want and "%{%v:lua.require'straps.ui'.winbar()%}" or ""
+    vim.wo[w].winbar = want and WINBAR_EXPR or ""
   end
 
   agents_do_render(bufnr)
@@ -1600,8 +1610,11 @@ function M.winbar()
     if cfg.agents_winbar == false then
       return ""
     end
-    local wb = require("straps.registry").try_call("fn.agents_winbar")
-    return type(wb) == "string" and wb or ""
+    -- pcall both layers: try_call nil-guards a MISSING entry but an error
+    -- inside the fn propagates, and a throwing winbar expression makes Neovim
+    -- reset the option (same hazard session_info guards against).
+    local ok, wb = pcall(require("straps.registry").try_call, "fn.agents_winbar")
+    return (ok and type(wb) == "string") and wb or ""
   end
   if vim.b[bufnr].straps_session == true and cfg.session_winbar ~= false then
     return M.session_winbar(bufnr)

@@ -514,21 +514,65 @@ case("ui.winbar dispatches per buffer: session, agents, other", function()
   local sess = state.new_session()
   ui.show_session(sess, "")
   local wb = ui.winbar()
-  assert(wb:find("straps", 1, true) and wb:find("idle", 1, true),
+  -- Pin session-specific content, not just the %#StrapsWinbar# prefix: the
+  -- model label and the run-status segment both come from session_winbar.
+  assert(wb:find("Sonnet 5", 1, true) and wb:find("idle", 1, true),
     "session dispatch wrong: " .. wb)
   assert(vim.wo[0].winbar:find("straps.ui'.winbar", 1, true),
     "session window should install the dispatcher")
   -- session_winbar = false: dispatcher goes quiet even with the bar installed
   -- (a swapped-in session must not resurrect an opted-out winbar).
+  -- pcall so the config flip is restored even when the assertion throws.
   straps.config.session_winbar = false
-  local off = ui.winbar()
+  local ok, off = pcall(ui.winbar)
   straps.config.session_winbar = true
+  assert(ok, "dispatcher threw under session_winbar = false: " .. tostring(off))
   assert(off == "", "session_winbar = false should silence the dispatcher: " .. off)
   vim.cmd("close")
   -- Non-straps buffer -> "".
   local plain = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_current_buf(plain)
   assert(ui.winbar() == "", "dispatcher should be empty on a plain buffer")
+end)
+
+case("show_session clears an inherited dispatcher when session_winbar = false", function()
+  -- The agents window carries the dispatcher; <CR> swaps a session in via the
+  -- "none" path. With session_winbar = false the swap must CLEAR the option —
+  -- a non-empty winbar holds a blank bar row open even when it evaluates "".
+  local sess = state.new_session()
+  vim.cmd("only")
+  local buf = ui.open_agents("")
+  local win = vim.api.nvim_get_current_win()
+  assert(vim.wo[win].winbar ~= "", "precondition: agents window has the dispatcher")
+  straps.config.session_winbar = false
+  local ok, err = pcall(function()
+    ui.show_session(sess, "none")
+    assert(vim.api.nvim_win_get_buf(win) == sess, "session not swapped into the window")
+    assert(vim.wo[win].winbar == "",
+      "opt-out swap left the dispatcher installed: " .. vim.wo[win].winbar)
+  end)
+  straps.config.session_winbar = true
+  assert(ok, tostring(err))
+  -- Counterfactual dimension: with the opt-out lifted the same swap installs.
+  ui.open_agents("")
+  local win2 = vim.api.nvim_get_current_win()
+  ui.show_session(sess, "none")
+  assert(vim.wo[win2].winbar ~= "", "default swap should install the dispatcher")
+end)
+
+case("a throwing fn.agents_winbar degrades to an empty winbar", function()
+  define("fn.agents_winbar", "fn", "test: always throws",
+    "return function() error('boom') end")
+  local ok, err = pcall(function()
+    ui.open_agents("")
+    local ok_call, wb = pcall(ui.winbar)
+    assert(ok_call, "ui.winbar propagated the fn error: " .. tostring(wb))
+    assert(wb == "", "throwing fn.agents_winbar should yield '': " .. tostring(wb))
+  end)
+  -- Restore the default so later cases see the real legend.
+  define("fn.agents_winbar", "fn", "agents winbar",
+    [[return function() return require("straps.ui")._agents_winbar() end]])
+  assert(ok, tostring(err))
 end)
 
 case("agents window gets list options and cursor on a row", function()

@@ -1151,6 +1151,38 @@ for context that isn't tied to one option.
 | `tools_expanded` | `false` | Fold `tool_use`/`tool_result` blocks open by default when `true` (`foldlevel = 99`); otherwise the default `foldlevel = 0` keeps them closed (conversation turns never fold). See [Navigating a session](#navigating-a-session). |
 | `session_winbar` | `true` | Show a window-local winbar on each session window with the active model/effort (per-buffer override else global) and run status. `false` hides it; `ui.session_status()` / `ui.session_winbar()` stay usable in a manual statusline either way. |
 | `agents_winbar` | `true` | Show the agents buffer's keymap legend in a window-local winbar. `false` moves the legend to the first buffer line. |
+| `layers` | see below | Which default registrations `setup()` performs, at group granularity. See [Layers](#layers). |
+
+### Layers
+
+`config.layers` controls which groups of defaults `setup()` registers:
+
+| Key | Default | Contains |
+| --- | --- | --- |
+| `editor` | `true` | The LSP/tree-sitter tool set (`tool.definition`, `tool.references`, `tool.hover`, `tool.diagnostics`, `tool.symbols`, ...) — everything in `lua/straps/editor.lua`. |
+| `openai` | `true` | The OpenAI backend fns (`fn.openai_api_key`, `fn.provider_openai`) registered inside `provider.lua`'s `register()`. |
+
+```lua
+require("straps").setup({
+  layers = { editor = false },
+})
+```
+
+A layer is a **registration gate, not a kill switch**: `false` skips
+registering that group's entries; it does not unregister anything a previous
+`setup()` call already registered. Toggling a layer back on in a later
+`setup()` call registers its missing entries then. To actually drop
+already-registered entries, restart Neovim.
+
+Degradation with `openai = false`: `fn.provider` errors with `"straps
+provider: the openai layer is disabled (setup{ layers = { openai = false }
+})"` if a request tries to dispatch to `"openai"`, and `:StrapsModel`
+reports `fn.list_models`'s `"openai layer disabled (...)"` instead of
+raising. With `editor = false`, the affected tools simply do not appear in
+what `fn.build_tools` sends to the API — but the core system prompt still
+*mentions* editor-native tools (LSP/status checks before refactors)
+regardless of this layer; full prompt layering that removes those mentions
+too is future work.
 
 ## Security
 

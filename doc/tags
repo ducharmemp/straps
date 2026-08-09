@@ -31,6 +31,7 @@ fn.provider_pref	straps.txt	/*fn.provider_pref*
 fn.readonly_policy	straps.txt	/*fn.readonly_policy*
 fn.render	straps.txt	/*fn.render*
 fn.system_prompt	straps.txt	/*fn.system_prompt*
+fn.system_prompt_layer	straps.txt	/*fn.system_prompt_layer*
 fn.tool_display	straps.txt	/*fn.tool_display*
 hook.after_tool	straps.txt	/*hook.after_tool*
 hook.after_write	straps.txt	/*hook.after_write*
@@ -52,7 +53,9 @@ straps-fn	straps.txt	/*straps-fn*
 straps-health	straps.txt	/*straps-health*
 straps-highlights	straps.txt	/*straps-highlights*
 straps-hooks	straps.txt	/*straps-hooks*
+straps-hooks-fanout	straps.txt	/*straps-hooks-fanout*
 straps-introduction	straps.txt	/*straps-introduction*
+straps-layers	straps.txt	/*straps-layers*
 straps-models-tool	straps.txt	/*straps-models-tool*
 straps-multiplayer	straps.txt	/*straps-multiplayer*
 straps-registry	straps.txt	/*straps-registry*

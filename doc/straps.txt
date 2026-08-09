@@ -349,6 +349,22 @@ request_timeout_ms	(number) 300000. Idle watchdog: kill a request whose
 log_file		(string|nil) nil (off). Structured JSONL event log; see
 			|fn.log|.
 
+							*straps-layers*
+layers			(table) { editor = true, openai = true }. Which
+			default registration groups |straps.setup()| performs.
+			`editor` gates the LSP/tree-sitter tool set
+			(lua/straps/editor.lua); `openai` gates the OpenAI
+			backend fns (`fn.openai_api_key`, `fn.provider_openai`).
+			A registration gate, not a kill switch: false skips
+			registering that group; it does not unregister entries
+			an earlier `setup()` call already registered (restart
+			to drop them), and toggling one back on in a later
+			`setup()` call registers its missing entries then.
+			With `openai = false`, |fn.provider| errors with a
+			clean "openai layer is disabled" message when asked
+			to dispatch to "openai", and |fn.list_models| returns
+			`(nil, err)` instead of raising.
+
 Per-session overrides live in buffer variables (b:straps_model,
 b:straps_effort, ...) set by |:StrapsModel| / |:StrapsEffort| on a session
 buffer, so two sessions can run different models at once. The effective
@@ -440,6 +456,25 @@ Hooks are the "always do X" seams. Each is a registry entry you can redefine
 (|:StrapsEdit hook.NAME|). Redefining "always"-shaped behavior into a hook
 beats remembering to repeat it.
 
+							*straps-hooks-fanout*
+Fan-out. Some hooks are broadcast to MANY subscribers, not just the one entry
+named `hook.NAME`. A subscriber registers itself as `hook.NAME.<suffix>` (e.g.
+`hook.after_write.mylinter`). `registry.hook_entries(name)` returns the entry
+named exactly `name` PLUS every `hook.name.<suffix>` entry, over the merged
+active scope, sorted by registration order (`seq` ascending — the builtin
+default first). `registry.call_hooks(name, ...)` runs each with `pcall` so one
+broken subscriber cannot stop the others, and returns two tables: `results`
+(the non-nil returns, in order) and `errors` (one `{ name, err }` per
+subscriber that raised). Add a subscriber with `registry_define` (kind "hook",
+name `hook.NAME.<suffix>`); no need to redefine the default.
+
+The fanned-out hooks: |hook.after_write| (all string results appended to the
+tool result; a raising subscriber becomes a `[hook <name> error: ...]` line),
+and the loop's |hook.on_run_start| / |hook.on_run_end| / |hook.on_turn_start|
+/ |hook.before_tool|. |hook.after_tool| is fanned out as a FOLD: each
+subscriber gets the CURRENT result and any non-nil return replaces it for the
+next one, in registration order. NOT fanned out (single entry, called
+directly): |hook.confirm|, |hook.on_progress|, and `hook.on_define`.
 						*hook.confirm*
 hook.confirm(name, input, ctx) -> allowed, reason
 		The permission gate, called before every tool. Default:
@@ -454,15 +489,19 @@ hook.confirm(name, input, ctx) -> allowed, reason
 
 						*hook.after_write*
 hook.after_write(path, ctx) -> string|nil
-		Called after write_file / edit_file. If it returns a string it
-		is appended to the tool result. The default feeds the editor's
-		own LSP back to the agent: it waits briefly for the language
+		Called after write_file / edit_file / patch_file. If it returns a
+		string it is appended to the tool result. The default feeds the
+		editor's own LSP back to the agent: it waits briefly for the language
 		server to re-lint the just-written file, then returns its
 		ERROR/WARN diagnostics, so the agent sees breakage it caused
 		without being asked. No client on the file, or no new
 		diagnostics, appends nothing. Turn off with
 		|straps-config| `after_write_diagnostics = false`, or redefine
-		it to run an external linter instead.
+		it to run an external linter instead. Fanned out
+		(|straps-hooks-fanout|): this default plus every
+		`hook.after_write.<suffix>` subscriber runs, and all their string
+		results are appended in registration order — add a linter without
+		replacing the diagnostics default.
 
 						*hook.on_run_start*
 						*hook.on_run_end*
@@ -507,8 +546,11 @@ hook.on_progress(ev, ctx)
 hook.before_tool(name, input, ctx)
 hook.after_tool(name, input, result, ok, ctx) -> result?
 		Optional seams around each tool call (not registered by
-		default). before_tool runs after confirm; after_tool may
-		transform the result string it returns.
+		default). before_tool runs after confirm. Both are fanned out
+		(|straps-hooks-fanout|): before_tool broadcasts to every
+		`hook.before_tool.<suffix>`; after_tool FOLDS — each
+		`hook.after_tool.<suffix>` receives the current result and any
+		non-nil return replaces it for the next subscriber.
 
 ==============================================================================
 9. CORE FUNCTIONS (fn.*)				*straps-fn*
@@ -578,6 +620,23 @@ fn.system_prompt(opts?)		Compose the system prompt from its layers:
 				|hook.on_run_start| multiplayer notice) —
 				informational, never authority, and
 				overridden by any real user instruction.
+						*fn.system_prompt_layer*
+fn.system_prompt_layer.<name>(opts) -> string|nil
+				The composition seam |fn.system_prompt| iterates.
+				It walks every fn entry named
+				`fn.system_prompt_layer.*` in registration order
+				(seq), calls each with the same `opts`, skips a
+				nil or "" return, and joins the rest with a blank
+				line. The four builtins — `.core` `.env` `.skills`
+				`.project` — each delegate to the matching
+				|fn.system_prompt|_core/_env/_skills/_project fn
+				and add that section's `# Header` framing. Add your
+				own section by defining a new
+				`fn.system_prompt_layer.<name>` (kind "fn") that
+				returns a formatted `# Header\n\n...` string, or
+				""/nil to contribute nothing. Order is append-only,
+				so a new layer lands after the builtins and the
+				cache prefix stays stable.
 						*fn.render*
 fn.render(bufnr)		The transcript presentation pass (conceal +
 				extmarks + folds). No-op it for raw markers.

@@ -173,6 +173,24 @@ case("no runs in flight is reported OK", function()
   assert(find(rec, "ok", "no runs in flight"), "expected 'no runs in flight'")
 end)
 
+case("layers section reports both default-on layers as OK", function()
+  local rec = collect()
+  assert(find(rec, "start", "straps: layers"), "missing layers section")
+  assert(find(rec, "ok", "editor layer enabled"), "editor layer should be OK by default")
+  assert(find(rec, "ok", "openai layer enabled"), "openai layer should be OK by default")
+end)
+
+case("disabled layer reports as info, not error", function()
+  local saved = straps.config.layers
+  straps.config.layers = { editor = true, openai = false }
+  local rec = collect()
+  straps.config.layers = saved
+  -- The openai entries ARE registered in this process (setup ran all-on);
+  -- the flag alone must flip the report to the deliberate-off info line.
+  assert(find(rec, "info", "openai layer disabled"), "expected the disabled info line")
+  assert(not find(rec, "error", "openai layer"), "a disabled layer must not error")
+end)
+
 case("report never throws even with a bogus base_url / config", function()
   local saved = straps.config.base_url
   straps.config.base_url = "http://127.0.0.1:0"

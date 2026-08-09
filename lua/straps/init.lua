@@ -137,6 +137,21 @@ M.config = {
     { name = "medium", level = "medium", budget_tokens = 10000 },
     { name = "high", level = "high", budget_tokens = 24000 },
   },
+
+  -- Which default registrations setup() performs, at GROUP granularity. true
+  -- (the default) registers the group; false skips registering it entirely.
+  -- This is a registration gate, not a kill switch: toggling a layer off in a
+  -- LATER setup() call does not remove entries a previous setup() already
+  -- registered — restart Neovim to actually drop them. editor = false skips
+  -- require("straps.editor").register() (the LSP/tree-sitter tool group);
+  -- openai = false skips the two OpenAI-only entries inside
+  -- provider.lua's register() (fn.openai_api_key, fn.provider_openai) —
+  -- fn.provider then errors with a clear message if asked to dispatch to
+  -- "openai", and fn.list_models returns (nil, err) instead of raising.
+  layers = {
+    editor = true,
+    openai = true,
+  },
 }
 
 -- (path .. "\n" .. hash) -> true for every .straps.lua content already
@@ -256,7 +271,12 @@ function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
   require("straps.provider").register()
   require("straps.tools").register()
-  require("straps.editor").register()
+  -- layers.editor = false skips the LSP/tree-sitter tool group (see the
+  -- config comment above); nil-safe so callers that skip setup() and call
+  -- register() directly are unaffected.
+  if (M.config.layers or {}).editor ~= false then
+    require("straps.editor").register()
+  end
   require("straps.ui").setup()
   return M
 end

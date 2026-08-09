@@ -91,8 +91,12 @@ local function check_api_key()
   local registry = try(function() return require("straps.registry") end)
   local entry = registry and registry.get(entry_name)
   if not entry then
-    health.warn(entry_name .. " is not registered (setup() has not run yet)",
-      { "Call require('straps').setup{} in your config." })
+    if openai and entry_name == "fn.openai_api_key" and (config.layers or {}).openai == false then
+      health.info("openai layer disabled (setup{ layers = { openai = false } }) — skipping key check")
+    else
+      health.warn(entry_name .. " is not registered (setup() has not run yet)",
+        { "Call require('straps').setup{} in your config." })
+    end
   end
 
   if vim.env[env_var] and vim.env[env_var] ~= "" then
@@ -295,6 +299,33 @@ local function check_registry()
   end
 end
 
+-- config.layers gates whole registration groups (see init.lua's layers
+-- config). A layer left on but missing its sentinel entry means setup()
+-- never ran or its registration failed; a layer turned off is expected
+-- absence, not a fault.
+local function check_layers()
+  health.start("straps: layers")
+  local cfg = config()
+  local layers = cfg.layers or {}
+  local registry = try(function() return require("straps.registry") end)
+  local sentinels = {
+    editor = "tool.definition",
+    openai = "fn.provider_openai",
+  }
+  for _, name in ipairs({ "editor", "openai" }) do
+    local enabled = layers[name] ~= false
+    local sentinel = sentinels[name]
+    local present = registry and registry.get(sentinel)
+    if enabled and not present then
+      health.error(name .. " layer enabled but entries missing — setup() not run, or registration failed")
+    elseif enabled then
+      health.ok(name .. " layer enabled (" .. sentinel .. " registered)")
+    else
+      health.info(name .. " layer disabled (setup{ layers = { " .. name .. " = false } })")
+    end
+  end
+end
+
 -- Model / effort: the two settings whose mismatch 400s a whole request.
 local function check_model()
   health.start("straps: model")
@@ -372,6 +403,7 @@ function M.check()
   check_parser()
   check_project()
   check_registry()
+  check_layers()
   check_model()
   check_runs()
 end

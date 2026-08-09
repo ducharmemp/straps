@@ -95,6 +95,13 @@ return function(provider_override)
     key_fn = "fn.api_key"
   end
 
+  -- The openai layer may be off (setup{ layers = { openai = false } }), in
+  -- which case fn.openai_api_key was never registered; the pcall below would
+  -- otherwise report a generic "no API key" that hides the real cause.
+  if openai and not registry.get("fn.openai_api_key") then
+    return nil, "openai layer disabled (setup{ layers = { openai = false } })"
+  end
+
   local ok_key, api_key = pcall(registry.call, key_fn)
   if not ok_key or type(api_key) ~= "string" or api_key == "" then
     return nil, "no API key (" .. tostring(api_key) .. ")"
@@ -1198,6 +1205,11 @@ return function(req, ctx)
     return registry.call("fn.provider_anthropic", req, ctx)
   end
   if provider == "openai" then
+    -- layers.openai = false leaves fn.provider_openai unregistered; error with
+    -- a clean, actionable string instead of the raw "unknown fn" from call().
+    if not registry.get("fn.provider_openai") then
+      error("straps provider: the openai layer is disabled (setup{ layers = { openai = false } })")
+    end
     return registry.call("fn.provider_openai", req, ctx)
   end
   error("straps provider: unknown provider " .. tostring(provider)
@@ -2209,12 +2221,17 @@ function M.register()
     doc = "Read/write the persisted provider choice ($XDG_CONFIG_HOME/straps/provider). (value?) -> value: no arg reads, a string writes.",
     source = PROVIDER_PREF_SRC,
   })
-  define({
-    name = "fn.openai_api_key",
-    kind = "fn",
-    doc = "Return the OpenAI API key (default: $OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key; the file must be chmod 600).",
-    source = OPENAI_API_KEY_SRC,
-  })
+  -- layers.openai = false skips this openai-only entry (setup{ layers = {
+  -- openai = false } }); nil-safe so register() called without setup() (10
+  -- test files do this) still registers it.
+  if ((require("straps").config or {}).layers or {}).openai ~= false then
+    define({
+      name = "fn.openai_api_key",
+      kind = "fn",
+      doc = "Return the OpenAI API key (default: $OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key; the file must be chmod 600).",
+      source = OPENAI_API_KEY_SRC,
+    })
+  end
   define({
     name = "fn.list_models",
     kind = "fn",
@@ -2245,12 +2262,16 @@ function M.register()
     doc = "Anthropic Messages API over streaming SSE via curl. (req, ctx) -> { content, stop_reason }.",
     source = PROVIDER_ANTHROPIC_SRC,
   })
-  define({
-    name = "fn.provider_openai",
-    kind = "fn",
-    doc = "OpenAI Chat Completions over streaming SSE via curl. (req, ctx) -> { content, stop_reason }.",
-    source = PROVIDER_OPENAI_SRC,
-  })
+  -- layers.openai = false skips this openai-only entry; see the matching
+  -- guard around fn.openai_api_key above.
+  if ((require("straps").config or {}).layers or {}).openai ~= false then
+    define({
+      name = "fn.provider_openai",
+      kind = "fn",
+      doc = "OpenAI Chat Completions over streaming SSE via curl. (req, ctx) -> { content, stop_reason }.",
+      source = PROVIDER_OPENAI_SRC,
+    })
+  end
   define({
     name = "fn.provider",
     kind = "fn",

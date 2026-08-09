@@ -456,5 +456,11 @@ case("dump restores entries in registration order", function()
   registry.remove("fn.aa_dump_second")
 end)
 
+case("setup{} with both layers left at their default registers editor + openai", function()
+  require("straps").setup({})
+  assert(registry.get("tool.definition"), "tool.definition should be present (editor layer default ON)")
+  assert(registry.get("fn.provider_openai"), "fn.provider_openai should be present (openai layer default ON)")
+end)
+
 print(("\n%s"):format(fails == 0 and "ALL PASS" or (fails .. " FAILURE(S)")))
 os.exit(fails == 0 and 0 or 1)

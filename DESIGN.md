@@ -1485,7 +1485,9 @@ optional), API key (env, key-file mode 600, and whether `fn.api_key` actually
 resolves), sessions (dir writable + transcript count), transcript rendering
 (tree-sitter `straps` parser + queries, `config.render`), project registry
 (`.straps.lua` trust state against the sha256 store), registry (entry counts,
-redefinitions, missing core entries, `fn.log`), model (model/effort pairing —
+redefinitions, missing core entries, `fn.log`), layers (each `config.layers`
+flag's on/off state; on but sentinel entry missing is an error, off is info),
+model (model/effort pairing —
 the mismatch that 400s a request), and active runs (a warning that quitting
 cancels in-flight sessions). It is read-only and touches no windows.
 `tests/run_health.lua` stubs `vim.health.*` to collect the report and asserts
@@ -1514,12 +1516,27 @@ require("straps").setup{
 ```
 
 `M.config` holds merged config. `setup()`: merge opts, then
-`provider.register()`, `tools.register()`, `ui.setup()`. Idempotent (re-running
-setup must not clobber user redefinitions: `register()` fns must skip entries
-that already exist with version > 1... simpler rule: `register()` uses
-`registry.define_default(spec)` — a registry helper that defines ONLY if the
-name is absent. Add `define_default` to registry.lua.)
+`provider.register()`, `tools.register()`, then `require("straps.editor").register()`
+gated on `(M.config.layers or {}).editor ~= false`, then `ui.setup()`.
+Idempotent (re-running setup must not clobber user redefinitions: `register()`
+fns must skip entries that already exist with version > 1... simpler rule:
+`register()` uses `registry.define_default(spec)` — a registry helper that
+defines ONLY if the name is absent. Add `define_default` to registry.lua.)
 Expose `M.registry`, `M.state`, `M.loop` for user config files.
+
+`M.config.layers` (`{ editor = true, openai = true }`, both default on) gates
+which default registration groups `setup()` performs, at GROUP granularity:
+`editor = false` skips `require("straps.editor").register()` entirely;
+`openai = false` skips the two openai-only entries registered inside
+`provider.lua`'s `register()` (`fn.openai_api_key`, `fn.provider_openai`;
+guarded individually since they are not adjacent in that function). This is a
+registration gate, not a kill switch — toggling a layer off in a LATER
+`setup()` call does not remove entries an earlier `setup()` already
+registered; toggling one back on registers its missing entries then. Not
+gateable, deliberately: `files`/`search`/`exec` are the product's identity;
+`permissions` (`hook.confirm`) must never be removable in a way that makes
+straps less restrictive by default; `agents`/`spawn` are entangled with
+state/loop plumbing and are a future seam, not a clean cut today.
 
 ## Tests (plain asserts, run with `nvim --headless -l tests/<f>.lua`; exit 0/1, print PASS/FAIL per case)
 

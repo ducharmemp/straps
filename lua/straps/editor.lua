@@ -133,7 +133,7 @@ local function maybe_set_locations(ctx, input, title, locs)
     if item then items[#items + 1] = item end
   end
   local ok, kind = pcall(function()
-    return require("straps.ui").set_locations(ctx and ctx.bufnr,
+    return require("straps.findings").set_locations(ctx and ctx.bufnr,
       { title = title, items = items }, input.open ~= false)
   end)
   return ok and kind or "quickfix"
@@ -563,7 +563,7 @@ return function(input, ctx)
     -- :lnext/:cnext; the returned text below is unchanged.
     if input and input.quickfix then
       pcall(function()
-        require("straps.ui").set_locations(ctx and ctx.bufnr,
+        require("straps.findings").set_locations(ctx and ctx.bufnr,
           { title = "straps: diagnostics", items = items }, false)
       end)
     end
@@ -3162,7 +3162,7 @@ return function(input, ctx)
   if open == nil then open = true end
   -- Route to THIS session's findings list (its window's location list when
   -- on-screen — isolated from other sessions — else the global quickfix list).
-  local list_kind = require("straps.ui").set_locations(ctx and ctx.bufnr,
+  local list_kind = require("straps.findings").set_locations(ctx and ctx.bufnr,
     { title = title, items = qf }, open)
   local nav = (list_kind == "loclist") and ":lnext/:lprev" or ":cnext/:cprev"
   return ("set_findings: loaded %d entr%s (%s) — the user can step them with %s")

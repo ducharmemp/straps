@@ -738,6 +738,32 @@ by-name lookup, so redefining an entry changes behavior immediately.
   registry as one executable Lua string. Write it to a file; run that file
   (`:StrapsEval` or `:luafile`) to restore.
 
+### Subscribing to a hook without clobbering it
+
+A hook name can have more than one subscriber. Defining `hook.after_write`
+again would clobber the builtin default; define `hook.after_write.<suffix>`
+instead and both run, in registration order, whenever `write_file`/
+`edit_file`/`patch_file` fire the hook:
+
+```lua
+require("straps.registry").define{
+  name = "hook.after_write.mylint",
+  kind = "hook",
+  doc = "Run mylint on every written file, alongside the default LSP hook.",
+  source = [[return function(path, ctx)
+    local out = vim.system({ "mylint", path }):wait()
+    return out.stdout ~= "" and ("mylint:\n" .. out.stdout) or nil
+  end]],
+}
+```
+
+Each subscriber's non-nil string return is appended to the tool result; if a
+subscriber raises, the others still run and a `[hook <name> error: ...]` line
+marks the failure instead of losing the write's result. `hook.confirm` and
+`hook.on_progress` stay single-slot — a permission decision and a per-chunk
+progress event are not things to fan out — so redefining those still
+replaces the entry outright.
+
 ### The system prompt
 
 The system prompt is layered, and every layer is a registry entry:
@@ -786,6 +812,29 @@ is individually redefinable (`:StrapsEdit fn.system_prompt_env`, or
 `registry.define` in your config); because the composer looks the layers up
 through the registry at call time, a redefined layer takes effect for the
 next new session.
+
+Adding a new SECTION (rather than changing one of the four above) doesn't
+need a redefinition of `fn.system_prompt` at all: define
+`fn.system_prompt_layer.<name>` returning a fully formatted section string
+(headers included), or `nil`/`""` to skip it for a given session:
+
+```lua
+require("straps.registry").define{
+  name = "fn.system_prompt_layer.team_conventions",
+  kind = "fn",
+  doc = "Prompt layer: our team's PR checklist.",
+  source = [[return function(opts)
+    return "# PR checklist\n\nRun tests, update CHANGELOG, request review from @team."
+  end]],
+}
+```
+
+`fn.system_prompt` iterates every `fn.system_prompt_layer.*` entry in
+registration order, calls each with the same `opts` (subagent adaptation
+data, when the session is a spawned child), skips a nil/`""` result, and
+joins the rest with a blank line. A new layer registers AFTER the existing
+ones (append-only), so it lands at the end of the prompt and never disturbs
+the prompt-cache prefix of an already-running session.
 
 ## Worked example: a linter hook
 
@@ -1196,6 +1245,37 @@ require("straps.registry").define{
 
 After this redefinition, `:StrapsAuto vcs` grants git-only `bash` calls. Other
 `bash` calls still classify as `exec` and still prompt.
+
+### Declaring a tool's capability directly
+
+Classifying by name/input pattern (above) works from outside a tool. When
+you register the tool yourself — from `setup()`, a config file, or a
+trusted `.straps.lua` — you can instead declare its category on the entry:
+
+```lua
+require("straps.registry").define{
+  name = "tool.list_branches",
+  kind = "tool",
+  doc = "List git branches.",
+  capability = "read",
+  source = [[return function()
+    return vim.fn.system({ "git", "branch", "--list" })
+  end]],
+}
+```
+
+`fn.capability` checks a tool's own `capability` field FIRST, before its
+hardcoded classification, so `list_branches` is auto-allowed like any other
+read-only tool with no `fn.capability` redefinition needed. `capability` can
+also be a custom category (e.g. `"vcs"`) — that category still is not
+grantable unless you also add it to `fn.capability()`'s grantable list (see
+above), so it prompts every call but is at least policy-visible instead of
+falling into `"other"`.
+
+This is a TRUSTED-registration-only feature: `tool.registry_define` (what
+the agent calls to self-extend) has no `capability` parameter, so an
+agent-defined tool can never self-declare `"read"` and skip confirmation —
+only code that runs `registry.define` directly can do that.
 
 ## Statusline
 

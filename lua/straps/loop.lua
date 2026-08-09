@@ -190,7 +190,7 @@ local function execute_tool(bufnr, ctx, block, cfg, opts)
     end
   end
 
-  registry.try_call("hook.before_tool", name, input, ctx)
+  registry.call_hooks("hook.before_tool", name, input, ctx)
 
   local ok, result = pcall(registry.call, "tool." .. name, input, ctx)
   if ok then
@@ -217,7 +217,16 @@ local function execute_tool(bufnr, ctx, block, cfg, opts)
       .. ("\n[straps: result truncated at %d bytes]"):format(cfg.max_tool_result_bytes)
   end
 
-  result = registry.try_call("hook.after_tool", name, input, result, ok, ctx) or result
+  -- Fold hook.after_tool subscribers in registration order: each one receives
+  -- the CURRENT result (so subscriber N sees subscriber N-1's transformation)
+  -- and a non-nil return replaces `result` for the next subscriber; a raising
+  -- subscriber is skipped so it can never break the ones after it.
+  for _, entry in ipairs(registry.hook_entries("hook.after_tool")) do
+    local hok, ret = pcall(entry.fn, name, input, result, ok, ctx)
+    if hok and ret ~= nil then
+      result = ret
+    end
+  end
   return ok, tostring(result)
 end
 
@@ -309,7 +318,7 @@ local function run_turns(bufnr, ctx, run)
 
   progress(bufnr, ctx, { type = "start" }, "starting")
   log(bufnr, { ev = "run_start" })
-  registry.try_call("hook.on_run_start", ctx)
+  registry.call_hooks("hook.on_run_start", ctx)
 
   -- Per-buffer override (subagents get their own, usually tighter, budget).
   local max_turns = cfg.max_turns
@@ -335,7 +344,7 @@ local function run_turns(bufnr, ctx, run)
     -- Per-turn seam, before the parse that builds this turn's request: the
     -- default notice tells the agent which model/effort it is running on and
     -- re-announces a mid-run switch (the pickers write vim.b between turns).
-    registry.try_call("hook.on_turn_start", ctx, turn)
+    registry.call_hooks("hook.on_turn_start", ctx, turn)
     -- Auto-compaction (off unless a threshold is set): the loop is about to
     -- read the whole buffer anyway, so the size check is cheap. Every compaction
     -- rewrites old message blocks, which invalidates the messages cache tier
@@ -667,7 +676,7 @@ function M.start(bufnr)
     local reason = ok and (ret or "ok") or "error"
     log(bufnr, { ev = "run_end", reason = reason, turns = run.turns })
     progress(bufnr, ctx, { type = "done", reason = reason }, "")
-    pcall(registry.try_call, "hook.on_run_end", ctx)
+    registry.call_hooks("hook.on_run_end", ctx)
     pcall(state.ensure_trailing_user, bufnr)
     runs[bufnr] = nil
     pcall(function() vim.b[bufnr].straps_status = "idle" end)

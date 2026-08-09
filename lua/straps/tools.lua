@@ -207,9 +207,14 @@ return function(input, ctx)
   local n = vim.api.nvim_buf_line_count(buf)
   local result = string.format(
     "wrote %s (%d line%s) — undo with u in the buffer", path, n, n == 1 and "" or "s")
-  local extra = registry.try_call("hook.after_write", path, ctx)
-  if type(extra) == "string" and extra ~= "" then
-    result = result .. "\n" .. extra
+  local hook_results, hook_errors = registry.call_hooks("hook.after_write", path, ctx)
+  for _, extra in ipairs(hook_results) do
+    if type(extra) == "string" and extra ~= "" then
+      result = result .. "\n" .. extra
+    end
+  end
+  for _, e in ipairs(hook_errors) do
+    result = result .. "\n[hook " .. e.name .. " error: " .. e.err .. "]"
   end
   return result
 end
@@ -361,9 +366,14 @@ return function(input, ctx)
   local result = string.format(
     "edited %s (%d replacement%s) — undo with u in the buffer",
     path, n, n == 1 and "" or "s")
-  local extra = registry.try_call("hook.after_write", path, ctx)
-  if type(extra) == "string" and extra ~= "" then
-    result = result .. "\n" .. extra
+  local hook_results, hook_errors = registry.call_hooks("hook.after_write", path, ctx)
+  for _, extra in ipairs(hook_results) do
+    if type(extra) == "string" and extra ~= "" then
+      result = result .. "\n" .. extra
+    end
+  end
+  for _, e in ipairs(hook_errors) do
+    result = result .. "\n[hook " .. e.name .. " error: " .. e.err .. "]"
   end
   return result
 end
@@ -515,8 +525,15 @@ return function(input, ctx)
 
   local result = string.format("patched %s (%d hunk%s) — undo with u in the buffer",
     path, #hunks, #hunks == 1 and "" or "s")
-  local extra = registry.try_call("hook.after_write", path, ctx)
-  if type(extra) == "string" and extra ~= "" then result = result .. "\n" .. extra end
+  local hook_results, hook_errors = registry.call_hooks("hook.after_write", path, ctx)
+  for _, extra in ipairs(hook_results) do
+    if type(extra) == "string" and extra ~= "" then
+      result = result .. "\n" .. extra
+    end
+  end
+  for _, e in ipairs(hook_errors) do
+    result = result .. "\n[hook " .. e.name .. " error: " .. e.err .. "]"
+  end
   return result
 end
 ]==],
@@ -1144,7 +1161,7 @@ return function(input, ctx)
   local list_kind = "quickfix"
   do
     local ok, kind = pcall(function()
-      return require("straps.ui").set_locations(ctx and ctx.bufnr, { title = title, items = valid }, open)
+      return require("straps.findings").set_locations(ctx and ctx.bufnr, { title = title, items = valid }, open)
     end)
     if ok and kind then list_kind = kind end
   end
@@ -2156,7 +2173,7 @@ return function(input, ctx)
   local set_kind = "quickfix"
   local function set_qf(items)
     local ok, kind = pcall(function()
-      return require("straps.ui").set_locations(ctx and ctx.bufnr, { title = title, items = items }, false)
+      return require("straps.findings").set_locations(ctx and ctx.bufnr, { title = title, items = items }, false)
     end)
     if ok and kind then set_kind = kind end
   end
@@ -2251,8 +2268,8 @@ return function(input, ctx)
   -- Read THIS session's findings list: its window's location list when the
   -- session is on-screen (private, so concurrent sessions never stomp each
   -- other's target set), else the global quickfix list.
-  local ui = require("straps.ui")
-  local qf, list_kind = ui.get_locations(ctx and ctx.bufnr)
+  local findings = require("straps.findings")
+  local qf, list_kind = findings.get_locations(ctx and ctx.bufnr)
   if type(qf) ~= "table" or #qf == 0 then
     return "findings list is empty — run grep first to populate it"
   end
@@ -2306,7 +2323,7 @@ return function(input, ctx)
   end
 
   local body = string.format("s#%s#%s#%s | update", pat, rep, flags)
-  local ok, err = ui.locations_do(ctx and ctx.bufnr, body)
+  local ok, err = findings.locations_do(ctx and ctx.bufnr, body)
   if not ok then
     -- Never leak a raw Vim error as the tool result; wrap it clearly.
     return "bulk_replace: substitution failed: " .. tostring(err)
@@ -2875,11 +2892,20 @@ end
       .. " (agent-defined tools — never grantable). Called with no args it"
       .. " returns the array of GRANTABLE categories { edit, delete, exec, lua,"
       .. " net, spawn }. Redefine it to add custom categories — e.g. classify"
-      .. " bash inputs matching ^git%s into a \"vcs\" category.",
+      .. " bash inputs matching ^git%s into a \"vcs\" category. A tool.* entry's"
+      .. " own capability field (settable only via registry.define, not"
+      .. " tool.registry_define) takes precedence over this classification.",
     source = [==[
 return function(name, input)
   local grantable = { "edit", "delete", "exec", "lua", "net", "spawn" }
   if name == nil then return grantable end
+
+  -- Entries may declare their own category (set only via trusted definition
+  -- paths — registry.define from config/.straps.lua; tool.registry_define
+  -- deliberately does not accept the field, so an agent-defined tool cannot
+  -- self-declare "read").
+  local e = require("straps.registry").get("tool." .. tostring(name))
+  if e and type(e.capability) == "string" then return e.capability end
 
   local read = {
     read_file = true, glob = true, tree = true, path_info = true, grep = true,
@@ -3266,7 +3292,8 @@ end
   define({
     name = "hook.after_write",
     kind = "hook",
-    doc = "Called as (path, ctx) after write_file or edit_file completes. If it"
+    doc = "Called as (path, ctx) after write_file, edit_file, or patch_file"
+      .. " completes. If it"
       .. " returns a string, that string is appended to the tool result the"
       .. " agent sees. The default feeds the editor's own LSP back to the agent:"
       .. " it waits briefly (bounded, async) for the language server to re-lint"
@@ -3275,7 +3302,11 @@ end
       .. " on the file, or no new diagnostics, returns nil (nothing appended)."
       .. " Turn it off with config.after_write_diagnostics = false, or redefine"
       .. " this hook (it is the canonical 'always do X after Y' seam — e.g. run"
-      .. " an external linter instead and return its output).",
+      .. " an external linter instead and return its output). Additional"
+      .. " subscribers can be added as hook.after_write.<suffix> entries"
+      .. " without replacing this default — this entry plus every"
+      .. " hook.after_write.<suffix> entry runs and their string results are"
+      .. " all appended, in registration order.",
     source = [==[
 return function(path, ctx)
   -- Editor-native lint feedback: after the edit (which already sent the LSP a

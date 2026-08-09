@@ -34,7 +34,8 @@ lua/straps/provider.lua    -- registers fn.provider plus Anthropic/OpenAI curl b
 lua/straps/loop.lua        -- coroutine agent loop
 lua/straps/tools.lua       -- registers all builtin tools + default hooks
 lua/straps/editor.lua      -- editor-native tools (LSP + tree-sitter)
-lua/straps/ui.lua          -- registry edit buffers, listing, keymaps, folds
+lua/straps/findings.lua    -- per-session findings-list service (loclist/quickfix)
+lua/straps/ui.lua          -- registry edit buffers, listing, keymaps, folds; findings.lua delegations kept for back-compat
 lua/straps/health.lua      -- :checkhealth straps (install/environment probes)
 plugin/straps.lua          -- user commands (guarded, no heavy requires at load)
 doc/straps.txt             -- :help straps (vimdoc; tags via :helptags doc)
@@ -104,6 +105,57 @@ end
 Namespacing convention: tools are `tool.<api_name>` where `<api_name>` (the
 part after `tool.`) is what the LLM sees and must match `^[a-zA-Z0-9_-]+$`;
 `skill.<name>` entries are knowledge/prose, not callable capabilities.
+
+### Capability metadata on entries
+
+`spec.capability` is an optional string on `define()`: when present it must be
+a string (`define` errors otherwise) and is carried onto the entry as
+`entry.capability`. `render()` emits `capability = %q,` (placed after
+`input_schema`, before the `source` long-bracket block) so `registry_get` /
+`dump()` / `.straps.lua` persistence round-trip it. `fn.capability` (tools.lua)
+consults it FIRST: `registry.get("tool." .. name)` — if the entry has a
+`capability` field, that value wins over the hardcoded classification.
+`tool.registry_define` deliberately does NOT accept a `capability` field (its
+input schema has no such property), so an agent-defined tool can never
+self-declare a category like `"read"`; only a trusted definition path —
+`register()`, user config, a trusted `.straps.lua`, or `registry.define`
+called directly from `eval_lua` — can set it.
+
+### Hook fan-out (multi-subscriber hooks)
+
+Hooks are multi-subscriber: a second party wanting `hook.after_write` defines
+`hook.after_write.<suffix>` instead of clobbering the base entry.
+
+- `hook_entries(name) -> entry[]` — the fan-out primitive. The entry named
+  exactly `name` plus every entry whose name starts with `name .. "."`, all
+  `kind == "hook"`, resolved through the MERGED active-scope view (so a
+  session-scoped subscriber and the global default both appear), sorted by
+  `seq` ascending (registration order, oldest — usually the builtin default —
+  first).
+- `call_hooks(name, ...) -> results, errors` — calls every `hook_entries(name)`
+  entry with `pcall`. Non-nil returns collect into `results` in seq order;
+  a raising subscriber collects `{name = <entry name>, err = <message>}` into
+  `errors` instead of aborting the others. One broken subscriber never
+  prevents the rest from running.
+
+Call sites that fan out via `call_hooks`: `hook.after_write` (the three write
+tools — `write_file`, `edit_file`, `patch_file` — concatenate all string
+results onto the tool result with `\n`, and append each error as a visible
+`[hook <name> error: <err>]` line); `hook.before_tool`, `hook.on_run_start`,
+`hook.on_turn_start`, `hook.on_run_end` in loop.lua (results and errors
+ignored — a pcall'd fan-out is strictly more robust than the single `try_call`
+it replaces). `hook.after_tool` fans out differently — a FOLD, at the
+`execute_tool` call site, over `hook_entries("hook.after_tool")`: each
+subscriber is called `(name, input, result, ok, ctx)` in seq order and a
+non-nil return replaces `result` for the NEXT subscriber, so subscriber N sees
+subscriber N-1's transformation; a raising subscriber is skipped so it cannot
+break the ones after it.
+
+Hooks that never fan out, by design: `hook.confirm` (a single security
+decision with exactly two call sites in loop.lua — fanning out a permission
+gate makes no sense); `hook.on_progress` (hot path — a `merged_entries` scan
+per stream chunk is too costly); `hook.on_define` (recursion risk — it fires
+from inside `define()` itself).
 
 ## state.lua — transcript buffer format
 
@@ -319,12 +371,13 @@ ctx = {
 
 Run algorithm (each numbered step goes through the registry so it's swappable):
 
-1. `registry.call("hook.on_run_start", ctx)` via `try_call`.
+1. `registry.call_hooks("hook.on_run_start", ctx)` — fan-out (see registry.lua);
+   results and errors ignored.
 2. Loop up to `config.max_turns` times:
    a. Drain queued steering into user blocks, then
-      `registry.try_call("hook.on_turn_start", ctx, turn)` — the per-turn seam,
+      `registry.call_hooks("hook.on_turn_start", ctx, turn)` — the per-turn seam,
       BEFORE the parse below, so a hook that appends a block is part of this
-      turn's request. No-op by default.
+      turn's request. Fan-out; results/errors ignored. No-op by default.
    b. `parsed = state.parse(bufnr)`, then `fn.model_note(ctx)` (pcall'd) is
       appended to `parsed.system` for THIS request only — the model-awareness
       note (see "Model AWARENESS"); the buffer is never touched.
@@ -340,12 +393,17 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
       - `allowed, reason = registry.call("hook.confirm", name, input, ctx)`
         If not allowed → tool_result with `is_error=true`, content
         `"user denied: " .. (reason or "")`, continue to next tool_use.
-      - `registry.try_call("hook.before_tool", name, input, ctx)`
+      - `registry.call_hooks("hook.before_tool", name, input, ctx)` — fan-out;
+        results/errors ignored.
       - `ok, result = pcall(registry.call, "tool." .. name, input, ctx)`
         (unknown tool → error path). Result: string, or table (json-encode),
         or nil → "ok". Truncate results > `config.max_tool_result_bytes`
         (default 100_000) with a note.
-      - `result = registry.try_call("hook.after_tool", name, input, result, ok, ctx) or result`
+      - `hook.after_tool` FOLDS over `registry.hook_entries("hook.after_tool")`:
+        each subscriber is called `(name, input, result, ok, ctx)` in seq order
+        and a non-nil return replaces `result` for the NEXT subscriber (so
+        subscriber N sees subscriber N-1's transformation); a raising
+        subscriber is `pcall`'d away so it cannot break the ones after it.
       - `state.append(bufnr, "tool_result", {id=, is_error=not ok}, tostring(result))`
    f. Stall check (progress-aware soft stop): classify the turn — stalled when
       it issued tool calls AND either every call errored, OR every call was an
@@ -358,7 +416,8 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
       reason `"stalled"` and a loud, distinct note (below). This measures the
       spinning `max_turns` was only ever a proxy for.
    g. `resp.stop_reason == "tool_use"` → continue loop; else break.
-3. `registry.try_call("hook.on_run_end", ctx)`; `state.ensure_trailing_user(bufnr)`;
+3. `registry.call_hooks("hook.on_run_end", ctx)` — fan-out; results/errors
+   ignored; `state.ensure_trailing_user(bufnr)`;
    clear the running flag (also on error — wrap the whole run body, append an
    `assistant` block with the error message on failure so the user sees it).
 4. Cancellation: checked between turns and between tool calls; provider's
@@ -768,17 +827,23 @@ API names (registry names prefixed `tool.`):
   already-open buffer), so unsaved user edits are visible to reads just like
   edit/write paths.
 - `write_file {path, content}` — mkdir -p parent, write through the target's
-  buffer; then `registry.try_call("hook.after_write", path, ctx)`
-  and if it returns a string, append it to the tool result. **`hook.after_write`
-  ships as the LSP-diagnostics feedback loop** (below) — the canonical seam for
-  the "auto-run a linter after writes" idiom, now built by default.
+  buffer; then `registry.call_hooks("hook.after_write", path, ctx)` fans out
+  to every `hook.after_write` / `hook.after_write.<suffix>` subscriber
+  (registration order): each string result is appended to the tool result
+  with `\n`, each raising subscriber appends a visible
+  `[hook <name> error: <err>]` line instead of aborting the others.
+  **`hook.after_write` ships as the LSP-diagnostics feedback loop** (below,
+  registered as the lowest-seq, i.e. first, subscriber) — the canonical seam
+  for the "auto-run a linter after writes" idiom, now built by default; a
+  second party adds `hook.after_write.<suffix>` instead of clobbering it.
 - `edit_file {path, old_string, new_string, replace_all?}` — exact-match edit;
   error if 0 or (when not replace_all) >1 matches (plain-text find, no
-  patterns). Also fires `hook.after_write`.
+  patterns). Also fires `hook.after_write` (same fan-out as `write_file`).
 - `patch_file {path, hunks}` — structured line-range hunks applied through the
   same live buffer path as `write_file`/`edit_file`; useful when the agent knows
   exact line ranges and wants one undoable multi-hunk patch. Optional per-hunk
   `expected_old_text` guards against stale line ranges in the live buffer.
+  Also fires `hook.after_write` (same fan-out).
 - `path_info {paths}` / `tree {path?, max_depth?, max_entries?, hidden?}` —
   bounded filesystem introspection without shelling out.
 - `fetch_url {url, max_bytes?, timeout_ms?, follow_redirects?}` — bounded curl
@@ -934,12 +999,17 @@ Default hooks registered here:
 ## System prompt: layered, composed, each layer redefinable
 
 The established harness shape: a harness-owned core prompt + injected
-environment context + project memory files. In straps each layer is a registry entry
+environment context + project memory files. In straps each underlying layer
+(core/env/skills/project) AND each composed section
+(`fn.system_prompt_layer.*`, see below) is its own registry entry
 (define_default in provider.register()), composed by `fn.system_prompt` —
 which stays the single entry `state.new_session` calls, so wholesale
 redefinition still works and the result still lands in the editable system
 block at session creation (env/project content is frozen per session; edit
-the block or start a new session to refresh — document this):
+the block or start a new session to refresh — document this). The list-based
+composition (a plugin registers a new `fn.system_prompt_layer.<name>` instead
+of redefining `fn.system_prompt` wholesale) is documented under
+`fn.system_prompt(opts?)` below:
 
 - `fn.system_prompt_core()` — the base prompt (below).
 - `fn.system_prompt_env()` — generated environment block, one `key: value`
@@ -962,22 +1032,41 @@ the block or start a new session to refresh — document this):
   also an ancestor) is included once at its most general position;
   unreadable/missing files are silently skipped. Returns "" when nothing
   found.
-- `fn.system_prompt(opts?)` — joins core, env (under a `# Environment`
-  heading), skills (under `# Skills`, when any exist) and project (under
-  `# Project instructions` with a sentence telling the agent these come
-  from the project's memory files and must be followed) with blank lines;
-  skips empty layers. Composition calls the other layers through
-  `registry.call`, so redefining any single layer takes effect for the
-  next new session. Optional `opts` (from `state.new_session(opts)`,
-  which `tool.spawn` calls with `{ subagent = true, readonly?, tools? }`)
-  are forwarded to the core layer ONLY, which adapts the prompt to a
+- `fn.system_prompt(opts?)` — composed by iterating `registry.names_by_seq("fn")`,
+  keeping names matching `^fn%.system_prompt_layer%.`, calling each with the
+  SAME `opts`, skipping a nil/`""` result, and joining the non-empty results
+  with `"\n\n"`. This is the seam a plugin uses to contribute a new prompt
+  section without redefining the whole composition: define
+  `fn.system_prompt_layer.<name>` returning a fully formatted section string
+  (or nil/`""` to skip) and it joins in wherever its `seq` (registration order)
+  places it — append-only, so a new layer registers after the existing ones
+  and the prompt-cache prefix stays stable. A layer fn that raises PROPAGATES
+  the error (a broken layer must fail loudly, same as before). Four layer
+  entries ship, registered in this order so default output is byte-identical
+  to the old fixed composition: `fn.system_prompt_layer.core` (delegates to
+  `fn.system_prompt_core` via `registry.call`, unwrapped), `.env` (delegates to
+  `fn.system_prompt_env` via `registry.call`, wraps a non-empty result in
+  `"# Environment\n\n"`, else nil), `.skills` (delegates to
+  `fn.system_prompt_skills` via `registry.try_call` — an absent entry is
+  tolerated — wraps a non-empty result in a `"# Skills\n\n"` preamble, else
+  nil), `.project` (delegates to `fn.system_prompt_project` via
+  `registry.call`, wraps a non-empty result in a `"# Project instructions\n\n"`
+  preamble, else nil). CONTRACT: every layer fn is called as `(opts)`, not
+  `()` — a change from the old composition, where only the core layer received
+  `opts`. A user's own redefinition of `fn.system_prompt_env`/`_skills`/
+  `_project` (the underlying, unwrapped entries) is UNAFFECTED: those keep
+  their original zero-arg signature, since only the new `fn.system_prompt_layer.*`
+  wrappers receive `opts`. `opts` (from `state.new_session(opts)`, which
+  `tool.spawn` calls with `{ subagent = true, readonly?, tools? }`) is
+  forwarded to every layer, but only the core layer's underlying
+  `fn.system_prompt_core` consumes it today — it adapts the prompt to a
   spawned child's shape: the `# Subagents` section is dropped, a
   `# You are a subagent` section (the parent sees only the final reply;
   make it complete, follow the task's answer format) is appended, plus a
-  READ-ONLY note and/or a tool-restriction list when set. A user's
-  zero-arg redefinition of `fn.system_prompt` or `fn.system_prompt_core`
-  silently ignores the extra argument (harmless in Lua) — children then
-  get the full parent-shaped prompt.
+  READ-ONLY note and/or a tool-restriction list when set. A user's zero-arg
+  redefinition of `fn.system_prompt` or `fn.system_prompt_core` silently
+  ignores the extra argument (harmless in Lua) — children then get the full
+  parent-shaped prompt.
 
 ### Core prompt content (fn.system_prompt_core) — second pass
 

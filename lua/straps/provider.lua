@@ -2034,46 +2034,88 @@ return function()
 end
 ]==]
 
+-- Layer wrapper: delegates to fn.system_prompt_core (unchanged, kept for
+-- back-compat with direct redefinitions) and returns its output as-is —
+-- the core layer carries no extra framing. opts is forwarded (e.g.
+-- { subagent, readonly, tools } from tool.spawn via state.new_session).
+local SYSTEM_PROMPT_LAYER_CORE_SRC = [==[
+return function(opts)
+  local registry = require("straps.registry")
+  return registry.call("fn.system_prompt_core", opts)
+end
+]==]
+
+-- Layer wrapper: delegates to fn.system_prompt_env and adds the
+-- "# Environment" framing. Returns nil when the underlying layer is empty,
+-- so the composer skips the section (matching today's skip behavior).
+local SYSTEM_PROMPT_LAYER_ENV_SRC = [==[
+return function(opts)
+  local registry = require("straps.registry")
+  local env = registry.call("fn.system_prompt_env")
+  if not env or env == "" then
+    return nil
+  end
+  return "# Environment\n\n" .. env
+end
+]==]
+
+-- Layer wrapper: delegates to fn.system_prompt_skills via try_call (an
+-- absent entry is tolerated, matching today's posture) and adds the
+-- "# Skills" preamble. Returns nil when there is nothing to show.
+local SYSTEM_PROMPT_LAYER_SKILLS_SRC = [==[
+return function(opts)
+  local registry = require("straps.registry")
+  local skills = registry.try_call("fn.system_prompt_skills")
+  if not skills or skills == "" then
+    return nil
+  end
+  return "# Skills\n\n"
+    .. "Stored knowledge, loadable on demand: call the skill tool with a"
+    .. " name below when its description matches the task at hand.\n\n"
+    .. skills
+end
+]==]
+
+-- Layer wrapper: delegates to fn.system_prompt_project and adds the
+-- "# Project instructions" preamble. Returns nil when there are no project
+-- memory files to include.
+local SYSTEM_PROMPT_LAYER_PROJECT_SRC = [==[
+return function(opts)
+  local registry = require("straps.registry")
+  local project = registry.call("fn.system_prompt_project")
+  if not project or project == "" then
+    return nil
+  end
+  return "# Project instructions\n\n"
+    .. "The following instructions come from the project's memory files;"
+    .. " follow them -- they take precedence over the general guidance above.\n\n"
+    .. project
+end
+]==]
+
 local SYSTEM_PROMPT_SRC = [==[
--- Composes the system prompt for new sessions from four layers, each
--- looked up through the registry AT CALL TIME: fn.system_prompt_core,
--- fn.system_prompt_env (under "# Environment"), fn.system_prompt_skills
--- (under "# Skills") and fn.system_prompt_project (under "# Project
--- instructions"). Redefine any single layer to change the next new
--- session; redefine this entry to replace the composition wholesale.
--- Empty layers are skipped. Optional opts (e.g. { subagent, readonly,
--- tools } from tool.spawn via state.new_session) are forwarded to the
--- core layer only.
+-- Composes the system prompt by iterating registry fn entries named
+-- fn.system_prompt_layer.<name>, IN REGISTRATION ORDER (seq) — the seam a
+-- plugin uses to contribute a new prompt section without redefining the
+-- whole composition. Each layer fn is called with the same opts (e.g.
+-- { subagent, readonly, tools } from tool.spawn via state.new_session) and
+-- must return a fully formatted section string, or nil/"" to skip. Layer
+-- errors PROPAGATE (a broken layer must fail loudly, same as today).
+-- Non-empty results are joined with "\n\n"; order is append-only (new
+-- layers register after existing ones), keeping the prompt-cache prefix
+-- stable. Redefine a single fn.system_prompt_layer.* entry to change its
+-- section, or this entry to replace the composition wholesale.
 return function(opts)
   local registry = require("straps.registry")
   local parts = {}
-
-  local core = registry.call("fn.system_prompt_core", opts)
-  if core and core ~= "" then
-    parts[#parts + 1] = core
+  for _, name in ipairs(registry.names_by_seq("fn")) do
+    if name:match("^fn%.system_prompt_layer%.") then
+      local section = registry.call(name, opts)
+      if section and section ~= "" then
+        parts[#parts + 1] = section
+      end
+    end
   end
-
-  local env = registry.call("fn.system_prompt_env")
-  if env and env ~= "" then
-    parts[#parts + 1] = "# Environment\n\n" .. env
-  end
-
-  local skills = registry.try_call("fn.system_prompt_skills")
-  if skills and skills ~= "" then
-    parts[#parts + 1] = "# Skills\n\n"
-      .. "Stored knowledge, loadable on demand: call the skill tool with a"
-      .. " name below when its description matches the task at hand.\n\n"
-      .. skills
-  end
-
-  local project = registry.call("fn.system_prompt_project")
-  if project and project ~= "" then
-    parts[#parts + 1] = "# Project instructions\n\n"
-      .. "The following instructions come from the project's memory files;"
-      .. " follow them -- they take precedence over the general guidance above.\n\n"
-      .. project
-  end
-
   return table.concat(parts, "\n\n")
 end
 ]==]
@@ -2108,10 +2150,38 @@ function M.register()
     doc = "Skills layer of the system prompt: one line per skill.* entry, loadable via tool.skill.",
     source = SYSTEM_PROMPT_SKILLS_SRC,
   })
+  -- Layer fns: the composable seam fn.system_prompt iterates over. Order
+  -- of registration is order of appearance in the composed prompt (seq),
+  -- so this order (core, env, skills, project) reproduces today's output
+  -- byte-for-byte.
+  define({
+    name = "fn.system_prompt_layer.core",
+    kind = "fn",
+    doc = "Prompt layer: core identity/norms/workflow section (delegates to fn.system_prompt_core).",
+    source = SYSTEM_PROMPT_LAYER_CORE_SRC,
+  })
+  define({
+    name = "fn.system_prompt_layer.env",
+    kind = "fn",
+    doc = "Prompt layer: \"# Environment\" section (delegates to fn.system_prompt_env).",
+    source = SYSTEM_PROMPT_LAYER_ENV_SRC,
+  })
+  define({
+    name = "fn.system_prompt_layer.skills",
+    kind = "fn",
+    doc = "Prompt layer: \"# Skills\" section (delegates to fn.system_prompt_skills).",
+    source = SYSTEM_PROMPT_LAYER_SKILLS_SRC,
+  })
+  define({
+    name = "fn.system_prompt_layer.project",
+    kind = "fn",
+    doc = "Prompt layer: \"# Project instructions\" section (delegates to fn.system_prompt_project).",
+    source = SYSTEM_PROMPT_LAYER_PROJECT_SRC,
+  })
   define({
     name = "fn.system_prompt",
     kind = "fn",
-    doc = "Compose the system prompt for new sessions from the core/env/skills/project layers.",
+    doc = "Compose the system prompt from fn.system_prompt_layer.* entries, in registration order.",
     source = SYSTEM_PROMPT_SRC,
   })
   define({

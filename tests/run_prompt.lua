@@ -1,8 +1,10 @@
 -- System prompt tests: the layered prompt (fn.system_prompt_core/_env/
--- _project composed by fn.system_prompt). Covers composition, AGENTS.md/
--- CLAUDE.md discovery and upward layering, config.instructions_files, the
--- 20000-byte cap, late-bound layer redefinition, new_session pickup, and
--- the env VCS line.
+-- _project, wrapped by fn.system_prompt_layer.core/.env/.skills/.project
+-- and composed by fn.system_prompt, which iterates fn.system_prompt_layer.*
+-- entries in registration order). Covers composition, AGENTS.md/CLAUDE.md
+-- discovery and upward layering, config.instructions_files, the 20000-byte
+-- cap, late-bound layer redefinition, new_session pickup, the env VCS
+-- line, and third-party layer contribution via fn.system_prompt_layer.*.
 -- Run: nvim --headless -l tests/run_prompt.lua
 
 local here = debug.getinfo(1, "S").source:sub(2)
@@ -315,6 +317,78 @@ case("env layer lists the top-level shape of cwd, dirs first", function()
   end)
   cd(orig_cwd)
   assert(ok, err)
+end)
+
+-- ----------------------------------------------------- layer contribution
+case("a new fn.system_prompt_layer.* entry appends a section at the end", function()
+  registry.define({
+    name = "fn.system_prompt_layer.zzz",
+    kind = "fn",
+    doc = "test: extra trailing layer",
+    source = [[return function() return "# Extra\n\nhello" end]],
+  })
+  local ok, err = pcall(function()
+    local prompt = registry.call("fn.system_prompt")
+    assert(prompt:find("# Extra\n\nhello", 1, true), "new layer section missing")
+    -- It must be at the very end (appended after project, the last builtin layer).
+    local project_pos = assert(prompt:find("# Project instructions", 1, true))
+    local extra_pos = assert(prompt:find("# Extra", 1, true))
+    assert(project_pos < extra_pos, "new layer should come after # Project instructions")
+    assert(prompt:sub(-#("# Extra\n\nhello")) == "# Extra\n\nhello",
+      "new layer should be the tail of the composed prompt")
+
+    -- Counterfactual: break the assertion target (make the new layer stop
+    -- appearing at the end) and confirm this check would have caught it.
+    local broken = prompt:sub(1, project_pos - 1) .. "# Extra\n\nhello\n\n"
+      .. prompt:sub(project_pos, project_pos + #("# Project instructions") - 1)
+    local broken_project_pos = broken:find("# Project instructions", 1, true)
+    local broken_extra_pos = broken:find("# Extra", 1, true)
+    assert(not (broken_project_pos < broken_extra_pos),
+      "counterfactual should fail the ordering assertion")
+  end)
+  registry.remove("fn.system_prompt_layer.zzz", { scope = "global" })
+  assert(ok, err)
+end)
+
+case("an empty fn.system_prompt_layer.* result drops the section", function()
+  registry.define({
+    name = "fn.system_prompt_layer.zzz",
+    kind = "fn",
+    doc = "test: extra trailing layer, now empty",
+    source = [[return function() return "" end]],
+  })
+  local ok, err = pcall(function()
+    local prompt = registry.call("fn.system_prompt")
+    assert(not prompt:find("# Extra", 1, true), "empty layer should not appear")
+
+    -- Counterfactual: a layer returning non-empty content DOES appear, so
+    -- this assertion is not vacuously true.
+    registry.define({
+      name = "fn.system_prompt_layer.zzz",
+      kind = "fn",
+      doc = "test: extra trailing layer, non-empty again",
+      source = [[return function() return "# Extra\n\nhello" end]],
+    })
+    local prompt2 = registry.call("fn.system_prompt")
+    assert(prompt2:find("# Extra", 1, true), "counterfactual: non-empty layer should appear")
+  end)
+  registry.remove("fn.system_prompt_layer.zzz", { scope = "global" })
+  assert(ok, err)
+end)
+
+case("relative order of the four builtin layers is preserved", function()
+  local prompt = registry.call("fn.system_prompt")
+  local core_pos = assert(prompt:find("You are Cinch, a coding agent running inside Neovim", 1, true))
+  local env_pos = assert(prompt:find("\n# Environment\n", 1, true))
+  local skills_pos = assert(prompt:find("\n# Skills\n", 1, true))
+  local project_pos = assert(prompt:find("\n# Project instructions\n", 1, true))
+  assert(core_pos < env_pos, "core should precede env")
+  assert(env_pos < skills_pos, "env should precede skills")
+  assert(skills_pos < project_pos, "skills should precede project")
+
+  -- Counterfactual: scrambled positions would fail this chain.
+  assert(not (project_pos < core_pos and env_pos < skills_pos and skills_pos < project_pos),
+    "counterfactual: a scrambled order should fail the chain")
 end)
 
 if failed then

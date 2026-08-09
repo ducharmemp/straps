@@ -133,6 +133,9 @@ function M.define(spec, opts)
   if type(spec.source) ~= "string" then
     error(("straps.registry.define: %s: source must be a string"):format(spec.name))
   end
+  if spec.capability ~= nil and type(spec.capability) ~= "string" then
+    error(("straps.registry.define: %s: capability must be a string"):format(spec.name))
+  end
 
   local fn
   if spec.kind == "skill" then
@@ -186,6 +189,7 @@ function M.define(spec, opts)
     doc = spec.doc,
     input_schema = spec.input_schema,
     source = spec.source,
+    capability = spec.capability,
     fn = fn,
     version = (prev and prev.version or 0) + 1,
     seq = seq,
@@ -232,6 +236,46 @@ function M.try_call(name, ...)
     return nil
   end
   return entry.fn(...)
+end
+
+--- Ordered fan-out subscriber list for hook `name`: the entry named exactly
+--- `name` plus every entry whose name starts with `name .. "."`, all
+--- kind == "hook", resolved through the MERGED active-scope view (so a
+--- session-scoped subscriber and the global default both appear), sorted by
+--- seq ascending — registration order, oldest (usually the builtin default)
+--- first. This is the fan-out primitive; call_hooks() below is built on it.
+function M.hook_entries(name)
+  local merged = merged_entries()
+  local prefix = name .. "."
+  local out = {}
+  for entry_name, entry in pairs(merged) do
+    if entry.kind == "hook" and (entry_name == name or entry_name:sub(1, #prefix) == prefix) then
+      out[#out + 1] = entry
+    end
+  end
+  table.sort(out, function(a, b)
+    return a.seq < b.seq
+  end)
+  return out
+end
+
+--- Call every subscriber to hook `name` (see hook_entries) with pcall, so one
+--- broken subscriber never prevents the others from running. Returns two
+--- tables: `results`, the non-nil return values in seq order, and `errors`,
+--- one {name = <entry name>, err = <message>} per subscriber that raised.
+function M.call_hooks(name, ...)
+  local results, errors = {}, {}
+  for _, entry in ipairs(M.hook_entries(name)) do
+    local ok, ret = pcall(entry.fn, ...)
+    if ok then
+      if ret ~= nil then
+        results[#results + 1] = ret
+      end
+    else
+      errors[#errors + 1] = { name = entry.name, err = tostring(ret) }
+    end
+  end
+  return results, errors
 end
 
 --- Entry names in REGISTRATION order (by seq), optionally filtered by kind,
@@ -318,6 +362,9 @@ function M.render(name)
   end
   if e.input_schema ~= nil then
     parts[#parts + 1] = "  input_schema = " .. vim.inspect(e.input_schema) .. ","
+  end
+  if e.capability ~= nil then
+    parts[#parts + 1] = ("  capability = %q,"):format(e.capability)
   end
   parts[#parts + 1] = ("  source = [%s[\n%s]%s],"):format(eq, e.source, eq)
   parts[#parts + 1] = "}"

@@ -517,33 +517,15 @@ function M.open_file_ref()
 end
 
 -- Per-session findings lists (quickfix isolation) ---------------------------
--- The quickfix list is GLOBAL to the Neovim instance, so two concurrent
--- sessions populating it would stomp each other — and bulk_replace, which acts
--- on "the current list", could then edit another session's files. Fix: when a
--- session is on-screen, route its findings to that WINDOW's location list
--- (per-window, private); fall back to the global quickfix list only when the
--- session has no window (e.g. a windowless subagent), which is the pre-existing
--- global behavior and no worse than today.
+-- Findings-list service moved to straps.findings; delegations kept because
+-- ui.set_locations has internal callers (transcript outline) and external
+-- callers/tests.
 
 --- The window showing session buffer `bufnr`, or nil. Non-floating, and
 --- deterministic (lowest win id) so a grep and the later bulk_replace on the
 --- same session resolve to the SAME window's location list.
 function M.session_win(bufnr)
-  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
-    return nil
-  end
-  local wins = vim.fn.win_findbuf(bufnr)
-  if type(wins) ~= "table" then
-    return nil
-  end
-  table.sort(wins)
-  for _, w in ipairs(wins) do
-    if vim.api.nvim_win_is_valid(w)
-        and vim.api.nvim_win_get_config(w).relative == "" then
-      return w
-    end
-  end
-  return nil
+  return require("straps.findings").session_win(bufnr)
 end
 
 --- Set this session's findings list. `what` = { title, items }. Uses the
@@ -552,43 +534,19 @@ end
 --- are entries. Returns "loclist" or "quickfix" (so callers can name the right
 --- :lnext/:cnext navigation).
 function M.set_locations(bufnr, what, open)
-  local win = M.session_win(bufnr)
-  local title = what.title
-  local items = what.items or {}
-  if win then
-    pcall(vim.fn.setloclist, win, {}, " ", { title = title, items = items })
-    if open and #items > 0 then
-      pcall(vim.fn.win_execute, win, "lopen")
-    end
-    return "loclist"
-  end
-  pcall(vim.fn.setqflist, {}, " ", { title = title, items = items })
-  if open and #items > 0 then
-    pcall(function() vim.cmd("botright copen") end)
-  end
-  return "quickfix"
+  return require("straps.findings").set_locations(bufnr, what, open)
 end
 
 --- Read this session's findings list. Returns items(list), kind, win-or-nil.
 function M.get_locations(bufnr)
-  local win = M.session_win(bufnr)
-  if win then
-    return vim.fn.getloclist(win), "loclist", win
-  end
-  return vim.fn.getqflist(), "quickfix", nil
+  return require("straps.findings").get_locations(bufnr)
 end
 
 --- Run an ex substitution across this session's findings list: `:ldo` in its
 --- window (private) when on-screen, else `:cdo` globally. `body` is the part
 --- after the do-command, e.g. "s#a#b#ge | update". Returns ok, err, kind.
 function M.locations_do(bufnr, body)
-  local win = M.session_win(bufnr)
-  if win then
-    local ok, err = pcall(vim.fn.win_execute, win, "silent ldo " .. body)
-    return ok, err, "loclist"
-  end
-  local ok, err = pcall(vim.cmd, "silent cdo " .. body)
-  return ok, err, "quickfix"
+  return require("straps.findings").locations_do(bufnr, body)
 end
 
 -- Buffer-local gf that understands the path:line references straps agents

@@ -3,8 +3,9 @@
 This repo is straps.nvim — the harness hosting you right now. The loop
 that is calling you is `lua/straps/loop.lua`, the prompt you are reading
 was assembled by `lua/straps/provider.lua`, and every tool you call was
-registered from source in `lua/straps/tools.lua` and
-`lua/straps/editor.lua`. A bug you introduce here is a bug in your own
+registered from source under `lua/straps/layers/` and
+`lua/straps/editor.lua` (dispatched by `lua/straps/tools.lua`). A bug you
+introduce here is a bug in your own
 machinery.
 
 # Two copies of everything

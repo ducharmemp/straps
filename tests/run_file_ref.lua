@@ -33,12 +33,12 @@ local function at(line, col)
 end
 
 case("path:line opens the file at the line", function()
-  at("the guard lives in lua/straps/tools.lua:293 now", 25)
+  at("the guard lives in lua/straps/tools.lua:29 now", 25)
   assert(ui.open_file_ref() == true, "should open")
   local name = vim.api.nvim_buf_get_name(0)
   assert(name:match("lua/straps/tools%.lua$"), "wrong file: " .. name)
   local pos = vim.api.nvim_win_get_cursor(0)
-  assert(pos[1] == 293, "wrong line: " .. pos[1])
+  assert(pos[1] == 29, "wrong line: " .. pos[1])
 end)
 
 case("path:line:col also sets the column", function()

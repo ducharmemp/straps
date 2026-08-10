@@ -32,7 +32,8 @@ lua/straps/registry.lua    -- the late-bound registry (heart of the plugin)
 lua/straps/state.lua       -- transcript buffer format: create/append/parse
 lua/straps/provider.lua    -- registers fn.provider plus Anthropic/OpenAI curl backends
 lua/straps/loop.lua        -- coroutine agent loop
-lua/straps/tools.lua       -- registers all builtin tools + default hooks
+lua/straps/tools.lua       -- registration dispatcher; composes builtin-tool layer manifests
+lua/straps/layers/*.lua    -- layer manifests: builtin tools/hooks/fns grouped by layer (files, agents, exec, session, search, selfext, net, permissions)
 lua/straps/editor.lua      -- editor-native tools (LSP + tree-sitter)
 lua/straps/findings.lua    -- per-session findings-list service (loclist/quickfix)
 lua/straps/ui.lua          -- registry edit buffers, listing, keymaps, folds; findings.lua delegations kept for back-compat
@@ -46,6 +47,7 @@ tree-sitter-straps/        -- the transcript grammar (generated src/ committed)
 tests/run_registry_state.lua
 tests/run_loop.lua
 tests/run_agents_buffer.lua
+tests/run_reorg.lua
 README.md
 ```
 
@@ -112,7 +114,8 @@ part after `tool.`) is what the LLM sees and must match `^[a-zA-Z0-9_-]+$`;
 a string (`define` errors otherwise) and is carried onto the entry as
 `entry.capability`. `render()` emits `capability = %q,` (placed after
 `input_schema`, before the `source` long-bracket block) so `registry_get` /
-`dump()` / `.straps.lua` persistence round-trip it. `fn.capability` (tools.lua)
+`dump()` / `.straps.lua` persistence round-trip it. `fn.capability`
+(layers/permissions.lua)
 consults it FIRST: `registry.get("tool." .. name)` — if the entry has a
 `capability` field, that value wins over the hardcoded classification.
 `tool.registry_define` deliberately does NOT accept a `capability` field (its
@@ -818,7 +821,7 @@ mechanics (trigger language in the tool doc itself lifts usage).
 - The file itself is plain Lua — `registry.define` calls; `registry.dump()`
   output is valid content. README documents the save-back convention.
 
-## tools.lua — builtin tools (each ~focused; all defined via source strings)
+## tools.lua + layers/ — builtin tools (each ~focused; all defined via source strings)
 
 API names (registry names prefixed `tool.`):
 
@@ -941,6 +944,10 @@ API names (registry names prefixed `tool.`):
     under the snapshot. Notes are flattened to one line; receipts are never
     empty (`parse` DROPS an empty prose block, which would change roles);
     already-excised blocks are skipped, so it is idempotent.
+
+### Layer manifests
+
+The split is organizational only — registration order (and with it the prompt-cache prefix) is preserved exactly, verified by tests/run_reorg.lua's relative-order assertion. Each layer module under lua/straps/layers/ carries an empty fn.system_prompt_layer.<name> skeleton that returns ""; the composer skips empty fragments, reserving the slot for that layer's share of the core prompt. Moving the prose is deliberately deferred — the core prompt's interleaved guidance teaches tools by contrast and position, and carving it up has an unmeasured behavioral cost.
 
 Default hooks registered here:
 
@@ -1642,7 +1649,7 @@ unified-diff renderer that the confirm-dialog edit preview also uses.
   findings the agent built itself; grep and run_quickfix already fill the list
   for searches and build output, so the doc points there first.
 
-### 2. Native-undo edits (tools.lua: write_file, edit_file, patch_file)
+### 2. Native-undo edits (layers/files.lua: write_file, edit_file, patch_file)
 
 Apply agent edits THROUGH the file's buffer so they enter its native undo tree
 — the user reverts with `u` / `:earlier` / undotree, not just git.
@@ -1669,7 +1676,7 @@ Apply agent edits THROUGH the file's buffer so they enter its native undo tree
   is created + loaded + undoable.
 
 Concurrent-editor detection (fn.reconcile_buf, fn.check_writer, fn.mark_seen —
-tools.lua; call sites in write_file/edit_file/patch_file/read_file and
+layers/files.lua; call sites in write_file/edit_file/patch_file/read_file and
 undo_edit): a competing editor is surfaced to the agent as an ERROR (edits) or
 a prepended note (reads) — never a merge, never a W12 prompt, never a silent
 overwrite. Two topologies, no new files on disk:
@@ -1710,7 +1717,7 @@ overwrite. Two topologies, no new files on disk:
 - Tests: `tests/run_reconcile.lua`.
 
 Multiplayer AWARENESS (fn.peer_agents, tool.agents, hook.on_run_start,
-skill.multiplayer — tools.lua, prose in provider.lua): detection above tells an
+skill.multiplayer — layers/agents.lua, prose in provider.lua): detection above tells an
 agent about a neighbour at the moment they collide; this tells it they exist
 before that. Same-instance only, for the same reason — a session in another
 Neovim shares no buffer state to read.
@@ -1728,8 +1735,9 @@ Neovim shares no buffer state to read.
 - `tool.agents` formats that for the agent, plus the cross-instance caveat and
   a pointer to `skill.multiplayer`. Read-only: in `fn.readonly_policy`'s
   allowlist (hence auto-allowed and permitted to readonly children) and in the
-  loop's `PARALLEL_READONLY` set. Defined last of the TOOLS in tools.lua's
-  `register()` (the hooks and fns follow it) — tool seq order is append-only for
+  loop's `PARALLEL_READONLY` set. Defined last of the TOOLS in the dispatcher's
+  registration order (layers/agents.lua; the hooks and fns follow it) — tool seq
+  order is append-only for
   cache stability.
 - `hook.on_run_start` stops being a no-op: with peers RUNNING it appends one
   user block naming them. Three guards, each a test: no running peer → no
@@ -1746,7 +1754,7 @@ Neovim shares no buffer state to read.
   rather than racing.
 - Tests: `tests/run_multiplayer.lua`.
 
-Model AWARENESS (`fn.model_note` — tools.lua, call site in loop.lua): the
+Model AWARENESS (`fn.model_note` — layers/agents.lua, call site in loop.lua): the
 winbar has always told the USER which model a session runs on; the agent itself
 could not see it, and so spawned subagents on its own model by default rather
 than by choice. `tool.spawn` takes `model`/`effort` and falls back to the

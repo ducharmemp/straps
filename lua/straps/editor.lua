@@ -3170,6 +3170,19 @@ return function(input, ctx)
 end
 ]==]),
   })
+
+  -- Prompt fragment slot for the editor layer — registered here (at the END of
+  -- editor.lua's register()) rather than in the tools.lua skeleton pass, since
+  -- editor.lua is already its own layer manifest. Returns "" until the editor
+  -- guidance moves out of the core prompt (organizational skeleton).
+  define({
+    name = "fn.system_prompt_layer.editor",
+    kind = "fn",
+    doc = "Prompt fragment slot for the editor layer — returns '' until that"
+      .. " layer's guidance moves out of the core prompt (organizational"
+      .. " skeleton).",
+    source = "return function() return \"\" end",
+  })
 end
 
 return M

@@ -569,6 +569,46 @@ per-session cost readout. A `config.model_prices` map { id -> { input,
 output, cache_read, cache_write } per Mtok } and a `$x.xx` winbar segment.
 Optional; usage/context % is the more useful signal and already shipped.
 
+## SIGKILL-proof process cleanup for shell tools
+
+Shipped: shell tools (bash, run_quickfix) spawn detached process-group
+leaders and group-kill on cancel/timeout; a VimLeavePre autocmd fires every
+active run's cancel fns, so orderly exits (`:qa`, `:qa!`, SIGTERM/SIGHUP)
+kill in-flight command trees. The remaining gap: SIGKILL of Neovim itself
+(kernel OOM, `kill -9` by hand) runs no autocmds, so those trees are
+orphaned — and their timeout timer, which lives in-process, dies with
+Neovim, so a `sleep infinity`-shaped command runs unbounded.
+
+Every real fix moves the kill outside the doomed process. Options, in
+order of merit:
+
+1. **Pipe-EOF watcher** (the classic; the pick if this is ever built).
+   The kernel closes a dead process's pipe ends on ANY death, SIGKILL
+   included. Each spawned tree gets a watcher process holding a pipe from
+   nvim: on EOF, `kill -9 -PGID`. Shape: `cmd & (cat >/dev/null;
+   kill -9 -$$) & wait` with the watcher's stdin piped from nvim. No
+   polling, no races, portable macOS/Linux. Costs: one extra process per
+   command; the wrapper occupies stdin (stdin-reading commands would need
+   a second fd — vim.system doesn't expose extra stdio, so that means
+   uv.spawn); the completion path (watcher must not linger after a normal
+   exit) needs prototyping before it can be trusted.
+2. **One long-lived supervisor** instead of per-command watchers: straps
+   writes each new pgid to a supervisor's pipe; on EOF it kills every
+   registered group. Could use kqueue EVFILT_PROC / Linux pidfd instead of
+   the pipe. Amortizes to one process, but adds a protocol and lifecycle —
+   overkill at straps' scale.
+3. **Parent-death signal**: `prctl(PR_SET_PDEATHSIG)` — Linux only, not
+   exposed by libuv, no macOS equivalent. Ruled out as the mechanism here.
+4. **Reap-on-next-start** (heal, not prevent): record pgid + owning nvim
+   pid in a state file; next session start / `:checkhealth straps` kills
+   groups whose nvim is dead. Cheap, but the orphan lives until then, and
+   pgid recycling means it must sanity-check the cmdline before signaling.
+
+Not building now: SIGKILL of an editor is rare, the orphan is bounded by
+its own natural runtime, and the failure is annoyance, not corruption.
+If the dead-timeout case bites in practice, build option 1, prototyping
+the wrapper's completion semantics first.
+
 ## (rejected) Quit guard for running agents
 
 Considered and dropped. A QuitPre/ExitPre hook can only veto a *polite* `:qa`

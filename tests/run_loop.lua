@@ -334,6 +334,105 @@ end
   assert(buf_text(bufnr):find("recovered", 1, true), "buffer not reusable after stop")
 end)
 
+case("loop.stop forcibly ends a run whose tool never resolves", function()
+  allow_all()
+  local straps = require("straps")
+  local prev_backstop = straps.config.stop_backstop_ms
+  straps.config.stop_backstop_ms = 300
+  local ok_case, err_case = pcall(function()
+
+  -- A tool that awaits forever and registers NO cancel handler: without the
+  -- backstop the run coroutine stays suspended in ctx.await after stop().
+  _G.straps_test_wedged = false
+  define("tool.wedge", "tool", "test: awaits forever, no cancel handler", [==[
+return function(input, ctx)
+  _G.straps_test_wedged = true
+  ctx.await(function(resolve) end)
+  return "unreachable"
+end
+]==])
+  define("fn.provider", "fn", "test: one wedging tool then end_turn", [==[
+return function(req, ctx)
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  return { stop_reason = "tool_use", content = {
+    { type = "tool_use", id = "w1", name = "wedge", input = vim.empty_dict() },
+  } }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("wedge")
+  loop.start(bufnr)
+  -- wait until the tool is in flight (awaiting with no way to resolve)
+  assert(vim.wait(2000, function() return _G.straps_test_wedged end, 10),
+    "wedging tool never started")
+  assert(loop.running(bufnr), "run should still be active, wedged in the tool's await")
+
+  loop.stop(bufnr)
+  assert(vim.wait(2000, function() return not loop.running(bufnr) end, 10),
+    "backstop did not force the wedged run to end")
+
+  local text = buf_text(bufnr)
+  assert(text:find("[straps: run cancelled]", 1, true), "missing cancellation note")
+
+  -- Every appended tool_use is paired with a result (the loop stubs results for
+  -- cancelled tools), so the healed transcript ships no unpaired tool_use.
+  local uses, results = 0, 0
+  for _, m in ipairs(state.parse(bufnr).messages) do
+    for _, part in ipairs(m.content) do
+      if part.type == "tool_use" then uses = uses + 1 end
+      if part.type == "tool_result" then results = results + 1 end
+    end
+  end
+  assert(uses == 1 and results == 1,
+    "unpaired tool blocks after forced end: " .. uses .. " uses, " .. results .. " results")
+  end)
+  straps.config.stop_backstop_ms = prev_backstop -- restore even when a mid-case assert fired
+  assert(ok_case, err_case)
+end)
+
+case("VimLeavePre fires active runs' cancel fns (kills orphaned processes)", function()
+  allow_all()
+  -- A run wedged in a tool await, with a cancel handler standing in for the
+  -- shell tools' group-kill: exit cleanup must invoke it synchronously.
+  _G.straps_test_exit_killed = false
+  _G.straps_test_exit_wedged = false
+  define("tool.exit_wedge", "tool", "test: awaits forever, kill flag on cancel", [==[
+return function(input, ctx)
+  ctx.on_cancel(function() _G.straps_test_exit_killed = true end)
+  _G.straps_test_exit_wedged = true
+  ctx.await(function(resolve) end)
+end
+]==])
+  define("fn.provider", "fn", "test: one wedging tool", [==[
+return function(req, ctx)
+  ctx.await(function(resolve) vim.defer_fn(resolve, 5) end)
+  return { stop_reason = "tool_use", content = {
+    { type = "tool_use", id = "x1", name = "exit_wedge", input = vim.empty_dict() },
+  } }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("wedge for exit")
+  loop.start(bufnr)
+  assert(vim.wait(2000, function() return _G.straps_test_exit_wedged end, 10),
+    "wedging tool never started")
+  assert(not _G.straps_test_exit_killed, "cancel fn ran before exit")
+
+  vim.api.nvim_exec_autocmds("VimLeavePre", {})
+  assert(_G.straps_test_exit_killed,
+    "VimLeavePre did not fire the active run's cancel fns")
+
+  -- Not exiting for real here: end the run via the backstop so later cases
+  -- get a clean loop.
+  local straps = require("straps")
+  local prev_backstop = straps.config.stop_backstop_ms
+  straps.config.stop_backstop_ms = 100
+  loop.stop(bufnr)
+  local ended = vim.wait(2000, function() return not loop.running(bufnr) end, 10)
+  straps.config.stop_backstop_ms = prev_backstop
+  assert(ended, "run did not end after stop")
+end)
+
 case("empty conversation fails fast with a helpful message, no provider call", function()
   define("fn.provider", "fn", "test: must not be called", [==[
 return function() error("provider should not be reached for an empty conversation") end

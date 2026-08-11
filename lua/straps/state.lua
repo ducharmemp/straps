@@ -225,7 +225,14 @@ function M.session_dir()
     if vim.fn.isdirectory(d) == 0 then
       error("session_dir is not a directory: " .. tostring(d))
     end
-    return d
+    -- Resolve symlinks (e.g. macOS TMPDIR: /var/folders/... -> /private/var/
+    -- folders/...) so every path this module builds from the dir agrees with
+    -- vim.fn.bufadd's buffer name, which nvim already resolves internally.
+    -- Without this, new_session()'s path and list_sessions()'s glob(dir/*)
+    -- can describe the same file with two different strings, and any
+    -- string-equality comparison between them (ui.all_sessions' loaded/saved
+    -- exclusion, tests) silently fails to match.
+    return vim.uv.fs_realpath(d) or d
   end)
   if ok then
     return dir

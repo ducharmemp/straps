@@ -269,6 +269,65 @@ case("run_in_terminal is killed by cancellation", function()
   vim.cmd("only")
 end)
 
+-- Poll pgrep for up to `timeout_ms` for a pattern to disappear, to avoid a
+-- race between the kill and the process table updating.
+local function wait_for_dead(pattern, timeout_ms)
+  local deadline = vim.uv.hrtime() + (timeout_ms or 2000) * 1e6
+  while vim.uv.hrtime() < deadline do
+    local out = vim.fn.system({ "pgrep", "-f", pattern })
+    if vim.v.shell_error ~= 0 or out:match("^%s*$") then return true end
+    vim.wait(100)
+  end
+  return false
+end
+
+-- A fractional sleep duration unique to THIS process makes the grandchild's
+-- cmdline ("sleep 87.<pid>") collision-proof against a concurrent run of the
+-- same suite (parallel CI, two checkouts): pgrep/pkill -f on it can neither
+-- see nor kill another run's sleeps.
+local kill_tag = tostring(vim.uv.os_getpid())
+
+case("bash cancel kills the whole process tree", function()
+  local pat = "sleep 87." .. kill_tag
+  local ok, err = pcall(function()
+    local cancel_fns = {}
+    vim.defer_fn(function()
+      for _, fn in ipairs(cancel_fns) do pcall(fn) end
+    end, 200)
+    local t0 = vim.uv.hrtime()
+    local out = drive(function(ctx)
+      return registry.call("tool.bash",
+        { command = pat .. "; echo done-marker-straps-a" }, ctx)
+    end, 15000, {
+      on_cancel = function(fn) cancel_fns[#cancel_fns + 1] = fn end,
+    })
+    local ms = (vim.uv.hrtime() - t0) / 1e6
+    assert(#cancel_fns > 0, "tool never registered a cancel handler")
+    assert(out:find("exit code:", 1, true), "cancelled command should still report its exit")
+    assert(ms < 5000, "cancel did not stop the command promptly: " .. math.floor(ms) .. "ms")
+    assert(wait_for_dead(pat, 2000), pat .. " survived the cancel")
+  end)
+  pcall(vim.fn.system, { "pkill", "-f", pat })
+  assert(ok, tostring(err))
+end)
+
+case("bash timeout kills a surviving process tree", function()
+  local pat = "sleep 88." .. kill_tag
+  local ok, err = pcall(function()
+    local t0 = vim.uv.hrtime()
+    local out = drive(function(ctx)
+      return registry.call("tool.bash",
+        { command = pat .. "; echo never", timeout_ms = 500 }, ctx)
+    end, 15000)
+    local ms = (vim.uv.hrtime() - t0) / 1e6
+    assert(out:find("exceeded timeout", 1, true), "timeout note missing:\n" .. out:sub(1, 200))
+    assert(ms < 6000, "timeout did not stop the command promptly: " .. math.floor(ms) .. "ms")
+    assert(wait_for_dead(pat, 2000), pat .. " survived the timeout")
+  end)
+  pcall(vim.fn.system, { "pkill", "-f", pat })
+  assert(ok, tostring(err))
+end)
+
 case("run_in_terminal cleans up the split when the job cannot start", function()
   -- An extra window, with focus kept in it: with only two windows, closing
   -- the terminal split would land focus back on the right window by accident,

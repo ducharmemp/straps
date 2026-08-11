@@ -351,7 +351,11 @@ error result, tail is user-role) so the resumed session is sendable.
 
 ```lua
 loop.start(bufnr)   -- error/notify if a run is already active for bufnr
-loop.stop(bufnr)    -- request cancel: flips flag, invokes registered cancel fns
+loop.stop(bufnr)    -- request cancel: flips flag, invokes registered cancel fns;
+                   -- if the run coroutine is still suspended on the same await
+                   -- after config.stop_backstop_ms (default 4000ms), forcibly
+                   -- resumes it with no values so the awaiting tool errors and
+                   -- the run ends with the normal cancellation note.
 loop.running(bufnr) -> bool
 ```
 
@@ -424,7 +428,17 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
    clear the running flag (also on error — wrap the whole run body, append an
    `assistant` block with the error message on failure so the user sees it).
 4. Cancellation: checked between turns and between tool calls; provider's
-   cancel fn kills curl. A cancelled run ends cleanly with a note appended.
+   cancel fn kills curl. Tool cancel fns kill the whole process group —
+   shell tools (bash, run_quickfix) spawn detached as process-group
+   leaders so grandchildren cannot outlive the group. If no cancel handler
+   resolves the pending await within config.stop_backstop_ms (default
+   4000ms), loop.stop forcibly resumes the run coroutine with no values;
+   the awaiting tool errors on nil, the error is caught as a tool error,
+   and the run ends with the normal cancellation note. On VimLeavePre the
+   loop fires every active run's cancel fns synchronously — a Unix child
+   is reparented, not killed, when its parent dies, so without this a
+   command still running at :qa would outlive Neovim (and its in-process
+   timeout timer would die with it).
 
 ### Steering (mid-run user messages)
 
@@ -858,8 +872,11 @@ API names (registry names prefixed `tool.`):
   host), and with `follow_redirects` passes `--proto-redir =http,https` so a
   redirect cannot downgrade to `file://` etc. The byte cap is enforced
   client-side by killing curl once `max_bytes` is reached.
-- `bash {command, timeout_ms?}` — `vim.system({"bash","-lc",cmd})` through
-  `ctx.await`; returns exit code + stdout + stderr; default timeout 120s.
+- `bash {command, timeout_ms?}` — spawns `bash -lc cmd` detached as a
+  process-group leader via `vim.system`; on cancel, kills the whole
+  process group (SIGKILL); on timeout, sends SIGTERM then SIGKILL 2s
+  later. Returns exit code + stdout + stderr. Timeout is reported in the
+  result text, not via exit code 124. Default timeout 120s.
 - `glob {pattern}` — `vim.fn.glob(pattern, false, true)`, cap 500 entries.
 - `grep {pattern, path?}` — prefer `rg` if executable, else `grep -rn`, cap
   output.

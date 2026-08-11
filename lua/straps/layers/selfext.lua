@@ -152,9 +152,24 @@ return function(input, ctx)
     input_schema = schema,
     source = input.source,
   }, opts)
-  return "defined " .. entry.name .. " v" .. tostring(entry.version)
+  local result = "defined " .. entry.name .. " v" .. tostring(entry.version)
     .. (entry.scope and " (session scope — shadows global, dies with this session)"
       or " (global scope — all sessions)")
+  -- Warn (never refuse) when a new tool's source appears to block Neovim's
+  -- main loop: :wait()/vim.wait/vim.fn.system freeze the transcript and
+  -- prevent :StrapsStop from running for the call's whole duration.
+  if kind == "tool" and type(input.source) == "string" then
+    local blocking = input.source:find(":wait%s*%(")
+      or input.source:find("vim%.wait")
+      or input.source:find("vim%.fn%.system")
+    if blocking then
+      result = result .. "\nwarning: this tool source appears to call a blocking wait"
+        .. " (vim.system():wait(), vim.wait, or vim.fn.system). These block Neovim's"
+        .. " main loop for their whole duration — the transcript freezes and"
+        .. " :StrapsStop cannot run. Do subprocess/timer work through ctx.await instead."
+    end
+  end
+  return result
 end
 ]==],
   })

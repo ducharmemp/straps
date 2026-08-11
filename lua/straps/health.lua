@@ -387,7 +387,8 @@ local function check_runs()
     return
   end
   health.warn(("%d run%s in flight"):format(#running, #running == 1 and "" or "s"),
-    { "Quitting Neovim now cancels them; :StrapsStop on each buffer to end cleanly." })
+    { "Quitting Neovim now cancels them and kills their spawned processes;"
+      .. " :StrapsStop on each buffer to end cleanly." })
   for _, bufnr in ipairs(running) do
     local name = try(function() return vim.api.nvim_buf_get_name(bufnr) end) or "?"
     health.info(("  buffer %d: %s"):format(bufnr, vim.fn.fnamemodify(name, ":t")))

@@ -45,6 +45,11 @@ M.config = {
   -- call already made this run. This is the real spinning-catcher; max_turns
   -- is only the hard backstop, hence generous. 0 disables the detector.
   stall_limit = 6,
+  -- :StrapsStop backstop: after cancel handlers fire, a run coroutine still
+  -- suspended on the SAME await this long later (a tool that never resolves —
+  -- missing/ineffective cancel handler) is forcibly resumed with no values,
+  -- so the awaiting tool errors and the run ends with the cancellation note.
+  stop_backstop_ms = 4000,
   max_tool_result_bytes = 100000,
   cache = true,
   compact_keep_turns = 2,

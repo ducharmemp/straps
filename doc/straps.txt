@@ -285,6 +285,11 @@ max_turns		(number) 128. Hard backstop on turns per run; a
 stall_limit		(number) 6. End a run after this many CONSECUTIVE
 			stalled turns (every tool call errored, or a
 			(tool,input) call repeated). 0 disables the detector.
+stop_backstop_ms	(number) 4000. |:StrapsStop| backstop: a run still
+			suspended on the same await this long after the
+			cancel handlers fired is forcibly resumed, so the
+			wedged tool errors and the run ends with the normal
+			cancellation note.
 blank_nudge_limit	(number) 1. Catches a turn that ends with no tool
 			call and no visible text ("runs a command then
 			returns silence"). Nudges the model to report or

@@ -213,6 +213,35 @@ case("tool.registry_define defaults to session scope; scope='global' opts out", 
   assert(registry.get("tool.rd_global") ~= nil, "scope='global' tool missing globally")
 end)
 
+case("tool.registry_define warns on blocking waits in tool sources", function()
+  local buf = vim.api.nvim_create_buf(true, false)
+  local prev = registry.set_active_scope(buf)
+  local ok, err = pcall(function()
+    -- vim.system():wait() blocks the main loop; the define succeeds but warns.
+    local out = registry.call("tool.registry_define", {
+      name = "tool.rd_blocking", kind = "tool",
+      source = [[return function() return vim.system({ "true" }):wait().code end]],
+    }, { bufnr = buf })
+    assert(out:find("defined tool.rd_blocking", 1, true), "define should succeed: " .. out)
+    assert(out:find("warning:", 1, true) and out:find("ctx.await", 1, true),
+      "blocking tool source should carry a warning: " .. out)
+    -- A ctx.await-based source gets no warning.
+    out = registry.call("tool.registry_define", {
+      name = "tool.rd_nonblocking", kind = "tool",
+      source = [[return function(_, ctx) return ctx.await(function(r) r("ok") end) end]],
+    }, { bufnr = buf })
+    assert(not out:find("warning:", 1, true), "non-blocking source wrongly warned: " .. out)
+    -- Non-tool kinds are exempt (hooks may legitimately vim.wait outside a run).
+    out = registry.call("tool.registry_define", {
+      name = "hook.rd_hook", kind = "hook",
+      source = [[return function() vim.wait(1) end]],
+    }, { bufnr = buf })
+    assert(not out:find("warning:", 1, true), "hook source wrongly warned: " .. out)
+  end)
+  registry.set_active_scope(prev)
+  assert(ok, err)
+end)
+
 -- --------------------------------------------------------- build_tools shaping
 
 case("build_tools honors the child tool filter and hides spawn at depth limit", function()

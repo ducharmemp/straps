@@ -23,8 +23,8 @@ function M.register()
       .. " findings list and returns a compact summary instead of a wall of text."
       .. " Parameters:"
       .. " command (required) — the shell command line to execute; timeout_ms"
-      .. " (optional, default 120000) — the process is killed if it runs longer"
-      .. " than this many milliseconds (exit code 124 indicates a timeout)."
+      .. " (optional, default 120000) — the process tree is killed if it runs"
+      .. " longer than this many milliseconds (the result notes the timeout)."
       .. " Refuses bare read/search/list/stat/fetch commands (cat/head/tail/sed -n,"
       .. " grep/rg, ls/find/fd/stat/file, curl/wget with no pipe or redirect) in favor"
       .. " of the vim-native read_file, grep, tree/path_info, and fetch_url tools.",
@@ -73,8 +73,19 @@ return function(input, ctx)
   local out_len, err_len = 0, 0
   local capped = false
   local proc
+  local finished, timed_out = false, false
+  -- proc:kill only signals the direct bash child; a compound command's
+  -- grandchildren (and anything holding the stdout/stderr pipes open)
+  -- survive and on_exit never fires. detach=true makes the child a process
+  -- group leader (setsid), so vim.uv.kill(-pid, sig) can signal the whole
+  -- tree. Fall back to proc:kill if the group signal fails outright.
+  local function kill_tree(sig)
+    if not (proc and proc.pid) then return end
+    local ok = pcall(function() assert(vim.uv.kill(-proc.pid, sig)) end)
+    if not ok then pcall(function() proc:kill(sig) end) end
+  end
   local function stop_for_cap()
-    if proc then pcall(function() proc:kill(9) end) end
+    kill_tree("sigkill")
   end
   local function take(dst, len_name, chunk)
     if not chunk or chunk == "" then return end
@@ -90,17 +101,32 @@ return function(input, ctx)
       { "bash", "-lc", cmd },
       {
         text = true,
-        timeout = timeout_ms,
+        detach = true,
         stdout = function(_, chunk) take(stdout, "out", chunk) end,
         stderr = function(_, chunk) take(stderr, "err", chunk) end,
       },
-      function(out) resolve(out) end)
+      function(out)
+        finished = true
+        resolve(out)
+      end)
     if ctx.on_cancel then
-      ctx.on_cancel(function() pcall(function() proc:kill(9) end) end)
+      ctx.on_cancel(function() kill_tree("sigkill") end)
     end
+    -- opts.timeout only SIGTERMs the direct child, the same defect as
+    -- proc:kill above, so the timeout is enforced by hand: SIGTERM the
+    -- group, then SIGKILL it if it has not exited after a grace period.
+    -- The finished guard keeps a stale timer from signalling a recycled pgid.
+    vim.defer_fn(function()
+      if finished then return end
+      timed_out = true
+      kill_tree("sigterm")
+      vim.defer_fn(function()
+        if not finished then kill_tree("sigkill") end
+      end, 2000)
+    end, timeout_ms)
   end)
   local lines = { "exit code: " .. tostring(res.code) }
-  if res.code == 124 then
+  if timed_out then
     lines[#lines] = lines[#lines] .. " (killed: exceeded timeout of " .. timeout_ms .. " ms)"
   end
   if capped then
@@ -281,14 +307,36 @@ return function(input, ctx)
   end
   local timeout_ms = tonumber(input.timeout_ms) or 300000
 
+  local proc
+  local finished, timed_out = false, false
+  -- Same process-tree defect as tool.bash: proc:kill/opts.timeout only
+  -- signal the direct bash child, so a compound command's grandchildren
+  -- survive and on_exit never fires. detach=true + vim.uv.kill(-pid, sig)
+  -- signals the whole group.
+  local function kill_tree(sig)
+    if not (proc and proc.pid) then return end
+    local ok = pcall(function() assert(vim.uv.kill(-proc.pid, sig)) end)
+    if not ok then pcall(function() proc:kill(sig) end) end
+  end
   local res = ctx.await(function(resolve)
-    local proc = vim.system(
+    proc = vim.system(
       { "bash", "-lc", cmd },
-      { text = true, timeout = timeout_ms },
-      function(out) resolve(out) end)
+      { text = true, detach = true },
+      function(out)
+        finished = true
+        resolve(out)
+      end)
     if ctx.on_cancel then
-      ctx.on_cancel(function() pcall(function() proc:kill(9) end) end)
+      ctx.on_cancel(function() kill_tree("sigkill") end)
     end
+    vim.defer_fn(function()
+      if finished then return end
+      timed_out = true
+      kill_tree("sigterm")
+      vim.defer_fn(function()
+        if not finished then kill_tree("sigkill") end
+      end, 2000)
+    end, timeout_ms)
   end)
 
   -- Diagnostics land on either stream (compilers use stderr, many test
@@ -336,7 +384,7 @@ return function(input, ctx)
   -- Compact summary for the agent: the exit code and the parsed locations,
   -- NOT the raw output (which is what the list is for). Cap the listing.
   local out = { "exit code: " .. tostring(res.code) }
-  if res.code == 124 then
+  if timed_out then
     out[#out] = out[#out] .. " (killed: exceeded timeout of " .. timeout_ms .. " ms)"
   end
   if #valid == 0 then

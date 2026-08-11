@@ -683,6 +683,7 @@ function M.start(bufnr)
     -- all windows: subagent finishing updates the parent's count
     pcall(function() require("straps.ui").redraw_status(true) end)
   end)
+  run.co = co -- M.stop's backstop force-resumes this if a tool never resolves
 
   -- Initial resume under this buffer's registry scope (see ctx.await for
   -- the matching per-resume scoping).
@@ -711,7 +712,65 @@ function M.stop(bufnr)
   for _, fn in ipairs(fns) do
     pcall(fn)
   end
+
+  -- Backstop for a tool that never resolves its await: a missing/failing
+  -- ctx.on_cancel handler (or one that kills a process leader whose surviving
+  -- grandchildren keep vim.system's stdout pipe open, so on_exit never fires)
+  -- leaves the run coroutine suspended in ctx.await forever — run.cancelled is
+  -- flipped but nothing resumes the coroutine to observe it. After
+  -- stop_backstop_ms we force a resume with NO values. The awaiting tool then
+  -- receives nil, errors on it, execute_tool's pcall catches that as a tool
+  -- error, and the loop's run.cancelled checks end the run with the
+  -- cancellation note — the clean path. A forced resume that lands in a
+  -- provider (or hook.confirm) await instead escapes as an error into
+  -- run_turns' pcall (M.start), which appends "straps: run error: ..." and
+  -- cleans up — less pretty, still ended. The parallel-readonly tool path needs
+  -- no backstop: its poll loop already resolves on run.cancelled within ~20ms.
+  -- stop_backstop_ms is the delay before the forced resume fires (default 4000).
+  local ok, straps = pcall(require, "straps")
+  local cfg = (ok and type(straps) == "table" and rawget(straps, "config")) or {}
+  local delay = cfg.stop_backstop_ms or 4000
+  local seq = run.await_seq
+  vim.defer_fn(function()
+    if runs[bufnr] ~= run or run.done or run.await_seq ~= seq
+      or not run.co or coroutine.status(run.co) ~= "suspended" then
+      return
+    end
+    -- Invalidate the pending await's real resolve: its scheduled callback
+    -- checks run.await_seq ~= seq and drops itself (see ctx.await, ~line 115),
+    -- so a late resolution after this cannot double-resume the coroutine.
+    run.await_seq = run.await_seq + 1
+    -- Force-resume under this buffer's registry scope, mirroring ctx.await's
+    -- driver (~lines 121-127).
+    local reg = require("straps.registry")
+    local prev_scope = reg.set_active_scope(bufnr)
+    local resumed, err = coroutine.resume(run.co)
+    reg.set_active_scope(prev_scope)
+    if not resumed then
+      runs[bufnr] = nil
+      vim.notify("straps: run crashed: " .. tostring(err), vim.log.levels.ERROR)
+    end
+  end, delay)
 end
+
+-- Exit cleanup: a Unix child whose parent dies is reparented, not killed, so
+-- a command still running at :qa would outlive Neovim (and its in-process
+-- timeout timer dies with us — the orphan would run unbounded). Fire every
+-- active run's registered cancel fns synchronously on VimLeavePre; for the
+-- shell tools each fn group-SIGKILLs its detached process tree. No backstop,
+-- no note: the event loop is ending, only the kills matter.
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  group = vim.api.nvim_create_augroup("straps_loop_exit", { clear = true }),
+  callback = function()
+    for _, run in pairs(runs) do
+      run.cancelled = true
+      for _, fn in ipairs(run.cancel_fns) do
+        pcall(fn)
+      end
+      run.cancel_fns = {}
+    end
+  end,
+})
 
 --- Queue a mid-run user message ("steering"). Returns true if queued, false
 --- if no run is active (callers fall back to M.start). The queue lives in

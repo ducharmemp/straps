@@ -1648,7 +1648,11 @@ every request, so a tool you define now is callable on your next turn.
 An entry's source must be a Lua chunk that returns a function. Tools
 receive (input, ctx): input is the decoded JSON arguments; ctx carries
 bufnr plus await/emit/on_cancel/cancelled for async work. input_schema is
-passed to registry_define as a JSON string.
+passed to registry_define as a JSON string. Do async work in tool sources
+through ctx.await — subprocesses, timers, anything that waits. Never call
+vim.system():wait(), vim.fn.system, or vim.wait there: they block
+Neovim's main loop, freezing the editor and the transcript until they
+return, and :StrapsStop cannot interrupt them.
 
 A skill is knowledge, not capability. An extension -- a tool, hook or
 fn -- is capability. Add an extension when you need to become MORE

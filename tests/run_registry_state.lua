@@ -217,6 +217,8 @@ case("transcript parse: roles merged, ids intact", function()
   state.append(bufnr, "assistant", nil, "I'll look at the registry first.")
   state.append(bufnr, "tool_use", { id = "toolu_01", name = "registry_get" },
     '{\n  "name": "tool.write_file"\n}')
+  state.append(bufnr, "tool_use", { id = "toolu_02", name = "registry_get" },
+    '{\n  "name": "tool.no_such"\n}')
   state.append(bufnr, "tool_result", { id = "toolu_01", is_error = false },
     "return function(input, ctx) end")
   state.append(bufnr, "tool_result", { id = "toolu_02", is_error = true },
@@ -232,12 +234,14 @@ case("transcript parse: roles merged, ids intact", function()
 
   local asst = parsed.messages[2]
   eq(asst.role, "assistant")
-  eq(#asst.content, 2, "text + tool_use grouped into one assistant message")
+  eq(#asst.content, 3, "text + tool_use batch grouped into one assistant message")
   eq(asst.content[1], { type = "text", text = "I'll look at the registry first." })
   eq(asst.content[2].type, "tool_use")
   eq(asst.content[2].id, "toolu_01")
   eq(asst.content[2].name, "registry_get")
   eq(asst.content[2].input, { name = "tool.write_file" }, "input decoded from JSON")
+  eq(asst.content[3].type, "tool_use")
+  eq(asst.content[3].id, "toolu_02")
 
   local results = parsed.messages[3]
   eq(results.role, "user")
@@ -309,6 +313,96 @@ case("tool blocks with undecodable attrs are skipped, not emitted null", functio
   -- The valid user/assistant text still parses.
   eq(parsed.messages[1].content[1], { type = "text", text = "hi" })
   eq(parsed.messages[2].content[1], { type = "text", text = "working" })
+end)
+
+case("orphaned tool_result downgrades to user text", function()
+  -- A stray edit that deletes a tool_use MARKER line leaves the call's input
+  -- as assistant text and its tool_result orphaned; shipping that result
+  -- as-is 400s at the API ("unexpected tool_use_id"). Parse downgrades it.
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "go")
+  state.append(bufnr, "assistant", nil, '{ "buffers": [343] }') -- marker lost
+  state.append(bufnr, "tool_result", { id = "toolu_lost", is_error = false },
+    "## subagent — timed out")
+  state.append(bufnr, "user", nil, "continue")
+  local parsed = state.parse(bufnr)
+  for _, m in ipairs(parsed.messages) do
+    for _, p in ipairs(m.content) do
+      assert(p.type ~= "tool_result", "orphaned tool_result shipped to the API")
+    end
+  end
+  -- Downgrade keeps the frame + id + original content, in a user message.
+  local msg = parsed.messages[3]
+  eq(msg.role, "user")
+  local text = msg.content[1].text
+  assert(text:find("orphaned tool result", 1, true), "frame missing: " .. text)
+  assert(text:find("toolu_lost", 1, true), "id missing")
+  assert(text:find("## subagent — timed out", 1, true), "original content missing")
+end)
+
+case("orphan downgrade never precedes a valid tool_result", function()
+  -- Batch of two calls where the FIRST tool_use marker was lost: the valid
+  -- result must stay first in the merged user message (the API requires
+  -- tool_result parts before other content), the orphan's text after it.
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "go")
+  state.append(bufnr, "tool_use", { id = "t_ok", name = "ping" }, "{}")
+  state.append(bufnr, "tool_result", { id = "t_gone", is_error = false }, "orphan body")
+  state.append(bufnr, "tool_result", { id = "t_ok", is_error = false }, "pong")
+  local parsed = state.parse(bufnr)
+  local msg = parsed.messages[3]
+  eq(msg.role, "user")
+  eq(#msg.content, 2)
+  eq(msg.content[1].type, "tool_result", "valid result first")
+  eq(msg.content[1].tool_use_id, "t_ok")
+  eq(msg.content[2].type, "text", "orphan text after the results")
+  assert(msg.content[2].text:find("orphan body", 1, true), "orphan content kept")
+end)
+
+case("duplicate tool_result for one id downgrades", function()
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "go")
+  state.append(bufnr, "tool_use", { id = "t1", name = "ping" }, "{}")
+  state.append(bufnr, "tool_result", { id = "t1", is_error = false }, "first")
+  state.append(bufnr, "tool_result", { id = "t1", is_error = false }, "second")
+  local parsed = state.parse(bufnr)
+  local msg = parsed.messages[3]
+  eq(msg.content[1], { type = "tool_result", tool_use_id = "t1",
+    content = "first", is_error = false })
+  eq(msg.content[2].type, "text", "duplicate downgraded")
+  assert(msg.content[2].text:find("second", 1, true))
+end)
+
+case("tool_result stranded past a later assistant message downgrades", function()
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "go")
+  state.append(bufnr, "tool_use", { id = "t1", name = "ping" }, "{}")
+  state.append(bufnr, "user", nil, "wait") -- ends the assistant message
+  state.append(bufnr, "assistant", nil, "moving on") -- NEW assistant message: reset
+  state.append(bufnr, "tool_result", { id = "t1", is_error = false }, "late result")
+  local parsed = state.parse(bufnr)
+  for _, m in ipairs(parsed.messages) do
+    for _, p in ipairs(m.content) do
+      assert(p.type ~= "tool_result", "stranded result shipped as tool_result")
+    end
+  end
+  local msg = parsed.messages[#parsed.messages]
+  eq(msg.role, "user")
+  assert(msg.content[1].text:find("late result", 1, true))
+end)
+
+case("empty assistant marker between use and result does not orphan", function()
+  -- The loop appends an empty assistant marker before every provider call;
+  -- it pushes nothing and must not reset the open-tool_use set.
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "go")
+  state.append(bufnr, "tool_use", { id = "t1", name = "ping" }, "{}")
+  state.append(bufnr, "assistant", nil, "")
+  state.append(bufnr, "tool_result", { id = "t1", is_error = false }, "pong")
+  local parsed = state.parse(bufnr)
+  local msg = parsed.messages[3]
+  eq(msg.content[1], { type = "tool_result", tool_use_id = "t1",
+    content = "pong", is_error = false }, "pair intact across empty marker")
 end)
 
 case("escaping round-trips marker-like content", function()

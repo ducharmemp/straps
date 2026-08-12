@@ -104,17 +104,42 @@ function M.parse(bufnr)
   end
 
   local messages = {}
+  -- tool_use ids of the CURRENT assistant message, not yet answered. The API
+  -- requires a tool_result's tool_use_id to name a tool_use in the immediately
+  -- preceding assistant message, so the set resets whenever a NEW assistant
+  -- message begins (an EMPTY assistant marker pushes nothing and so never
+  -- resets — the pre-provider marker between a batch's use and result must
+  -- not orphan the pair). Consumed on pairing, so a duplicate result for the
+  -- same id is caught too.
+  local open_tool_uses = {}
   local function push(role, part)
     local last = messages[#messages]
     if last and last.role == role then
       last.content[#last.content + 1] = part
     else
+      if role == "assistant" then
+        open_tool_uses = {} -- reset BEFORE the caller records this part's id
+      end
       messages[#messages + 1] = { role = role, content = { part } }
     end
+  end
+  -- An orphaned tool_result (its tool_use lost — e.g. a stray edit deleted the
+  -- marker line) would 400 at the API, so it is downgraded to plain user text.
+  -- Downgrades are DEFERRED until the tool_result run they sit in ends, so the
+  -- text never lands ahead of a valid tool_result in the same user message.
+  local pending_orphans = {}
+  local function flush_orphans()
+    for _, text in ipairs(pending_orphans) do
+      push("user", { type = "text", text = text })
+    end
+    pending_orphans = {}
   end
 
   for i = start, #blocks do
     local b = blocks[i]
+    if b.kind ~= "tool_result" then
+      flush_orphans()
+    end
     if b.kind == "user" then
       if b.content ~= "" then -- empty user block (the prompt area) is dropped
         push("user", { type = "text", text = b.content })
@@ -139,20 +164,31 @@ function M.parse(bufnr)
           name = name,
           input = input,
         })
+        open_tool_uses[id] = true
       end
     elseif b.kind == "tool_result" then
       local id = b.attrs and b.attrs.id
       -- Likewise, a tool_result with no id cannot be paired to a tool_use.
       if id then
-        push("user", {
-          type = "tool_result",
-          tool_use_id = id,
-          content = b.content,
-          is_error = (b.attrs and b.attrs.is_error) or false,
-        })
+        if open_tool_uses[id] then
+          open_tool_uses[id] = nil
+          push("user", {
+            type = "tool_result",
+            tool_use_id = id,
+            content = b.content,
+            is_error = (b.attrs and b.attrs.is_error) or false,
+          })
+        else
+          -- Orphan: no open tool_use with this id (marker lost, duplicate
+          -- result, or a result stranded past a later assistant message).
+          pending_orphans[#pending_orphans + 1] =
+            ("[straps: orphaned tool result (id %s) — its tool_use block is"
+              .. " missing from the transcript]\n\n%s"):format(id, b.content)
+        end
       end
     end
   end
+  flush_orphans()
 
   return { system = system, messages = messages }
 end

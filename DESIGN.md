@@ -236,6 +236,14 @@ messages are Anthropic Messages API shaped:
   `id`/`name` (which the API rejects). Unpaired-but-well-formed tool blocks
   are still preserved: a `tool_use` with no result yet is the normal mid-turn
   state the loop parses right before the provider call.
+- An ORPHANED `tool_result` — its `id` names no tool_use in the current
+  assistant message (the marker line was lost to a stray edit, or the result
+  is a duplicate / stranded past a later assistant message) — is downgraded
+  to a plain user text part framed `[straps: orphaned tool result (id ...)
+  ...]` carrying the original content. Shipping it as a tool_result would
+  400 at the API. The buffer is never modified; only the assembled request
+  changes. Downgraded text is emitted after the tool_result run it sat in,
+  so it never precedes a valid tool_result in the same user message.
 
 ### API
 

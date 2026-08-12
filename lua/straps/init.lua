@@ -50,6 +50,15 @@ M.config = {
   -- missing/ineffective cancel handler) is forcibly resumed with no values,
   -- so the awaiting tool errors and the run ends with the cancellation note.
   stop_backstop_ms = 4000,
+  -- The "wait tripwire" (straps.guard): inside an agent run, vim.system():wait()
+  -- and vim.wait() raise a teaching error instead of blocking Neovim's main
+  -- loop (UI/transcript/:StrapsStop freeze until they return) — the exact
+  -- mistake that froze a real session (an agent-defined tool.run_specs, and
+  -- this repo's own .straps.lua tool.run_tests, both used vim.system():wait()).
+  -- Outside a run (main thread, a hook called directly, a test with no marked
+  -- coroutine) both behave exactly as stock Neovim. false disables the guard
+  -- entirely — set it only if the tripwire itself is causing trouble.
+  wait_guard = true,
   max_tool_result_bytes = 100000,
   cache = true,
   compact_keep_turns = 2,
@@ -274,6 +283,9 @@ end
 --- so runtime redefinitions (yours or the agent's) survive.
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+  if M.config.wait_guard ~= false then
+    require("straps.guard").install()
+  end
   require("straps.provider").register()
   require("straps.tools").register()
   -- layers.editor = false skips the LSP/tree-sitter tool group (see the

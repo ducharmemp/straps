@@ -75,6 +75,36 @@ local function pack(...)
   return { n = select("#", ...), ... }
 end
 
+-- Shared by new_ctx and child_ctx: ctx.system(cmd, opts) is sugar for the
+-- ctx.await-wrapped vim.system every tool would otherwise hand-write (see
+-- tool.bash/tool.run_quickfix in layers/exec.lua for the fuller, timeout-aware
+-- version). Cancelling the run kills the process: the process GROUP
+-- (vim.uv.kill(-pid, ...), falling back to the direct child) when opts.detach
+-- was set, else just the direct child — matching each shape's own semantics.
+-- `ctx` is the enclosing table, captured by upvalue and read lazily, so this
+-- can be built before ctx.await/ctx.on_cancel are themselves assigned (same
+-- forward-reference pattern the rest of new_ctx already relies on).
+local function make_ctx_system(ctx)
+  return function(cmd, opts)
+    opts = opts or {}
+    local proc
+    return ctx.await(function(resolve)
+      proc = vim.system(cmd, opts, resolve)
+      if ctx.on_cancel then
+        ctx.on_cancel(function()
+          if not (proc and proc.pid) then return end
+          if opts.detach then
+            local ok = pcall(function() assert(vim.uv.kill(-proc.pid, "sigkill")) end)
+            if not ok then pcall(function() proc:kill(9) end) end
+          else
+            pcall(function() proc:kill(9) end)
+          end
+        end)
+      end
+    end)
+  end
+end
+
 -- Progress must never break a run: hook errors are swallowed, and the phase
 -- mirror (vim.b straps_phase) is best-effort. phase == nil means "no change".
 local function progress(bufnr, ctx, ev, phase)
@@ -173,6 +203,7 @@ local function new_ctx(bufnr, run)
       pcall(function() require("straps.ui").note_activity(bufnr) end)
     end,
   }
+  ctx.system = make_ctx_system(ctx)
   return ctx
 end
 
@@ -285,6 +316,7 @@ local function child_ctx(parent_ctx, bufnr, finish)
     end)
     return coroutine.yield()
   end
+  ctx.system = make_ctx_system(ctx)
   return ctx
 end
 
@@ -488,6 +520,7 @@ local function run_turns(bufnr, ctx, run)
             local cctx = child_ctx(ctx, bufnr, finish)
             finish(execute_tool(bufnr, cctx, block, cfg, { skip_confirm = true }))
           end)
+          require("straps.guard").mark(co)
           local reg = require("straps.registry")
           local prev_scope = reg.set_active_scope(bufnr)
           local ok_resume, err = coroutine.resume(co)
@@ -684,6 +717,7 @@ function M.start(bufnr)
     pcall(function() require("straps.ui").redraw_status(true) end)
   end)
   run.co = co -- M.stop's backstop force-resumes this if a tool never resolves
+  require("straps.guard").mark(co)
 
   -- Initial resume under this buffer's registry scope (see ctx.await for
   -- the matching per-resume scoping).

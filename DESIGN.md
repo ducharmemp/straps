@@ -373,8 +373,28 @@ ctx = {
   on_cancel = function(fn) end, -- register cancel handler (e.g. kill curl);
                                 -- handlers cleared after each await completes
   cancelled = function() -> bool,
+  system = function(cmd, opts) end, -- sugar: ctx.await-wrapped vim.system;
+    -- opts.detach kills the whole process group on cancel (vim.uv.kill(-pid)),
+    -- else just the direct child. See lua/straps/guard.lua.
 }
 ```
+
+`ctx.system` and the wait tripwire (`lua/straps/guard.lua`, `config.wait_guard`,
+default on): every run/parallel-tool coroutine the loop creates is
+`guard.mark()`ed; inside a marked coroutine, `vim.system():wait()` and
+`vim.wait()` raise a teaching error pointing at `ctx.await`/`ctx.system`
+instead of blocking Neovim's main loop (UI, transcript, `:StrapsStop`) for
+their whole duration — the mistake that actually froze a session (an
+agent-defined tool, and separately this repo's own `.straps.lua`, both used
+`vim.system():wait()`). `guard.allow_blocking(fn)` is the documented escape
+hatch for a genuinely bounded, non-yielding in-run wait (see
+`fn.system_prompt_env`'s git branch in provider.lua). `vim.fn.system` is left
+unguarded — a magic table, riskier to wrap, and common enough in short
+legitimate in-run uses — so it gets only the register-time pattern warning
+(`tool.registry_define`, layers/selfext.lua), not a hard error. Known
+limitation, stated rather than hidden: the guard marks coroutines by
+identity, so a tool that spawns its OWN nested coroutine and waits from
+inside it is invisible to the guard and still freezes the editor.
 
 Run algorithm (each numbered step goes through the registry so it's swappable):
 

@@ -290,6 +290,10 @@ stop_backstop_ms	(number) 4000. |:StrapsStop| backstop: a run still
 			cancel handlers fired is forcibly resumed, so the
 			wedged tool errors and the run ends with the normal
 			cancellation note.
+wait_guard		(boolean) true. Inside an agent run, vim.system():wait()
+			and vim.wait() raise a teaching error instead of
+			blocking Neovim's main loop. Use ctx.await or
+			ctx.system(cmd, opts) in tool sources instead.
 blank_nudge_limit	(number) 1. Catches a turn that ends with no tool
 			call and no visible text ("runs a command then
 			returns silence"). Nudges the model to report or

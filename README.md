@@ -541,11 +541,9 @@ require("straps.registry").define{
   input_schema = { type = "object", properties = { path = { type = "string" } } },
   source = [[return function(input, ctx)
     local cmd = input.path and ("make test TESTS=" .. input.path) or "make test"
-    -- ctx.await, never vim.system():wait()/vim.fn.system: those block
+    -- ctx.system, never vim.system():wait()/vim.fn.system: those block
     -- Neovim's main loop for the whole run and :StrapsStop cannot interrupt.
-    local res = ctx.await(function(resolve)
-      vim.system({ "bash", "-lc", cmd }, { text = true }, resolve)
-    end)
+    local res = ctx.system({ "bash", "-lc", cmd }, { text = true })
     return (res.stdout or "") .. (res.stderr or "")
   end]],
 }
@@ -1143,6 +1141,7 @@ for context that isn't tied to one option.
 | `max_turns` | `128` | Hard ceiling on assistant turns per run — the backstop, not the primary spinning-catcher (that's `stall_limit`), hence generous. |
 | `stall_limit` | `6` | Progress-aware soft stop: end the run after this many *consecutive* stalled turns — a turn is stalled when its every tool call errored, or when every call repeats a `(tool, input)` already made this run (a turn that also makes a new distinct call counts as progress). Catches an agent spinning without progress early and loudly (a distinct note, quoting the last error), instead of waiting for `max_turns`. Set `0` to disable and let `max_turns` alone bound runs. |
 | `stop_backstop_ms` | `4000` | `:StrapsStop` backstop: after the cancel handlers fire, a run still suspended on the same await this long later (a tool whose cancel handler is missing or failed to make it resolve) is forcibly resumed, so the tool errors and the run ends with the normal cancellation note instead of hanging. |
+| `wait_guard` | `true` | The wait tripwire: inside an agent run, `vim.system():wait()` and `vim.wait()` raise a teaching error instead of blocking Neovim's main loop (UI/transcript/`:StrapsStop` freeze until they return). Use `ctx.await` or `ctx.system(cmd, opts)` in tool sources instead. `false` disables the guard. |
 | `max_tool_result_bytes` | `100000` | Tool results larger than this are truncated with a note. |
 | `base_url` | `"https://api.anthropic.com"` | Endpoint base for the Anthropic backend; point it at any Anthropic-compatible server or proxy. |
 | `request_timeout_ms` | `300000` | Idle watchdog: if the response stream goes this long without any data, the request is killed and the run ends with an explanatory error instead of hanging. Raise it for slow local models. |

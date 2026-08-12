@@ -1647,12 +1647,18 @@ every request, so a tool you define now is callable on your next turn.
 
 An entry's source must be a Lua chunk that returns a function. Tools
 receive (input, ctx): input is the decoded JSON arguments; ctx carries
-bufnr plus await/emit/on_cancel/cancelled for async work. input_schema is
-passed to registry_define as a JSON string. Do async work in tool sources
-through ctx.await — subprocesses, timers, anything that waits. Never call
-vim.system():wait(), vim.fn.system, or vim.wait there: they block
-Neovim's main loop, freezing the editor and the transcript until they
-return, and :StrapsStop cannot interrupt them.
+bufnr plus await/emit/on_cancel/cancelled/system for async work. input_schema
+is passed to registry_define as a JSON string. Do async work in tool sources
+through ctx.await, or ctx.system(cmd, opts) as shorthand for a ctx.await-
+wrapped vim.system — subprocesses, timers, anything that waits. Inside a run,
+vim.system():wait() and vim.wait() now RAISE instead of blocking: they freeze
+Neovim's main loop (UI, transcript, :StrapsStop) for as long as they run, so
+straps.guard turns that mistake into an immediate, teaching error rather than
+a silent freeze. The guard cannot see into a tool's OWN nested coroutine
+(coroutine.create/coroutine.wrap) — a blocking wait called from inside one of
+those still freezes the editor, so do not work around the error by spawning
+your own coroutine. vim.fn.system is unguarded (only warned about at define
+time) for the same reason: prefer ctx.await/ctx.system there too.
 
 A skill is knowledge, not capability. An extension -- a tool, hook or
 fn -- is capability. Add an extension when you need to become MORE
@@ -1921,9 +1927,19 @@ return function()
       add("vcs", git and "jj (colocated git)" or "jj")
     elseif git then
       local desc = "git"
+      -- fn.system_prompt_env runs synchronously inside the run coroutine
+      -- (tool.spawn -> state.new_session -> fn.system_prompt, no ctx.await
+      -- available at this call depth), so this blocking wait is deliberate,
+      -- not an oversight: allow_blocking is the guard's documented escape
+      -- hatch for exactly this shape — bounded (500ms), once per child
+      -- session, no yield inside. Do not replace with a raw :wait(): the
+      -- straps.guard tripwire would error here otherwise.
+      local guard = require("straps.guard")
       local function run(cmd)
         local ok, res = pcall(function()
-          return vim.system(cmd, { cwd = cwd, text = true }):wait(500)
+          return guard.allow_blocking(function()
+            return vim.system(cmd, { cwd = cwd, text = true }):wait(500)
+          end)
         end)
         if ok and type(res) == "table" and res.code == 0 then
           return res.stdout or ""

@@ -200,6 +200,35 @@ local function check_parser()
   end
 end
 
+-- The global corpus (stdpath("config")/straps/init.lua) is executed Lua too,
+-- but trusted implicitly (it is in the user's own config dir). Report only
+-- whether it exists and is readable — there is no trust state to show.
+local function check_global()
+  local path = vim.fn.stdpath("config") .. "/straps/init.lua"
+  health.start("straps: global corpus (" .. path .. ")")
+  if vim.fn.filereadable(path) == 0 then
+    health.info("no global corpus (optional; loaded for every session when present)")
+    return
+  end
+  local content = try(function()
+    local f = assert(io.open(path, "r"))
+    local text = f:read("*a")
+    f:close()
+    return text
+  end)
+  if not content then
+    health.warn("found but unreadable: " .. path)
+    return
+  end
+  local chunk, err = load(content, "@" .. path)
+  if not chunk then
+    health.error("does not compile: " .. path, { tostring(err) })
+    return
+  end
+  health.ok("present and compiles: " .. path
+    .. "  (executed for every session, before any project .straps.lua)")
+end
+
 -- .straps.lua is executed Lua; its trust state is a security fact the user
 -- should be able to read without digging in stdpath("data").
 local function check_project()
@@ -402,6 +431,7 @@ function M.check()
   check_api_key()
   check_sessions()
   check_parser()
+  check_global()
   check_project()
   check_registry()
   check_layers()

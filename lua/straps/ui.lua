@@ -579,10 +579,14 @@ end
 ---   instead of splitting, recording a jumplist entry so <C-o>/<C-i> navigate
 ---   back to the replaced buffer and forward again.
 function M.show_session(bufnr, split_cmd)
-  -- Project registry (trusted .straps.lua, if any), so project-defined tools
-  -- exist for the session's first request and land after the builtins in seq
-  -- order (append-only, cache-safe). pcall: opening a session must never fail
-  -- because a project file is broken.
+  -- Global corpus (stdpath("config")/straps/init.lua, if any): the user's
+  -- cwd-independent library of skills/tools/hooks/fns, loaded FIRST so a
+  -- project .straps.lua below can override an entry (later define wins).
+  -- Project registry (trusted .straps.lua, if any) loads next, so
+  -- project-defined tools exist for the session's first request and land
+  -- after the builtins in seq order (append-only, cache-safe). pcall:
+  -- opening a session must never fail because either file is broken.
+  pcall(require("straps").load_global_registry)
   pcall(require("straps").load_project_registry)
   if split_cmd == "none" then
     -- Reuse the current window (oil-style): swap the session buffer in via

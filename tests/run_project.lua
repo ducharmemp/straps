@@ -1,7 +1,9 @@
 -- Project registry tests: .straps.lua discovery, direnv-style trust
 -- (confirm gate, sha256 trust store, in-memory once-per-content guard),
 -- append-only seq ordering of project-defined tools, and the
--- ui.open_session() auto-load path.
+-- ui.open_session() auto-load path. Also the GLOBAL corpus
+-- (stdpath("config")/straps/init.lua): cwd-independent, trusted implicitly,
+-- loaded once per session.
 -- Run: nvim --headless -l tests/run_project.lua
 
 -- :p makes root absolute: this suite cd's into tempdirs before some modules
@@ -201,6 +203,83 @@ require("straps.registry").define({
   assert(registry.get("fn.ui_marker"), "ui marker entry missing after open_session")
   assert(_G.STRAPS_UI_COUNT == 1,
     "expected exactly 1 execution via open_session, got " .. tostring(_G.STRAPS_UI_COUNT))
+end)
+
+-- ==================================================================
+-- Global corpus (stdpath("config")/straps/init.lua): cwd-independent,
+-- trusted implicitly (user's own config dir), loaded once per session.
+-- ==================================================================
+
+local GLOBAL_SRC = [[
+_G.STRAPS_GLOBAL_COUNT = (_G.STRAPS_GLOBAL_COUNT or 0) + 1
+require("straps.registry").define({
+  name = "skill.global_marker", kind = "skill", doc = "test: global skill",
+  source = "the global corpus skill body",
+})
+require("straps.registry").define({
+  name = "tool.global_tool", kind = "tool", doc = "test: global tool",
+  source = "return function() return 'global-tool' end",
+})
+]]
+
+case("missing global file: false, 'none', no error, no execution", function()
+  local ok, loaded, info = pcall(straps.load_global_registry,
+    { path = tmp .. "/nope/straps/init.lua" })
+  assert(ok, "load_global_registry threw: " .. tostring(loaded))
+  assert(loaded == false, "expected loaded=false for missing file, got " .. tostring(loaded))
+  assert(type(info) == "string" and info:find("none", 1, true),
+    "expected 'none'-ish info, got " .. tostring(info))
+  assert(registry.get("skill.global_marker") == nil, "marker defined despite missing file")
+end)
+
+local gpath = tmp .. "/globalcfg/straps/init.lua"
+vim.fn.mkdir(vim.fn.fnamemodify(gpath, ":h"), "p")
+write_file(gpath, GLOBAL_SRC)
+
+case("present global file loads without any trust prompt", function()
+  local loaded, info = straps.load_global_registry({ path = gpath })
+  assert(loaded == true, "global load failed: " .. tostring(info))
+  assert(registry.get("skill.global_marker"), "global skill missing after load")
+  assert(registry.get("tool.global_tool"), "global tool missing after load")
+  assert(_G.STRAPS_GLOBAL_COUNT == 1,
+    "expected exactly 1 execution, got " .. tostring(_G.STRAPS_GLOBAL_COUNT))
+end)
+
+case("global corpus does not depend on cwd (loads from a bare dir)", function()
+  local bare = tmp .. "/bare2/deep"
+  vim.fn.mkdir(bare, "p")
+  -- Reset the once-guard by pointing at a fresh copy at a new path.
+  local gpath2 = tmp .. "/globalcfg2/straps/init.lua"
+  vim.fn.mkdir(vim.fn.fnamemodify(gpath2, ":h"), "p")
+  write_file(gpath2, GLOBAL_SRC)
+  cd(bare)
+  local loaded = straps.load_global_registry({ path = gpath2 })
+  cd(orig_cwd)
+  assert(loaded == true, "global corpus must load regardless of cwd")
+  assert(_G.STRAPS_GLOBAL_COUNT == 2,
+    "fresh path should execute again, got " .. tostring(_G.STRAPS_GLOBAL_COUNT))
+end)
+
+case("once-per-session guard: same path does not re-execute", function()
+  local loaded, info = straps.load_global_registry({ path = gpath })
+  assert(loaded == true, "expected loaded=true from once-guard, got " .. tostring(info))
+  assert(info:find("already loaded", 1, true), "expected 'already loaded' info, got " .. tostring(info))
+  assert(_G.STRAPS_GLOBAL_COUNT == 2,
+    "same path must execute at most once per session, got " .. tostring(_G.STRAPS_GLOBAL_COUNT))
+end)
+
+case("broken global file: no throw, not marked loaded (retried next session)", function()
+  local bad = tmp .. "/badglobal/straps/init.lua"
+  vim.fn.mkdir(vim.fn.fnamemodify(bad, ":h"), "p")
+  write_file(bad, "error('boom during global load')\n")
+  local ok, loaded = pcall(straps.load_global_registry, { path = bad })
+  assert(ok, "load_global_registry threw on a broken file: " .. tostring(loaded))
+  assert(loaded == false, "broken global file should not report loaded")
+  -- Fix the file and confirm the once-guard did NOT swallow the retry.
+  write_file(bad, "_G.STRAPS_GLOBAL_FIXED = true\n")
+  local loaded2 = straps.load_global_registry({ path = bad })
+  assert(loaded2 == true, "fixed global file must load on retry (not blocked by the guard)")
+  assert(_G.STRAPS_GLOBAL_FIXED == true, "fixed global file did not execute on retry")
 end)
 
 if failed then

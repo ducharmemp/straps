@@ -551,6 +551,27 @@ require("straps.registry").define{
 }
 ```
 
+### Global corpus: `stdpath("config")/straps/init.lua`
+
+A `.straps.lua` travels with a checkout; it is the wrong home for the
+skills, tools and hooks you want in EVERY project. Those go in a global
+corpus at `stdpath("config")/straps/init.lua` (for example
+`~/.config/nvim/straps/init.lua`) — the same plain Lua as `.straps.lua`, a
+sequence of `require("straps.registry").define{...}` calls. Every session
+loads it, regardless of the working directory.
+
+It is trusted implicitly: it lives in your own config directory, like your
+`init.lua`, so straps executes it with no confirm prompt — there is no
+checkout to distrust. It loads once per Neovim session, and BEFORE the
+project `.straps.lua`, so a project file can override a global entry (the
+later `define` wins). The file is optional: if it does not exist, nothing
+happens.
+
+Use it for a personal skill library — a `skill.release_process`, a
+`skill.debugging_async` — and for tools and hooks you want everywhere. To
+grow it, ask the agent to render an entry with `registry_get` and append
+it to this file, exactly as with `.straps.lua`.
+
 ## Skills — knowledge, not capability
 
 A fourth entry kind, `skill.NAME`, stores prose instead of code: `source`
@@ -565,7 +586,8 @@ Skills cost one listing line each in the system prompt (a `# Skills`
 section, present only when skills exist); the body loads on demand via the
 `skill` tool. They follow the same lifecycle as every other entry:
 session-scoped by default, persisted by appending their `registry_get`
-rendering to `.straps.lua`.
+rendering to `.straps.lua` (per project) or to the global corpus
+(`stdpath("config")/straps/init.lua`, every session — see above).
 
 Two skills ship as builtins: `skill.showing_user`, the full presentation
 guidance behind the core prompt's short `# Showing the user` stub (loaded

@@ -783,7 +783,7 @@ breakpoints so the replayed prefix becomes a server-side cache hit:
   tool — set the token threshold near the model's limit. Logs via fn.log
   `{ev="compact", est_tokens, ...}`. Off by default.
 
-### Self-extension activation (prompt) + project registry (.straps.lua)
+### Self-extension activation (prompt) + global corpus + project registry (.straps.lua)
 
 The machinery exists; these changes make the agent actually USE it, and give
 its investments a place to survive the session.
@@ -813,6 +813,24 @@ its investments a place to survive the session.
 **tool.registry_define doc:** prepend the when-clause "Call this whenever a
 behavior should persist beyond the current exchange — " before the existing
 mechanics (trigger language in the tool doc itself lifts usage).
+
+**Global corpus (init.lua) — stdpath("config")/straps/init.lua:**
+- `M.load_global_registry(opts?) -> loaded(bool), info(string)`. The user's
+  PERSONAL, cwd-independent library of skills/tools/hooks/fns, loaded for
+  EVERY session regardless of cwd. Missing file → false, "none" (opt-in).
+- Trusted IMPLICITLY: it lives in the user's own config dir, like init.lua
+  itself, so it is executed with NO hash/confirm dance (contrast the project
+  file below, which ships with a checkout and so earns direnv-style trust).
+  `opts.path` overrides the location (tests).
+- Execute via `load(content, "@" .. path)` + pcall; errors are vim.notify'd
+  and returned, never thrown. Track path in-memory so the same file executes
+  at most once per nvim session; a file that FAILS is not marked, so a fixed
+  file retries next session.
+- Called from `ui.show_session()` (pcall-wrapped) BEFORE
+  `load_project_registry`, so a project `.straps.lua` can OVERRIDE a global
+  entry (later `define` wins), and both land after builtins in seq order.
+- Plain Lua — `registry.define` calls; `registry.dump()` output is valid
+  content — same shape as `.straps.lua`.
 
 **.straps.lua auto-load (init.lua) — direnv-style trust:**
 - `M.load_project_registry(opts?) -> loaded(bool), info(string)`. Finds the

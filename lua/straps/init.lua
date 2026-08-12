@@ -163,6 +163,10 @@ M.config = {
 -- executed in this Neovim session: the same content runs at most once.
 local project_loaded = {}
 
+-- path -> true for the global corpus already executed this Neovim session,
+-- so the same file runs at most once even across many opened sessions.
+local global_loaded = {}
+
 local function trusted_store_path(opts)
   return (opts and opts.store_path)
     or (vim.fn.stdpath("data") .. "/straps/trusted.json")
@@ -193,6 +197,63 @@ local function write_trust_store(path, store)
     f:write(vim.json.encode(store))
     f:close()
   end)
+end
+
+--- Path of the global corpus file: a user-owned .straps.lua-style Lua file
+--- (registry.define calls; registry.dump() output is valid content), loaded
+--- for EVERY session regardless of cwd. Lives in the user's own config dir,
+--- so — like init.lua itself — it is trusted implicitly and needs no
+--- hash/confirm dance. opts.path overrides it (tests).
+local function global_registry_path(opts)
+  return (opts and opts.path)
+    or (vim.fn.stdpath("config") .. "/straps/init.lua")
+end
+
+--- Load the global corpus (stdpath("config")/straps/init.lua): a personal,
+--- cwd-independent library of skills, tools, hooks and fns, defined once and
+--- available in every session. Distinct from the PROJECT registry
+--- (.straps.lua), which ships with a checkout and so earns direnv-style
+--- hash-trust; this file is yours, in your own config dir, so it is executed
+--- without a trust prompt — exactly like your init.lua. Missing file: a
+--- silent no-op (this is opt-in). The same path executes at most once per
+--- Neovim session. Runs BEFORE the project registry, so a project .straps.lua
+--- can override a global entry (later define() wins). opts.path overrides the
+--- location (tests). Returns loaded(bool), info(string). Never throws.
+function M.load_global_registry(opts)
+  opts = opts or {}
+  local path = vim.fn.fnamemodify(global_registry_path(opts), ":p")
+  if vim.fn.filereadable(path) == 0 then
+    return false, "none"
+  end
+  if global_loaded[path] then
+    return true, "already loaded: " .. path
+  end
+
+  local ok_read, content = pcall(function()
+    local f = assert(io.open(path, "r"))
+    local text = f:read("*a")
+    f:close()
+    return text
+  end)
+  if not ok_read or type(content) ~= "string" then
+    return false, "unreadable: " .. path
+  end
+
+  local chunk, load_err = load(content, "@" .. path)
+  if not chunk then
+    pcall(vim.notify, "straps: " .. path .. " does not compile: "
+      .. tostring(load_err), vim.log.levels.ERROR)
+    return false, "load error: " .. tostring(load_err)
+  end
+  local ok_run, run_err = pcall(chunk)
+  if not ok_run then
+    pcall(vim.notify, "straps: error executing " .. path .. ": "
+      .. tostring(run_err), vim.log.levels.ERROR)
+    return false, "error: " .. tostring(run_err)
+  end
+  -- Mark loaded only after a clean run: a broken file is retried next session.
+  global_loaded[path] = true
+  return true, "loaded: " .. path
 end
 
 --- Load the nearest .straps.lua upward from cwd — the project registry:

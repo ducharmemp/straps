@@ -69,14 +69,38 @@ end
 --- Run an ex substitution across this session's findings list: `:ldo` in its
 --- window (private) when on-screen, else `:cdo` globally. `body` is the part
 --- after the do-command, e.g. "s#a#b#ge | update". Returns ok, err, kind.
+---
+--- :ldo/:cdo NAVIGATE the window through every entry (that is how they visit
+--- files), so the window ends up showing the last edited file — for the ldo
+--- path that window is the SESSION's, and the transcript vanishes from view.
+--- Snapshot the window's buffer and view before, restore after (success or
+--- failure), so the do-command's edits land but the displacement never shows.
 function M.locations_do(bufnr, body)
   local win = M.session_win(bufnr)
+  local target = win or vim.api.nvim_get_current_win()
+  local prev_buf = vim.api.nvim_win_get_buf(target)
+  local view
+  pcall(function()
+    view = vim.api.nvim_win_call(target, vim.fn.winsaveview)
+  end)
+  local ok, err
   if win then
-    local ok, err = pcall(vim.fn.win_execute, win, "silent ldo " .. body)
-    return ok, err, "loclist"
+    ok, err = pcall(vim.fn.win_execute, win, "silent ldo " .. body)
+  else
+    ok, err = pcall(vim.cmd, "silent cdo " .. body)
   end
-  local ok, err = pcall(vim.cmd, "silent cdo " .. body)
-  return ok, err, "quickfix"
+  pcall(function()
+    if not (vim.api.nvim_win_is_valid(target) and vim.api.nvim_buf_is_valid(prev_buf)) then
+      return
+    end
+    if vim.api.nvim_win_get_buf(target) ~= prev_buf then
+      vim.api.nvim_win_set_buf(target, prev_buf)
+    end
+    if type(view) == "table" then
+      vim.api.nvim_win_call(target, function() vim.fn.winrestview(view) end)
+    end
+  end)
+  return ok, err, win and "loclist" or "quickfix"
 end
 
 return M

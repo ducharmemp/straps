@@ -6,7 +6,8 @@
 -- staying out of the quickfix list); diagnostics {quickfix=true}
 -- landing seeded diagnostics in the list (and leaving it untouched without the
 -- flag); bulk_replace editing every file in a seeded quickfix list (undoably,
--- with a file count) via :cdo; its dry_run and empty-list paths.
+-- with a file count) via :cdo; its dry_run and empty-list paths;
+-- locations_do restoring the session window's buffer + view across :ldo.
 
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(here, ":p"), ":h:h")
@@ -334,6 +335,61 @@ case("concurrent sessions get isolated per-window findings lists", function()
   assert(table.concat(vim.fn.readfile(fa), ","):find("HIT", 1, true), "A's file not edited")
   assert(not table.concat(vim.fn.readfile(fb), ","):find("HIT", 1, true),
     "B's file was edited by A's bulk_replace — isolation failed")
+
+  vim.cmd("only")
+end)
+
+-- :ldo NAVIGATES the window it runs in through every loclist entry, so an ldo
+-- through the on-screen SESSION window would leave that window showing the last
+-- edited file — the transcript scrolls out of view mid-run. locations_do must
+-- snapshot the window's buffer + view before the substitution and restore them
+-- after, so bulk_replace's edits land but the session window never moves.
+case("bulk_replace preserves the session window's buffer and view across :ldo", function()
+  local state = require("straps.state")
+  local ui = require("straps.ui")
+  vim.cmd("only")
+
+  -- A session buffer, shown in the current window, scrolled to a known view.
+  local sess = state.new_session()
+  vim.api.nvim_set_current_buf(sess)
+  local win = vim.api.nvim_get_current_win()
+  assert(ui.session_win(sess) == win, "session not on-screen")
+  -- Give the transcript enough lines that a scroll position is meaningful.
+  vim.bo[sess].modifiable = true
+  local filler = {}
+  for i = 1, 200 do filler[i] = "transcript line " .. i end
+  vim.api.nvim_buf_set_lines(sess, 0, -1, false, filler)
+  vim.api.nvim_win_set_cursor(win, { 120, 3 })
+  vim.api.nvim_win_call(win, function() vim.cmd("normal! zz") end)
+  local view_before = vim.api.nvim_win_call(win, vim.fn.winsaveview)
+
+  -- The findings list points at a DIFFERENT file — the one :ldo will visit.
+  local dir = vim.fn.tempname(); vim.fn.mkdir(dir, "p")
+  local f = dir .. "/edited.txt"
+  do local h = assert(io.open(f, "w")); h:write("target\ntarget\n"); h:close() end
+  ui.set_locations(sess, { title = "L",
+    items = { { filename = f, lnum = 1, col = 1, text = "target" } } }, false)
+
+  local out = registry.call("tool.bulk_replace",
+    { pattern = "target", replacement = "HIT" }, { bufnr = sess })
+
+  -- The substitution landed (counterfactual anchor: without :ldo running, this
+  -- fails, so the restore below is proven to sit on top of a real edit).
+  assert(out:find("loclist", 1, true), "expected the loclist path: " .. out)
+  assert(table.concat(vim.fn.readfile(f), ","):find("HIT", 1, true),
+    "bulk_replace did not edit the target file")
+
+  -- The session window still shows the transcript, at the same view.
+  assert(vim.api.nvim_win_is_valid(win), "session window was destroyed")
+  assert(vim.api.nvim_win_get_buf(win) == sess,
+    "session window was left showing another buffer after :ldo (buf "
+      .. vim.api.nvim_win_get_buf(win) .. " != session " .. sess .. ")")
+  local view_after = vim.api.nvim_win_call(win, vim.fn.winsaveview)
+  assert(view_after.lnum == view_before.lnum and view_after.topline == view_before.topline
+      and view_after.col == view_before.col,
+    ("session window view moved: before {lnum=%d,topline=%d,col=%d} after {lnum=%d,topline=%d,col=%d}")
+      :format(view_before.lnum, view_before.topline, view_before.col,
+        view_after.lnum, view_after.topline, view_after.col))
 
   vim.cmd("only")
 end)

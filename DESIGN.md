@@ -1,8 +1,8 @@
 # straps.nvim — design spec
 
-A minimal, complete harness for coding agents inside Neovim — a small,
-legible core (in the spirit of the `pi` agent harness) where **everything
-is redefinable at runtime** and **buffers are the state**.
+A fully integrated, Neovim-oriented agent harness with editable conversations
+and malleable tooling. Its behavior is defined by runtime registry entries, and
+its session state lives in buffers.
 
 Three invariants (do not violate):
 
@@ -527,7 +527,7 @@ edit.
     refreshes the elapsed seconds; timer + extmark are torn down on
     `done`, buffer wipe, or invalid buffer.
 - Redefining `hook.on_progress` (e.g. to vim.notify or fidget.nvim) replaces
-  the policy without touching ui.lua; the README shows this.
+  the policy without touching ui.lua.
 
 ### Run endings must be loud; long runs must be legible
 
@@ -554,8 +554,8 @@ edit.
     status?, stop_reason?}`
   Every entry gets `ts` (os.date "%H:%M:%S") and `buf`. Being a registry
   entry, it is redefinable like everything else.
-- README documents `config.log_file` and a "Long sessions" note: context is
-  the transcript, so pruning old tool results is just deleting buffer lines.
+- Context is the transcript, so pruning old tool results is deleting buffer
+  lines. `config.log_file` enables structured event logs for long runs.
 
 ## provider.lua — registers `fn.provider` (+ `fn.provider_anthropic`, `fn.provider_openai`, `fn.provider_pref`, `fn.api_key`, `fn.openai_api_key`, `fn.list_models`, `fn.build_tools`, `fn.system_prompt`)
 
@@ -767,8 +767,8 @@ breakpoints so the replayed prefix becomes a server-side cache hit:
     "nothing to compact" string. Must leave the transcript parseable with
     alternating roles (tool_use/tool_result pairing intact — only contents
     shrink, blocks are never removed).
-  - LLM-summarizing compaction is a REDEFINITION users or the agent can
-    apply; the README sketches it (call fn.provider with a summarize prompt).
+  - Users or the agent can redefine this with LLM-summarizing compaction by
+    calling `fn.provider` with a summary prompt.
 - `state.list_blocks(bufnr) -> { {kind, attrs, marker_lnum, first_lnum,
   last_lnum}, ... }` (1-based, content range excludes the marker line;
   empty content → first_lnum > last_lnum). Public helper so compact
@@ -856,7 +856,8 @@ mechanics (trigger language in the tool doc itself lifts usage).
   so project-defined tools exist for the session's first request and land
   after builtins in seq order (append-only, cache-safe).
 - The file itself is plain Lua — `registry.define` calls; `registry.dump()`
-  output is valid content. README documents the save-back convention.
+  output is valid content. The save-back convention is documented in
+  `doc/straps.txt` under `straps-registry`.
 
 ## tools.lua + layers/ — builtin tools (each ~focused; all defined via source strings)
 

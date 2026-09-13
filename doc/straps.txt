@@ -385,10 +385,14 @@ an entry: a Lua source string, compiled on define, looked up by name at every
 call site. Names are namespaced `tool.<name>`, `hook.<name>`, `fn.<name>`,
 `skill.<name>`.
 
-Scoping. Entries are global by default. A running session can hold
-session-scoped shadows that override a global entry for that session (and its
-subagents) and vanish when the session closes — the sandbox the agent
-experiments in. `registry.remove` drops global entries only.
+Scoping. `registry.define` targets the active scope, or the global registry
+when no scope is active. The agent's `registry_define` tool defaults to its
+active session; its explicit scopes are `session` and `global`. Session entries
+shadow globals. A child inherits its parent's shadows, then applies its own;
+parent sessions do not see child entries. Scoped entries vanish when their
+session closes. By default, `registry.remove` removes the nearest entry in the
+active scope chain, then the global entry when no scoped entry exists. Its Lua
+API can target `global` or start from a numeric buffer scope.
 
 Versioning. Redefining an entry bumps its `version`; the first-define `seq` is
 preserved so the API tool array stays append-only (prompt-cache stable). The

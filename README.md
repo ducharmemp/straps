@@ -31,7 +31,7 @@ Three invariants:
   - In either case the key file must not be accessible by group/other —
     `chmod 600` it.
 
-No other dependencies. No plenary.
+No other required dependencies. Ripgrep is optional and makes searches faster. No plenary.
 
 Run `:checkhealth straps` to verify the install — it probes curl, the API key
 (including a group/other-readable key file), a writable session dir, the
@@ -44,7 +44,7 @@ With lazy.nvim:
 
 ```lua
 {
-  "matt/straps", -- placeholder; point at wherever this repo lives
+  "ducharmemp/straps",
   config = function()
     require("straps").setup({
       -- defaults shown; all optional
@@ -346,7 +346,7 @@ Installing the parser:
   ```lua
   require("nvim-treesitter.parsers").get_parser_configs().straps = {
     install_info = {
-      url = "https://github.com/matt/straps", -- wherever this repo lives
+      url = "https://github.com/ducharmemp/straps"
       location = "tree-sitter-straps",
       files = { "src/parser.c" },
     },
@@ -865,8 +865,9 @@ the prompt-cache prefix of an already-running session.
 
 ## Worked example: a linter hook
 
-`tool.write_file` and `tool.edit_file` both fire `hook.after_write` with the
-path just written. This is the canonical seam for "always do X after writes".
+`tool.write_file`, `tool.edit_file`, and `tool.patch_file` fire
+`hook.after_write` with the path just written. This is the canonical seam for
+"always do X after writes".
 
 **By default it already does something useful:** after the agent writes a
 file, the hook waits briefly for the attached language server to re-lint it and
@@ -880,9 +881,9 @@ diagnostics after write (1):
 lua/straps/loop.lua:312:9: ERROR undefined global 'tool_block' [lua_ls]
 ```
 
-Turn it off with `after_write_diagnostics = false` in `setup()`, cap the wait
-with `after_write_diagnostics_ms`, or replace it entirely — the rest of this
-section shows redefining it to run an external linter instead.
+Turn it off with `after_write_diagnostics = false` in `setup()`, or cap the
+wait with `after_write_diagnostics_ms`. Add a suffixed subscriber to run an
+external linter without replacing the builtin diagnostics hook.
 
 ### Version 1: ask the agent to do it
 
@@ -896,7 +897,7 @@ it makes a `registry_define` tool call roughly like:
 
 ```json
 {
-  "name": "hook.after_write",
+  "name": "hook.after_write.ruff",
   "kind": "hook",
   "doc": "Run ruff on every written file, return its output.",
   "source": "return function(path, ctx)\n  local out = vim.system({ \"ruff\", \"check\", path }):wait()\n  return \"ruff:\\n\" .. (out.stdout or \"\") .. (out.stderr or \"\")\nend"
@@ -913,7 +914,7 @@ appends ruff output to the tool result the agent sees. No re-prompting, no
 require("straps").setup()
 
 require("straps").registry.define({
-  name = "hook.after_write",
+  name = "hook.after_write.ruff",
   kind = "hook",
   doc = "Run ruff on every written file, return its output.",
   source = [==[
@@ -969,9 +970,9 @@ entries; the defaults try the env var, then
 | `read_file` | Read a file through its live Neovim buffer with numbered lines (offset/limit, capped ~2000 lines), so unsaved edits are visible just like edit/write paths. |
 | `write_file` | Write a file (creates parent dirs) through its buffer, so the write enters the file's native undo history — revert with `u` / `:earlier` / undotree; fires `hook.after_write`. |
 | `edit_file` | Exact-string replacement applied through the file's buffer as one undoable step (revert with `u` / undotree); matches against the live buffer, so unsaved edits are seen; fires `hook.after_write`. |
-| `patch_file` | Structured line-range hunks (`start_line`, `end_line`, `new_text`, optional `expected_old_text`) applied through the live buffer as one undoable patch; use when ranges are known and exact-string matching is awkward. |
+| `patch_file` | Structured line-range hunks (`start_line`, `end_line`, `new_text`, optional `expected_old_text`) applied through the live buffer as one undoable patch; fires `hook.after_write`. |
 | `path_info` / `tree` | Bounded filesystem metadata and directory-tree inspection without shelling out. |
-| `fetch_url` | Safe bounded http(s) fetch via curl: no ambient credentials, timeout/byte cap, optional redirects. Refuses internal/loopback/link-local hosts (SSRF guard) and pins redirects to http(s). |
+| `fetch_url` | Bounded http(s) fetch via curl with no ambient credentials. Refuses internal host literals and DNS answers. Redirect following is refused; inspect `Location` and fetch it separately. |
 | `bash` | Run a shell command via `bash -lc`; returns exit code, stdout, stderr, and kills output floods after a bounded per-stream capture. |
 | `run_in_terminal` | Run a visible streaming `:terminal` command for long/interesting builds or tests. |
 | `run_quickfix` | Run a build/test/lint command and parse its output into the session's findings list via native `errorformat`; returns a compact exit-code + parsed-locations summary. |
@@ -1221,8 +1222,10 @@ its own confirm hook — but doing that is itself a `registry_define` call,
 which the current confirm hook makes you approve first. Read
 `registry_define` inputs before saying yes, and be sparing with "Always this
 tool" for it. None of this is sandboxing: an approved `bash` or `eval_lua`
-call runs with your full user privileges inside your editor. If you want
-real isolation, run Neovim in a container or sandbox.
+call runs with your full user privileges inside your editor. A trusted
+`.straps.lua` has the same authority. Provider endpoints receive API keys and
+complete conversation payloads. Durable transcripts can contain prompts,
+source, and tool output. If you need isolation, run Neovim in a sandbox.
 
 ### Auto mode: capability grants
 

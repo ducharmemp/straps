@@ -515,11 +515,8 @@ return function(req, ctx)
         elseif cb.type == "tool_use" then
           blocks[msg.index] = { type = "tool_use", id = cb.id, name = cb.name, partial = "" }
         elseif cb.type == "thinking" or cb.type == "redacted_thinking" then
-          -- Extended thinking (config.effort): streamed into the transcript
-          -- like ordinary text via emit. The signature is captured so a
-          -- future state grammar could round-trip a signed thinking block
-          -- (required by the API for interleaved thinking + tool_use); today
-          -- the block grammar has no "thinking" kind, so it is not resent.
+          -- Keep provider reasoning out of the durable transcript. Capture the
+          -- signature for a future signed-thinking grammar, but do not emit it.
           blocks[msg.index] = {
             type = cb.type,
             thinking = cb.thinking or "",
@@ -536,7 +533,6 @@ return function(req, ctx)
           b.partial = b.partial .. (d.partial_json or "")
         elseif b and d.type == "thinking_delta" then
           b.thinking = b.thinking .. (d.thinking or "")
-          ctx.emit({ type = "text_delta", text = d.thinking or "" })
         elseif b and d.type == "signature_delta" then
           b.signature = (b.signature or "") .. (d.signature or "")
         end
@@ -983,15 +979,8 @@ return function(req, ctx)
 
     local function handle_choice(choice)
       local delta = choice.delta or {}
-      -- Reasoning deltas (o-series / gateways expose delta.reasoning_content;
-      -- some use delta.reasoning). Stream them for visibility like the
-      -- Anthropic thinking_delta path; they are not round-tripped into the
-      -- returned assistant text (the transcript grammar has no thinking kind).
-      local reasoning = delta.reasoning_content
-      if type(reasoning) ~= "string" then reasoning = delta.reasoning end
-      if type(reasoning) == "string" and reasoning ~= "" then
-        ctx.emit({ type = "text_delta", text = reasoning })
-      end
+      -- Provider reasoning fields are deliberately ignored. Only visible
+      -- content is emitted into the durable transcript.
       if type(delta.content) == "string" and delta.content ~= "" then
         if not text_block then
           text_block = { type = "text", text = "" }

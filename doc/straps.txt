@@ -1,7 +1,7 @@
 *straps.txt*	A minimal, redefinable coding-agent harness inside Neovim
 
 Author:  straps.nvim
-License: same as Neovim
+License: MIT
 
 ==============================================================================
 CONTENTS						*straps* *straps.nvim*
@@ -43,7 +43,7 @@ Neovim. Three invariants govern the whole design:
    define tool, and the tool list sent to the API is rebuilt from the registry
    every call, so a tool the agent defines in one turn is callable the next.
 
-Requirements: Neovim >= 0.11, and `curl` on $PATH. No other dependencies.
+Requirements: Neovim >= 0.11 and `curl` on $PATH. Ripgrep is optional.
 Run |:checkhealth| straps to verify your install — see |straps-health|.
 
 ==============================================================================

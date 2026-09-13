@@ -607,10 +607,9 @@ secret, so no mode-600 guard.
   Buffer partial lines; parse SSE (`event:`/`data:` lines). Handle:
   `content_block_start` (text | tool_use), `content_block_delta`
   (`text_delta` → `ctx.emit{type="text_delta", text=...}`;
-  `input_json_delta` → accumulate partial_json; `thinking_delta` → emit +
-  accumulate; `signature_delta` → accumulate onto the thinking block's
-  `signature` so a future state grammar could round-trip a signed thinking
-  block — today it is streamed for visibility but not resent),
+  `input_json_delta` → accumulate partial_json; `thinking_delta` → accumulate
+  without emitting it into the durable transcript; `signature_delta` →
+  accumulate onto the thinking block's `signature` for a future state grammar),
   `content_block_stop`
   (tool_use: `input = vim.json.decode(partial ~= "" and partial or "{}")`),
   `message_delta` (capture stop_reason), `message_stop` (resolve),
@@ -662,11 +661,9 @@ Same `(req, ctx)` contract, OpenAI's wire shape. Selected when
   configured `config.openai_models` entry has `reasoning = true` or
   `reasoning_effort = true`, the active `config.efforts` entry has a `level`,
   and the Chat Completions request has no function tools. Untagged models,
-  `"off"`, entries with no level, or tool-bearing requests send none. Reasoning deltas
-  (`delta.reasoning_content`, or `delta.reasoning` on some gateways) are
-  streamed to the transcript via `ctx.emit{type="text_delta"}` like the
-  Anthropic `thinking_delta` path, but not accumulated into the returned
-  assistant text (the block grammar has no thinking kind).
+  `"off"`, entries with no level, or tool-bearing requests send none. Reasoning
+  deltas (`delta.reasoning_content`, or `delta.reasoning` on some gateways) are
+  ignored so provider reasoning never enters the durable transcript.
 - Same idle watchdog and backoff scaffolding; retries 429/500/502/503.
 
 `fn.system_prompt` default source returns the default system prompt (below).
@@ -892,12 +889,11 @@ API names (registry names prefixed `tool.`):
 - `fetch_url {url, max_bytes?, timeout_ms?, follow_redirects?}` — bounded curl
   fetch with config disabled (`curl --disable`), no ambient cookies/credentials,
   timeout and byte cap; not auto-allowed by the default confirm hook. SSRF
-  guard: refuses obviously-internal hosts (localhost, loopback 127/8, private
-  10/8 · 172.16/12 · 192.168/16, link-local 169.254/16 incl. cloud metadata,
-  IPv6 ::1 / fc00::/7 / fe80::/10; userinfo in the authority cannot mask the
-  host), and with `follow_redirects` passes `--proto-redir =http,https` so a
-  redirect cannot downgrade to `file://` etc. The byte cap is enforced
-  client-side by killing curl once `max_bytes` is reached.
+  guard: refuses internal host literals and DNS answers (localhost, loopback,
+  private and link-local ranges, including cloud metadata). Redirect following
+  is refused because curl cannot re-run that DNS policy before each hop. Inspect
+  the Location header and submit the destination as a separate confirmed call.
+  The byte cap kills curl once `max_bytes` is reached.
 - `bash {command, timeout_ms?}` — spawns `bash -lc cmd` detached as a
   process-group leader via `vim.system`; on cancel, kills the whole
   process group (SIGKILL); on timeout, sends SIGTERM then SIGKILL 2s

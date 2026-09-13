@@ -43,17 +43,15 @@ vim.fn.mkdir(tmp, "p")
 case("write_file result carries both default and extra subscriber output, in seq order", function()
   -- Redefine the base hook.after_write (subscriber #1) and add an extra
   -- subscriber (hook.after_write.extra, subscriber #2).
-  define("hook.after_write", "hook", "test: base subscriber", [[return function() return "A" end]])
-  define("hook.after_write.extra", "hook", "test: extra subscriber", [[return function() return "B" end]])
+  define("hook.after_write", "hook", "test: base subscriber", [[return function() return "HOOK_BASE" end]])
+  define("hook.after_write.extra", "hook", "test: extra subscriber", [[return function() return "HOOK_EXTRA" end]])
 
   local path = tmp .. "/g1.txt"
   local result = registry.call("tool.write_file", { path = path, content = "hi\n" }, { bufnr = 0 })
   assert(type(result) == "string", "expected a string result")
-  assert(result:find("A", 1, true), "missing base subscriber output 'A': " .. result)
-  assert(result:find("B", 1, true), "missing extra subscriber output 'B': " .. result)
-  local pos_a = result:find("A", 1, true)
-  local pos_b = result:find("B", 1, true)
-  assert(pos_a < pos_b, "seq order violated: 'A' (base, lower seq) must appear before 'B' (extra): " .. result)
+  local pos_a = assert(result:find("\nHOOK_BASE\n", 1, true), "missing base subscriber output: " .. result)
+  local pos_b = assert(result:find("\nHOOK_EXTRA", 1, true), "missing extra subscriber output: " .. result)
+  assert(pos_a < pos_b, "subscriber result order is wrong: " .. result)
 end)
 
 -- Counterfactual: with the extra subscriber removed, "B" must not appear.
@@ -61,10 +59,10 @@ case("counterfactual: removing the extra subscriber drops its output", function(
   registry.remove("hook.after_write.extra", { scope = "global" })
   local path = tmp .. "/g1b.txt"
   local result = registry.call("tool.write_file", { path = path, content = "hi\n" }, { bufnr = 0 })
-  assert(result:find("A", 1, true), "base subscriber output missing: " .. result)
-  assert(not result:find("B", 1, true), "removed subscriber's output should be gone: " .. result)
+  assert(result:find("\nHOOK_BASE", 1, true), "base subscriber output missing: " .. result)
+  assert(not result:find("HOOK_EXTRA", 1, true), "removed subscriber output survived: " .. result)
   -- restore for later cases
-  define("hook.after_write.extra", "hook", "test: extra subscriber", [[return function() return "B" end]])
+  define("hook.after_write.extra", "hook", "test: extra subscriber", [[return function() return "HOOK_EXTRA" end]])
 end)
 
 case("a broken subscriber does not prevent the write or the other subscribers", function()
@@ -73,8 +71,8 @@ case("a broken subscriber does not prevent the write or the other subscribers", 
   local path = tmp .. "/g2.txt"
   local result = registry.call("tool.write_file", { path = path, content = "hi\n" }, { bufnr = 0 })
   assert(result:find("wrote ", 1, true), "write itself must still succeed: " .. result)
-  assert(result:find("A", 1, true), "base subscriber output missing: " .. result)
-  assert(result:find("B", 1, true), "extra subscriber output missing: " .. result)
+  assert(result:find("HOOK_BASE", 1, true), "base subscriber output missing: " .. result)
+  assert(result:find("HOOK_EXTRA", 1, true), "extra subscriber output missing: " .. result)
   assert(result:find("[hook hook.after_write.boom error:", 1, true),
     "missing the error line naming the failing subscriber: " .. result)
   assert(result:find("kaboom", 1, true), "error line should carry the raised message: " .. result)

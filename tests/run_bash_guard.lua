@@ -135,14 +135,19 @@ case("fetch_url refuses internal/loopback/link-local hosts (SSRF guard)", functi
     assert(tostring(err):find("internal", 1, true),
       "wrong error for " .. url .. ": " .. tostring(err))
   end
-  -- A public host is NOT blocked by the guard (it gets past to curl, which the
-  -- disabled-network test env then fails — but not with the SSRF message).
+  -- A public IP reaches curl rather than the SSRF refusal.
   local ok, err = pcall(registry.call, "tool.fetch_url",
     { url = "http://93.184.216.34/x", timeout_ms = 1 }, ctx)
   if not ok then
     assert(not tostring(err):find("internal", 1, true),
       "public IP wrongly blocked as internal: " .. tostring(err))
   end
+end)
+
+case("fetch_url refuses automatic redirects", function()
+  local out = registry.call("tool.fetch_url",
+    { url = "http://93.184.216.34/x", follow_redirects = true }, ctx)
+  assert(out:find("not followed automatically", 1, true), "redirect refusal missing: " .. out)
 end)
 
 case("huge output is capped before returning to the loop", function()

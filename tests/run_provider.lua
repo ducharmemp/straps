@@ -422,10 +422,10 @@ vim.env.PATH = tmp .. "/thinking:" .. real_path
 straps.config.effort = "medium"
 local _, text_think = run_session("think about it")
 
-case("thinking_delta text streams into the transcript and the turn completes", function()
-  assert(text_think:find("pondering%.%.%.", 1) or text_think:find("pondering..."),
-    "thinking_delta text missing from transcript:\n" .. text_think)
-  assert(text_think:find("thinking test done", 1, true), "final text after thinking missing")
+case("thinking_delta stays out of the transcript while visible text remains", function()
+  assert(not text_think:find("pondering...", 1, true),
+    "thinking_delta leaked into transcript:\n" .. text_think)
+  assert(text_think:find("thinking test done", 1, true), "visible answer after thinking missing")
 end)
 
 straps.config.effort = "off"

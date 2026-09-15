@@ -634,8 +634,8 @@ function M.show_session(bufnr, split_cmd)
   local ok_straps, straps = pcall(require, "straps")
   if not (ok_straps and type(straps) == "table" and straps.config
       and straps.config.render == false) then
-    vim.wo[0].conceallevel = 2
-    vim.wo[0].concealcursor = "nc"
+    vim.wo[0][0].conceallevel = 2
+    vim.wo[0][0].concealcursor = "nc"
     require("straps.registry").try_call("fn.render", bufnr)
     M._attach_render(bufnr)
   end
@@ -1423,12 +1423,12 @@ function M.open_agents(split_cmd)
   end
 
   local w = vim.api.nvim_get_current_win()
-  vim.wo[w].wrap = false
-  vim.wo[w].cursorline = true
-  vim.wo[w].number = false
-  vim.wo[w].relativenumber = false
-  vim.wo[w].signcolumn = "no"
-  vim.wo[w].foldcolumn = "0"
+  vim.wo[w][0].wrap = false
+  vim.wo[w][0].cursorline = true
+  vim.wo[w][0].number = false
+  vim.wo[w][0].relativenumber = false
+  vim.wo[w][0].signcolumn = "no"
+  vim.wo[w][0].foldcolumn = "0"
   -- The keymap legend lives in the winbar (fn.agents_winbar via the ui.winbar
   -- dispatcher), so it is visible without scrolling past the saved rows.
   -- config.agents_winbar = false skips it; the render puts the legend on the
@@ -2373,15 +2373,23 @@ end
 --- FileType autocmd (covers `:e some.straps`, where the buffer is already
 --- current when it fires) and from open_session_buffer (covers the common
 --- new/resume-session path where filetype was set while hidden).
+---
+--- Every assignment uses the `vim.wo[win][0]` (`:setlocal`) form, and must.
+--- A window option carries two values: a per-(window, buffer) one and a
+--- per-window one. Plain `vim.wo[win].opt = v` is `:set` and writes both, and
+--- the per-window value outlives this buffer in that window — so a split off
+--- the session window, or any file swapped into it (gf, :edit, <C-o>), folds
+--- by the straps foldexpr on the user's own source. `[0]` writes only
+--- per-(window, buffer), which is exactly the scope the transcript needs.
 function M.apply_fold_opts(bufnr)
   local ok, straps = pcall(require, "straps")
   local expanded = ok and type(straps) == "table" and straps.config
     and straps.config.tools_expanded
   for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
-    vim.wo[win].foldmethod = "expr"
-    vim.wo[win].foldexpr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
-    vim.wo[win].foldtext = "v:lua.require'straps.ui'.foldtext()"
-    vim.wo[win].foldlevel = expanded and 99 or 0
+    vim.wo[win][0].foldmethod = "expr"
+    vim.wo[win][0].foldexpr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
+    vim.wo[win][0].foldtext = "v:lua.require'straps.ui'.foldtext()"
+    vim.wo[win][0].foldlevel = expanded and 99 or 0
   end
 end
 

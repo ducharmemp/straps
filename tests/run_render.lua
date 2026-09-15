@@ -526,5 +526,132 @@ case("ui.open_session()'s window actually gets fold options and navigation maps"
   vim.api.nvim_win_close(w, true)
 end)
 
+-- A window option in Neovim carries TWO values: a per-(window, buffer) one
+-- (`&l:`, what `:setlocal` writes) and a per-window one (`&g:`, what `:set`
+-- writes in addition). straps used the plain `vim.wo[w].opt = v`, which is
+-- `:set`, so the transcript's options landed on the per-window value too. That
+-- value outlives the session buffer in that window: a split off the session
+-- window, or any file swapped into it (gf, :edit, <C-o>), then folded by the
+-- straps foldexpr with conceallevel=2 — the user's source file wearing the
+-- transcript's fold rules, which reads as "my folds broke". `vim.wo[w][0]` is
+-- `:setlocal`: per-(window, buffer) only. Every window-option write in straps
+-- must use that form, and these cases assert on the per-window value directly,
+-- since that is the dimension the bug lived in.
+local function per_window(win, name)
+  return vim.api.nvim_win_call(win, function() return vim.fn.eval("&g:" .. name) end)
+end
+local function per_window_buffer(win, name)
+  return vim.api.nvim_win_call(win, function() return vim.fn.eval("&l:" .. name) end)
+end
+
+-- Each case sets EVERY option it checks to a user value that differs from the
+-- straps one, or the assertion cannot fail: a user global that already equals
+-- what straps writes (foldlevel 0, relativenumber false) pins nothing.
+case("session window options are per-(window,buffer), never per-window", function()
+  local user = { foldmethod = "indent", foldexpr = "0", foldtext = "foldtext()",
+    foldlevel = 7, conceallevel = 0, concealcursor = "" }
+  local prev = {}
+  for name, val in pairs(user) do
+    prev[name] = vim.api.nvim_get_option_value(name, { scope = "global" })
+    vim.api.nvim_set_option_value(name, val, { scope = "global" })
+  end
+
+  local sbuf = ui.open_session()
+  local w = vim.fn.win_findbuf(sbuf)[1]
+  assert(w, "open_session should leave the buffer in a window")
+  -- The straps options ARE applied, on the per-(window, buffer) value...
+  assert(per_window_buffer(w, "foldmethod") == "expr",
+    "session window should fold by expr, got " .. tostring(per_window_buffer(w, "foldmethod")))
+  assert(tostring(per_window_buffer(w, "foldexpr")):find("straps", 1, true),
+    "session window should use the straps foldexpr, got " .. tostring(per_window_buffer(w, "foldexpr")))
+  assert(tostring(per_window_buffer(w, "foldtext")):find("straps", 1, true),
+    "session window should use the straps foldtext, got " .. tostring(per_window_buffer(w, "foldtext")))
+  assert(per_window_buffer(w, "foldlevel") == 0,
+    "tools_expanded defaults false: foldlevel should be 0, got " .. tostring(per_window_buffer(w, "foldlevel")))
+  assert(per_window_buffer(w, "conceallevel") == 2,
+    "session window should conceal markers, got " .. tostring(per_window_buffer(w, "conceallevel")))
+  assert(per_window_buffer(w, "concealcursor") == "nc",
+    "session window should set concealcursor, got " .. tostring(per_window_buffer(w, "concealcursor")))
+  -- ...and every per-window value still holds the USER's setting, so none of
+  -- them can follow the window onto another buffer.
+  for name, want in pairs(user) do
+    assert(per_window(w, name) == want,
+      ("per-window '%s' leaked: %s (user set %s)"):format(name,
+        tostring(per_window(w, name)), tostring(want)))
+  end
+
+  for name, val in pairs(prev) do
+    vim.api.nvim_set_option_value(name, val, { scope = "global" })
+  end
+  vim.api.nvim_win_close(w, true)
+end)
+
+case("agents window options are per-(window,buffer), never per-window", function()
+  local user = { wrap = true, cursorline = false, number = true,
+    relativenumber = true, signcolumn = "yes", foldcolumn = "4" }
+  local straps_side = { wrap = 0, cursorline = 1, number = 0,
+    relativenumber = 0, signcolumn = "no", foldcolumn = "0" }
+  local prev = {}
+  for name, val in pairs(user) do
+    prev[name] = vim.api.nvim_get_option_value(name, { scope = "global" })
+    vim.api.nvim_set_option_value(name, val, { scope = "global" })
+  end
+
+  local abuf = ui.open_agents()
+  local w = vim.fn.win_findbuf(abuf)[1]
+  assert(w, "open_agents should leave the buffer in a window")
+  for name, want in pairs(straps_side) do
+    assert(per_window_buffer(w, name) == want,
+      ("agents window should set %s=%s, got %s"):format(name, tostring(want),
+        tostring(per_window_buffer(w, name))))
+  end
+  for name, val in pairs(user) do
+    local want = (val == true and 1) or (val == false and 0) or val
+    assert(per_window(w, name) == want,
+      ("per-window '%s' leaked: %s (user set %s)"):format(name,
+        tostring(per_window(w, name)), tostring(want)))
+  end
+
+  for name, val in pairs(prev) do
+    vim.api.nvim_set_option_value(name, val, { scope = "global" })
+  end
+  vim.api.nvim_win_close(w, true)
+end)
+
+-- The two cases above cover the windows a test can open and inspect. The
+-- remaining write sites (editor.lua's ask_user float) live behind a blocking
+-- picker, so they are pinned statically instead: every window-option write in
+-- the plugin's own source must use the `vim.wo[...][0]` form. This also catches
+-- a NEW site added later, which a per-window case never would.
+case("every window-option write in the source uses the :setlocal form", function()
+  local offenders = {}
+  for _, rel in ipairs({ "lua/straps/ui.lua", "lua/straps/editor.lua", ".straps.lua" }) do
+    local path = root .. "/" .. rel
+    if vim.fn.filereadable(path) == 1 then
+      for lnum, line in ipairs(vim.fn.readfile(path)) do
+        -- `vim.wo[<idx>].<opt> =` with no `[0]` between them is the `:set`
+        -- form. Skip comment lines: the doc-comments here spell the rule out
+        -- using the very form they warn against.
+        local code = not line:match("^%s*%-%-")
+        local opt = code and line:match("vim%.wo%[[^%]]*%]%.([%w_]+)%s*=[^=]")
+        local ok_opt, info = false, nil
+        if opt then
+          ok_opt, info = pcall(vim.api.nvim_get_option_info2, opt, {})
+        end
+        if ok_opt and info then
+          -- A global-local option (winbar, statusline) is already :setlocal
+          -- under this form, so it is not an offender.
+          if info.scope == "win" and not info.global_local then
+            offenders[#offenders + 1] = ("%s:%d %s"):format(rel, lnum, opt)
+          end
+        end
+      end
+    end
+  end
+  assert(#offenders == 0,
+    "window options written with the :set form (use vim.wo[w][0]): "
+    .. table.concat(offenders, ", "))
+end)
+
 print(failed and "FAILED" or "ALL PASS")
 os.exit(failed and 1 or 0)

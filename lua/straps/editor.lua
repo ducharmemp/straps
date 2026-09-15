@@ -2504,8 +2504,8 @@ return function(input, ctx)
       zindex = 150,
     })
     wins[#wins + 1] = qwin
-    vim.wo[qwin].wrap = true
-    vim.wo[qwin].linebreak = true
+    vim.wo[qwin][0].wrap = true
+    vim.wo[qwin][0].linebreak = true
     vim.cmd("redraw")
   end)
 

@@ -145,9 +145,16 @@ Call sites that fan out via `call_hooks`: `hook.after_write` (the three write
 tools — `write_file`, `edit_file`, `patch_file` — concatenate all string
 results onto the tool result with `\n`, and append each error as a visible
 `[hook <name> error: <err>]` line); `hook.before_tool`, `hook.on_run_start`,
-`hook.on_turn_start`, `hook.on_run_end` in loop.lua (results and errors
+`hook.on_turn_start` in loop.lua (results and errors
 ignored — a pcall'd fan-out is strictly more robust than the single `try_call`
-it replaces). `hook.after_tool` fans out differently — a FOLD, at the
+it replaces); `hook.on_run_end`, also in loop.lua, called as `(ctx, reason)`
+and the one call site that does NOT ignore the returns: each entry in `errors`
+is written to the run log as a `run_end_hook_error` event, and the
+`call_hooks` call is itself wrapped in `pcall` because RESOLUTION
+(`hook_entries`' merge and seq sort) sits outside the per-subscriber pcall —
+a raise there would skip the cleanup that follows it (`ensure_trailing_user`,
+the `straps_status = "idle"` stamp), leaving the session displaying
+"running" forever. `hook.after_tool` fans out differently — a FOLD, at the
 `execute_tool` call site, over `hook_entries("hook.after_tool")`: each
 subscriber is called `(name, input, result, ok, ctx)` in seq order and a
 non-nil return replaces `result` for the NEXT subscriber, so subscriber N sees
@@ -431,8 +438,12 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
       reason `"stalled"` and a loud, distinct note (below). This measures the
       spinning `max_turns` was only ever a proxy for.
    g. `resp.stop_reason == "tool_use"` → continue loop; else break.
-3. `registry.call_hooks("hook.on_run_end", ctx)` — fan-out; results/errors
-   ignored; `state.ensure_trailing_user(bufnr)`;
+3. `pcall(registry.call_hooks, "hook.on_run_end", ctx, reason)` — fan-out,
+   carrying the same ending reason the log and `{type="done"}` progress events
+   get (`"ok"` | `"cancelled"` | `"max_turns"` | `"stalled"` | `"blank"` |
+   `"error"`); each subscriber error is logged as a `run_end_hook_error` event
+   and the call is pcall'd so a resolution failure cannot skip the cleanup that
+   follows. Then `state.ensure_trailing_user(bufnr)`;
    clear the running flag (also on error — wrap the whole run body, append an
    `assistant` block with the error message on failure so the user sees it).
 4. Cancellation: checked between turns and between tool calls; provider's
@@ -451,10 +462,14 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
 ### Steering (mid-run user messages)
 
 - Queue: `vim.b[bufnr].straps_steering` — a list of strings (buffer state).
-- `loop.steer(bufnr, text)`: if a run is active, push onto the queue (read
+- `loop.steer(bufnr, text, quiet)`: if a run is active, push onto the queue (read
   vim.b, copy, write back — vim.b tables are snapshots), emit progress event
-  `{type="steer_queued"}`, notify "steering queued". If no run is active,
-  return false (callers fall back to `loop.start`).
+  `{type="steer_queued"}`, notify "steering queued" unless `quiet` is set
+  (harness-generated steering — a subagent completion notice — must not toast
+  at the user). If no run is active,
+  return false (callers fall back to `loop.start`). The return value is
+  therefore the ATOMIC "is a run active" test: `fn.session_notify` relies on
+  there being no window between the check and the enqueue.
 - Draining (single helper): pop all queued strings and
   `state.append(bufnr, "user", nil, text)` each, clear the queue. Called at
   two points in `run_turns`:
@@ -939,7 +954,11 @@ API names (registry names prefixed `tool.`):
   blocking call per child run serially. `spawn` also registers a
   `ctx.on_cancel` that stops the child, so a parent cancelled BEFORE the
   matching `spawn_wait` does not orphan already-launched children (spawn_wait
-  installs its own cancel handler for the wait window).
+  installs its own cancel handler for the wait window). A parent need not block
+  at all: when a child's run ends, `hook.on_run_end.notify_parent` pushes a
+  completion notice into the parent (see "Subagent completion notices" below),
+  so "spawn, keep working, collect when the notice lands" is a first-class
+  alternative to `spawn_wait`.
 - `spawn_wait {buffers}` — awaits the named child buffers (validated: live +
   `straps_parent == ctx.bufnr`) in a SINGLE poll loop, so the wait costs the
   slowest child, not the sum. Each child's `straps_spawn_timeout_ms` (stamped by
@@ -949,6 +968,56 @@ API names (registry names prefixed `tool.`):
   every outstanding child. Returns one `## subagent (buffer N)` section per
   child (status + task + transcript path + the child's last assistant text).
   `fn.build_tools` hides BOTH `spawn` and `spawn_wait` at the spawn depth limit.
+  Before its first await (one synchronous segment, so no child can finish
+  in between) it also **claims** each validated child
+  (`vim.b[child].straps_spawn_claimed = true`) and drops any already-queued
+  completion notice for it from the parent's steering queue — see below. A child
+  buffer wiped mid-wait no longer aborts the call: `nvim_buf_get_name` is
+  pcall'd, so one dead child cannot lose its live siblings' answers.
+
+#### Subagent completion notices
+
+`spawn_wait` used to be the only channel back from a child, which forced a
+parent to block to learn anything. `hook.on_run_end.notify_parent` — a
+subscriber, so the no-op `hook.on_run_end` default and any user redefinition of
+it keep working — fires at the CHILD's run end and delivers one line to the
+parent through `fn.session_notify`.
+
+- **Delivery** (`fn.session_notify(bufnr, text, opts) -> "steer"|"append"|nil`,
+  shared with `fn.autocmd_bridge` so the policy lives at one late-bound name):
+  a running session gets it as steering (`quiet`, so no toast); an idle one gets
+  an ordinary user block plus a restored trailing user block. A child NEVER
+  starts its parent's run — that would spend the user's tokens unasked.
+  `loop.steer`'s RETURN is the running test, not a preceding `loop.running`
+  call: `state.append` into a session whose provider is mid-stream lands the
+  block inside the streaming assistant block and glues the following deltas
+  onto it, so the two must not be separable. The append path is additionally
+  deferred through `vim.schedule` (FIFO after any already-scheduled delta) and
+  re-tests `loop.steer` once, so a run starting in between gets steering.
+- **Content**: the child's buffer number, its one-line task, the outcome, and
+  how to collect it. Never the child's answer text — that would defeat the
+  context isolation spawn exists for. The body comes from the redefinable
+  `fn.spawn_notice(child, reason)`; the `[straps] subagent buffer N: ` PREFIX is
+  owned by the hook, so a redefined body cannot break the dedupe that matches
+  it. Outcome wording tracks `reason`: `ok` → "finished", `error` → "crashed",
+  `max_turns` → "hit its turn limit", `stalled`/`blank` → "stopped without
+  producing an answer". A truncated child is never reported as finished.
+- **Suppression**, in guard order: a non-subagent run (no `straps_parent` —
+  read and type-checked BEFORE any `nvim_buf_is_valid` call, since that raises
+  on nil); an invalid or non-session parent; `config.spawn_notify = false`;
+  `reason == "cancelled"` OR `ctx.cancelled()`; a claimed child. The
+  `ctx.cancelled()` half is not redundant: a stopped run whose forced resume
+  raises inside the provider ends `"error"` seconds later (the
+  `config.stop_backstop_ms` path), and reporting a user-killed child as
+  "crashed" would be a lie. The claim covers the other half — once `spawn_wait`
+  has claimed a child, its tool result IS the report, on every path including a
+  parent cancelled mid-wait.
+- **Staleness is tolerated in the text, not chased in code.** A notice that
+  already drained into the parent's transcript cannot be filtered, and queued
+  steering survives a cancelled run to drain into the parent's NEXT run — so a
+  stale notice can cost one extra parent turn. `fn.spawn_notice`'s body
+  therefore tells the agent to ignore a notice for a child it already
+  collected, and to restate its answer if it had already finished.
 - `transcript_excise {session?, blocks?, range?, note?}` — **context surgery**:
   the agent excising dead weight from its OWN transcript (or a child's) so it
   stops being replayed. Invariant 1 is what makes it possible — the buffer IS
@@ -1041,7 +1110,14 @@ Default hooks registered here:
 - `hook.on_turn_start` — no-op; the per-turn seam for budget checks and
   telemetry. (Model awareness moved to `fn.model_note`, a per-request system
   suffix — see "Model AWARENESS" below.)
-- `hook.on_run_end` — no-op.
+- `hook.on_run_end` — the base entry is a no-op; `config.spawn_notify = false`
+  (or redefining the entry) silences the builtin subscriber
+  `hook.on_run_end.notify_parent`, which tells a parent its subagent finished
+  (see "Subagent completion notices").
+- `fn.session_notify` — deliver a harness-generated user message to a session:
+  steering when it is running, an appended user block when idle, never starting
+  its run.
+- `fn.spawn_notice` — the body of that notice.
 
 ## System prompt: layered, composed, each layer redefinable
 
@@ -1246,7 +1322,8 @@ Clears the straps-render namespace and repopulates by walking
   are concealed so the open state is clean.
 - Rendering is window-agnostic (extmarks are buffer-scoped); conceal needs the
   window opt `conceallevel=2`, `concealcursor=nc` set when the session window
-  opens.
+  opens. Written with `vim.wo[win][0]` (`:setlocal`), never plain `vim.wo[win]`
+  (`:set`) — see the window-option rule under Folding below.
 
 Trigger: `nvim_buf_attach(bufnr, false, { on_lines = <schedule render> })`
 installed when the session buffer opens — buf_attach fires on BOTH user edits
@@ -1512,6 +1589,14 @@ Existing suites must all still pass.
   pairs and the system block (level 1); user/assistant turns never fold.
   `foldlevel=0` so tool calls start closed and the conversation stays visible.
   Keep it ~20 lines.
+- Every window option straps sets — fold\*, conceal\*, and the agents window's
+  `wrap`/`number`/`signcolumn`/`foldcolumn` — is written per-(window, buffer)
+  with `vim.wo[win][0]` (`:setlocal`). Plain `vim.wo[win].opt = v` is `:set`,
+  which also writes the per-window value, and that value outlives the buffer in
+  the window: a split off the session window, or any file swapped into it,
+  would then render the user's source with the transcript's fold and conceal
+  rules. `tests/run_render.lua` pins this on the `&g:`/`&l:` dimension and
+  rejects the `:set` form anywhere in the source.
 - Session navigation: `ui.goto_turn` (`]]`/`[[`) and `ui.outline` (`gO`), wired
   by `ui.map_navigation`. See [Navigation](#navigation-turn-motions--outline).
 - plugin/straps.lua defines commands lazily (`require` inside callbacks),

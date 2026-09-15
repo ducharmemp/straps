@@ -30,6 +30,8 @@ fn.provider_openai	straps.txt	/*fn.provider_openai*
 fn.provider_pref	straps.txt	/*fn.provider_pref*
 fn.readonly_policy	straps.txt	/*fn.readonly_policy*
 fn.render	straps.txt	/*fn.render*
+fn.session_notify	straps.txt	/*fn.session_notify*
+fn.spawn_notice	straps.txt	/*fn.spawn_notice*
 fn.system_prompt	straps.txt	/*fn.system_prompt*
 fn.system_prompt_layer	straps.txt	/*fn.system_prompt_layer*
 fn.tool_display	straps.txt	/*fn.tool_display*
@@ -39,6 +41,7 @@ hook.before_tool	straps.txt	/*hook.before_tool*
 hook.confirm	straps.txt	/*hook.confirm*
 hook.on_progress	straps.txt	/*hook.on_progress*
 hook.on_run_end	straps.txt	/*hook.on_run_end*
+hook.on_run_end.notify_parent	straps.txt	/*hook.on_run_end.notify_parent*
 hook.on_run_start	straps.txt	/*hook.on_run_start*
 hook.on_turn_start	straps.txt	/*hook.on_turn_start*
 straps	straps.txt	/*straps*

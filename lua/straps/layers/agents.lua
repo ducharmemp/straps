@@ -124,7 +124,10 @@ function M.register_spawn()
       .. " receive only its final answer (via spawn_wait). The task must be"
       .. " COMPLETE and self-contained; the child sees none of this"
       .. " conversation. Returns the child's handle (buffer number) to pass to"
-      .. " spawn_wait. Parameters: task (required); system (optional) — extra"
+      .. " spawn_wait. You do NOT have to block: when a child finishes while you"
+      .. " keep working, a [straps] notice naming its buffer arrives in this"
+      .. " conversation, and you collect it with spawn_wait then (it returns at"
+      .. " once for a finished child). Parameters: task (required); system (optional) — extra"
       .. " standing instructions, prepended to the task; provider (optional) —"
       .. " child backend, inherited from this session/global default when unset; tools (optional array"
       .. " of tool names) — the child sees only these tools; readonly (optional"
@@ -364,7 +367,9 @@ end
       .. " at spawn) is enforced here; a child that overruns is stopped and"
       .. " reported as timed out. Cancelling the parent run stops every"
       .. " outstanding child. Returns one section per child: its handle, task,"
-      .. " status (finished/timed out), and its final answer text."
+      .. " status (finished/timed out), and its final answer text. Collecting a"
+      .. " child here is what silences its completion notice, so a child that"
+      .. " already finished is reported once, not twice."
       .. " Parameters: buffers (required) — array of subagent buffer numbers"
       .. " returned by spawn.",
     input_schema = {
@@ -401,6 +406,51 @@ return function(input, ctx)
       bad[#bad + 1] = child
     end
   end
+
+  -- Claim each VALIDATED child, and drop any completion notice already queued
+  -- for it. Both happen here, in one synchronous segment before the first
+  -- await, so no child can finish in between.
+  --
+  -- The claim is what silences hook.on_run_end.notify_parent: from here on THIS
+  -- tool's result is how the child gets reported, on every path including the
+  -- parent being cancelled mid-wait. It is never cleared — a report already
+  -- delivered does not become undelivered.
+  --
+  -- Only `children` are claimed, never `bad`: a handle belonging to another
+  -- session is somebody else's child, and claiming it would silence a SIBLING
+  -- session's notice.
+  --
+  -- The filter covers the ordinary fan-out shape — spawn N, do other work, then
+  -- one spawn_wait — where a child that finished during "other work" already
+  -- queued a notice that this result is about to make redundant. A notice that
+  -- already drained into the transcript is out of reach; fn.spawn_notice's text
+  -- tells the agent to ignore a notice it has already collected.
+  for _, c in ipairs(children) do
+    pcall(function() vim.b[c].straps_spawn_claimed = true end)
+  end
+  pcall(function()
+    local queue = vim.b[ctx.bufnr].straps_steering
+    if type(queue) ~= "table" or #queue == 0 then return end
+    local prefixes = {}
+    for _, c in ipairs(children) do
+      prefixes[#prefixes + 1] = ("[straps] subagent buffer %d: "):format(c)
+    end
+    local kept = {}
+    for _, s in ipairs(queue) do
+      local drop = false
+      for _, pre in ipairs(prefixes) do
+        -- Plain prefix compare: the notice text contains [ and ], so a pattern
+        -- match would silently find nothing. The trailing ": " in the prefix is
+        -- what keeps child 1 from matching child 12.
+        if type(s) == "string" and s:sub(1, #pre) == pre then
+          drop = true
+          break
+        end
+      end
+      if not drop then kept[#kept + 1] = s end
+    end
+    if #kept ~= #queue then vim.b[ctx.bufnr].straps_steering = kept end
+  end)
 
   -- Await ALL outstanding children in a SINGLE await: one poll loop checks
   -- every child, so the wait costs the slowest child, not the sum. Each child
@@ -469,7 +519,11 @@ return function(input, ctx)
 
   local out = {}
   for _, child in ipairs(children) do
-    local nm = vim.api.nvim_buf_get_name(child)
+    -- A child buffer wiped during the wait makes nvim_buf_get_name raise,
+    -- which would abort the whole call and lose the answers of its live
+    -- siblings in this same batch.
+    local nm = ""
+    pcall(function() nm = vim.api.nvim_buf_get_name(child) end)
     local where = nm ~= "" and vim.fn.fnamemodify(nm, ":~:.") or ("buffer " .. child)
     local task = ""
     pcall(function() task = vim.b[child].straps_task or "" end)
@@ -759,11 +813,15 @@ end
   define({
     name = "hook.on_run_end",
     kind = "hook",
-    doc = "Called as (ctx) when an agent run ends (normally, on error, or after"
-      .. " cancellation). No-op by default; redefine for teardown or"
-      .. " notifications.",
+    doc = "Called as (ctx, reason) when an agent run ends (normally, on error,"
+      .. " or after cancellation). reason is the ending the loop named:"
+      .. " \"ok\", \"cancelled\", \"max_turns\", \"stalled\", \"blank\", or"
+      .. " \"error\". This base entry is a no-op; redefine it for teardown, or"
+      .. " ADD a subscriber (hook.on_run_end.<suffix>, see the fan-out"
+      .. " convention) to leave it in place — hook.on_run_end.notify_parent is"
+      .. " the builtin subscriber that tells a parent its subagent finished.",
     source = [==[
-return function(ctx)
+return function(ctx, reason)
   -- no-op by default
 end
 ]==],
@@ -780,8 +838,9 @@ end
       .. " entry = 'hook.NAME' (a registry entry called with the autocmd args"
       .. " table), bufnr = session buffer number }. Whenever the event fires,"
       .. " the entry runs; if it returns a non-empty string, that string is"
-      .. " queued onto the session as a user message: steering if a run is"
-      .. " active, an ordinary user block otherwise. Returns the autocmd id"
+      .. " delivered onto the session as a user message through"
+      .. " fn.session_notify (steering if a run is active, an ordinary user"
+      .. " block otherwise). Returns the autocmd id"
       .. " (remove with vim.api.nvim_del_autocmd). Example: bridge"
       .. " DiagnosticChanged to a hook that reports new errors, and the agent"
       .. " hears about breakage as the user saves.",
@@ -806,17 +865,169 @@ return function(spec)
       end)
       if ok and type(s) == "string" and s ~= "" then
         vim.schedule(function()
-          if not vim.api.nvim_buf_is_valid(session) then return end
-          local loop = require("straps.loop")
-          if loop.running(session) then
-            loop.steer(session, s)
-          else
-            pcall(require("straps.state").append, session, "user", nil, s)
-          end
+          require("straps.registry").try_call("fn.session_notify", session, s)
         end)
       end
     end,
   })
+end
+]==],
+  })
+
+  -- --------------------------------------------------------- fn.session_notify
+
+  -- The "harness speaks to an agent" delivery policy, at ONE late-bound name:
+  -- a running session hears it as steering, an idle one as an ordinary user
+  -- block. fn.autocmd_bridge and hook.on_run_end.notify_parent both route
+  -- through here, so redefining delivery changes every channel at once.
+  --
+  -- Why loop.steer's RETURN is the running test rather than loop.running: the
+  -- two must not be separable. state.append into a session whose provider is
+  -- mid-stream lands the block inside the streaming assistant block and glues
+  -- the following deltas onto it — a corrupted transcript. steer returns false
+  -- only when no run is active, with no window in between.
+  define({
+    name = "fn.session_notify",
+    kind = "fn",
+    doc = "Deliver a harness-generated user message to a session. Call as"
+      .. " (bufnr, text, opts) with opts = { quiet = true } to suppress the"
+      .. " steering toast (for messages the user did not type). A session with"
+      .. " an active run gets it as steering, drained into the transcript at the"
+      .. " next turn boundary; an idle session gets an ordinary user block plus a"
+      .. " restored trailing user block, and is NEVER auto-started. Returns"
+      .. " 'steer', 'append', or nil for an invalid buffer or empty text.",
+    source = [==[
+return function(bufnr, text, opts)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then return end
+  if type(text) ~= "string" or text == "" then return end
+  local loop = require("straps.loop")
+  local quiet = opts and opts.quiet or nil
+  if loop.steer(bufnr, text, quiet) then return "steer" end
+  -- Idle: append directly. Scheduled so any already-scheduled streaming delta
+  -- from the run that just ended lands first (ctx.emit schedules its appends
+  -- and vim.schedule is FIFO), and re-tested because a new run may have
+  -- started in the meantime — exactly one steer attempt, so a queued message
+  -- is never also appended.
+  vim.schedule(function()
+    pcall(function()
+      if not vim.api.nvim_buf_is_valid(bufnr) then return end
+      if loop.steer(bufnr, text, quiet) then return end
+      local state = require("straps.state")
+      state.append(bufnr, "user", nil, text)
+      state.ensure_trailing_user(bufnr)
+    end)
+  end)
+  return "append"
+end
+]==],
+  })
+
+  -- ----------------------------------------------------------- fn.spawn_notice
+
+  define({
+    name = "fn.spawn_notice",
+    kind = "fn",
+    doc = "The BODY of the notice hook.on_run_end.notify_parent delivers to a"
+      .. " parent when its subagent finishes. Called as (child, reason) ->"
+      .. " string; the child's one-line task is read from b:straps_task. The"
+      .. " caller owns the '[straps] subagent buffer N: ' prefix (spawn_wait"
+      .. " matches it to drop notices for children it already collected), so a"
+      .. " redefinition here cannot break that dedupe. Return the empty string"
+      .. " to silence the notice.",
+    source = [==[
+return function(child, reason)
+  -- Never "finished" for a truncated ending: a parent that trusts a partial
+  -- answer is worse off than one told the child stopped short.
+  local outcome = ({
+    ok = "finished",
+    error = "crashed",
+    max_turns = "hit its turn limit",
+    stalled = "stopped without producing an answer",
+    blank = "stopped without producing an answer",
+  })[tostring(reason)] or ("ended (" .. tostring(reason) .. ")")
+  local task
+  pcall(function() task = vim.b[child].straps_task end)
+  local parts = { outcome }
+  if type(task) == "string" and task ~= "" then
+    parts[#parts + 1] = "task: " .. task
+  end
+  return table.concat(parts, " — ")
+    .. (". Collect its answer with spawn_wait{ buffers = { %d } } (it returns at"
+      .. " once now). Ignore this if you already collected that subagent; if you"
+      .. " have already given your final answer and do not need it, restate that"
+      .. " answer."):format(child)
+end
+]==],
+  })
+
+  -- ------------------------------------------- hook.on_run_end.notify_parent
+
+  -- Completion PUSH for subagents. Without it spawn_wait is the only channel
+  -- back from a child, so a parent must block to learn anything; with it a
+  -- parent can spawn, keep working, and collect when the notice lands.
+  --
+  -- A SUBSCRIBER (hook.on_run_end.<suffix>), not a redefinition of the base
+  -- entry: the no-op default and any user redefinition of hook.on_run_end both
+  -- keep working, and this can be silenced on its own.
+  --
+  -- Suppression is deliberately two-part. reason == "cancelled" covers the
+  -- ordinary stop; ctx.cancelled() covers the case reason cannot — a stopped
+  -- run whose forced resume raises inside the provider ends "error" seconds
+  -- after the stop, and reporting a user-killed child as "crashed" would be a
+  -- lie. straps_spawn_claimed covers the other half: once spawn_wait has
+  -- claimed a child, its tool result is the report and the push is redundant.
+  define({
+    name = "hook.on_run_end.notify_parent",
+    kind = "hook",
+    doc = "Subscriber to hook.on_run_end: when a SUBAGENT's run ends, deliver a"
+      .. " one-line notice to its parent session (steering if the parent is"
+      .. " running, an ordinary user block if it is idle — never starting the"
+      .. " parent's run), so the parent can keep working instead of blocking in"
+      .. " spawn_wait. The notice names the child buffer and how to collect it,"
+      .. " never its answer text — the child's context stays isolated. Silent"
+      .. " for a non-subagent run, a stopped/cancelled child, a child spawn_wait"
+      .. " already claimed, and when config.spawn_notify = false (or redefine"
+      .. " this entry). Text comes from fn.spawn_notice.",
+    source = [==[
+return function(ctx, reason)
+  local child = ctx and ctx.bufnr
+  if type(child) ~= "number" or not vim.api.nvim_buf_is_valid(child) then return end
+  -- Read the parent handle BEFORE any validity call: an ordinary (non-subagent)
+  -- session has no straps_parent, and nvim_buf_is_valid(nil) raises.
+  local parent
+  pcall(function() parent = vim.b[child].straps_parent end)
+  if type(parent) ~= "number" then return end
+  if not vim.api.nvim_buf_is_valid(parent) then return end
+  local is_session
+  pcall(function() is_session = vim.b[parent].straps_session end)
+  if is_session ~= true then return end
+
+  local enabled = true
+  pcall(function()
+    local cfg = require("straps").config
+    if cfg and cfg.spawn_notify == false then enabled = false end
+  end)
+  if not enabled then return end
+
+  if reason == "cancelled" then return end
+  local stopped = false
+  pcall(function()
+    if ctx.cancelled and ctx.cancelled() then stopped = true end
+  end)
+  if stopped then return end
+
+  local claimed
+  pcall(function() claimed = vim.b[child].straps_spawn_claimed end)
+  if claimed then return end
+
+  local registry = require("straps.registry")
+  local ok_body, body = pcall(registry.try_call, "fn.spawn_notice", child, reason)
+  if not ok_body or type(body) ~= "string" or body == "" then return end
+  -- The prefix is OURS, not fn.spawn_notice's: spawn_wait matches it verbatim
+  -- to drop notices for children it collected, so a redefined body cannot
+  -- break that dedupe.
+  local notice = ("[straps] subagent buffer %d: "):format(child) .. body
+  registry.try_call("fn.session_notify", parent, notice, { quiet = true })
 end
 ]==],
   })

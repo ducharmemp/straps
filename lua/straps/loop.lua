@@ -676,7 +676,19 @@ function M.start(bufnr)
     local reason = ok and (ret or "ok") or "error"
     log(bufnr, { ev = "run_end", reason = reason, turns = run.turns })
     progress(bufnr, ctx, { type = "done", reason = reason }, "")
-    registry.call_hooks("hook.on_run_end", ctx)
+    -- Subscribers receive the ending reason, like the log and progress events
+    -- above. The pcall covers RESOLUTION (hook_entries / the seq sort), which
+    -- sits outside call_hooks' per-subscriber pcall: a raise there would skip
+    -- the cleanup below, leaving the session stamped "running" with no
+    -- trailing user block to type in.
+    local ok_hooks, results, errors = pcall(registry.call_hooks, "hook.on_run_end", ctx, reason)
+    if not ok_hooks then
+      log(bufnr, { ev = "run_end_hook_error", err = tostring(results) })
+    elseif type(errors) == "table" then
+      for _, e in ipairs(errors) do
+        log(bufnr, { ev = "run_end_hook_error", hook = e.name, err = e.err })
+      end
+    end
     pcall(state.ensure_trailing_user, bufnr)
     runs[bufnr] = nil
     pcall(function() vim.b[bufnr].straps_status = "idle" end)
@@ -773,9 +785,12 @@ vim.api.nvim_create_autocmd("VimLeavePre", {
 })
 
 --- Queue a mid-run user message ("steering"). Returns true if queued, false
---- if no run is active (callers fall back to M.start). The queue lives in
---- vim.b straps_steering; vim.b tables are snapshots, so copy-modify-write.
-function M.steer(bufnr, text)
+--- if no run is active (callers fall back to M.start) — so the return value
+--- is also the atomic "is a run active" test, with no window between the check
+--- and the enqueue. The queue lives in vim.b straps_steering; vim.b tables are
+--- snapshots, so copy-modify-write. `quiet` suppresses only the user-facing
+--- toast, for harness-generated steering the user did not type.
+function M.steer(bufnr, text, quiet)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local run = runs[bufnr]
   if not run then
@@ -788,7 +803,9 @@ function M.steer(bufnr, text)
   queue[#queue + 1] = text
   vim.b[bufnr].straps_steering = queue
   progress(bufnr, run.ctx, { type = "steer_queued" })
-  vim.notify("straps: steering queued")
+  if not quiet then
+    vim.notify("straps: steering queued")
+  end
   return true
 end
 

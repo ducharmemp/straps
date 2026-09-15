@@ -38,7 +38,7 @@ function M.register()
   agents.register_tools()     -- agents, models
   permissions.register()      -- fn.capability, fn.readonly_policy, hook.confirm
   files.register_hooks()      -- hook.after_write
-  agents.register_hooks()     -- hook.on_run_start, hook.on_turn_start, fn.model_note, hook.on_run_end, fn.autocmd_bridge
+  agents.register_hooks()     -- hook.on_run_start, hook.on_turn_start, fn.model_note, hook.on_run_end, fn.autocmd_bridge, fn.session_notify, fn.spawn_notice, hook.on_run_end.notify_parent
 
   -- Skeleton pass: an empty prompt-fragment slot per layer, registered AFTER
   -- every entry above so the registry.dump() prefix stays byte-identical and

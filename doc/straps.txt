@@ -239,7 +239,9 @@ mutates the buffer text. `:set conceallevel=0` reveals the raw markers, and
 Steering. A message sent while a run is active is queued (not started as a new
 run) and drained into the transcript at the next turn boundary, so the model
 acts on it mid-flight. |:StrapsSteer| queues directly; <CR>/|:StrapsSend|
-prompt for the text.
+prompt for the text. The harness steers too, through |fn.session_notify|: a
+subagent completion notice reaches a busy parent this way, without the
+"steering queued" toast a message you typed produces.
 
 Progress. While a run is active a virtual-text indicator on the last line
 shows the phase, elapsed time, stream liveness and the stop/steer hints. The
@@ -309,6 +311,12 @@ after_write_diagnostics	(boolean) true. Default |hook.after_write|: feed the
 			back into the tool result. false makes the hook a no-op.
 after_write_diagnostics_ms (number) 800. How long that hook waits for the
 			language server to re-lint before reporting.
+spawn_notify		(boolean) true. Default
+			|hook.on_run_end.notify_parent|: when a subagent's run
+			ends, deliver a one-line notice to its parent session,
+			so the parent can keep working instead of blocking in
+			`spawn_wait`. See |straps-subagents|. false silences
+			the notice, or redefine the hook or |fn.spawn_notice|.
 instructions_files	(list) {}. Extra memory files included in the system
 			prompt after AGENTS.md/CLAUDE.md.
 session_dir		(string|nil) nil -> stdpath("data")/straps/sessions.
@@ -513,13 +521,47 @@ hook.after_write(path, ctx) -> string|nil
 		replacing the diagnostics default.
 
 						*hook.on_run_start*
+hook.on_run_start(ctx)
+		Called when a run starts. Posts the multiplayer notice when
+		other agents are running (see |straps-multiplayer|) and does
+		nothing otherwise. Redefine it for setup or notifications.
+
 						*hook.on_run_end*
-hook.on_run_start(ctx) / hook.on_run_end(ctx)
-		Called when a run starts / ends (always, including error and
-		cancel). on_run_start posts the multiplayer notice when other
-		agents are running (see |straps-multiplayer|) and does nothing
-		otherwise; on_run_end is a no-op. Redefine either for
-		setup/teardown or notifications.
+hook.on_run_end(ctx, reason)
+		Called when a run ends, always, including error and cancel.
+		`reason` is the ending the loop named: "ok", "cancelled",
+		"max_turns", "stalled", "blank", or "error". This base entry is
+		a no-op. Fanned out (|straps-hooks-fanout|), and the one
+		fan-out whose subscriber errors are logged (as
+		`run_end_hook_error` events, see `log_file`).
+
+					*hook.on_run_end.notify_parent*
+hook.on_run_end.notify_parent(ctx, reason)
+		Builtin subscriber: when a SUBAGENT's run ends, deliver a
+		one-line notice to its parent session, so the parent can keep
+		working instead of blocking in `spawn_wait`. See
+		|straps-subagents|. Silent for an ordinary run, a child the
+		user stopped, a child `spawn_wait` already collected, and when
+		`spawn_notify` is false. Text comes from |fn.spawn_notice|.
+
+						*fn.session_notify*
+fn.session_notify({bufnr}, {text}, {opts})
+		Deliver a harness-generated user message to a session:
+		steering if a run is active (drained at the next turn
+		boundary), an ordinary user block plus a restored trailing user
+		block if it is idle. Never starts the session's run. `opts` =
+		`{ quiet = true }` suppresses the steering toast, for messages
+		the user did not type. Returns "steer", "append", or nil for an
+		invalid buffer or empty text. Shared by |fn.autocmd_bridge| and
+		|hook.on_run_end.notify_parent|, so redefining it changes every
+		harness-to-agent channel at once.
+
+						*fn.spawn_notice*
+fn.spawn_notice({child}, {reason})
+		The BODY of a subagent completion notice: the child's task, the
+		outcome, and how to collect it. The caller owns the
+		`[straps] subagent buffer N: ` prefix. Return "" to silence the
+		notice.
 
 						*hook.on_turn_start*
 hook.on_turn_start(ctx, turn)
@@ -685,6 +727,17 @@ setup().
 with a handle; the child runs concurrently. `spawn_wait` blocks on one or more
 handles and returns their final answers — waiting on N children costs the
 slowest, not the sum. Issue N `spawn` calls in one turn to fan out.
+
+A parent does not have to block. When a child's run ends,
+|hook.on_run_end.notify_parent| delivers one line to the parent naming the
+child's buffer, its task, the outcome and how to collect it — as steering if
+the parent is running, as an ordinary user block if it is idle. A child never
+starts its parent's run. So "spawn, keep working, collect when the notice
+lands" is an alternative to `spawn_wait`, and `spawn_wait` on a child that
+already finished returns at once. The notice never carries the child's answer
+text: the point of a subagent is that its context stays its own. Collecting a
+child with `spawn_wait` silences its notice, a child the user stopped is
+silent, and `spawn_notify = false` turns the whole thing off.
 
 A child is a full session: its transcript is a real buffer the user can open
 (`show = true`), watch and steer. It inherits the parent's registry view but

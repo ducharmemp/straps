@@ -1508,6 +1508,11 @@ your tool calls and streamed text live as you work.
   across turns), collect the handles, then one spawn_wait over all of
   them — they run at once, so the wait costs the slowest child, not the
   sum. Do NOT spawn one, wait, spawn the next: that serializes them.
+- You do not have to block at all: a child that finishes while you keep
+  working announces itself with a [straps] notice naming its buffer, so
+  "spawn, carry on, collect when the notice lands" is available whenever
+  the child's answer is not your next step. spawn_wait on a child that
+  already finished returns immediately.
 - The child sees NONE of this conversation: write the task complete and
   self-contained, including every path, constraint, and the exact shape
   of the answer you want back.

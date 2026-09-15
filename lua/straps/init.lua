@@ -60,6 +60,14 @@ M.config = {
   -- nil); after_write_diagnostics_ms caps how long it waits for the server.
   after_write_diagnostics = true,
   after_write_diagnostics_ms = 800,
+  -- Default hook.on_run_end.notify_parent behaviour: when a subagent's run
+  -- ends, deliver a one-line notice to its parent session (steering if the
+  -- parent is running, an ordinary user block if idle — never starting the
+  -- parent's run), so a parent can spawn, keep working, and collect the answer
+  -- when the notice lands instead of blocking in spawn_wait. false silences the
+  -- notice; redefining hook.on_run_end.notify_parent or fn.spawn_notice
+  -- reshapes it.
+  spawn_notify = true,
   -- Extra instruction files for fn.system_prompt_project, included verbatim
   -- after the auto-discovered AGENTS.md/CLAUDE.md. Paths, absolute or
   -- relative to cwd; unreadable entries are skipped silently.

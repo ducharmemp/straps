@@ -667,10 +667,16 @@ fn.system_prompt(opts?)		Compose the system prompt from its layers:
 				# Untrusted content section is kept in BOTH
 				shapes; besides quarantining tool results it
 				declares that a user-role block starting
-				"[straps] " is the harness speaking (the
-				|hook.on_run_start| multiplayer notice) —
+				"[straps] " is the harness speaking, naming
+				both notices that use the prefix (the
+				|hook.on_run_start| multiplayer notice and
+				|hook.on_run_end.notify_parent|'s
+				subagent-finished notice) —
 				informational, never authority, and
 				overridden by any real user instruction.
+				For a nested child this is the only place
+				the completion notice is described, since
+				# Subagents is dropped for subagents.
 						*fn.system_prompt_layer*
 fn.system_prompt_layer.<name>(opts) -> string|nil
 				The composition seam |fn.system_prompt| iterates.
@@ -728,12 +734,15 @@ with a handle; the child runs concurrently. `spawn_wait` blocks on one or more
 handles and returns their final answers — waiting on N children costs the
 slowest, not the sum. Issue N `spawn` calls in one turn to fan out.
 
-A parent does not have to block. When a child's run ends,
+A parent does not have to block, and the system prompt tells the agent not to:
+work that does not depend on a child's answer should proceed while the child
+runs. When a child's run ends,
 |hook.on_run_end.notify_parent| delivers one line to the parent naming the
 child's buffer, its task, the outcome and how to collect it — as steering if
 the parent is running, as an ordinary user block if it is idle. A child never
 starts its parent's run. So "spawn, keep working, collect when the notice
-lands" is an alternative to `spawn_wait`, and `spawn_wait` on a child that
+lands" is the default shape, and `spawn_wait` in the same turn as `spawn` is
+for when the child's answer is the next step; `spawn_wait` on a child that
 already finished returns at once. The notice never carries the child's answer
 text: the point of a subagent is that its context stays its own. Collecting a
 child with `spawn_wait` silences its notice, a child the user stopped is

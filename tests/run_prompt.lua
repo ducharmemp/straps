@@ -195,9 +195,9 @@ end)
 
 case("the [straps] harness-speech convention is declared, and to subagents too", function()
   -- The harness appends user-role notices (hook.on_run_start's multiplayer
-  -- notice) because the API gives it no channel of its own. Unless the prompt
-  -- names that convention, an agent reads harness text as the user's
-  -- instructions.
+  -- notice, hook.on_run_end.notify_parent's subagent-finished notice) because
+  -- the API gives it no channel of its own. Unless the prompt names that
+  -- convention, an agent reads harness text as the user's instructions.
   local core = registry.call("fn.system_prompt_core")
   assert(core:find("%[straps%] "), "the [straps] prefix should be named in the prompt")
   assert(core:find("HARNESS speaking", 1, true), "harness attribution missing")
@@ -212,6 +212,23 @@ case("the [straps] harness-speech convention is declared, and to subagents too",
   local sub = registry.call("fn.system_prompt_core", { subagent = true })
   assert(sub:find("HARNESS speaking", 1, true),
     "a subagent receives these notices too and must know who is speaking")
+end)
+
+case("the harness-speech section enumerates the subagent notice, not just peers", function()
+  -- Both notices carry the same prefix and route (fn.session_notify). This
+  -- section is the ONLY place a nested child (max_spawn_depth raised) can read
+  -- about the subagent notice, since # Subagents is dropped for children — so
+  -- the enumeration must name it in BOTH prompt shapes.
+  for _, shape in ipairs({ {}, { subagent = true } }) do
+    local p = registry.call("fn.system_prompt_core", shape)
+    local label = shape.subagent and "child prompt" or "parent prompt"
+    local intro = p:match("A user%-role block beginning[^\n]*\n[^\n]*\n[^\n]*\n[^\n]*")
+    assert(intro, label .. ": harness-speech paragraph not found")
+    assert(intro:find("other agents", 1, true),
+      label .. ": the multiplayer notice should stay enumerated: " .. intro)
+    assert(intro:find("subagent you spawned has finished", 1, true),
+      label .. ": the subagent completion notice must be enumerated too: " .. intro)
+  end
 end)
 
 -- ---------------------------------------------------------- subagent variant
@@ -240,6 +257,23 @@ case("subagent opts add readonly and tool-restriction notes", function()
   assert(sub:find("restricted to: read_file, grep", 1, true), "tools note missing")
 end)
 
+case("# Subagents commands the non-blocking path, not merely permits it", function()
+  -- The fan-out bullet gives an imperative with a named anti-pattern ("Do NOT
+  -- spawn one, wait, spawn the next"); without the same shape here, blocking in
+  -- the same turn as spawn stays the path of least resistance.
+  local core = registry.call("fn.system_prompt_core")
+  local section = core:match("\n# Subagents\n(.-)\n# ")
+  assert(section, "# Subagents section not found")
+  assert(section:find("Do NOT block on a child", 1, true),
+    "the non-blocking guidance must be an imperative, not a description")
+  assert(section:find("does not depend on it", 1, true),
+    "the trigger condition (work independent of the child's answer) must be named")
+  assert(section:find("returns\n  immediately", 1, true)
+      or section:find("returns immediately", 1, true),
+    "collecting a finished child must be stated to be free")
+  assert(section:find("same turn as spawn only when", 1, true),
+    "the prompt must name when blocking in the spawn turn IS right")
+end)
 case("fn.system_prompt forwards opts to the core layer only", function()
   local full = registry.call("fn.system_prompt", { subagent = true })
   assert(full:find("\n# You are a subagent\n", 1, true), "composer dropped the opts")

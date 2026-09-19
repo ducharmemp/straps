@@ -303,8 +303,16 @@ local function check_registry()
       { "Call require('straps').setup{} in your config." })
     return
   end
-  health.ok(("%d tools, %d hooks, %d fns, %d skills")
-    :format(counts.tool, counts.hook, counts.fn, counts.skill))
+  local guard_names = {}
+  for _, g in ipairs(registry.guard_entries()) do
+    guard_names[#guard_names + 1] = g.name
+  end
+  health.ok(("%d tools, %d hooks, %d fns, %d skills, %d guards")
+    :format(counts.tool, counts.hook, counts.fn, counts.skill, #guard_names))
+  if #guard_names > 0 then
+    health.info("guards (" .. (registry.guards_frozen() and "frozen" or "not yet frozen") .. "): "
+      .. table.concat(guard_names, ", "))
+  end
   -- The load-bearing entries: a missing one means a broken session, and this
   -- is cheaper to read than :StrapsRegistry.
   for _, name in ipairs({ "fn.provider", "fn.system_prompt", "fn.build_tools",

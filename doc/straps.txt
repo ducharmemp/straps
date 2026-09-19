@@ -423,6 +423,19 @@ Inspect and edit from Lua:
 Or from the agent's own tools: `registry_list`, `registry_get`,
 `registry_define` (|straps-tools|).
 
+						*registry.get* *registry.bind*
+What you get back. `registry.get(name)` returns a read-only COPY of the
+entry's public fields (`name, kind, doc, input_schema, capability, source,
+version, seq, scope`) — never the compiled function, and never the stored
+table, so writes to it change nothing. To chain onto a previous definition
+(the |fn.capability| example under |straps-auto|), capture it with
+`registry.bind(name)`, which returns the compiled function resolved now.
+`bind` refuses `tool.*`: tools run only through `registry.call`, which passes
+the guard chain (|hook.guard|). Entry storage is private to the module;
+`registry.entries` and `registry.scopes` do not exist. Grants live in the
+registry too (`registry.grant`, `registry.granted`, `registry.clear_grants`;
+see |straps-auto|). A scope's parent is fixed when the scope is created.
+
 ==============================================================================
 7. TOOLS						*straps-tools*
 
@@ -490,19 +503,78 @@ tool result; a raising subscriber becomes a `[hook <name> error: ...]` line),
 and the loop's |hook.on_run_start| / |hook.on_run_end| / |hook.on_turn_start|
 / |hook.before_tool|. |hook.after_tool| is fanned out as a FOLD: each
 subscriber gets the CURRENT result and any non-nil return replaces it for the
-next one, in registration order. NOT fanned out (single entry, called
-directly): |hook.confirm|, |hook.on_progress|, and `hook.on_define`.
+next one, in registration order. |hook.guard| is a fold with the opposite error
+policy: every guard runs and a raising guard BLOCKS. NOT fanned out (single
+entry, called directly): |hook.confirm|, |hook.on_progress|, and
+`hook.on_define`.
 						*hook.confirm*
 hook.confirm(name, input, ctx) -> allowed, reason
-		The permission gate, called before every tool. Default:
+		The permission gate, called for every tool the model requests,
+		after the before-guards (|hook.guard|). Default:
 		auto-allow the read-only tools; silently allow any call
 		whose |fn.capability| category has been granted (a
-		`cap:<category>` key in b:straps_allowed, written by
+		`cap:<category>` key in the session's grant set, written by
 		|:StrapsAuto| or a subagent `allow`); otherwise prompt
 		(Yes / No / Always this tool / for edits, Always in <dir>
 		/ Always all edits), showing a diff for file edits. Grants
-		persist in b:straps_allowed. Never loosen this on the
+		persist via `registry.grant`. Never loosen this on the
 		agent's initiative. See |straps-auto|.
+
+						*hook.guard* *straps-guards*
+hook.guard.<suffix>(op, ...) -> verdict, reason
+		The policy chain the agent cannot alter. Install guards in
+		`stdpath("config")/straps/init.lua` (or your init.lua after
+		`setup()`); the chain FREEZES when that file has loaded and
+		at the first run — after that nothing (you, the agent, a
+		`.straps.lua`) defines, redefines or removes a guard until
+		Neovim restarts. Guards are global-only. None ship.
+
+		Every guard is called for every op, in registration order,
+		with a fixed argument list per op: >
+		  ("before", name, input, ctx, info)
+		  ("after",  name, input, result, ok, ctx, info)
+		  ("define", spec, opts, info)
+		  ("remove", name, opts, info)
+<		`info` is `{ active = bufnr|nil, executing = tool|nil,
+		frozen = bool }`. Return `false, reason` to BLOCK: the tool
+		does not run (before), the model sees
+		`blocked by <guard>: <reason>` as an error result, and
+		|hook.confirm| is not consulted; for define/remove the call
+		raises. For "after", a string return REPLACES the result the
+		model sees (runs last, after |hook.after_tool|, on the
+		truncated result). Anything else passes — `true` never skips
+		the confirm prompt. A guard that raises blocks. `ctx` is nil
+		for define/remove and for tools run directly via
+		`registry.call`; on the loop path a before/after guard may
+		`ctx.await` (a model-based classifier is a curl).
+
+		Scope guards by `op` and name. A guard blocking every
+		`define` during a run breaks `spawn`, which defines the
+		child's confirm shadow. Each guard call logs a
+		`{ ev = "guard", op, name, guard, verdict, ms }` event to
+		|fn.log|. Example — refuse writes to the straps config dir: >lua
+		require("straps.registry").define{
+		  name = "hook.guard.config_dir", kind = "hook",
+		  doc = "no agent writes under stdpath('config')/straps",
+		  source = [==[
+		    local dir = vim.fn.stdpath("config") .. "/straps/"
+		    return function(op, name, input)
+		      if op ~= "before" then return end
+		      local p = type(input) == "table" and input.path
+		      if type(p) == "string"
+		        and vim.fn.fnamemodify(p, ":p"):sub(1, #dir) == dir then
+		        return false, "straps config dir is off limits"
+		      end
+		    end
+		  ]==],
+		}
+<		Ceiling. A silently granted `lua` or `exec` category, or a
+		hash-trusted `.straps.lua`, is full-privilege Lua in the same
+		process: `debug.*`, `ffi`, `package.loaded`, `load()` of an
+		entry's `source`, `nvim --server $NVIM` from bash, and editing
+		the session buffer all reach past the chain. Straps does not
+		harden against those; a guard classifying `eval_lua`/`bash`
+		input is where such attempts are visible.
 
 						*hook.after_write*
 hook.after_write(path, ctx) -> string|nil
@@ -830,7 +902,9 @@ Grant categories to the current session with |:StrapsAuto|: >vim
 	:StrapsAuto             " report current category grants
 	:StrapsAuto off         " clear all category grants
 <
-Grants are stored as `cap:<category>` keys in b:straps_allowed. `off` clears
+Grants are stored as `cap:<category>` keys in the registry's per-session grant
+set (`registry.granted(bufnr)`; not a buffer variable, which any Lua the agent
+runs could write). `off` clears
 only those keys, so editdir: and per-tool grants stay. Grant categories to a
 subagent with `spawn`'s `allow` (see |straps-subagents|). Category grants are
 path-unrestricted: an `edit` grant covers every path, including a trusted
@@ -845,7 +919,7 @@ category, add `vcs` to the grantable list, then `:StrapsAuto vcs` grants it. >lu
 	  name = "fn.capability", kind = "fn",
 	  doc = "git-only bash is its own 'vcs' category",
 	  source = [==[
-	    local base = require("straps.registry").get("fn.capability").fn
+	    local base = require("straps.registry").bind("fn.capability")
 	    return function(name, input)
 	      if name == nil then
 	        local g = base(); table.insert(g, "vcs"); return g

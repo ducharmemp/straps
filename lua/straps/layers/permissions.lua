@@ -164,7 +164,7 @@ end
       .. " edit anywhere under the detected project root, and 'Always all edits'"
       .. " grants every future write_file/edit_file/patch_file call regardless of path."
       .. " Other tools get Yes / No / 'Always this tool', scoped to the tool name. All"
-      .. " grants persist in vim.b[ctx.bufnr].straps_allowed. A cap:<category> key"
+      .. " grants persist in the registry's per-session grant set (registry.granted). A cap:<category> key"
       .. " in that allow-set (written by :StrapsAuto or spawn's allow arg) silently"
       .. " permits every call fn.capability puts in that category. Redefine to"
       .. " change the policy.",
@@ -227,12 +227,13 @@ return function(name, input, ctx)
     return abspath:sub(1, #absdir) == absdir
   end
 
-  -- Read the per-buffer allow-set defensively: it may be nil, and ctx.bufnr
-  -- may not name a valid buffer.
-  local ok, allowed = pcall(function()
-    return ctx and ctx.bufnr and vim.b[ctx.bufnr].straps_allowed or nil
+  -- The per-session grant set lives in the registry (not a buffer variable,
+  -- which any Lua the agent runs could write).
+  local allowed = {}
+  pcall(function()
+    if ctx and ctx.bufnr then allowed = require("straps.registry").granted(ctx.bufnr) end
   end)
-  local have_allowed = ok and type(allowed) == "table"
+  local have_allowed = next(allowed) ~= nil
 
   -- Category grants: "cap:<category>" keys in the allow-set (written by
   -- :StrapsAuto or tool.spawn's allow arg) silently permit every call that
@@ -392,12 +393,10 @@ return function(name, input, ctx)
   end
 
   local function grant(key)
-    local set = {}
-    if have_allowed then
-      for k, v in pairs(allowed) do set[k] = v end
+    local ok, err = pcall(function() require("straps.registry").grant(ctx.bufnr, key) end)
+    if not ok then
+      pcall(vim.notify, "straps: grant not recorded: " .. tostring(err), vim.log.levels.ERROR)
     end
-    set[key] = true
-    pcall(function() vim.b[ctx.bufnr].straps_allowed = set end)
   end
 
   if is_edit and choice == 3 then

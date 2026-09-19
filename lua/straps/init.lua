@@ -217,17 +217,7 @@ local function global_registry_path(opts)
     or (vim.fn.stdpath("config") .. "/straps/init.lua")
 end
 
---- Load the global corpus (stdpath("config")/straps/init.lua): a personal,
---- cwd-independent library of skills, tools, hooks and fns, defined once and
---- available in every session. Distinct from the PROJECT registry
---- (.straps.lua), which ships with a checkout and so earns direnv-style
---- hash-trust; this file is yours, in your own config dir, so it is executed
---- without a trust prompt — exactly like your init.lua. Missing file: a
---- silent no-op (this is opt-in). The same path executes at most once per
---- Neovim session. Runs BEFORE the project registry, so a project .straps.lua
---- can override a global entry (later define() wins). opts.path overrides the
---- location (tests). Returns loaded(bool), info(string). Never throws.
-function M.load_global_registry(opts)
+local function load_global_registry_body(opts)
   opts = opts or {}
   local path = vim.fn.fnamemodify(global_registry_path(opts), ":p")
   if vim.fn.filereadable(path) == 0 then
@@ -264,6 +254,24 @@ function M.load_global_registry(opts)
   return true, "loaded: " .. path
 end
 
+--- Load the global corpus (stdpath("config")/straps/init.lua): a personal,
+--- cwd-independent library of skills, tools, hooks and fns, defined once and
+--- available in every session. Distinct from the PROJECT registry
+--- (.straps.lua), which ships with a checkout and so earns direnv-style
+--- hash-trust; this file is yours, in your own config dir, so it is executed
+--- without a trust prompt — exactly like your init.lua. Missing file: a
+--- silent no-op (this is opt-in). The same path executes at most once per
+--- Neovim session. Runs BEFORE the project registry, so a project .straps.lua
+--- can override a global entry (later define() wins). opts.path overrides the
+--- location (tests). Returns loaded(bool), info(string). Never throws.
+--- Whatever the outcome, the guard chain (hook.guard.*) is frozen on return:
+--- this file is the one place guards install from.
+function M.load_global_registry(opts)
+  local loaded, info = load_global_registry_body(opts)
+  require("straps.registry").freeze_guards()
+  return loaded, info
+end
+
 --- Load the nearest .straps.lua upward from cwd — the project registry:
 --- plain Lua (registry.define calls; registry.dump() output is valid
 --- content). direnv-style trust: content is executed only if its sha256
@@ -273,8 +281,10 @@ end
 --- so the same content loads silently from then on; any edit re-prompts.
 --- The same (path, hash) executes at most once per Neovim session.
 --- opts.store_path overrides the trust store location (tests).
---- Returns loaded(bool), info(string). Never throws.
+--- Returns loaded(bool), info(string). Never throws. A project file runs
+--- against a frozen guard chain: it may not define or remove hook.guard.*.
 function M.load_project_registry(opts)
+  require("straps.registry").freeze_guards()
   opts = opts or {}
   local found = vim.fs.find(".straps.lua",
     { upward = true, path = vim.fn.getcwd(), type = "file" })[1]

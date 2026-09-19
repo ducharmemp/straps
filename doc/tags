@@ -39,11 +39,14 @@ hook.after_tool	straps.txt	/*hook.after_tool*
 hook.after_write	straps.txt	/*hook.after_write*
 hook.before_tool	straps.txt	/*hook.before_tool*
 hook.confirm	straps.txt	/*hook.confirm*
+hook.guard	straps.txt	/*hook.guard*
 hook.on_progress	straps.txt	/*hook.on_progress*
 hook.on_run_end	straps.txt	/*hook.on_run_end*
 hook.on_run_end.notify_parent	straps.txt	/*hook.on_run_end.notify_parent*
 hook.on_run_start	straps.txt	/*hook.on_run_start*
 hook.on_turn_start	straps.txt	/*hook.on_turn_start*
+registry.bind	straps.txt	/*registry.bind*
+registry.get	straps.txt	/*registry.get*
 straps	straps.txt	/*straps*
 straps-agents	straps.txt	/*straps-agents*
 straps-agents-tool	straps.txt	/*straps-agents-tool*
@@ -53,6 +56,7 @@ straps-commands	straps.txt	/*straps-commands*
 straps-config	straps.txt	/*straps-config*
 straps-config-model	straps.txt	/*straps-config-model*
 straps-fn	straps.txt	/*straps-fn*
+straps-guards	straps.txt	/*straps-guards*
 straps-health	straps.txt	/*straps-health*
 straps-highlights	straps.txt	/*straps-highlights*
 straps-hooks	straps.txt	/*straps-hooks*

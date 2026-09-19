@@ -2188,22 +2188,22 @@ function M.pick_provider()
 end
 
 --- :StrapsAuto — grant permission categories to THIS session (auto mode). A
---- grant writes a "cap:<category>" key into vim.b straps_allowed, which the
---- default hook.confirm honors to auto-allow every call fn.capability puts in
---- that category (no prompt). Must run on a session buffer. arg nil/"" reports
---- the current cap: grants; "off" clears them (leaving other keys, e.g.
---- editdir:, intact); otherwise a space/comma list of categories to grant.
+--- grant writes a "cap:<category>" key into the registry's per-session grant
+--- set, which the default hook.confirm honors to auto-allow every call
+--- fn.capability puts in that category (no prompt). Must run on a session
+--- buffer. arg nil/"" reports the current cap: grants; "off" clears them
+--- (leaving other keys, e.g. editdir:, intact); otherwise a space/comma list
+--- of categories to grant.
 function M.auto(arg)
   local buf = vim.api.nvim_get_current_buf()
   if not vim.b.straps_session then
     return vim.notify("straps: not a straps session buffer", vim.log.levels.ERROR)
   end
+  local registry = require("straps.registry")
 
   local function grants_list()
-    local set = vim.b[buf].straps_allowed
-    if type(set) ~= "table" then return nil end
     local cats = {}
-    for k in pairs(set) do
+    for k in pairs(registry.granted(buf)) do
       local c = type(k) == "string" and k:match("^cap:(.*)$") or nil
       if c then cats[#cats + 1] = c end
     end
@@ -2216,23 +2216,13 @@ function M.auto(arg)
     return vim.notify("straps: auto grants: " .. (grants_list() or "none"))
   end
 
-  -- vim.b tables are snapshots: copy, mutate, assign back (see grant() in
-  -- hook.confirm for the idiom).
-  local set = {}
-  if type(vim.b[buf].straps_allowed) == "table" then
-    for k, v in pairs(vim.b[buf].straps_allowed) do set[k] = v end
-  end
-
   if arg == "off" then
     local cleared = grants_list()
-    for k in pairs(set) do
-      if type(k) == "string" and k:match("^cap:") then set[k] = nil end
-    end
-    vim.b[buf].straps_allowed = set
+    registry.clear_grants(buf, "cap:")
     return vim.notify("straps: auto grants cleared: " .. (cleared or "none"))
   end
 
-  local grantable = require("straps.registry").try_call("fn.capability") or {}
+  local grantable = registry.try_call("fn.capability") or {}
   local is_grantable = {}
   for _, c in ipairs(grantable) do is_grantable[c] = true end
   local tokens = {}
@@ -2243,8 +2233,10 @@ function M.auto(arg)
         .. " (valid: " .. table.concat(grantable, ", ") .. ")")
     end
   end
-  for _, tok in ipairs(tokens) do set["cap:" .. tok] = true end
-  vim.b[buf].straps_allowed = set
+  local ok, err = pcall(function()
+    for _, tok in ipairs(tokens) do registry.grant(buf, "cap:" .. tok) end
+  end)
+  if not ok then return notify_err("straps: " .. tostring(err)) end
   vim.notify("straps: auto grants: " .. (grants_list() or "none"))
 end
 

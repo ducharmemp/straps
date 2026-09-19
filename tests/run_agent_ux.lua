@@ -896,7 +896,7 @@ case("'Always in <dir>' grants the parent directory, not neighbors with the same
     { path = base .. "/aa/one.txt", old_string = "x", new_string = "y" }, { bufnr = cbuf })
   assert(allowed == true, "choice 3 should allow")
   assert(prompts == 1, "expected exactly one prompt, got " .. prompts)
-  local set = vim.b[cbuf].straps_allowed
+  local set = registry.granted(cbuf)
   assert(type(set) == "table" and set["editdir:" .. base .. "/aa"],
     "editdir grant missing: " .. vim.inspect(set))
 
@@ -954,7 +954,7 @@ case("'Always all edits' grants every path for edit tools only", function()
   local allowed = registry.call("hook.confirm", "write_file",
     { path = vim.fn.tempname() .. "/a.txt", content = "c" }, { bufnr = cbuf })
   assert(allowed == true, "choice 4 should allow")
-  assert(vim.b[cbuf].straps_allowed["editfiles:*"], "editfiles:* grant missing")
+  assert(registry.granted(cbuf)["editfiles:*"], "editfiles:* grant missing")
 
   vim.fn.confirm = function() return 0 end
   allowed = registry.call("hook.confirm", "edit_file",
@@ -987,7 +987,7 @@ case("'Always in this project' grants the whole repo root, covering sibling dirs
     { bufnr = cbuf })
   assert(allowed == true, "project choice should allow")
   assert(prompts == 1, "expected one prompt, got " .. prompts)
-  local set = vim.b[cbuf].straps_allowed
+  local set = registry.granted(cbuf)
   assert(type(set) == "table" and set["editdir:" .. root],
     "project-root grant missing: " .. vim.inspect(set))
 
@@ -1019,9 +1019,9 @@ case("the project choice is absent when the file has no root marker above it", f
   vim.fn.confirm = real_confirm
   assert(allowed == true, "choice 4 should allow")
   -- With no project marker, index 4 is 'Always all edits', not a project grant.
-  assert(vim.b[cbuf].straps_allowed["editfiles:*"],
+  assert(registry.granted(cbuf)["editfiles:*"],
     "index 4 should be 'all edits' when no project choice is offered: "
-      .. vim.inspect(vim.b[cbuf].straps_allowed))
+      .. vim.inspect(registry.granted(cbuf)))
 end)
 
 -- -------------------------------------------------------------- autocmd_bridge

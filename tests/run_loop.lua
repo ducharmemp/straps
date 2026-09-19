@@ -66,7 +66,7 @@ case("provider entries registered and compiled", function()
   for _, name in ipairs({ "fn.provider", "fn.api_key", "fn.build_tools", "fn.system_prompt" }) do
     local e = registry.get(name)
     assert(e, name .. " not registered")
-    assert(type(e.fn) == "function", name .. " did not compile to a function")
+    assert(e.fn == nil, name .. " view must not expose the compiled fn")
   end
   assert(registry.call("fn.system_prompt"):find("registry_define", 1, true),
     "system prompt does not teach self-extension")

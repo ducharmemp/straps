@@ -7,6 +7,10 @@ local M = {}
 
 local unpack = unpack or table.unpack
 
+-- Captured once: the gate every tool call passes must not be swappable by
+-- a later package.loaded / require substitution made from inside a run.
+local registry = require("straps.registry")
+
 -- bufnr -> { cancelled, cancel_fns, await_seq, done }
 local runs = {}
 
@@ -78,7 +82,7 @@ end
 -- Progress must never break a run: hook errors are swallowed, and the phase
 -- mirror (vim.b straps_phase) is best-effort. phase == nil means "no change".
 local function progress(bufnr, ctx, ev, phase)
-  pcall(require("straps.registry").try_call, "hook.on_progress", ev, ctx)
+  pcall(registry.try_call, "hook.on_progress", ev, ctx)
   if phase ~= nil then
     pcall(function() vim.b[bufnr].straps_phase = phase end)
   end
@@ -93,7 +97,7 @@ end
 -- buffer is stamped onto every event here so call sites stay terse.
 local function log(bufnr, ev)
   ev.buf = bufnr
-  pcall(require("straps.registry").try_call, "fn.log", ev)
+  pcall(registry.try_call, "fn.log", ev)
 end
 
 local function new_ctx(bufnr, run)
@@ -123,10 +127,9 @@ local function new_ctx(bufnr, run)
           -- Every synchronous segment of the run executes with this
           -- buffer's registry scope active, so all lookups (and defines)
           -- inside the run resolve through the session's scope chain.
-          local reg = require("straps.registry")
-          local prev_scope = reg.set_active_scope(bufnr)
+          local prev_scope = registry.set_active_scope(bufnr)
           local ok, err = coroutine.resume(co, unpack(args, 1, args.n))
-          reg.set_active_scope(prev_scope)
+          registry.set_active_scope(prev_scope)
           if not ok then
             runs[bufnr] = nil
             vim.notify("straps: run crashed: " .. tostring(err), vim.log.levels.ERROR)
@@ -176,23 +179,27 @@ local function new_ctx(bufnr, run)
   return ctx
 end
 
--- One tool_use block (its tool_use marker is already in the buffer):
--- confirm -> before_tool -> call -> after_tool -> normalized result. The caller
--- appends tool_result blocks in API order, even when execution was parallel.
-local function execute_tool(bufnr, ctx, block, cfg, opts)
-  local registry = require("straps.registry")
-  local name, input = block.name, block.input or {}
-
-  if not (opts and opts.skip_confirm) then
-    local allowed, reason = registry.call("hook.confirm", name, input, ctx)
-    if not allowed then
-      return false, "user denied: " .. (reason or "")
-    end
+-- The model-origin gate: hook.confirm, then the before_tool fan-out. Passed
+-- to registry.gate_tool as opts.confirm so it runs AFTER the before-guards.
+local function confirm_then_before_tool(name, input, ctx)
+  local allowed, reason = registry.call("hook.confirm", name, input, ctx)
+  if not allowed then
+    return false, reason
   end
-
   registry.call_hooks("hook.before_tool", name, input, ctx)
+  return true
+end
 
-  local ok, result = pcall(registry.call, "tool." .. name, input, ctx)
+-- Stage 1 of a tool_use block: before-guards -> confirm -> before_tool.
+-- Returns allowed, reason, run (run executes the gated entry exactly once).
+local function gate_tool(ctx, block)
+  return registry.gate_tool(block.name, block.input or {}, ctx, { confirm = confirm_then_before_tool })
+end
+
+-- Stage 2: run -> normalize -> truncate -> after_tool fold -> after-guards.
+local function finish_tool(ctx, block, cfg, run)
+  local name, input = block.name, block.input or {}
+  local ok, result = run(ctx)
   if ok then
     if result == nil then
       result = "ok"
@@ -222,12 +229,25 @@ local function execute_tool(bufnr, ctx, block, cfg, opts)
   -- and a non-nil return replaces `result` for the next subscriber; a raising
   -- subscriber is skipped so it can never break the ones after it.
   for _, entry in ipairs(registry.hook_entries("hook.after_tool")) do
-    local hok, ret = pcall(entry.fn, name, input, result, ok, ctx)
+    local hok, ret = pcall(registry.call, entry.name, name, input, result, ok, ctx)
     if hok and ret ~= nil then
       result = ret
     end
   end
+
+  -- The after-guards run last, on exactly the bytes the model will see.
+  result, ok = registry.after_guards(name, input, tostring(result), ok, ctx)
   return ok, tostring(result)
+end
+
+-- One tool_use block (its tool_use marker is already in the buffer), serially:
+-- gate -> run -> normalized result. The caller appends tool_result blocks.
+local function execute_tool(ctx, block, cfg)
+  local allowed, reason, run = gate_tool(ctx, block)
+  if not allowed then
+    return false, reason
+  end
+  return finish_tool(ctx, block, cfg, run)
 end
 
 local function append_tool_result(bufnr, block, ok, result)
@@ -257,7 +277,7 @@ local function all_parallel_readonly(blocks)
   return true
 end
 
-local function child_ctx(parent_ctx, bufnr, finish)
+local function child_ctx(parent_ctx, bufnr, finish, run)
   local ctx = {
     bufnr = bufnr,
     emit = parent_ctx.emit,
@@ -276,10 +296,12 @@ local function child_ctx(parent_ctx, bufnr, finish)
       local args = pack(...)
       vim.schedule(function()
         if ctx._await_seq ~= seq or coroutine.status(co) ~= "suspended" then return end
-        local reg = require("straps.registry")
-        local prev_scope = reg.set_active_scope(bufnr)
+        -- A resolve arriving after the run was cancelled or finished must not
+        -- resume the job: its stub result has already been appended.
+        if run and (run.cancelled or run.done) then return end
+        local prev_scope = registry.set_active_scope(bufnr)
         local ok, err = coroutine.resume(co, unpack(args, 1, args.n))
-        reg.set_active_scope(prev_scope)
+        registry.set_active_scope(prev_scope)
         if not ok then finish(false, tostring(err)) end
       end)
     end)
@@ -307,7 +329,6 @@ end
 -- Returns the run's ending reason:
 -- "ok" | "cancelled" | "max_turns" | "stalled" | "blank".
 local function run_turns(bufnr, ctx, run)
-  local registry = require("straps.registry")
   local state = require("straps.state")
   local cfg = get_config()
 
@@ -464,19 +485,36 @@ local function run_turns(bufnr, ctx, run)
     local n_calls, n_errors, any_repeat, any_new, last_error = 0, 0, false, false, nil
     if all_parallel_readonly(tool_blocks) then
       local jobs = {}
+      -- Gate every block first, on the run coroutine (a before-guard may
+      -- await), so no job starts until the whole batch has passed the gate.
       for i, block in ipairs(tool_blocks) do
         progress(bufnr, ctx, { type = "tool", name = block.name }, "tool: " .. tostring(block.name))
         local key = tostring(block.name) .. "\0" .. pretty_json(block.input or {})
         if run.seen_calls[key] then any_repeat = true else any_new = true end
         run.seen_calls[key] = true
         n_calls = n_calls + 1
-        local t0 = vim.uv.hrtime()
-        local allowed, reason = registry.call("hook.confirm", block.name, block.input or {}, ctx)
-        if not allowed then
-          jobs[i] = { done = true, ok = false, result = "user denied: " .. (reason or ""), ms = 0 }
+        if run.cancelled then
+          jobs[i] = { done = true, ok = false, result = "run cancelled before this tool executed", ms = 0 }
         else
-          jobs[i] = { done = false, block = block, started = t0 }
-          local job = jobs[i]
+          local allowed, reason, gated_run = gate_tool(ctx, block)
+          if not allowed then
+            jobs[i] = { done = true, ok = false, result = reason, ms = 0 }
+          else
+            jobs[i] = { done = false, block = block, run = gated_run }
+          end
+        end
+      end
+      if run.cancelled then
+        for _, job in ipairs(jobs) do
+          if not job.done then
+            job.done, job.ok, job.result, job.ms = true, false, "run cancelled before this tool executed", 0
+          end
+        end
+      end
+      for i, block in ipairs(tool_blocks) do
+        local job = jobs[i]
+        if not job.done then
+          job.started = vim.uv.hrtime()
           local function finish(ok, result)
             if job.done then return end
             job.done = true
@@ -485,13 +523,12 @@ local function run_turns(bufnr, ctx, run)
             job.ms = math.floor((vim.uv.hrtime() - job.started) / 1e6)
           end
           local co = coroutine.create(function()
-            local cctx = child_ctx(ctx, bufnr, finish)
-            finish(execute_tool(bufnr, cctx, block, cfg, { skip_confirm = true }))
+            local cctx = child_ctx(ctx, bufnr, finish, run)
+            finish(finish_tool(cctx, block, cfg, job.run))
           end)
-          local reg = require("straps.registry")
-          local prev_scope = reg.set_active_scope(bufnr)
+          local prev_scope = registry.set_active_scope(bufnr)
           local ok_resume, err = coroutine.resume(co)
-          reg.set_active_scope(prev_scope)
+          registry.set_active_scope(prev_scope)
           if not ok_resume then finish(false, err) end
         end
       end
@@ -546,7 +583,7 @@ local function run_turns(bufnr, ctx, run)
         end
         run.seen_calls[key] = true
         local t0 = vim.uv.hrtime()
-        local ok, result = execute_tool(bufnr, ctx, block, cfg)
+        local ok, result = execute_tool(ctx, block, cfg)
         append_tool_result(bufnr, block, ok, result)
         n_calls = n_calls + 1
         if not ok then
@@ -654,7 +691,10 @@ function M.start(bufnr)
     vim.notify("straps: a run is already active for this buffer", vim.log.levels.WARN)
     return
   end
-  local registry = require("straps.registry")
+  -- Every session owns its scope (so no peer can create one under itself),
+  -- and the guard chain is frozen before anything registry-resolved runs.
+  registry.ensure_scope(bufnr)
+  registry.freeze_guards()
   local state = require("straps.state")
 
   local run = { cancelled = false, cancel_fns = {}, await_seq = 0, done = false, turns = 0 }
@@ -699,10 +739,9 @@ function M.start(bufnr)
 
   -- Initial resume under this buffer's registry scope (see ctx.await for
   -- the matching per-resume scoping).
-  local reg = require("straps.registry")
-  local prev_scope = reg.set_active_scope(bufnr)
+  local prev_scope = registry.set_active_scope(bufnr)
   local ok, err = coroutine.resume(co)
-  reg.set_active_scope(prev_scope)
+  registry.set_active_scope(prev_scope)
   if not ok then
     runs[bufnr] = nil
     error(err)
@@ -754,10 +793,9 @@ function M.stop(bufnr)
     run.await_seq = run.await_seq + 1
     -- Force-resume under this buffer's registry scope, mirroring ctx.await's
     -- driver (~lines 121-127).
-    local reg = require("straps.registry")
-    local prev_scope = reg.set_active_scope(bufnr)
+    local prev_scope = registry.set_active_scope(bufnr)
     local resumed, err = coroutine.resume(run.co)
-    reg.set_active_scope(prev_scope)
+    registry.set_active_scope(prev_scope)
     if not resumed then
       runs[bufnr] = nil
       vim.notify("straps: run crashed: " .. tostring(err), vim.log.levels.ERROR)

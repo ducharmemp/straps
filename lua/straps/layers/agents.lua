@@ -265,24 +265,22 @@ return function(input, ctx)
     vim.b[child].straps_tool_filter = input.tools
   end
   if input.readonly or type(input.allow) == "table" then
-    -- Seed the child's per-buffer grant set from allow (readonly => empty).
-    -- vim.b returns copies, so build the whole table then assign once, before
-    -- loop.start so the first tool call already sees it.
+    -- Seed the child's grant set from allow (readonly => empty), before
+    -- loop.start so the first tool call already sees it. Grants live in the
+    -- registry, keyed by the CHILD buffer — granting another session is
+    -- permitted; only self-grants from a tool body are refused.
     local grantable = registry.try_call("fn.capability") or {}
     local is_grantable = {}
     for _, c in ipairs(grantable) do is_grantable[c] = true end
-    local grants = {}
     if type(input.allow) == "table" then
       for _, entry in ipairs(input.allow) do
         if is_grantable[entry] then
-          grants["cap:" .. entry] = true
+          registry.grant(child, "cap:" .. entry)
         else
-          grants[entry] = true -- tool-name grant
+          registry.grant(child, entry) -- tool-name grant
         end
       end
     end
-    vim.b[child].straps_allowed = grants
-
     registry.define({
       name = "hook.confirm",
       kind = "hook",
@@ -296,7 +294,7 @@ return function(name, tin, tctx)
   if cap == "read" then return true end
   local allowed
   pcall(function()
-    allowed = tctx and tctx.bufnr and vim.b[tctx.bufnr].straps_allowed or nil
+    allowed = tctx and tctx.bufnr and reg.granted(tctx.bufnr) or nil
   end)
   if type(allowed) == "table" then
     if cap and allowed["cap:" .. tostring(cap)] then return true end

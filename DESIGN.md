@@ -10,15 +10,26 @@ Three invariants (do not violate):
    format. Each turn, the loop re-parses the buffer to build API messages. The
    user (or the agent) can edit history, edit the system prompt, delete
    messages — the buffer is canonical. Registry entries are exposed as editable
-   Lua buffers.
+   Lua buffers. One exception: permission grants live in a registry-private
+   per-session table (`registry.grant`/`granted`), not in `b:straps_allowed`.
+   A buffer variable is writable by any Lua the agent runs, so a grant stored
+   there is a grant the agent can award itself. The table is keyed by session
+   bufnr and cleared on `BufWipeout`; its lifetime is still the buffer's.
 2. **Everything is late-bound and redefinable.** All tools, hooks, the provider,
    and the key loop functions are entries in a registry, stored as *Lua source
    strings*, compiled on define, and looked up by name at every call site.
    Redefining an entry takes effect on the very next call — even mid-run.
+   Entries resolve to a read-only copy; the compiled function is reachable only
+   through `call`/`try_call`/`bind`, and every tool execution passes
+   `gate_tool`. One exception to redefinability: `hook.guard.*` entries are the
+   policy chain gating tool execution and entry definition. They load from the
+   user's own config before any run starts and freeze there; after the freeze
+   nothing — user, agent, or `.straps.lua` — defines, redefines, or removes one
+   until Neovim restarts. The agent cannot alter the policy that constrains it.
 3. **The agent can extend itself.** The agent has registry introspection and
    `registry_define` as tools. The tool list sent to the API is rebuilt from
    the registry on every provider call, so a tool the agent defines in turn N
-   is callable in turn N+1.
+   is callable in turn N+1. Its reach is unchanged except for `hook.guard.*`.
 
 Target: Neovim >= 0.11 (use `vim.system`, `vim.json`, `vim.schedule`,
 `vim.fn.confirm`). LuaJIT / Lua 5.1 semantics. Zero external dependencies
@@ -85,24 +96,63 @@ end
   tiny function returning that prose so `call()` remains uniform. Stores
   `{ name, kind, doc, input_schema, source, fn, version, seq }` where `version`
   increments on each redefine and first-define `seq` is preserved for append-only
-  tool ordering. After a successful (re)define, if an entry named
+  tool ordering. Storage (`entries`, `scopes`) is private to the module. Before
+  anything is stored the `define` guard op runs (see "Tool-call guards"); a
+  block raises. After a successful (re)define, if an entry named
   `hook.on_define` exists, call it as `(entry)` inside `pcall` (never let it
-  break define).
-- `get(name) -> entry | nil`
+  break define). `hook.on_define` does not fire for `hook.guard.*` defines.
+- `get(name) -> copy | nil` — a shallow copy of
+  `{ name, kind, doc, input_schema, capability, source, version, seq, scope }`.
+  Never the compiled `fn`, and never the stored table: writes to the copy are
+  inert. A readable `fn` would be a way to run a tool without the gate; a
+  writable `capability` would reclassify `bash` as read-only.
+- `bind(name) -> function | nil` — the compiled fn of a `hook.*`/`fn.*` entry,
+  resolved NOW. This is the chaining idiom (`local base = registry.bind("fn.capability")`
+  before redefining it); `call` cannot substitute there because `define` runs
+  the chunk before installing the entry. Refuses `tool.*`.
 - `call(name, ...) -> ...` — looks up at call time, errors clearly if missing.
+  For `tool.*` names: before-guards, then the fn; a block or a tool error is
+  re-raised with `error(x, 0)` so the caller sees the original value (no
+  added position prefix, table errors intact). Never confirmed.
 - `try_call(name, ...) -> nil | ...` — returns nil (no error) if the entry does
-  not exist; used for optional hooks. Errors inside the fn still propagate.
-- `names(kind?) -> string[]` — sorted.
-- `remove(name, opts?)` — scope-aware. Default removes what the ACTIVE scope
+  not exist; used for optional hooks. Errors inside the fn still propagate;
+  `tool.*` names follow `call`.
+- `gate_tool(name, input, ctx, opts) -> allowed, reason, run` — the gate every
+  tool execution passes: re-asserts the active scope from `ctx.bufnr`, runs the
+  before-guards, then `opts.confirm(name, input, ctx)` if given (the loop passes
+  `hook.confirm` + the `hook.before_tool` fan-out). On `allowed`, `run(ctx) ->
+  ok, raw` executes the entry resolved at gate time exactly once (`pcall`'d;
+  a second call raises). On refusal `run` is nil.
+- `after_guards(name, input, result, ok, ctx) -> result, ok` — the after fold.
+- `names(kind?) -> string[]` — sorted. `names_by_seq(kind?)` — registration
+  order. Both include `hook.guard.*`.
+- `remove(name, opts?)` — scope-aware. Runs the `remove` guard op first (a
+  frozen guard name raises before the op runs).
+  Default removes what the ACTIVE scope
   resolves: a session-scoped shadow in the active chain is dropped first
   (un-shadowing the global), else the global entry. `opts.scope = "global"`
   forces the global; `opts.scope = <bufnr>` targets a specific overlay.
   Returns true if something was removed.
+- `ensure_scope(bufnr, parent?)`, `scope_parent(bufnr) -> parent, exists` — a
+  scope's parent is fixed at creation; `ensure_scope` on an existing scope with
+  a different parent raises (one session must not route another's lookups
+  through its overlay). `loop.start` creates every session's scope.
+- `grant(bufnr, key)`, `clear_grants(bufnr, prefix) -> removed[]`,
+  `granted(bufnr) -> copy` — the per-session permission grants (`cap:<cat>`,
+  `editdir:<dir>`, `editfiles:*`, `<toolname>`). `grant` refuses when `bufnr`
+  is the active session AND a tool body is executing on this coroutine, so a
+  tool (eval_lua) cannot award its own session a grant; `hook.confirm`'s
+  remember-grant (runs in the gate), `:StrapsAuto` (no run) and spawn (grants
+  the child) are unaffected.
+- `freeze_guards()`, `guards_frozen()`, `guard_entries() -> copy[]` — see
+  "Tool-call guards".
 - `render(name) -> string` — the entry as an executable Lua chunk (see ui.lua):
   a `require("straps.registry").define{ ... }` call with the source embedded in
   a `[==[ ]==]` long string (bump `=` count if the source contains `]==]`).
-- `dump() -> string` — `render` of every entry concatenated; executing it
-  restores the registry. This is the persistence story.
+- `dump() -> string` — `render` of every global entry (guards included)
+  concatenated; executing it restores the registry. Guard entries replay only
+  before the freeze, i.e. from the global corpus file. This is the persistence
+  story.
 
 Namespacing convention: tools are `tool.<api_name>` where `<api_name>` (the
 part after `tool.`) is what the LLM sees and must match `^[a-zA-Z0-9_-]+$`;
@@ -122,7 +172,9 @@ consults it FIRST: `registry.get("tool." .. name)` — if the entry has a
 input schema has no such property), so an agent-defined tool can never
 self-declare a category like `"read"`; only a trusted definition path —
 `register()`, user config, a trusted `.straps.lua`, or `registry.define`
-called directly from `eval_lua` — can set it.
+called directly from `eval_lua` — can set it. (`eval_lua` is NOT a trusted
+path for `hook.guard.*`: those are frozen before any run.) The copy `get()`
+returns carries `capability` but writing it is inert.
 
 ### Hook fan-out (multi-subscriber hooks)
 
@@ -162,10 +214,12 @@ subscriber N-1's transformation; a raising subscriber is skipped so it cannot
 break the ones after it.
 
 Hooks that never fan out, by design: `hook.confirm` (a single security
-decision with exactly two call sites in loop.lua — fanning out a permission
-gate makes no sense); `hook.on_progress` (hot path — a `merged_entries` scan
-per stream chunk is too costly); `hook.on_define` (recursion risk — it fires
-from inside `define()` itself).
+decision, called from inside `gate_tool`'s confirm callback — fanning out a
+permission gate makes no sense); `hook.on_progress` (hot path — a
+`merged_entries` scan per stream chunk is too costly); `hook.on_define`
+(recursion risk — it fires from inside `define()` itself). `hook.guard.*`
+fans out as a FOLD with the opposite error policy: every guard runs, a
+raising guard BLOCKS (fail closed) — see "Tool-call guards".
 
 ## state.lua — transcript buffer format
 
@@ -412,21 +466,29 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
       block is harmless — parse omits empty text.)
    e. For each `tool_use` block in `resp.content`:
       - `state.append(bufnr, "tool_use", {id=, name=}, pretty_json(input))`
-      - `allowed, reason = registry.call("hook.confirm", name, input, ctx)`
-        If not allowed → tool_result with `is_error=true`, content
-        `"user denied: " .. (reason or "")`, continue to next tool_use.
-      - `registry.call_hooks("hook.before_tool", name, input, ctx)` — fan-out;
-        results/errors ignored.
-      - `ok, result = pcall(registry.call, "tool." .. name, input, ctx)`
-        (unknown tool → error path). Result: string, or table (json-encode),
-        or nil → "ok". Truncate results > `config.max_tool_result_bytes`
-        (default 100_000) with a note.
+      - `allowed, reason, run = registry.gate_tool(name, input, ctx, { confirm = cb })`
+        where `cb` runs `hook.confirm` then the `hook.before_tool` fan-out.
+        Inside the gate: the before-guards (`hook.guard.*`, op `"before"`)
+        run first — any `false` blocks with `"blocked by <guard>: <reason>"`
+        and confirm is never reached; then confirm — not allowed →
+        `"user denied: " .. (reason or "")`. Either way a refusal becomes a
+        tool_result with `is_error=true`; continue to the next tool_use.
+      - `ok, result = run(ctx)` — the entry resolved at gate time, `pcall`'d.
+        Result: string, or table (json-encode), or nil → "ok". Truncate
+        results > `config.max_tool_result_bytes` (default 100_000) with a note.
       - `hook.after_tool` FOLDS over `registry.hook_entries("hook.after_tool")`:
         each subscriber is called `(name, input, result, ok, ctx)` in seq order
         and a non-nil return replaces `result` for the NEXT subscriber (so
         subscriber N sees subscriber N-1's transformation); a raising
         subscriber is `pcall`'d away so it cannot break the ones after it.
+      - `result, ok = registry.after_guards(name, input, result, ok, ctx)` —
+        the after-guards (op `"after"`) see exactly the bytes the model will;
+        `false` blocks, a string replaces.
       - `state.append(bufnr, "tool_result", {id=, is_error=not ok}, tostring(result))`
+      The parallel read-only batch gates EVERY block first (on the run
+      coroutine, so an awaiting guard finishes before any job starts), stubs
+      the batch if the run was cancelled meanwhile, then spawns one job per
+      allowed block running `run` → truncate → after_tool → after_guards.
    f. Stall check (progress-aware soft stop): classify the turn — stalled when
       it issued tool calls AND either every call errored, OR every call was an
       exact repeat of a `(tool, input)` already made this run (i.e. the turn
@@ -940,8 +1002,9 @@ API names (registry names prefixed `tool.`):
   child's hook.confirm, so the category ceiling holds for name grants too.
   A tool-name grant otherwise bypasses category ceilings by design
   (`allow={"eval_lua"}` grants exactly that tool, unprompted).
-  Grants are seeded into `vim.b[child].straps_allowed` as `cap:<category>` /
-  `<toolname>` keys BEFORE the child's loop starts. The child gets a
+  Grants are seeded via `registry.grant(child, key)` as `cap:<category>` /
+  `<toolname>` keys BEFORE the child's loop starts (granting the CHILD from
+  the parent's tool body is permitted; only self-grants are refused). The child gets a
   child-scope `hook.confirm` shadow with unified semantics: read-category
   calls and granted categories/tools run unprompted, EVERYTHING ELSE IS
   DENIED (with a reason naming the child's grants) — no prompt, so an
@@ -1087,13 +1150,13 @@ Default hooks registered here:
   child gate consult these, so they cannot drift.
 - `hook.confirm(name, input, ctx) -> allowed, reason` — auto-allow the
   read-only tools (via `fn.readonly_policy`); honor category grants — a key
-  of the form `cap:<category>` in the per-session allow-set
-  (`vim.b[ctx.bufnr].straps_allowed`) silently permits every call
+  of the form `cap:<category>` in the per-session grant set
+  (`registry.granted(ctx.bufnr)`) silently permits every call
   `fn.capability` classifies into that category (cap: keys are written by
   `:StrapsAuto` and by spawn's `allow`); for everything else
   `vim.fn.confirm("straps: allow <name>?\n<preview of input>", ...)`
-  — "Always this tool" adds the name to the allow-set stored in
-  `vim.b[ctx.bufnr].straps_allowed` (buffer state, on theme). File edits
+  — "Always this tool" adds the name to the grant set via
+  `registry.grant(ctx.bufnr, name)`. File edits
   (write_file/edit_file/patch_file) get path-scoped grants instead of a
   per-tool toggle: "Always in <parent dir>" stores `editdir:<dir>`
   (matched as a realpath prefix, so it covers the subtree), "Always in
@@ -1102,6 +1165,59 @@ Default hooks registered here:
   when found and distinct from the parent dir), and "Always all edits"
   stores `editfiles:*`. Must be called on the main loop (wrap in a
   scheduled await, since we're inside a coroutine driven from callbacks).
+
+**Tool-call guards (`hook.guard.*`)** — the user-installed policy chain in
+front of and behind every tool call and every entry mutation. No guard ships;
+with none installed behavior is identical to a build without the mechanism.
+
+- Signature `(op, ...) -> verdict, reason`, called with FIXED arity per op:
+  `("before", name, input, ctx, info)`, `("after", name, input, result, ok,
+  ctx, info)`, `("define", spec, opts, info)`, `("remove", name, opts, info)`.
+  `info = { active = bufnr|nil, executing = toolname|nil, frozen = bool }`.
+  `active == nil` is common and legitimate (`:lua`, autocmds, tests, deferred
+  callbacks) and is not by itself grounds for a policy. `ctx` is nil on the
+  direct `registry.call("tool.*")` path and for define/remove; a guard that
+  awaits there raises and so blocks.
+- `false` blocks: tool_result `is_error=true`, text
+  `"blocked by <guard>: <reason>"` (distinct from `"user denied: ..."`, so the
+  model can tell policy from the user); for define/remove, `error()` with the
+  same text. For `"after"` a string return replaces the result. Anything else
+  passes. `true` never skips `hook.confirm` — a guard is a floor, not a grant
+  (spawn's readonly enforcement IS a child-scope confirm shadow; an allow
+  verdict would elevate past it).
+- Every guard runs, in seq order, even after a block (complete verdict log);
+  the first block's reason wins. A raising guard blocks with
+  `"guard <name> raised: <err>"`. Each guard call logs
+  `{ ev = "guard", op, name, guard, verdict = pass|block|replace|error, ms }`
+  via `fn.log`.
+- Before/after guards on the loop path run inside the run coroutine and may
+  `ctx.await` (a model-based classifier is a curl). On the parallel read-only
+  batch every block is gated before any job starts.
+- Reentrancy: a guard body that calls `define`/`remove`/`gate_tool`/
+  `call("tool.*")` re-enters the fold; the nested fold raises and the outer op
+  is blocked. Composition (a hook body calling `registry.call("tool.grep")`)
+  is not reentrancy: the inner call runs its own before-guards.
+- Storage and freeze: guards live in a registry-private table, never in
+  entries or scopes (no shadow can hide one); global-only. `freeze_guards()`
+  is one-way and runs when `load_global_registry` returns (any outcome), when
+  `load_project_registry` starts, and in `loop.start`. Install guards in
+  `stdpath("config")/straps/init.lua` (or `init.lua` after `setup()`); a
+  project `.straps.lua` and every run see a frozen chain. `get`/`render`/
+  `dump`/`names` show guards like any entry; `registry_get` renders them — the
+  agent can `read_file` the corpus anyway, and hiding the body would break
+  `:StrapsEdit` and the dump promise.
+- Ceiling: a silently granted `lua`/`exec`, or a hash-trusted
+  `.straps.lua`, is full-privilege Lua in the same state. `debug.*`, `ffi`,
+  `package.loaded`/`require` replacement, `load()` of any source string
+  (including an entry's `source` field — the fn in serializable form),
+  `nvim --server $NVIM --remote-expr` from `bash`, and `nvim_buf_set_lines` on
+  the session buffer (the transcript is not tamper-evident; a verdict is
+  enforcement at the call site, never policy read back from history) all reach
+  past this mechanism. Not hardened against. Their value: circumvention needs
+  one of those signatures, and the before-guard sees the `eval_lua`/`bash`
+  input that carries it. A guard blocking every `define` during a run breaks
+  spawn (it defines the child's confirm shadow inside a run) — scope guards by
+  `op` and name.
 - `hook.after_write` — default is the editor-native lint feedback loop: after
   a write, wait (bounded via `ctx.await`, `config.after_write_diagnostics_ms`,
   default 800ms) for the file's LSP to re-lint, then return its ERROR/WARN
@@ -1485,7 +1601,7 @@ Existing suites must all still pass.
 - `:StrapsSend` (current straps buffer), `:StrapsStop`, `:StrapsContinue`.
 - `:StrapsAuto [off|cat,...]` (session buffers only, `ui.auto`) — grants
   capability categories to the current session by writing `cap:<category>`
-  keys into `vim.b.straps_allowed`: `:StrapsAuto edit,exec` grants those, no
+  keys via `registry.grant`: `:StrapsAuto edit,exec` grants those, no
   arg reports current category grants, `off` clears all cap: keys (leaving
   editdir:/tool grants intact). Completion offers off plus the grantable
   categories from `fn.capability()`.

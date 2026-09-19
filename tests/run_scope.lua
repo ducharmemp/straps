@@ -185,9 +185,9 @@ case("BufWipeout drops the buffer's scope", function()
   registry.define({ name = "tool.doomed", kind = "tool", doc = "d",
     source = [[return function() return "d" end]] })
   registry.set_active_scope(prev)
-  assert(registry.scopes[buf], "scope should exist after a scoped define")
+  assert(select(2, registry.scope_parent(buf)), "scope should exist after a scoped define")
   vim.cmd("bwipeout! " .. buf)
-  assert(registry.scopes[buf] == nil, "scope should be dropped on BufWipeout")
+  assert(select(2, registry.scope_parent(buf)) == false, "scope should be dropped on BufWipeout")
 end)
 
 -- -------------------------------------------------- registry_define the tool
@@ -377,7 +377,8 @@ end
     end
   end
   assert(child, "child session buffer not found")
-  assert(registry.scopes[child] and registry.scopes[child].parent == parent,
+  local cparent, cexists = registry.scope_parent(child)
+  assert(cexists and cparent == parent,
     "child scope should chain under the parent")
   assert(vim.b[child].straps_spawn_depth == 1, "child depth not stamped")
 end)
@@ -1057,7 +1058,7 @@ case("default hook.confirm honors cap: grants and prompts without them", functio
   local hookc = registry.get("hook.confirm")
   assert(hookc, "hook.confirm missing")
   -- With cap:exec granted, bash is allowed without any prompt.
-  vim.b[buf].straps_allowed = { ["cap:exec"] = true }
+  registry.grant(buf, "cap:exec")
   local orig = vim.fn.confirm
   vim.fn.confirm = function() error("prompt reached despite cap:exec grant") end
   local ok, allowed = pcall(function()
@@ -1066,7 +1067,7 @@ case("default hook.confirm honors cap: grants and prompts without them", functio
   vim.fn.confirm = orig
   assert(ok and allowed == true, "cap:exec grant should allow bash: " .. tostring(allowed))
   -- Empty allow-set: falls through to the prompt, which we stub to No (2).
-  vim.b[buf].straps_allowed = {}
+  registry.clear_grants(buf)
   orig = vim.fn.confirm
   vim.fn.confirm = function() return 2 end
   local denied = registry.call("hook.confirm", "bash", { command = "x" }, { bufnr = buf })
@@ -1086,24 +1087,21 @@ case("ui.auto grants, validates, clears and refuses non-session buffers", functi
   assert(vim.b.straps_session == true, "session buffer not current")
 
   ui.auto("edit,exec")
-  local set = vim.b[sess].straps_allowed
+  local set = registry.granted(sess)
   assert(type(set) == "table" and set["cap:edit"] and set["cap:exec"],
     "auto('edit,exec') did not set cap keys")
 
   -- A bogus token changes nothing and notifies an error.
-  local before = vim.inspect(vim.b[sess].straps_allowed)
+  local before = vim.inspect(registry.granted(sess))
   notes = {}
   ui.auto("bogus")
-  assert(vim.inspect(vim.b[sess].straps_allowed) == before, "bogus token mutated the grants")
+  assert(vim.inspect(registry.granted(sess)) == before, "bogus token mutated the grants")
   assert(#notes > 0 and notes[#notes]:find("bogus", 1, true), "bogus token should notify an error")
 
   -- off clears cap: keys but leaves a pre-existing non-cap key intact.
-  local seed = {}
-  for k, v in pairs(vim.b[sess].straps_allowed) do seed[k] = v end
-  seed["editdir:/x"] = true
-  vim.b[sess].straps_allowed = seed
+  registry.grant(sess, "editdir:/x")
   ui.auto("off")
-  local after = vim.b[sess].straps_allowed
+  local after = registry.granted(sess)
   assert(after["editdir:/x"] == true, "off cleared a non-cap key")
   for k in pairs(after) do
     assert(not k:match("^cap:"), "off left a cap key: " .. k)
@@ -1114,7 +1112,7 @@ case("ui.auto grants, validates, clears and refuses non-session buffers", functi
   vim.api.nvim_set_current_buf(plain)
   notes = {}
   ui.auto("edit")
-  assert(vim.b[plain].straps_allowed == nil, "auto set grants on a non-session buffer")
+  assert(next(registry.granted(plain)) == nil, "auto set grants on a non-session buffer")
   assert(#notes > 0 and notes[#notes]:find("not a straps session", 1, true),
     "non-session auto should notify")
 

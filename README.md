@@ -111,6 +111,8 @@ Both files contain Lua and run with your Neovim process's privileges. Review the
 
 Straps is not a sandbox. Approved commands, Lua, file changes, and trusted registry files run with your user privileges.
 
+Every tool call passes a guard chain you install in `stdpath("config")/straps/init.lua` and the agent cannot modify (`:help straps-guards`). No guard ships by default. A guard is a filter and a tripwire, not a boundary: an approved `eval_lua` or `bash` call runs in the same Lua state as the guard.
+
 Providers receive API credentials and full conversation payloads. Session transcripts persist under Neovim's data directory and can contain prompts, source code, and tool output.
 
 Read [SECURITY.md](SECURITY.md) before you use custom endpoints or trust project configuration.

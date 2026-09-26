@@ -5,7 +5,7 @@
 // exists so the buffer's language tree carries the transcript structure —
 // prose blocks inject markdown, tool bodies inject JSON (queries/straps/) —
 // which gives treesitter highlighting and lets language-tree-driven markdown
-// renderers work on straps buffers. tests/run_treesitter.lua pins this
+// renderers work on straps buffers. tests/treesitter_spec.lua pins this
 // grammar's block boundaries to state.list_blocks().
 //
 // The format is line-oriented, so lexing is structured around lines: newlines

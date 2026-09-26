@@ -55,10 +55,10 @@ syntax/straps.vim          -- legacy syntax highlighting (no-parser fallback)
 ftplugin/straps.lua        -- starts treesitter when the straps parser exists
 queries/straps/            -- highlight + injection queries (markdown/JSON)
 tree-sitter-straps/        -- the transcript grammar (generated src/ committed)
-tests/run_registry_state.lua
-tests/run_loop.lua
-tests/run_agents_buffer.lua
-tests/run_reorg.lua
+tests/registry_state_spec.lua
+tests/loop_spec.lua
+tests/agents_buffer_spec.lua
+tests/reorg_spec.lua
 README.md
 ```
 
@@ -275,7 +275,7 @@ grammar in `tree-sitter-straps/` (with `queries/straps/` injecting markdown
 into prose content and JSON into tool bodies). It exists so treesitter
 highlighting and language-tree-driven markdown renderers work on the
 transcript; it never feeds parsing — `state.lua` is the parser of record for
-API messages in all cases. `tests/run_treesitter.lua` pins the two
+API messages in all cases. `tests/treesitter_spec.lua` pins the two
 implementations' block boundaries to each other.
 
 ### Parse → Anthropic messages
@@ -405,7 +405,7 @@ document.
 (new_session / ui.open_session) must set `require("straps").config.session_dir`
 to a fresh `vim.fn.tempname()` near the top, so runs never write to the real
 data dir and stay hermetic. `state.persist` already no-ops on the scratch
-buffers built with nvim_create_buf. New suite `tests/run_session_file.lua`:
+buffers built with nvim_create_buf. New suite `tests/session_file_spec.lua`:
 new_session writes a file whose content equals the buffer and contains the
 system marker; append persists to disk; list_sessions returns it newest-first;
 open_session_file reloads a written transcript into a straps_session buffer
@@ -1122,7 +1122,7 @@ parent through `fn.session_notify`.
 
 ### Layer manifests
 
-The split is organizational only — registration order (and with it the prompt-cache prefix) is preserved exactly, verified by tests/run_reorg.lua's relative-order assertion. Each layer module under lua/straps/layers/ carries an empty fn.system_prompt_layer.<name> skeleton that returns ""; the composer skips empty fragments, reserving the slot for that layer's share of the core prompt. Moving the prose is deliberately deferred — the core prompt's interleaved guidance teaches tools by contrast and position, and carving it up has an unmeasured behavioral cost.
+The split is organizational only — registration order (and with it the prompt-cache prefix) is preserved exactly, verified by tests/reorg_spec.lua's relative-order assertion. Each layer module under lua/straps/layers/ carries an empty fn.system_prompt_layer.<name> skeleton that returns ""; the composer skips empty fragments, reserving the slot for that layer's share of the core prompt. Moving the prose is deliberately deferred — the core prompt's interleaved guidance teaches tools by contrast and position, and carving it up has an unmeasured behavioral cost.
 
 Default hooks registered here:
 
@@ -1566,7 +1566,7 @@ for an agent-defined tool or change the style.
 - `render = true` — master switch; false skips fn.render wiring (raw markers).
 - `tools_expanded = false` — fold tools open by default when true.
 
-### Tests — tests/run_render.lua
+### Tests — tests/render_spec.lua
 
 Build a session buffer with a scripted transcript (user, assistant, a
 tool_use+tool_result pair, system). Then, without a real window where
@@ -1728,7 +1728,7 @@ Existing suites must all still pass.
   which also writes the per-window value, and that value outlives the buffer in
   the window: a split off the session window, or any file swapped into it,
   would then render the user's source with the transcript's fold and conceal
-  rules. `tests/run_render.lua` pins this on the `&g:`/`&l:` dimension and
+  rules. `tests/render_spec.lua` pins this on the `&g:`/`&l:` dimension and
   rejects the `:set` form anywhere in the source.
 - Session navigation: `ui.goto_turn` (`]]`/`[[`) and `ui.outline` (`gO`), wired
   by `ui.map_navigation`. See [Navigation](#navigation-turn-motions--outline).
@@ -1755,7 +1755,7 @@ flag's on/off state; on but sentinel entry missing is an error, off is info),
 model (model/effort pairing —
 the mismatch that 400s a request), and active runs (a warning that quitting
 cancels in-flight sessions). It is read-only and touches no windows.
-`tests/run_health.lua` stubs `vim.health.*` to collect the report and asserts
+`tests/health_spec.lua` stubs `vim.health.*` to collect the report and asserts
 the healthy and broken-state paths (no setup, unwritable dir) both classify
 without throwing.
 
@@ -1803,15 +1803,15 @@ gateable, deliberately: `files`/`search`/`exec` are the product's identity;
 straps less restrictive by default; `agents`/`spawn` are entangled with
 state/loop plumbing and are a future seam, not a clean cut today.
 
-## Tests (plain asserts, run with `nvim --headless -l tests/<f>.lua`; exit 0/1, print PASS/FAIL per case)
+## Tests (busted specs under nlua, run with `busted tests/<f>_spec.lua`; plain `assert` bodies, one `it` per case)
 
-- `run_registry_state.lua`: define/call; redefine changes behavior at existing
+- `registry_state_spec.lua`: define/call; redefine changes behavior at existing
   call sites (late binding); bad source rejected & old entry kept; render→
   execute round-trip; dump/restore; transcript: new_session → append user/
   assistant/tool_use/tool_result → parse produces correct Anthropic messages
   (roles merged, ids intact); escaping round-trips a content line that starts
   with `%%[straps:`; empty trailing user dropped.
-- `run_loop.lua`: register a stub `fn.provider` (redefine it — this IS the
+- `loop_spec.lua`: register a stub `fn.provider` (redefine it — this IS the
   architecture test) that scripts two turns: (1) returns a tool_use for a stub
   tool `ping`, (2) returns plain text "done". Stub `hook.confirm` to
   auto-allow. Run `loop.start`, wait via `vim.wait` for completion, assert the
@@ -1826,7 +1826,7 @@ state/loop plumbing and are a future seam, not a clean cut today.
   an `is_error` result and restores the trailing user block; pairing is per-id
   across a partly-finished batch and idempotent; heal declines while a run is
   live; heal leaves a hand-mangled transcript and a well-formed one untouched.
-- `run_model_note.lua`: `fn.model_note` — the note's shape (a `# Model`
+- `model_note_spec.lua`: `fn.model_note` — the note's shape (a `# Model`
   section: label + id for a listed model, id alone for an unlisted one, effort
   defaulting to "off", the subagent inheritance guidance and the pointer at
   `tool.models`); nil for non-session/dead buffers and bad ctx; the loop
@@ -1972,7 +1972,7 @@ overwrite. Two topologies, no new files on disk:
   process" (naming it would need a rendezvous file on disk — deliberately not
   done). WorkspaceEdit save paths, bulk_replace, and state.persist are not
   covered.
-- Tests: `tests/run_reconcile.lua`.
+- Tests: `tests/reconcile_spec.lua`.
 
 Multiplayer AWARENESS (fn.peer_agents, tool.agents, hook.on_run_start,
 skill.multiplayer — layers/agents.lua, prose in provider.lua): detection above tells an
@@ -2010,7 +2010,7 @@ Neovim shares no buffer state to read.
   mid-task code alone, treat the user's view and the quickfix list as
   single-occupancy, and hand off with `loop.steer` (a no-op on an idle peer)
   rather than racing.
-- Tests: `tests/run_multiplayer.lua`.
+- Tests: `tests/multiplayer_spec.lua`.
 
 Model AWARENESS (`fn.model_note` — layers/agents.lua, call site in loop.lua): the
 winbar has always told the USER which model a session runs on; the agent itself
@@ -2062,7 +2062,7 @@ parent's (tools.lua) — a real decision the agent had no inputs for.
   children) and in the loop's `PARALLEL_READONLY` set. Both the note and the
   prompt's `# Subagents` bullet point at it, as the multiplayer notice points at
   `tool.agents`.
-- Tests: `tests/run_model_note.lua`.
+- Tests: `tests/model_note_spec.lua`.
 
 ### 3. Quickfix + cdo (tools.lua grep + diagnostics + new bulk_replace)
 
@@ -2093,7 +2093,7 @@ parent's (tools.lua) — a real decision the agent had no inputs for.
   a prior failure). Both stdout and stderr are fed to the parser (compilers use
   stderr, many runners stdout). No efm match on non-empty output → a note
   telling the agent to pass an explicit errorformat. Confirm-gated (it runs
-  commands), like bash. Tests in `tests/run_run_quickfix.lua`: file:line:col
+  commands), like bash. Tests in `tests/tool_run_quickfix_spec.lua`: file:line:col
   parsing + open, clean-run clears, prose-hint, stderr capture, open=false,
   empty-command error, and the summary cap keeping the full list.
 
@@ -2116,7 +2116,7 @@ else global `:cdo <body>`). `grep`, `diagnostics{quickfix}`, `run_quickfix`,
 `set_findings` write through `set_locations`; `bulk_replace` reads through
 `get_locations` and edits through `locations_do`, and its result names whichever
 list ("loclist"/"quickfix"). Tools' user-facing summaries say `:lnext/:cnext`
-accordingly. Tested in `run_quickfix.lua`: two on-screen sessions get isolated
+accordingly. Tested in `quickfix_spec.lua`: two on-screen sessions get isolated
 per-window lists (and the global qf list stays untouched), bulk_replace on
 session A edits only A's file, and a windowless session falls back to global.
 

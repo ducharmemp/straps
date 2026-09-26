@@ -210,7 +210,7 @@ What it buys, all agent-facing (no human need be watching):
   different model/effort (per-buffer overrides already exist) — a controlled
   experiment instead of folklore.
 
-**Partly delivered:** `tool.transcript_excise` (tools.lua, tests/run_excise.lua)
+**Partly delivered:** `tool.transcript_excise` (tools.lua, tests/excise_spec.lua)
 ships the reclaim half of this — an agent excising a named dead end from its own
 transcript, or a parent doing it to a child's, with a visible receipt per block
 and the system block plus the turn in flight locked. It does not fork: there is
@@ -304,7 +304,7 @@ is a rewind I cannot remember choosing: if the `keep` receipt is bad I will
 re-explore the same dead end forever, so `timelines` should surface
 automatically at a fork point rather than be left to the agent's judgment.
 
-`/tmp/probe_surgery.lua` is the working proof and is ~90% of `tests/run_surgery.lua`.
+`/tmp/probe_surgery.lua` is the working proof and is ~90% of `tests/surgery_spec.lua`.
 
 ## The multiverse buffer: N competing implementations as undo-tree branches
 

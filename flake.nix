@@ -102,28 +102,36 @@
         tests = pkgs.stdenvNoCC.mkDerivation {
           name = "straps-tests";
           src = self;
-          nativeBuildInputs = [ pkgs.neovim pkgs.git pkgs.ripgrep pkgs.curl ];
+          # busted + nlua: `busted --lua nlua` (via .busted) runs each spec
+          # inside a headless Neovim, so the specs see vim.* like the plugin does.
+          nativeBuildInputs = [
+            pkgs.neovim pkgs.git pkgs.ripgrep pkgs.curl
+            pkgs.luajitPackages.busted pkgs.luajitPackages.nlua
+          ];
           dontBuild = true;
           doCheck = true;
           checkPhase = ''
             export HOME=$TMPDIR
             export XDG_DATA_HOME=$TMPDIR/data XDG_STATE_HOME=$TMPDIR/state XDG_CACHE_HOME=$TMPDIR/cache
-            # stdenvNoCC has no C compiler, so run_treesitter.lua's local
+            # stdenvNoCC has no C compiler, so treesitter_spec.lua's local
             # compile fallback cannot run here — without this parser it would
             # silently SKIP and the grammar would go untested in CI. The json
             # parser is not bundled with Neovim (markdown is); provide it so
             # the tool-body injection assertions run instead of skipping.
             install -Dm755 ${mkGrammar pkgs}/parser parser/straps.so
             install -Dm755 ${pkgs.tree-sitter-grammars.tree-sitter-json}/parser parser/json.so
-            # Both parsers were just installed above, so run_treesitter.lua's
+            # Both parsers were just installed above, so treesitter_spec.lua's
             # soft skip-on-missing-parser paths must be hard failures here —
             # a broken install must not leave the grammar untested with CI
             # green. The test enforces that itself when this is set.
             export STRAPS_TS_REQUIRED=1
+            # One busted process (one headless Neovim) per spec: the specs
+            # assume a fresh editor — buffers, autocmds, PATH, the registry
+            # singleton — and would leak state into each other otherwise.
             fail=0
-            for t in tests/run_*.lua; do
+            for t in tests/*_spec.lua; do
               echo "== $t"
-              nvim --headless -l "$t" || fail=1
+              busted "$t" || fail=1
             done
             [ "$fail" = 0 ]
           '';
@@ -133,7 +141,10 @@
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          packages = [ pkgs.neovim pkgs.ripgrep pkgs.curl ];
+          packages = [
+            pkgs.neovim pkgs.ripgrep pkgs.curl
+            pkgs.luajitPackages.busted pkgs.luajitPackages.nlua
+          ];
         };
       });
     };

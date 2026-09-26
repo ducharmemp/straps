@@ -4,25 +4,42 @@
 
 Use Neovim 0.11 or newer. Put `curl` on `PATH`. Ripgrep is optional.
 
-## Tests
-
-Run one focused test while you work:
+The tests run under [busted](https://github.com/lunarmodules/busted) with the
+[nlua](https://github.com/mfussenegger/nlua) interpreter, which runs each spec
+inside a headless Neovim. Install both for Lua 5.1 (Neovim's LuaJIT ABI):
 
 ```sh
-nvim --headless -l tests/run_provider.lua
+luarocks --lua-version 5.1 install busted
+luarocks --lua-version 5.1 install nlua
 ```
 
-Run every test before you submit a change:
+With Nix, `nix develop` provides both.
+
+## Tests
+
+Run one focused spec while you work:
+
+```sh
+busted tests/provider_spec.lua
+```
+
+Run every spec before you submit a change, one busted process per file:
 
 ```sh
 fail=0
-for test in tests/run_*.lua; do
-  nvim --headless -l "$test" || fail=1
+for spec in tests/*_spec.lua; do
+  busted "$spec" || fail=1
 done
 exit "$fail"
 ```
 
-The tree-sitter test builds its parser when a C compiler is available. CI requires the parser and JSON injection tests.
+Each spec assumes a fresh Neovim (buffers, autocmds, `PATH`, the registry
+singleton), so do not run them in one process. The root `.busted` selects
+`nlua` and the `tests/` directory. A spec's `step(...)` blocks sequence fixture
+code between `it` cases in document order; `--shuffle`, `--sort`, `--lazy` and
+`--repeat` break that order and are unsupported.
+
+The tree-sitter spec builds its parser when a C compiler is available. CI requires the parser and JSON injection tests.
 
 With Nix, run:
 

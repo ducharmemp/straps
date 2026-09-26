@@ -47,15 +47,20 @@ the new source into this session with `registry_define`.
 # Verify headless, not on yourself
 
 A fresh headless Neovim is the only clean reload of edited source, and
-the tests provide exactly that. Each `tests/run_*.lua` is self-contained:
+the tests provide exactly that. Each `tests/*_spec.lua` is a self-contained
+busted spec, run by `nlua` inside a headless Neovim (the root `.busted`
+selects both):
 
-    nvim --headless -l tests/run_<area>.lua
+    busted tests/<area>_spec.lua
 
 The header of each file states its exact run line. While iterating, run
-the test nearest your change; run the full set before calling the work
-done. There is no in-repo aggregate runner — loop over `tests/run_*.lua`
-from the repo root. (`nix flake check` also runs them all, but against
-the flake's tracked source, not your working tree.)
+the spec nearest your change; run the full set before calling the work
+done. Run one busted process per file — loop over `tests/*_spec.lua` from
+the repo root; a bare `busted` runs them all in ONE Neovim and they leak
+state into each other. (`nix flake check` also runs them all, but against
+the flake's tracked source, not your working tree.) Specs use
+`step(function() ... end)` to sequence fixture code between `it` cases in
+document order, so busted's `--shuffle`/`--sort`/`--lazy` are unsupported.
 
 Hot-loading your edit into this session with `registry_define` is a live
 experiment on the machinery mid-flight. Session scope makes it
@@ -77,7 +82,7 @@ permission path; verify those headless only.
   `lua/straps/provider.lua` (`SYSTEM_PROMPT_*_SRC`), including the
   project layer that put this file in front of you. That layer injects
   this file verbatim, capped at 20000 bytes — keep it well under.
-  `tests/run_prompt.lua` covers the assembly.
+  `tests/prompt_spec.lua` covers the assembly.
 - Target Neovim >= 0.11, LuaJIT / Lua 5.1 semantics, no dependencies
   beyond `curl`. No plenary.
 - Version control is jujutsu (`jj`), colocated with git. Use jj commands,

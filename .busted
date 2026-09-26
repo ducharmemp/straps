@@ -1,0 +1,1 @@
+return { _all = { lua = "nlua", ROOT = { "tests" }, pattern = "_spec" } }

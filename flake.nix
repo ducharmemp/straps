@@ -104,8 +104,9 @@
           src = self;
           # busted + nlua: `busted --lua nlua` (via .busted) runs each spec
           # inside a headless Neovim, so the specs see vim.* like the plugin does.
+          # procps: agent_ux_spec's process-tree kill cases poll pgrep/pkill.
           nativeBuildInputs = [
-            pkgs.neovim pkgs.git pkgs.ripgrep pkgs.curl
+            pkgs.neovim pkgs.git pkgs.ripgrep pkgs.curl pkgs.procps
             pkgs.luajitPackages.busted pkgs.luajitPackages.nlua
           ];
           dontBuild = true;

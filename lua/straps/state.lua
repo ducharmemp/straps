@@ -417,7 +417,8 @@ end
 
 --- Open an existing transcript file as a session buffer. Reuses the buffer if
 --- one already names the path, else bufadd + bufload; applies the session
---- buffer options. Does not modify content. Returns the bufnr.
+--- buffer options (buftype="", swapfile=false, filetype="straps",
+--- fsync=false on 0.12+). Does not modify content. Returns the bufnr.
 function M.open_session_file(path)
   local abspath = vim.fn.fnamemodify(path, ":p")
   local bufnr = vim.fn.bufnr(abspath)
@@ -429,6 +430,9 @@ function M.open_session_file(path)
   vim.bo[bufnr].swapfile = false
   vim.bo[bufnr].filetype = "straps"
   vim.b[bufnr].straps_session = true
+  if vim.fn.has("nvim-0.12") == 1 then
+    vim.bo[bufnr].fsync = false
+  end
   return bufnr
 end
 
@@ -482,6 +486,26 @@ function M.ensure_trailing_user(bufnr)
     return
   end
   M.append(bufnr, "user", nil, "") -- appends + persists
+end
+
+--- Fill the trailing EMPTY user block with text (the launch path: an
+--- instruction from the command line, stdin piped into the session). Lines go
+--- through escape_line like append's, so piped text that reads as a marker
+--- cannot forge a block. Errors unless the last block is an empty user block.
+function M.seed_user(bufnr, text)
+  local blocks = parse_blocks(bufnr)
+  local last = blocks[#blocks]
+  if not (last and last.kind == "user" and last.content == "") then
+    error("straps.state.seed_user: the transcript does not end on an empty user block", 0)
+  end
+  local lines = {}
+  for _, l in ipairs(vim.split(text, "\n", { plain = true })) do
+    lines[#lines + 1] = escape_line(l)
+  end
+  with_pin(bufnr, function()
+    vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, lines)
+  end)
+  M.persist(bufnr)
 end
 
 --- Repair a transcript that was interrupted mid-tool (Neovim killed, or the
@@ -565,12 +589,18 @@ end
 local session_n = 0
 
 -- Apply the durable session buffer options (buftype="" so :w / persist work).
+-- On nvim >= 0.12, also sets fsync=false: the buffer is the state and the
+-- file is a mirror rewritten at every block boundary, so persist()'s :write
+-- need not fsync each time.
 local function apply_session_opts(bufnr)
   vim.bo[bufnr].buftype = ""
   vim.bo[bufnr].bufhidden = "hide"
   vim.bo[bufnr].swapfile = false
   vim.bo[bufnr].filetype = "straps"
   vim.b[bufnr].straps_session = true
+  if vim.fn.has("nvim-0.12") == 1 then
+    vim.bo[bufnr].fsync = false
+  end
 end
 
 --- Create a durable, file-backed session buffer: buffer name = an absolute

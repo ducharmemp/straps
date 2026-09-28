@@ -71,9 +71,36 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 3. COMMANDS						*straps-commands*
 
 							*:Straps*
-:Straps			Open a new session buffer in a split and put the
+:Straps[!] [{cats}] [-- {instruction}]
+			Open a new session buffer in a split and put the
 			cursor on the trailing user block. See
-			|straps-session|.
+			|straps-session|. {cats} pre-grants permission
+			categories to the new session (comma or space
+			separated; `all` grants every grantable category), the
+			same grants |:StrapsAuto| makes. Text after `--` seeds
+			the user block. `!` sends that block at once (a
+			"nothing to send" notice when it is empty). An
+			unknown category is an error and opens nothing.
+
+			From the shell, this starts Neovim in a working
+			session: >sh
+	printf 'context' | nvim - +'Straps! edit,exec -- fix the failing test'
+<			Two things happen only during startup (inside `+cmd`
+			or `-c`): the text piped to `nvim -` is appended to
+			the seeded request (after a blank line; whitespace-only
+			input is dropped) and its buffer is wiped, and when
+			no window modifier was given and the startup window
+			shows that stdin buffer or the empty [No Name] buffer,
+			the session takes it over instead of splitting.
+			`nvim file +Straps` and `nvim +'vertical Straps'`
+			split. Piped text is escaped like any block content,
+			so a line that reads as a transcript marker cannot
+			forge a block. A plugin manager that loads straps on
+			first use of the `Straps` command sources the plugin
+			after Neovim read stdin, so the piped text is not
+			captured; load straps at startup to use it.
+			|:StrapsResume| takes no categories or instruction;
+			use |:StrapsAuto| on a resumed session.
 
 							*:StrapsResume*
 :StrapsResume [{name}]	Resume a saved session. No argument resumes the most
@@ -902,6 +929,10 @@ Grant categories to the current session with |:StrapsAuto|: >vim
 	:StrapsAuto             " report current category grants
 	:StrapsAuto off         " clear all category grants
 <
+A new session can start with grants: `:Straps edit,exec` (or `:Straps all`)
+grants them before the first request, so a shell can start Neovim in an
+auto-mode session: `nvim +'Straps! exec -- run the tests'`. See |:Straps|.
+
 Grants are stored as `cap:<category>` keys in the registry's per-session grant
 set (`registry.granted(bufnr)`; not a buffer variable, which any Lua the agent
 runs could write). `off` clears

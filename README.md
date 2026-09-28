@@ -65,6 +65,16 @@ The transcript is the session state. You can use normal Vim editing to revise hi
 
 Straps renders the transcript as a conversation and folds tool calls by default. The underlying text remains visible with `:set conceallevel=0`.
 
+### From the shell
+
+Start Neovim in a working session:
+
+```sh
+printf 'context for the task' | nvim - +'Straps! edit,exec -- fix the failing test'
+```
+
+`edit,exec` grants those permission categories to the session, the same set `:StrapsAuto` accepts (`edit`, `delete`, `exec`, `lua`, `net`, `spawn`; `all` grants every one; `registry_define` and agent-defined tools still prompt). The text after `--` is the request; piped stdin is appended to it. `!` sends the request at once. Each part is optional: `nvim +Straps` opens an empty session in the startup window. A plugin manager that loads straps on first use of the `Straps` command misses the piped text; load it at startup for the stdin form. See `:help :Straps`.
+
 ## Malleable tooling
 
 The registry contains four entry types:
@@ -96,7 +106,7 @@ Both files contain Lua and run with your Neovim process's privileges. Review the
 
 | Command | Purpose |
 | --- | --- |
-| `:Straps` | Open a new session. |
+| `:Straps[!] [{cats}] [-- {instruction}]` | Open a new session. `{cats}` pre-grants permission categories (`edit,exec`, `all`), `-- {instruction}` seeds the request, `!` sends it. |
 | `:StrapsSend` | Send the current request or steer an active run. |
 | `:StrapsStop` | Stop the active run. |
 | `:StrapsContinue [instruction]` | Continue a stopped run. |

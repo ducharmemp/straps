@@ -657,15 +657,100 @@ function M.show_session(bufnr, split_cmd)
   return bufnr
 end
 
+--- The grantable permission categories (fn.capability() with no args).
+function M.grantable_categories()
+  return require("straps.registry").try_call("fn.capability") or {}
+end
+
+-- nil when every token is a grantable category, else the error message.
+local function validate_categories(tokens)
+  local grantable = M.grantable_categories()
+  local is_grantable = {}
+  for _, c in ipairs(grantable) do is_grantable[c] = true end
+  for _, tok in ipairs(tokens) do
+    if not is_grantable[tok] then
+      return "unknown auto category " .. vim.inspect(tok)
+        .. " (valid: " .. table.concat(grantable, ", ") .. ")"
+    end
+  end
+  return nil
+end
+
 --- Open a fresh session: a plain transcript buffer in a split, cursor on the
 --- trailing (empty) user block. <CR> in normal mode sends it; while a run is
 --- active <CR> prompts to steer instead. Ordinary vim editing works
 --- throughout — including editing earlier history before sending.
 --- @param split_cmd string? split command to open the window with (see
 ---   M.show_session); nil/"" → horizontal "split".
-function M.open_session(split_cmd)
-  local bufnr = require("straps.state").new_session()
-  return M.show_session(bufnr, split_cmd)
+--- @param opts table? launch options (the `:Straps [cats] [-- text]` form):
+---   grants = { "edit", ... } permission categories granted to the new
+---   session (validated before anything is created); instruction = text to
+---   seed the trailing user block with; send = true starts the run when the
+---   seeded block is non-empty; explicit_split = true when the caller passed a
+---   window modifier, which disables the startup window reuse below.
+---   During startup (v:vim_did_enter == 0, i.e. `nvim +Straps`) the text of
+---   the stdin buffer (`nvim -`, recorded by plugin/straps.lua) is appended to
+---   the seed and that buffer is wiped, and the session takes over the
+---   startup window instead of splitting when that window shows the stdin
+---   buffer or the empty [No Name] buffer.
+function M.open_session(split_cmd, opts)
+  opts = opts or {}
+  local grants = opts.grants or {}
+  if #grants > 0 then
+    local err = validate_categories(grants)
+    if err then
+      return notify_err("straps: " .. err)
+    end
+  end
+  local state = require("straps.state")
+  local registry = require("straps.registry")
+  local starting = vim.v.vim_did_enter == 0
+
+  local stdin_buf = vim.g.straps_stdin_buf
+  if not (starting and type(stdin_buf) == "number" and vim.api.nvim_buf_is_loaded(stdin_buf)) then
+    stdin_buf = nil
+  end
+  local seed = opts.instruction or ""
+  if stdin_buf then
+    local piped = table.concat(vim.api.nvim_buf_get_lines(stdin_buf, 0, -1, false), "\n")
+    if piped:match("%S") then
+      seed = seed ~= "" and (seed .. "\n\n" .. piped) or piped
+    end
+    vim.g.straps_stdin_buf = nil
+  end
+
+  local bufnr = state.new_session()
+  for _, c in ipairs(grants) do
+    registry.grant(bufnr, "cap:" .. c)
+  end
+  if seed ~= "" then
+    state.seed_user(bufnr, seed)
+  end
+
+  local cur = vim.api.nvim_get_current_buf()
+  local reuse = starting and not opts.explicit_split and (
+    cur == stdin_buf
+    or (vim.api.nvim_buf_get_name(cur) == "" and not vim.bo[cur].modified
+      and vim.api.nvim_buf_line_count(cur) == 1
+      and vim.api.nvim_buf_get_lines(cur, 0, 1, false)[1] == "")
+  )
+  if stdin_buf then
+    vim.bo[stdin_buf].bufhidden = "hide"
+  end
+  M.show_session(bufnr, reuse and "none" or split_cmd)
+  if stdin_buf then
+    pcall(vim.api.nvim_buf_delete, stdin_buf, { force = true })
+  end
+
+  if opts.send then
+    if (state.last_user_text(bufnr) or "") ~= "" then
+      require("straps.loop").start(bufnr)
+    else
+      vim.notify("straps: nothing to send — give :Straps! an instruction after `--` or pipe stdin",
+        vim.log.levels.WARN)
+    end
+  end
+  return bufnr
 end
 
 --- Resume a durable session: same as open_session, but the transcript comes
@@ -1007,7 +1092,7 @@ end
 
 local AGENTS_BUFNAME = "straps://agents"
 local agents_ns = vim.api.nvim_create_namespace("straps_agents")
-local AGENTS_WIDTH = 76 -- one fixed line width for rules and rows (legibility beats matching the transcript rule width; fixed, not window-derived, because the debounce can render a windowless buffer)
+local AGENTS_WIDTH = 76 -- one fixed line width for rules and rows (legibility beats matching the transcript rule width; fixed, not window-derived, because fn.agents_render is a redefinable registry fn and can be called on a windowless buffer)
 -- The keymap legend, shared by the agents winbar and the first-line fallback
 -- (config.agents_winbar = false) so the two can never drift.
 local AGENTS_KEYS = "<CR> open   x stop   i steer   r rename   R refresh"
@@ -1114,7 +1199,8 @@ function M._agents_render(bufnr)
     -- The keymap legend lives in the window's winbar (fn.agents_winbar via
     -- ui.winbar). With config.agents_winbar = false it is the FIRST buffer
     -- line instead — on screen without scrolling either way. Config-derived,
-    -- never window-derived: the debounce can render a windowless buffer.
+    -- never window-derived: fn.agents_render is a redefinable registry fn
+    -- and can be called on a windowless buffer.
     do
       local ok_s, s = pcall(require, "straps")
       if ok_s and type(s) == "table" and s.config and s.config.agents_winbar == false then
@@ -1253,12 +1339,13 @@ local function agents_do_render(bufnr)
   require("straps.registry").try_call("fn.agents_render", bufnr)
 end
 
---- Debounced re-render of the agents buffer, if one is open. Called on every
---- progress event of every run (loop.progress) and on BufEnter — cheap no-op
---- when no agents buffer exists.
+--- Debounced re-render of the agents buffer, if one is displayed. Called on every
+--- progress event of every run (loop.progress) and on BufEnter/BufWinEnter —
+--- no-op unless the agents buffer is displayed in a window (any tabpage); a
+--- hidden buffer re-renders on BufEnter/BufWinEnter.
 function M.agents_refresh()
   local buf = find_agents_buf()
-  if not buf then
+  if not buf or #vim.fn.win_findbuf(buf) == 0 then
     return
   end
   if not agents_timer then
@@ -1270,7 +1357,7 @@ function M.agents_refresh()
     -- re-check validity inside, exactly like schedule_render does.
     vim.schedule(function()
       local b = find_agents_buf()
-      if b and vim.api.nvim_buf_is_valid(b) then
+      if b and vim.api.nvim_buf_is_valid(b) and #vim.fn.win_findbuf(b) > 0 then
         agents_do_render(b)
       end
     end)
@@ -1385,8 +1472,10 @@ function M.open_agents(split_cmd)
     map("R", "R")
 
     local group = vim.api.nvim_create_augroup("StrapsAgentsBuf" .. bufnr, { clear = true })
-    -- BufEnter catches saved/idle churn that emits no progress events.
-    vim.api.nvim_create_autocmd("BufEnter", {
+    -- BufEnter catches saved/idle churn that emits no progress events;
+    -- BufWinEnter catches a window opened without entering it (e.g.
+    -- nvim_open_win with enter=false).
+    vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
       group = group,
       buffer = bufnr,
       callback = function() M.agents_refresh() end,
@@ -2222,16 +2311,11 @@ function M.auto(arg)
     return vim.notify("straps: auto grants cleared: " .. (cleared or "none"))
   end
 
-  local grantable = registry.try_call("fn.capability") or {}
-  local is_grantable = {}
-  for _, c in ipairs(grantable) do is_grantable[c] = true end
   local tokens = {}
   for tok in arg:gmatch("[^%s,]+") do tokens[#tokens + 1] = tok end
-  for _, tok in ipairs(tokens) do
-    if not is_grantable[tok] then
-      return notify_err("straps: unknown auto category " .. vim.inspect(tok)
-        .. " (valid: " .. table.concat(grantable, ", ") .. ")")
-    end
+  local verr = validate_categories(tokens)
+  if verr then
+    return notify_err("straps: " .. verr)
   end
   local ok, err = pcall(function()
     for _, tok in ipairs(tokens) do registry.grant(buf, "cap:" .. tok) end

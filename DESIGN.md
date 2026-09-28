@@ -335,7 +335,9 @@ transcript format is already plain text, so buffer content == file content.
 - `state.session_dir()` — ensure + return the dir (config-aware, pcall-safe).
 - `state.new_session()` — now file-backed: buffer name = the path,
   `buftype=""` (normal, so `:w` works), swapfile=false, bufhidden=hide,
-  filetype=straps, `vim.b.straps_session=true`; append system + trailing user
+  fsync=false (buffer-local, nvim >= 0.12 only: the option is global on
+  0.11 and `vim.bo` throws), filetype=straps, `vim.b.straps_session=true`;
+  append system + trailing user
   as today; then persist. **Fallback:** if the dir can't be created/written
   (pcall fails), degrade to today's ephemeral buffer (buftype=nofile,
   `straps://session/n`) so the harness still runs — notify once.
@@ -345,7 +347,15 @@ transcript format is already plain text, so buffer content == file content.
   file-backed** (`buftype == ""` and has a name) — so the scratch buffers the
   tests create directly are never touched. Also a no-op when the buffer is not
   `modified`, so no-op block boundaries do not churn the file's mtime (which
-  would reorder `list_sessions`). pcall-wrapped.
+  would reorder `list_sessions`). pcall-wrapped. The write skips fsync
+  (buffer-local `fsync=false`, set with the other session options). The
+  buffer is the state, and the file is a mirror rewritten at every block
+  boundary. Measured on a 465KB transcript, fsync took ~8ms of a 10-18ms
+  write, and every tool call of every running agent paid it. A Neovim crash
+  loses nothing, because the kernel holds the written data; an OS crash or
+  power loss can lose writes made since the kernel's last flush. Neovim
+  still flushes on CursorHold and abnormal exit (`:help 'fsync'`). A manual
+  `:w` on a transcript skips fsync too.
 - Persist is called from `state.append` and `state.ensure_trailing_user`
   (block boundaries), NOT from `append_text` (per-delta streaming). A crash
   mid-stream loses only the in-flight assistant text since the last block; the
@@ -354,8 +364,9 @@ transcript format is already plain text, so buffer content == file content.
   session_dir, sorted mtime desc; pcall-safe, empty on error.
 - `state.open_session_file(path)` — reuse the buffer if one already names the
   path (`vim.fn.bufnr(path) ~= -1`), else `bufadd`+`bufload`; apply the
-  session buffer setup (buftype="", swapfile=false, filetype=straps,
-  straps_session=true); return bufnr. Does not modify content.
+  session buffer setup (buftype="", swapfile=false, fsync=false on 0.12+,
+  filetype=straps, straps_session=true); return bufnr. Does not modify
+  content.
 - `state.heal_interrupted(bufnr)` — the cost of persisting at block boundaries:
   a crash mid-tool leaves a `tool_use` on disk whose `tool_result` was never
   written, and the API rejects an unpaired `tool_use`, so that saved session
@@ -1598,6 +1609,38 @@ Existing suites must all still pass.
   through `ui.show_session`/`open_session`/`resume_session`/`open_agents`
   (default `"split"`), derived in the command from `opts.smods` — so no
   config knob is needed.
+- `:Straps[!] [{cats}] [-- {instruction}]` — the launch form, so a shell
+  can start Neovim in a working session:
+  `printf 'ctx' | nvim - +'Straps! edit,exec -- fix the failing test'`.
+  The command splits `opts.args` at the first whitespace-delimited `--`:
+  tokens before it are permission categories (comma/space separated, `all`
+  = every `fn.capability()` category, expanded in the command), text after
+  it is the instruction, trimmed at both ends and otherwise untouched.
+  `ui.open_session(split_cmd, opts)` takes
+  `{ grants, instruction, send, explicit_split }`: categories are validated
+  BEFORE any buffer exists (bad token → notify, nothing created), granted
+  as `cap:<c>` via `registry.grant` (the `:StrapsAuto` path, so
+  `hook.confirm` and guards are untouched; `define`/`other` still prompt),
+  the instruction goes into the trailing user block through
+  `state.seed_user` (escape_line'd, so piped text reading as a marker cannot
+  forge a block; refuses unless the last block is an empty user block), and
+  `!` calls `loop.start` when that block is non-empty (else a "nothing to
+  send" notify). Two paths run ONLY during startup (`v:vim_did_enter == 0`,
+  i.e. inside `+cmd`/`-c`), so interactive `:Straps` and every existing
+  caller/test keep split semantics: (1) stdin: plugin/straps.lua records
+  the `nvim -` buffer via a `StdinReadPost` autocmd into
+  `vim.g.straps_stdin_buf` (VimEnter clears it); open_session appends its
+  text after the instruction (blank line between; skipped when whitespace
+  only), sets `bufhidden=hide` on it (so the takeover below survives
+  `set nohidden`), then force-deletes it; (2) window reuse: when no
+  `<mods>` were given and the current buffer is the stdin buffer or the
+  empty unnamed startup buffer, the session takes over that window via
+  `show_session(bufnr, "none")`; `nvim file +Straps` still splits. Caveat:
+  a plugin manager that loads straps on first use of the `Straps` command
+  sources plugin/straps.lua after `StdinReadPost` fired, so stdin is not
+  captured; load at startup for the stdin form. `:StrapsResume` takes no
+  categories. Tested in `tests/launch_spec.lua`, including two child-nvim
+  startup cases with HOME/XDG redirected.
 - `:StrapsSend` (current straps buffer), `:StrapsStop`, `:StrapsContinue`.
 - `:StrapsAuto [off|cat,...]` (session buffers only, `ui.auto`) — grants
   capability categories to the current session by writing `cap:<category>`
@@ -1631,8 +1674,9 @@ Existing suites must all still pass.
   is installed as the `ui.winbar()` dispatcher (below).
   `config.agents_winbar = false` skips the winbar install and
   `fn.agents_render` puts the legend on the FIRST buffer line instead
-  (config-derived, never window-derived: the debounce can render a windowless
-  buffer). A section with zero rows is omitted; when all are empty a single
+  (config-derived, never window-derived: `fn.agents_render` is a redefinable
+  registry fn and can be called on a windowless buffer). A section with zero
+  rows is omitted; when all are empty a single
   empty-state line shows. A line→entry map
   (`{ [lnum] = { kind, bufnr?, path? } }`) is a MODULE-LEVEL Lua table keyed
   by bufnr, NOT `vim.b` (which cannot hold a sparse integer-keyed table
@@ -1650,11 +1694,17 @@ Existing suites must all still pass.
   from the user commands, still splits.) Two refresh seams keep it live: the loop's
   internal `progress()` calls `ui.agents_refresh()` on any session's progress
   event (mechanism beside the phase mirror, not the redefinable
-  `hook.on_progress`), and a BufEnter autocmd on the buffer catches
-  saved/idle churn that emits no progress. `agents_refresh()` is a trailing
+  `hook.on_progress`), and a BufEnter/BufWinEnter autocmd on the buffer
+  catches saved/idle churn that emits no progress (BufWinEnter covers a
+  window opened without entering it). `agents_refresh()` is a trailing
   ~100ms debounce over a module-level uv timer whose callback re-renders
   inside `vim.schedule` (re-checking `nvim_buf_is_valid`, like
-  `schedule_render`); it no-ops when no agents buffer is open. A BufWipeout
+  `schedule_render`). It no-ops unless the agents buffer is displayed in a
+  window in some tabpage. It checks that condition on the call and again in
+  the scheduled render. Without the check, a hidden agents buffer re-rendered
+  (measured at ~500ms with 682 saved transcripts) on every progress event of
+  every running agent. The BufEnter/BufWinEnter seam re-renders it when it
+  is shown again. A BufWipeout
   autocmd stops the timer and clears the line map. Every row is a single
   line capped at a fixed 76-cell width (`AGENTS_WIDTH`): variable-length
   fields (a running row's task, a loaded row's title, a saved row's

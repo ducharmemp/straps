@@ -67,6 +67,21 @@ it("append persists a user block to disk", function()
   assert(disk:find("hello-from-disk-please", 1, true), "appended text not persisted to disk")
 end)
 
+-- --------------------------------------------------------------- fsync=false
+it("session buffers set buffer-local fsync=false on nvim >= 0.12 without touching the global", function()
+  local saved_fsync = vim.o.fsync
+  local bufnr = state.new_session()
+  assert(vim.bo[bufnr].buftype == "", "new_session must stay file-backed")
+  if vim.fn.has("nvim-0.12") == 1 then
+    assert(vim.bo[bufnr].fsync == false, "new_session must set buffer-local fsync=false")
+    local re = state.open_session_file(vim.api.nvim_buf_get_name(bufnr))
+    assert(vim.bo[re].fsync == false, "open_session_file must set buffer-local fsync=false")
+    assert(vim.o.fsync == saved_fsync, "global fsync must be unchanged")
+  else
+    print("nvim < 0.12: fsync assertions skipped")
+  end
+end)
+
 -- --------------------------------------------------- list_sessions ordering
 it("list_sessions returns sessions, newest first", function()
   local saved = straps.config.session_dir

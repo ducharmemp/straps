@@ -2,7 +2,8 @@
 -- ordinary buffer listing ALL sessions (running / loaded / saved) with a tiny
 -- keymap grammar. Covers all_sessions() classification, fn.agents_render (a
 -- redefinable registry fn), the module-table line map, the <CR>/x/i/r keymaps,
--- the two refresh seams (loop.progress + BufEnter) and the debounce.
+-- the two refresh seams (loop.progress + BufEnter/BufWinEnter), the debounce,
+-- and the no-op while the agents buffer is hidden.
 --   busted tests/agents_buffer_spec.lua
 -- No network: fn.provider is redefined with scripted stubs. Plain asserts.
 
@@ -397,6 +398,41 @@ end
   assert(_G.straps_agents_render_count == before + 1,
     "two refreshes should coalesce to one render, got "
     .. (_G.straps_agents_render_count - before))
+end)
+
+it("refresh is a no-op while the agents buffer is hidden and re-renders on re-show", function()
+  local buf = ui.open_agents("")
+  -- The counting wrapper from the previous case is still installed.
+  vim.cmd("enew") -- hides the agents buffer: 0 windows, still loaded (bufhidden=hide)
+  vim.wait(200) -- let any timer armed by open_agents fire
+  assert(#vim.fn.win_findbuf(buf) == 0, "precondition: agents buffer should be hidden")
+  local before = _G.straps_agents_render_count
+  ui.agents_refresh()
+  ui.agents_refresh()
+  vim.wait(400, function() return false end, 10) -- wait past the full debounce window
+  assert(_G.straps_agents_render_count == before,
+    "hidden agents buffer must not render")
+  vim.cmd("buffer " .. buf)
+  vim.wait(400, function() return _G.straps_agents_render_count > before end, 10)
+  assert(_G.straps_agents_render_count == before + 1,
+    "re-shown agents buffer should render once, got "
+    .. (_G.straps_agents_render_count - before))
+end)
+
+it("a window opened without entering the agents buffer re-renders it (BufWinEnter)", function()
+  local buf = ui.open_agents("")
+  -- The counting wrapper from the previous case is still installed.
+  vim.cmd("enew")
+  vim.wait(200)
+  assert(#vim.fn.win_findbuf(buf) == 0, "precondition: agents buffer should be hidden")
+  local before = _G.straps_agents_render_count
+  local win = vim.api.nvim_open_win(buf, false, { split = "below" })
+  assert(vim.api.nvim_get_current_buf() ~= buf, "precondition: the agents buffer must not be entered")
+  vim.wait(400, function() return _G.straps_agents_render_count > before end, 10)
+  assert(_G.straps_agents_render_count == before + 1,
+    "BufWinEnter alone should render once, got "
+    .. (_G.straps_agents_render_count - before))
+  vim.api.nvim_set_current_win(win)
 end)
 
 it("loop progress seam refreshes the open agents buffer", function()

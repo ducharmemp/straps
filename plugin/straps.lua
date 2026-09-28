@@ -31,9 +31,66 @@ local function split_cmd_of(smods)
   return (prefix ~= "" and (prefix .. " ") or "") .. verb
 end
 
+-- `nvim - +Straps`: stdin lands in a buffer before -c commands run; remember
+-- which one so :Straps can seed the session with it. VimEnter clears the
+-- record, so a later interactive :Straps never swallows the user's buffer.
+local stdin_group = vim.api.nvim_create_augroup("straps_stdin", { clear = true })
+vim.api.nvim_create_autocmd("StdinReadPost", {
+  group = stdin_group,
+  callback = function(ev) vim.g.straps_stdin_buf = ev.buf end,
+})
+vim.api.nvim_create_autocmd("VimEnter", {
+  group = stdin_group,
+  callback = function() vim.g.straps_stdin_buf = nil end,
+})
+
+-- `:Straps [categories] [-- instruction]`: the text before the first
+-- whitespace-delimited `--` is permission categories (comma/space separated,
+-- `all` = every grantable one); the text after it is the instruction, kept
+-- verbatim apart from trimming. Returns cats (list), instruction (string|nil).
+local function parse_straps_args(args)
+  local padded = " " .. args .. " "
+  local s, e = padded:find("%s%-%-%s")
+  local cats_text, instruction
+  if s then
+    cats_text = padded:sub(1, s)
+    instruction = vim.trim(padded:sub(e))
+    if instruction == "" then instruction = nil end
+  else
+    cats_text = padded
+  end
+  local cats, all = {}, false
+  for tok in cats_text:gmatch("[^%s,]+") do
+    if tok == "all" then all = true else cats[#cats + 1] = tok end
+  end
+  if all then
+    for _, c in ipairs(require("straps.ui").grantable_categories()) do
+      cats[#cats + 1] = c
+    end
+  end
+  return cats, instruction
+end
+
 vim.api.nvim_create_user_command("Straps", function(opts)
-  require("straps.ui").open_session(split_cmd_of(opts.smods))
-end, { desc = "straps: open a new session (transcript buffer; :vertical for a vsplit)" })
+  local cats, instruction = parse_straps_args(opts.args)
+  require("straps.ui").open_session(split_cmd_of(opts.smods), {
+    grants = cats,
+    instruction = instruction,
+    send = opts.bang,
+    explicit_split = opts.smods.split ~= "" or opts.smods.vertical,
+  })
+end, {
+  nargs = "*",
+  bang = true,
+  complete = function(arglead)
+    local ok, ui = pcall(require, "straps.ui")
+    local items = ok and ui.grantable_categories() or {}
+    items = vim.list_extend({ "all", "--" }, items)
+    return vim.tbl_filter(function(it) return it:find(arglead, 1, true) == 1 end, items)
+  end,
+  desc = "straps: open a new session (:vertical for a vsplit);"
+    .. " [categories] pre-grant permissions, `-- text` seeds the request, ! sends it",
+})
 
 vim.api.nvim_create_user_command("StrapsResume", function(opts)
   local ui = require("straps.ui")

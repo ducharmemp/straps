@@ -324,6 +324,42 @@ end
   assert(buf_text(bufnr):find("recovered", 1, true), "buffer not reusable after stop")
 end)
 
+it("loop.stop cascades to running descendants (straps_parent tree)", function()
+  define("fn.provider", "fn", "test: hangs until cancelled", [==[
+return function(req, ctx)
+  ctx.await(function(resolve)
+    ctx.on_cancel(function() resolve("killed") end)
+    vim.defer_fn(function() resolve("timeout") end, 5000)
+  end)
+  if ctx.cancelled() then
+    return { content = {}, stop_reason = "cancelled" }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "should-not-appear" } } }
+end
+]==])
+  local parent = new_session_with_prompt("hang")
+  local child = new_session_with_prompt("hang")
+  local grandchild = new_session_with_prompt("hang")
+  local unrelated = new_session_with_prompt("hang")
+  vim.b[child].straps_parent = parent
+  vim.b[grandchild].straps_parent = child
+  for _, b in ipairs({ parent, child, grandchild, unrelated }) do loop.start(b) end
+  for _, b in ipairs({ parent, child, grandchild, unrelated }) do
+    assert(loop.running(b), "run should be active while awaiting")
+  end
+
+  loop.stop(parent)
+  assert(vim.wait(2000, function()
+    return not (loop.running(parent) or loop.running(child) or loop.running(grandchild))
+  end, 10), "stop did not cascade to every descendant")
+  assert(loop.running(unrelated), "stop must not touch a session outside the tree")
+  loop.stop(unrelated)
+  assert(vim.wait(2000, function() return not loop.running(unrelated) end, 10))
+  for _, b in ipairs({ child, grandchild }) do
+    assert(buf_text(b):find("cancelled", 1, true), "descendant missing the cancellation note")
+  end
+end)
+
 it("loop.stop forcibly ends a run whose tool never resolves", function()
   allow_all()
   local straps = require("straps")

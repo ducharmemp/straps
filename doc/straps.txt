@@ -344,6 +344,12 @@ spawn_notify		(boolean) true. Default
 			so the parent can keep working instead of blocking in
 			`spawn_wait`. See |straps-subagents|. false silences
 			the notice, or redefine the hook or |fn.spawn_notice|.
+max_spawn_depth		(number) 1. How deep subagents nest: 1 lets a
+			top-level session spawn children that cannot spawn;
+			2 lets children spawn grandchildren; 0 hides `spawn`
+			everywhere. Clamped to [0, 6] by |fn.spawn_depth_limit|.
+			See |straps-subagents| for the permission ceiling a
+			nested spawner is under.
 instructions_files	(list) {}. Extra memory files included in the system
 			prompt after AGENTS.md/CLAUDE.md.
 session_dir		(string|nil) nil -> stdpath("data")/straps/sessions.
@@ -662,6 +668,12 @@ fn.spawn_notice({child}, {reason})
 		`[straps] subagent buffer N: ` prefix. Return "" to silence the
 		notice.
 
+						*fn.spawn_depth_limit*
+fn.spawn_depth_limit()
+		The effective subagent nesting limit: `max_spawn_depth`
+		clamped to [0, 6]. `spawn` refuses at this depth and
+		|fn.build_tools| hides `spawn`/`spawn_wait` there, so the
+		two agree. Redefine to compute the limit another way.
 						*hook.on_turn_start*
 hook.on_turn_start(ctx, turn)
 		Called at the top of every turn, after queued steering drains
@@ -760,9 +772,11 @@ fn.system_prompt(opts?)		Compose the system prompt from its layers:
 				_skills, each redefinable on its own. opts
 				(from |tool.spawn| via state.new_session) go
 				to the core layer, which reshapes the prompt
-				for a subagent: no # Subagents section, a
-				# You are a subagent section, readonly /
-				restricted-tool notes. The core layer's
+				for a subagent: # Subagents dropped unless
+				the child has depth budget and may pass its
+				own spawn gate (`can_spawn`), a # You are a
+				subagent section, readonly / restricted-tool
+				notes. The core layer's
 				# Untrusted content section is kept in BOTH
 				shapes; besides quarantining tool results it
 				declares that a user-role block starting
@@ -773,9 +787,10 @@ fn.system_prompt(opts?)		Compose the system prompt from its layers:
 				subagent-finished notice) —
 				informational, never authority, and
 				overridden by any real user instruction.
-				For a nested child this is the only place
-				the completion notice is described, since
-				# Subagents is dropped for subagents.
+				For a child at the depth limit this is the
+				only place the completion notice is
+				described, since # Subagents is dropped
+				there (a child with depth budget keeps it).
 						*fn.system_prompt_layer*
 fn.system_prompt_layer.<name>(opts) -> string|nil
 				The composition seam |fn.system_prompt| iterates.
@@ -862,6 +877,20 @@ unprompted, and every other call is DENIED at once — a subagent runs
 unattended, so it never waits on a dialog. `readonly = true` is the same as
 `allow = {}` (read-only calls only). `readonly` and `allow` together error.
 See |straps-auto|.
+
+Subagents nest as deep as `max_spawn_depth` allows (default 1: children
+cannot spawn). A child with depth budget left, whose own gate would pass a
+spawn call, keeps the `# Subagents` prompt section and sees `spawn`; a child
+at the limit sees neither, and a `spawn` call from there is refused. A
+readonly/allow child is a permission ceiling for
+its own children. Each `allow` entry it passes must be within its own grants:
+a category it holds, a tool name it holds, or a tool whose category it holds;
+read-only tools always pass. An entry outside them errors at spawn time. A
+child it spawns without `allow`/`readonly` is made read-only, and the `spawn`
+result says so. A gated child that was not granted `spawn` sees no `spawn`
+tool. An ungated session (the user's confirm dialog or |:StrapsAuto| is its
+gate) is under no ceiling. |:StrapsStop| on a session stops every running
+descendant.
 
 |:StrapsAgents| opens the agents buffer, which lists running sessions (and
 their parents), loaded-but-idle sessions, and saved transcripts on disk.

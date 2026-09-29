@@ -757,11 +757,28 @@ function M.stop(bufnr)
     vim.notify("straps: no active run for this buffer", vim.log.levels.INFO)
     return
   end
+  local first_stop = not run.cancelled
   run.cancelled = true
   local fns = run.cancel_fns
   run.cancel_fns = {}
   for _, fn in ipairs(fns) do
     pcall(fn)
+  end
+
+  -- Cascade to running subagents. spawn's ctx.on_cancel handler covers only
+  -- the window until the parent's next await completes (cancel_fns are
+  -- cleared then), so a child launched two turns ago would otherwise outlive
+  -- a stopped parent. straps_parent forms a tree; recursion reaches every
+  -- descendant, and a repeat stop of an already-cancelled run does not
+  -- descend again (which also bounds a straps_parent cycle).
+  if first_stop then
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      if b ~= bufnr and runs[b] and not runs[b].cancelled then
+        local parent
+        pcall(function() parent = vim.b[b].straps_parent end)
+        if parent == bufnr then M.stop(b) end
+      end
+    end
   end
 
   -- Backstop for a tool that never resolves its await: a missing/failing

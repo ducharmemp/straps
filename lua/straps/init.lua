@@ -68,6 +68,13 @@ M.config = {
   -- notice; redefining hook.on_run_end.notify_parent or fn.spawn_notice
   -- reshapes it.
   spawn_notify = true,
+  -- How deep subagents may nest. 1 (default): a top-level session spawns
+  -- children, children cannot spawn. 2 lets children spawn grandchildren;
+  -- each further level adds one generation. 0 hides spawn everywhere.
+  -- fn.spawn_depth_limit clamps the value to [0, 6] so a spawn tree always
+  -- fits the registry's scope-chain walk. A gated child (readonly/allow) can
+  -- only grant its own children a subset of its own grants.
+  max_spawn_depth = 1,
   -- Extra instruction files for fn.system_prompt_project, included verbatim
   -- after the auto-discovered AGENTS.md/CLAUDE.md. Paths, absolute or
   -- relative to cwd; unreadable entries are skipped silently.

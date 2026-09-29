@@ -136,8 +136,10 @@ function M.register_spawn()
       .. " allow (optional array) — grant these permission categories (edit,"
       .. " delete, exec, lua, net, spawn) or specific tool names to the child:"
       .. " granted calls run without prompting, everything else is DENIED"
-      .. " (no prompt), readonly and allow are mutually exclusive; show (optional"
-      .. " boolean) —"
+      .. " (no prompt), readonly and allow are mutually exclusive — a session"
+      .. " that is itself readonly/allow-gated can grant only a subset of its"
+      .. " own grants, and its children default to readonly; nesting depth is"
+      .. " capped by config.max_spawn_depth; show (optional boolean) —"
       .. " open the child's transcript in a split; max_turns (optional,"
       .. " default 24); model (optional) — run the child on this model id"
       .. " instead of the session's; effort (optional) — extended-thinking"
@@ -186,6 +188,21 @@ return function(input, ctx)
   if input.readonly and type(input.allow) == "table" then
     error("spawn: readonly and allow are mutually exclusive (readonly is allow={})")
   end
+  if input.allow ~= nil and type(input.allow) ~= "table" then
+    error("spawn: allow must be an array of categories or tool names")
+  end
+  -- A gated spawner (itself a readonly/allow child, marked by the spawn:gated
+  -- grant) is a permission ceiling for its own children: it may delegate only
+  -- what it holds, and a child it spawns without allow/readonly is read-only.
+  -- A grant set with no marker is an ungated session whose gate is the user's
+  -- confirm dialog (or :StrapsAuto), so no ceiling applies there.
+  local parent_grants = registry.granted(ctx.bufnr)
+  local gated = parent_grants["spawn:gated"] == true
+  local forced_readonly = false
+  if gated and not input.readonly and input.allow == nil then
+    input.readonly = true
+    forced_readonly = true
+  end
   if type(input.allow) == "table" then
     local grantable = registry.try_call("fn.capability") or {}
     local is_grantable = {}
@@ -203,26 +220,56 @@ return function(input, ctx)
         error("spawn: allow entry " .. vim.inspect(entry)
           .. " is in the define category, which is never grantable")
       end
+      if gated then
+        local within
+        if is_grantable[entry] then
+          within = parent_grants["cap:" .. entry] == true
+        else
+          -- Classify by the tool's worst-case input: code_action/fix_diagnostic
+          -- read without an index and edit with one, and a name grant covers
+          -- every input.
+          local cap = registry.try_call("fn.capability", entry)
+          if cap == "read" then cap = registry.try_call("fn.capability", entry, { index = 1 }) end
+          within = cap == "read" or parent_grants[entry] == true
+            or (type(cap) == "string" and parent_grants["cap:" .. cap] == true)
+        end
+        if not within then
+          local held = {}
+          for k in pairs(parent_grants) do
+            if k ~= "spawn:gated" then held[#held + 1] = k end
+          end
+          table.sort(held)
+          error("spawn: allow entry " .. vim.inspect(entry)
+            .. " exceeds this session's own grants (" .. table.concat(held, ", ") .. ")")
+        end
+      end
     end
   end
 
-  -- Depth guard: subagents do not spawn sub-subagents unless the user
-  -- raises config.max_spawn_depth.
+  -- Depth guard: subagents nest only as deep as config.max_spawn_depth
+  -- (clamped by fn.spawn_depth_limit) allows.
   local depth = 0
   pcall(function() depth = vim.b[ctx.bufnr].straps_spawn_depth or 0 end)
-  local max_depth = 1
-  pcall(function()
-    max_depth = require("straps").config.max_spawn_depth or 1
-  end)
+  local max_depth = registry.try_call("fn.spawn_depth_limit") or 1
   if depth >= max_depth then
     return "spawn: refused — subagent depth limit (" .. max_depth
       .. ") reached; do this work yourself"
   end
 
-  -- Compose the child's prompt for its actual shape: no # Subagents section,
-  -- a # You are a subagent section, plus readonly / tool-restriction notes.
+  -- Compose the child's prompt for its actual shape: a # You are a subagent
+  -- section plus readonly / tool-restriction notes; # Subagents stays only
+  -- when the child has depth budget left AND its own gate would let a spawn
+  -- call through (a gated child needs the spawn category or tool name).
+  local child_gated = input.readonly or type(input.allow) == "table"
+  local child_may_spawn = not child_gated
+  if child_gated and type(input.allow) == "table" then
+    for _, e in ipairs(input.allow) do
+      if e == "spawn" then child_may_spawn = true end
+    end
+  end
   local child = state.new_session({
     subagent = true,
+    can_spawn = (depth + 1 < max_depth and child_may_spawn) or nil,
     readonly = input.readonly and true or nil,
     tools = (type(input.tools) == "table" and #input.tools > 0) and input.tools or nil,
   })
@@ -281,6 +328,11 @@ return function(input, ctx)
         end
       end
     end
+    -- The marker makes the child a ceiling for ITS children (see above). It
+    -- lives in the registry, where allow validation refuses it as an entry
+    -- and a tool body cannot grant its own session, so a child cannot forge
+    -- or shed it through spawn.
+    registry.grant(child, "spawn:gated")
     registry.define({
       name = "hook.confirm",
       kind = "hook",
@@ -300,11 +352,15 @@ return function(name, tin, tctx)
     if cap and allowed["cap:" .. tostring(cap)] then return true end
     if allowed[name] then return true end
   end
-  if type(allowed) ~= "table" or next(allowed) == nil then
+  local names = {}
+  if type(allowed) == "table" then
+    for k in pairs(allowed) do
+      if k ~= "spawn:gated" then names[#names + 1] = k end
+    end
+  end
+  if #names == 0 then
     return false, "readonly subagent: " .. tostring(name) .. " is not allowed"
   end
-  local names = {}
-  for k in pairs(allowed) do names[#names + 1] = k end
   table.sort(names)
   return false, "subagent: " .. tostring(name) .. " is not covered by this child's grants ("
     .. table.concat(names, ", ") .. ")"
@@ -347,8 +403,34 @@ end
   -- outstanding is handled by spawn_wait's cancel handler.
   local name = vim.api.nvim_buf_get_name(child)
   local where = name ~= "" and vim.fn.fnamemodify(name, ":~:.") or ("buffer " .. child)
-  return ("subagent started — buffer %d, transcript: %s\n"
+  local out = ("subagent started — buffer %d, transcript: %s\n"
     .. "collect its answer with spawn_wait{ buffers = { %d } }"):format(child, where, child)
+  if forced_readonly then
+    out = out .. "\nthis session is permission-gated, so the child was made read-only;"
+      .. " pass allow={...} within your own grants to delegate writes"
+  end
+  return out
+end
+]==],
+  })
+
+  -- ------------------------------------------------------ fn.spawn_depth_limit
+
+  define({
+    name = "fn.spawn_depth_limit",
+    kind = "fn",
+    doc = "The effective subagent nesting limit: config.max_spawn_depth clamped"
+      .. " to [0, 6] (depth D means D+1 chained scopes; 6 keeps one hop of"
+      .. " headroom under the registry's 8-hop scope-chain walk). tool.spawn"
+      .. " refuses at this depth and"
+      .. " fn.build_tools hides spawn/spawn_wait there, so the two agree."
+      .. " 0 hides spawn everywhere. Redefine to compute the limit some other way.",
+    source = [==[
+return function()
+  local raw
+  pcall(function() raw = require("straps").config.max_spawn_depth end)
+  local n = math.floor(tonumber(raw) or 1)
+  return math.max(0, math.min(n, 6))
 end
 ]==],
   })
@@ -796,7 +878,8 @@ return function(ctx)
   local shown = info.model_label ~= info.model
     and ("%s (%s)"):format(info.model_label, info.model) or info.model
   -- Carried here, not only in the prompt's # Subagents section: that section
-  -- is dropped for subagents, so a nested spawner would never read it.
+  -- is dropped for a subagent at the depth limit, so a nested spawner whose
+  -- limit was raised mid-session would never read it.
   return ("# Model\n\nThis session is running on %s · provider %s · effort %s."
     .. " Subagents inherit this model and effort unless you pass spawn an"
     .. " explicit model / effort — call the models tool for the ids you can"

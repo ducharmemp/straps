@@ -6,8 +6,10 @@
 -- global; BufWipeout dropping a scope; registry_define defaulting to session
 -- scope (and scope="global" opting out); build_tools honoring the child tool
 -- filter and hiding spawn at the depth limit; per-buffer max_turns; a full
--- spawn round trip through the loop; the readonly child confirm; and the
--- spawn depth guard.
+-- spawn round trip through the loop; the readonly child confirm; the spawn
+-- depth guard; fn.spawn_depth_limit's clamp; a three-level spawn tree under
+-- max_spawn_depth = 2; and the grant ceiling a gated child imposes on its own
+-- children.
 
 local script = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(script, ":p"), ":h:h")
@@ -646,6 +648,299 @@ it("spawn depth guard refuses a child spawning a grandchild", function()
   end)
   assert(out:find("refused", 1, true) and out:find("depth", 1, true),
     "depth guard did not trip: " .. out)
+end)
+
+-- -------------------------------------------------------------- nested spawn
+
+local function with_depth_limit(n, body)
+  local prev = straps.config.max_spawn_depth
+  straps.config.max_spawn_depth = n
+  local ok, err = pcall(body)
+  straps.config.max_spawn_depth = prev
+  assert(ok, err)
+end
+
+local function find_session(pred)
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and vim.b[b].straps_session and pred(b) then
+      return b
+    end
+  end
+end
+
+it("fn.spawn_depth_limit clamps config.max_spawn_depth to [0, 6]", function()
+  with_depth_limit(nil, function()
+    assert(registry.call("fn.spawn_depth_limit") == 1, "nil config should mean 1")
+  end)
+  with_depth_limit(3, function()
+    assert(registry.call("fn.spawn_depth_limit") == 3)
+  end)
+  with_depth_limit(40, function()
+    assert(registry.call("fn.spawn_depth_limit") == 6, "limit should clamp to 6")
+  end)
+  with_depth_limit(-2, function()
+    assert(registry.call("fn.spawn_depth_limit") == 0, "limit should floor at 0")
+  end)
+  with_depth_limit(0, function()
+    local buf = vim.api.nvim_create_buf(true, false)
+    registry.ensure_scope(buf)
+    local prev = registry.set_active_scope(buf)
+    local ok, err = pcall(function()
+      for _, t in ipairs(registry.call("fn.build_tools")) do
+        assert(t.name ~= "spawn" and t.name ~= "spawn_wait",
+          "limit 0 should hide spawn from a top-level session")
+      end
+    end)
+    registry.set_active_scope(prev)
+    assert(ok, err)
+    assert(not registry.call("fn.system_prompt_core"):find("\n# Subagents\n", 1, true),
+      "limit 0 should drop # Subagents from the top-level prompt")
+  end)
+end)
+
+it("build_tools offers spawn below the configured depth and hides it at the limit", function()
+  with_depth_limit(2, function()
+    local buf = vim.api.nvim_create_buf(true, false)
+    registry.ensure_scope(buf)
+    local prev = registry.set_active_scope(buf)
+    local ok, err = pcall(function()
+      local function has_spawn()
+        for _, t in ipairs(registry.call("fn.build_tools")) do
+          if t.name == "spawn" then return true end
+        end
+        return false
+      end
+      vim.b[buf].straps_spawn_depth = 1
+      assert(has_spawn(), "depth 1 under limit 2 should still offer spawn")
+      vim.b[buf].straps_spawn_depth = 2
+      assert(not has_spawn(), "depth 2 under limit 2 should hide spawn")
+    end)
+    registry.set_active_scope(prev)
+    assert(ok, err)
+  end)
+end)
+
+it("nested spawn: parent -> child -> grandchild under max_spawn_depth = 2", function()
+  allow_all()
+  -- One scripted provider serves all three levels; the first user text names
+  -- the level (disjoint markers: L1-TASK is not a substring of L2-TASK).
+  define("fn.provider", "fn", "test: three-level spawn tree", [==[
+return function(req, ctx)
+  local first_user, last_result
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" and not first_user then first_user = p.text end
+        if p.type == "tool_result" then last_result = p.content end
+      end
+    end
+  end
+  local level = 0
+  if first_user and first_user:find("L1-TASK", 1, true) then level = 1 end
+  if first_user and first_user:find("L2-TASK", 1, true) then level = 2 end
+  local final_text
+  if level == 2 then
+    if last_result then final_text = "L2-ANSWER-QQQ" end
+  elseif last_result and last_result:find("## subagent", 1, true) then
+    final_text = level == 1 and ("L1-ANSWER wrapping " .. last_result:match("L2%-ANSWER%-%w+"))
+      or "PARENT-DONE"
+  end
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      if final_text then ctx.emit({ type = "text_delta", text = final_text }) end
+      resolve()
+    end, 5)
+  end)
+  if final_text then
+    return { stop_reason = "end_turn", content = { { type = "text", text = final_text } } }
+  end
+  if #req.messages == 1 then
+    local task = level == 0 and "L1-TASK: delegate deeper."
+      or level == 1 and "L2-TASK: answer, but try to spawn first."
+      or "L3-TASK: never runs."
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "s" .. level, name = "spawn", input = { task = task } },
+    } }
+  end
+  local child = last_result and tonumber(last_result:match("buffer (%d+)"))
+  if child then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "w" .. level, name = "spawn_wait", input = { buffers = { child } } },
+    } }
+  end
+  error("unexpected request shape at level " .. level)
+end
+]==])
+
+  with_depth_limit(2, function()
+    local parent = state.new_session()
+    state.append_text(parent, "please nest")
+    loop.start(parent)
+    wait_done(parent, 30000)
+
+    local text = buf_text(parent)
+    assert(text:find("L2-ANSWER-QQQ", 1, true), "grandchild's answer did not reach the parent")
+    assert(text:find("PARENT-DONE", 1, true), "parent did not finish")
+
+    local child = find_session(function(b)
+      return vim.b[b].straps_parent == parent and vim.b[b].straps_spawn_depth == 1
+    end)
+    assert(child, "child session not found")
+    local grandchild = find_session(function(b)
+      return vim.b[b].straps_parent == child and vim.b[b].straps_spawn_depth == 2
+    end)
+    assert(grandchild, "grandchild session not found at depth 2")
+    local gp, gexists = registry.scope_parent(grandchild)
+    assert(gexists and gp == child, "grandchild scope should chain under the child")
+
+    local ctext = buf_text(child)
+    assert(ctext:find("\n# Subagents\n", 1, true),
+      "a child with depth budget should keep # Subagents")
+    assert(ctext:find("spawn subagents of your own", 1, true),
+      "child section should mention nested spawning")
+    local gtext = buf_text(grandchild)
+    assert(not gtext:find("\n# Subagents\n", 1, true),
+      "a grandchild at the limit should drop # Subagents")
+    assert(gtext:find("depth limit (2) reached", 1, true),
+      "grandchild's spawn should be refused at the limit:\n" .. gtext:sub(-400))
+  end)
+end)
+
+local IDLE_PROVIDER = [==[
+return function(req, ctx)
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      ctx.emit({ type = "text_delta", text = "idle-done" })
+      resolve()
+    end, 5)
+  end)
+  return { stop_reason = "end_turn", content = { { type = "text", text = "idle-done" } } }
+end
+]==]
+
+it("a gated child can grant its own children only a subset of its grants", function()
+  allow_all()
+  define("fn.provider", "fn", "test: every session answers at once", IDLE_PROVIDER)
+  with_depth_limit(2, function()
+    local parent = vim.api.nvim_create_buf(true, false)
+    local started = drive(function(ctx)
+      ctx.bufnr = parent
+      return registry.call("tool.spawn",
+        { task = "GATED-TASK: idle.", allow = { "spawn", "edit" } }, ctx)
+    end)
+    local child = tonumber(started:match("buffer (%d+)"))
+    assert(child, "child not started: " .. started)
+    wait_done(child)
+    assert(registry.granted(child)["spawn:gated"] == true, "child should carry the gated marker")
+    assert(buf_text(child):find("\n# Subagents\n", 1, true),
+      "a spawn-granted child with depth budget should keep # Subagents")
+    local noright = drive(function(ctx)
+      ctx.bufnr = parent
+      return registry.call("tool.spawn", { task = "NORIGHT-TASK", allow = { "edit" } }, ctx)
+    end)
+    local noright_buf = tonumber(noright:match("buffer (%d+)"))
+    wait_done(noright_buf)
+    assert(not buf_text(noright_buf):find("\n# Subagents\n", 1, true),
+      "a gated child without spawn rights must drop # Subagents even with depth budget")
+
+    local function try(input, from)
+      local ok, out = pcall(function()
+        return drive(function(ctx)
+          ctx.bufnr = from or child
+          return registry.call("tool.spawn", input, ctx)
+        end)
+      end)
+      local b = ok and tonumber(tostring(out):match("buffer (%d+)"))
+      if b then wait_done(b) end
+      return ok, tostring(out), b
+    end
+
+    local ok, err = try({ task = "G-EXEC", allow = { "exec" } })
+    assert(not ok and err:find("exceeds this session's own grants", 1, true),
+      "ungranted category should be refused: " .. err)
+    ok, err = try({ task = "G-BASH", allow = { "bash" } })
+    assert(not ok and err:find("exceeds this session's own grants", 1, true),
+      "tool name outside the parent's categories should be refused: " .. err)
+    ok, err = try({ task = "G-CODEACTION", allow = { "code_action" } })
+    assert(ok and err:find("subagent started", 1, true),
+      "code_action (edit with an index) should pass under cap:edit: " .. err)
+    local gc
+    ok, err, gc = try({ task = "G-EDIT", allow = { "edit", "write_file", "grep" } })
+    assert(ok and err:find("subagent started", 1, true),
+      "subset of the parent's grants should pass: " .. err)
+    assert(registry.granted(gc)["cap:edit"] and registry.granted(gc)["spawn:gated"],
+      "grandchild should hold the granted category and the marker")
+
+    -- No allow at all from a gated spawner: the grandchild is forced readonly.
+    local plain
+    ok, err, plain = try({ task = "G-PLAIN" })
+    assert(ok and err:find("made read%-only"), "forced readonly should be reported: " .. err)
+    local ptext = buf_text(plain)
+    assert(ptext:find("READ%-ONLY"), "forced-readonly grandchild should carry the readonly note")
+    assert(not ptext:find("\n# Subagents\n", 1, true),
+      "a readonly grandchild cannot pass its own spawn gate, so # Subagents must go")
+    local prev = registry.set_active_scope(plain)
+    local ok_c, allowed, reason = pcall(registry.call, "hook.confirm", "write_file",
+      { path = "/tmp/x", content = "" }, { bufnr = plain })
+    registry.set_active_scope(prev)
+    assert(ok_c, allowed)
+    assert(allowed == false, "forced-readonly grandchild should be denied writes")
+    assert(tostring(reason):find("readonly subagent: write_file is not allowed", 1, true),
+      "denial should read as the grant-less shadow, got: " .. tostring(reason))
+
+    -- A tool-name grant delegates under the exact name, and nothing wider.
+    local named
+    ok, err, named = try({ task = "NAMED-TASK", allow = { "spawn", "eval_lua" } }, parent)
+    assert(ok, err)
+    ok, err = try({ task = "N-SAME", allow = { "eval_lua" } }, named)
+    assert(ok and err:find("subagent started", 1, true),
+      "a held tool name should delegate: " .. err)
+    ok, err = try({ task = "N-WIDER", allow = { "lua" } }, named)
+    assert(not ok and err:find("exceeds this session's own grants", 1, true),
+      "a tool name must not widen into its category: " .. err)
+    -- A non-array allow is an error, never a silently ungated child.
+    ok, err = try({ task = "N-STRING", allow = "edit" }, named)
+    assert(not ok and err:find("allow must be an array", 1, true),
+      "string allow should error: " .. err)
+  end)
+end)
+
+it("an ungated parent with :StrapsAuto-style grants is not a ceiling", function()
+  allow_all()
+  define("fn.provider", "fn", "test: every session answers at once", IDLE_PROVIDER)
+  local parent = vim.api.nvim_create_buf(true, false)
+  registry.grant(parent, "cap:edit")
+  local out = drive(function(ctx)
+    ctx.bufnr = parent
+    return registry.call("tool.spawn", { task = "UNGATED-TASK", allow = { "exec" } }, ctx)
+  end)
+  assert(out:find("subagent started", 1, true),
+    "an ungated spawner's own grants must not cap its children: " .. out)
+  wait_done(tonumber(out:match("buffer (%d+)")))
+end)
+
+it("build_tools hides spawn from a gated child that was not granted spawn", function()
+  with_depth_limit(2, function()
+    local buf = vim.api.nvim_create_buf(true, false)
+    registry.ensure_scope(buf)
+    vim.b[buf].straps_spawn_depth = 1
+    registry.grant(buf, "spawn:gated")
+    registry.grant(buf, "cap:edit")
+    local prev = registry.set_active_scope(buf)
+    local ok, err = pcall(function()
+      local function has_spawn()
+        for _, t in ipairs(registry.call("fn.build_tools")) do
+          if t.name == "spawn" or t.name == "spawn_wait" then return true end
+        end
+        return false
+      end
+      assert(not has_spawn(), "gated without cap:spawn should hide spawn")
+      registry.grant(buf, "cap:spawn")
+      assert(has_spawn(), "gated with cap:spawn should offer spawn")
+    end)
+    registry.set_active_scope(prev)
+    assert(ok, err)
+  end)
 end)
 
 it("two concurrent runs keep their session scopes isolated", function()

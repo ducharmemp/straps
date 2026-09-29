@@ -206,9 +206,10 @@ end)
 
 it("the harness-speech section enumerates the subagent notice, not just peers", function()
   -- Both notices carry the same prefix and route (fn.session_notify). This
-  -- section is the ONLY place a nested child (max_spawn_depth raised) can read
-  -- about the subagent notice, since # Subagents is dropped for children — so
-  -- the enumeration must name it in BOTH prompt shapes.
+  -- section is the ONLY place a child AT the depth limit can read about the
+  -- subagent notice, since # Subagents is dropped for such a child (a child
+  -- with depth budget left keeps it) — so the enumeration must name it in
+  -- BOTH prompt shapes.
   for _, shape in ipairs({ {}, { subagent = true } }) do
     local p = registry.call("fn.system_prompt_core", shape)
     local label = shape.subagent and "child prompt" or "parent prompt"
@@ -245,6 +246,17 @@ it("subagent opts add readonly and tool-restriction notes", function()
     { subagent = true, readonly = true, tools = { "read_file", "grep" } })
   assert(sub:find("READ%-ONLY"), "readonly note missing")
   assert(sub:find("restricted to: read_file, grep", 1, true), "tools note missing")
+end)
+
+it("a child with depth budget (can_spawn) keeps # Subagents and learns the ceiling", function()
+  local sub = registry.call("fn.system_prompt_core", { subagent = true, can_spawn = true })
+  assert(sub:find("\n# Subagents\n", 1, true), "can_spawn child should keep # Subagents")
+  assert(sub:find("\n# You are a subagent\n", 1, true), "child section still required")
+  assert(sub:find("spawn subagents of your own", 1, true), "nesting note missing")
+  assert(sub:find("at most the permissions you hold", 1, true), "ceiling note missing")
+  local plain = registry.call("fn.system_prompt_core", { subagent = true })
+  assert(not plain:find("spawn subagents of your own", 1, true),
+    "a child at the limit should not be told it may spawn")
 end)
 
 it("# Subagents commands the non-blocking path, not merely permits it", function()

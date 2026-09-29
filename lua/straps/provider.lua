@@ -215,15 +215,14 @@ return function()
 
   -- Session shaping (set by tool.spawn on child sessions): an allow-list
   -- filter, and hiding spawn/spawn_wait entirely once the depth budget is
-  -- spent — a tool the model cannot use should not be offered.
+  -- spent or the child's own gate would deny spawn (a gated child without
+  -- the spawn category) — a tool the model cannot use should not be offered.
   local scope = registry.active_scope()
   if scope then
-    local filter, depth, max_depth
+    local filter, depth
     pcall(function() filter = vim.b[scope].straps_tool_filter end)
     pcall(function() depth = vim.b[scope].straps_spawn_depth end)
-    pcall(function()
-      max_depth = require("straps").config.max_spawn_depth or 1
-    end)
+    local max_depth = registry.try_call("fn.spawn_depth_limit") or 1
     if type(filter) == "table" and #filter > 0 then
       local allow = {}
       for _, n in ipairs(filter) do allow[n] = true end
@@ -233,7 +232,9 @@ return function()
       end
       tools = kept
     end
-    if (depth or 0) >= (max_depth or 1) then
+    local grants = registry.granted(scope)
+    local gate_denies_spawn = grants["spawn:gated"] == true and not grants["cap:spawn"]
+    if (depth or 0) >= max_depth or gate_denies_spawn then
       local kept = {}
       for _, t in ipairs(tools) do
         if t.name ~= "spawn" and t.name ~= "spawn_wait" then kept[#kept + 1] = t end
@@ -1393,10 +1394,12 @@ local SYSTEM_PROMPT_CORE_SRC = [==[
 -- Core layer of the system prompt: identity, output norms, workflow,
 -- editor powers, permissions, presentation, self-extension. Environment and project
 -- context live in fn.system_prompt_env / fn.system_prompt_project.
--- Optional opts ({ subagent, readonly, tools }) adapt the prompt for spawned
--- children: the # Subagents section is dropped, a # You are a subagent
--- section (with readonly / tool-restriction notes) is appended. No opts
--- yields the full parent-session prompt.
+-- Optional opts ({ subagent, can_spawn, readonly, tools }) adapt the prompt
+-- for spawned children: the # Subagents section is kept only when the child
+-- has depth budget left (can_spawn), a # You are a subagent section (with
+-- readonly / tool-restriction notes) is appended. No opts yields the full
+-- parent-session prompt; # Subagents is also dropped for a top-level session
+-- when fn.spawn_depth_limit is 0.
 return function(opts)
   opts = opts or {}
   local parts = {}
@@ -1495,7 +1498,14 @@ your tool calls and streamed text live as you work.
 - Self-extension follows the same rule: register tools and hooks when a
   trigger fires during the work, never as a project of its own.]]
 
-  if not opts.subagent then
+  local subagents_section
+  if opts.subagent then
+    subagents_section = opts.can_spawn == true
+  else
+    local limit = require("straps.registry").try_call("fn.spawn_depth_limit")
+    subagents_section = (tonumber(limit) or 1) > 0
+  end
+  if subagents_section then
     parts[#parts + 1] = [[# Subagents
 
 - spawn launches a subagent in its own session buffer and returns
@@ -1728,6 +1738,12 @@ matters must be in that reply: make it complete and self-contained,
 follow any answer format the task specifies exactly, and never end on a
 promise of more work. If the task cannot be completed, say so plainly in
 the reply — a truncated or missing answer wastes the whole run.]] }
+    if opts.can_spawn then
+      sub[#sub + 1] = [[You may spawn subagents of your own (the # Subagents section above
+applies). A child of yours receives at most the permissions you hold: if
+this session is readonly or allow-gated, its allow list must be a subset of
+your grants, and a child spawned without allow is read-only.]]
+    end
     if opts.readonly then
       sub[#sub + 1] = [[This is a READ-ONLY session: every write tool is denied without
 prompting. Investigate and report; do not attempt writes or workarounds,
@@ -2059,7 +2075,7 @@ end
 -- Layer wrapper: delegates to fn.system_prompt_core (unchanged, kept for
 -- back-compat with direct redefinitions) and returns its output as-is —
 -- the core layer carries no extra framing. opts is forwarded (e.g.
--- { subagent, readonly, tools } from tool.spawn via state.new_session).
+-- { subagent, can_spawn, readonly, tools } from tool.spawn via state.new_session).
 local SYSTEM_PROMPT_LAYER_CORE_SRC = [==[
 return function(opts)
   local registry = require("straps.registry")
@@ -2120,7 +2136,7 @@ local SYSTEM_PROMPT_SRC = [==[
 -- fn.system_prompt_layer.<name>, IN REGISTRATION ORDER (seq) — the seam a
 -- plugin uses to contribute a new prompt section without redefining the
 -- whole composition. Each layer fn is called with the same opts (e.g.
--- { subagent, readonly, tools } from tool.spawn via state.new_session) and
+-- { subagent, can_spawn, readonly, tools } from tool.spawn via state.new_session) and
 -- must return a fully formatted section string, or nil/"" to skip. Layer
 -- errors PROPAGATE (a broken layer must fail loudly, same as today).
 -- Non-empty results are joined with "\n\n"; order is append-only (new

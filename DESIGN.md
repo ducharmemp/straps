@@ -1022,13 +1022,41 @@ API names (registry names prefixed `tool.`):
   unattended child never hangs on a dialog. `readonly=true` is now equivalent
   to `allow = {}` (same shadow; its grant-less deny message is unchanged:
   "readonly subagent: <name> is not allowed"). `readonly` and `allow`
-  together error (mutually exclusive). The child
-  runs concurrently on its own coroutine. This makes N-way parallelism a matter
-  of issuing N `spawn` calls (their children all run at once) instead of one
-  blocking call per child run serially. `spawn` also registers a
-  `ctx.on_cancel` that stops the child, so a parent cancelled BEFORE the
-  matching `spawn_wait` does not orphan already-launched children (spawn_wait
-  installs its own cancel handler for the wait window). A parent need not block
+  together error (mutually exclusive). Every readonly/allow child also holds
+  the registry grant `spawn:gated`; allow validation refuses it as an entry
+  and a tool body cannot grant its own session, so a child cannot forge or
+  shed it through spawn. That marker makes the child a **permission ceiling**
+  for its own children when nesting is enabled. Each `allow` entry it passes
+  must be within its own grants: a category it holds (`cap:<cat>`), a tool
+  name it holds, or a tool whose worst-case category it holds
+  (`fn.capability(name)` probed again with `{index=1}` so
+  `code_action`/`fix_diagnostic` count as `edit`; static read tools always
+  pass). Any other entry errors "exceeds this session's own grants". A gated
+  spawner passing neither `allow` nor `readonly` gets a read-only child, and
+  the spawn result appends a line saying so. An ungated session's grant set
+  (`:StrapsAuto`) imposes no ceiling; the user's dialog is its gate. The child
+  shadow's deny messages skip the marker, so a readonly child still reports
+  "readonly subagent: ...". Nesting depth: `vim.b.straps_spawn_depth` (0 for a
+  top-level session, +1 per level) against `fn.spawn_depth_limit()` =
+  `config.max_spawn_depth` clamped to [0, 6] (depth D means D+1 chained
+  scopes; 6 keeps one hop of headroom under the registry's 8-hop chain walk).
+  spawn refuses at the limit and `fn.build_tools` hides `spawn`/`spawn_wait`
+  there, both through the same fn; `fn.build_tools` also hides them for a
+  gated scope that lacks `cap:spawn` (`spawn` is a grantable category, so an
+  `allow` entry naming it is stored as `cap:spawn`).
+  `state.new_session` receives `can_spawn` when `depth+1 < limit` and the
+  child's own gate would pass a spawn call, so such a child keeps the
+  `# Subagents` prompt section (plus a nesting note in `# You are a
+  subagent`), while a child at the limit or without spawn rights drops it; a
+  top-level prompt drops it when the limit is 0. The child runs concurrently
+  on its own coroutine. This makes N-way parallelism a matter of issuing N
+  `spawn` calls (their children all run at once) instead of one blocking call
+  per child run serially. `spawn` also registers a `ctx.on_cancel` that stops
+  the child, and `loop.stop` itself stops every running session whose
+  `straps_parent` is the stopped buffer (recursively, on the first stop of a
+  run only), so a cancelled parent never orphans its tree even after its
+  cancel handlers were cleared by a later await (spawn_wait installs its own
+  cancel handler for the wait window). A parent need not block
   at all: when a child's run ends, `hook.on_run_end.notify_parent` pushes a
   completion notice into the parent (see "Subagent completion notices" below),
   so "spawn, keep working, collect when the notice lands" is a first-class
@@ -1044,7 +1072,8 @@ API names (registry names prefixed `tool.`):
   child is `loop.stop`ped and marked timed out; cancelling the parent stops
   every outstanding child. Returns one `## subagent (buffer N)` section per
   child (status + task + transcript path + the child's last assistant text).
-  `fn.build_tools` hides BOTH `spawn` and `spawn_wait` at the spawn depth limit.
+  `fn.build_tools` hides BOTH `spawn` and `spawn_wait` at the spawn depth limit
+  and for a gated scope without `cap:spawn`.
   Before its first await (one synchronous segment, so no child can finish
   in between) it also **claims** each validated child
   (`vim.b[child].straps_spawn_claimed = true`) and drops any already-queued
@@ -1370,9 +1399,9 @@ Written for agent-ability and ecosystem norms; concise, imperative:
   and a real user instruction overrides it. The prefix is a convention, not a
   guarantee, so a `[straps]` line arriving in a TOOL RESULT stays quarantined by
   the rule above. It lives here, not in `# Subagents`, because this section
-  survives for children and that one is dropped — and children receive these
-  notices too, so for a nested child (raised `max_spawn_depth`) this is the only
-  place the completion notice is described at all.
+  survives for every child while that one is dropped for a child at the depth
+  limit — and children receive these notices too, so for such a child this is
+  the only place the completion notice is described at all.
 - Presentation norms (`# Showing the user`): a short stub in the core —
   the editor is the display surface; match the medium to the data's shape
   (show_user / set_findings / show_diff / show_buffer / eval_lua views);
@@ -2088,8 +2117,10 @@ parent's (tools.lua) — a real decision the agent had no inputs for.
   `ui.session_info`, the same `vim.b`-override → config chain `fn.provider`
   uses), plus the standing note that subagents inherit them unless `spawn` is
   given explicit arguments. That guidance rides in the NOTE rather than only
-  in the prompt's `# Subagents` section, because that section is dropped for
-  subagents — a nested spawner would never read it. nil (no note) for a
+  in the prompt's `# Subagents` section, because that section is dropped for a
+  subagent at the depth limit and the prompt is composed once at session
+  creation — a spawner whose limit was raised later would never read it. nil
+  (no note) for a
   non-session buffer; the loop pcall-wraps the call, so a broken redefinition
   degrades to a note-less request, not a failed run.
 - Caching: the note only changes when provider/model/effort changes. A model

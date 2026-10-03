@@ -5,7 +5,7 @@ A fully integrated, Neovim-oriented agent harness with editable conversations an
 Straps puts a coding agent inside the editor instead of beside it. Agents can inspect buffers, navigate through LSP and tree-sitter, edit files through native undo history, run commands, and show results in Neovim's own UI.
 
 - **The conversation is a buffer.** Edit an earlier message or tool result, then continue from the transcript you see.
-- **Tools meet the editor.** File edits respect unsaved buffers. Diagnostics, definitions, references, quickfix lists, diffs, terminals, and undo are first-class tools.
+- **Tools meet the editor.** File edits respect unsaved buffers. Diagnostics, definitions, references, quickfix lists, diffs, terminals, and undo are first-class tools. When a reply cites two or more `path:line` locations, straps loads them into the session window's location list (titled `straps: reply refs`), so `:lnext` walks the reply.
 - **Tooling can adapt.** Tools, hooks, providers, and core functions live in a runtime registry. You or the agent can inspect and redefine them.
 - **Improvements can persist.** Keep project-specific tools and knowledge in `.straps.lua`, or keep personal entries in your Neovim configuration.
 - **Sessions can work together.** Agents can delegate work to subagents and coordinate through shared Neovim buffers.
@@ -116,6 +116,10 @@ Both files contain Lua and run with your Neovim process's privileges. Review the
 | `:StrapsRegistry` | List registry entries. |
 | `:StrapsEdit {name}` | Edit and redefine a registry entry. |
 | `:StrapsHelp [tag]` | Open the reference documentation. |
+
+## Run events
+
+Each session buffer carries `b:straps_status` ("running" or "idle"), and every run fires the `User` autocmds `StrapsRunStart`, `StrapsRunEnd` and `StrapsStatusChanged`, so a statusline or bufferline can show when an agent finishes. See `:help straps-events` for the `data` fields and an example.
 
 ## Security
 

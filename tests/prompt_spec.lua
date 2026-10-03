@@ -293,10 +293,19 @@ it("new_session forwards opts so a spawned child's system block adapts", functio
 end)
 
 -- ------------------------------------------------------- showing-user skill
-it("presentation guidance lives in builtin skill.showing_user; core keeps a stub", function()
+it("core carries condensed presentation guidance; long form lives in skill.showing_user", function()
   local core = registry.call("fn.system_prompt_core")
-  assert(core:find("\n# Showing the user\n", 1, true), "core stub section missing")
-  assert(core:find("skill.showing_user", 1, true), "core should point at the skill")
+  local s = core:find("\n# Showing the user\n", 1, true)
+  assert(s, "core showing-user section missing")
+  local e_ = core:find("\n# ", s + 1, true) or #core
+  local section = core:sub(s, e_)
+  assert(section:find("show_diff", 1, true), "showing-user section should name show_diff")
+  assert(section:find("{left, right}", 1, true) and section:find("default hand-off", 1, true),
+    "showing-user section should make show_diff the post-edit hand-off")
+  assert(#section < 1990, "showing-user section outgrew its byte budget: " .. #section)
+  assert(not core:find("load\nskill.showing_user for the full guidance", 1, true),
+    "core should no longer defer the guidance to the skill")
+  assert(section:find("skill.showing_user", 1, true), "core should point at the skill")
   assert(not core:find("Notes pinned to particular lines", 1, true),
     "full presentation prose should live in the skill, not the core")
   local e = registry.get("skill.showing_user")

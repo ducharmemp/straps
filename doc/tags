@@ -15,6 +15,10 @@
 :StrapsSend	straps.txt	/*:StrapsSend*
 :StrapsSteer	straps.txt	/*:StrapsSteer*
 :StrapsStop	straps.txt	/*:StrapsStop*
+StrapsRunEnd	straps.txt	/*StrapsRunEnd*
+StrapsRunStart	straps.txt	/*StrapsRunStart*
+StrapsStatusChanged	straps.txt	/*StrapsStatusChanged*
+b:straps_status	straps.txt	/*b:straps_status*
 fn.api_key	straps.txt	/*fn.api_key*
 fn.autocmd_bridge	straps.txt	/*fn.autocmd_bridge*
 fn.build_tools	straps.txt	/*fn.build_tools*
@@ -44,6 +48,7 @@ hook.guard	straps.txt	/*hook.guard*
 hook.on_progress	straps.txt	/*hook.on_progress*
 hook.on_run_end	straps.txt	/*hook.on_run_end*
 hook.on_run_end.notify_parent	straps.txt	/*hook.on_run_end.notify_parent*
+hook.on_run_end.reply_refs	straps.txt	/*hook.on_run_end.reply_refs*
 hook.on_run_start	straps.txt	/*hook.on_run_start*
 hook.on_turn_start	straps.txt	/*hook.on_turn_start*
 registry.bind	straps.txt	/*registry.bind*
@@ -56,6 +61,7 @@ straps-checkhealth	straps.txt	/*straps-checkhealth*
 straps-commands	straps.txt	/*straps-commands*
 straps-config	straps.txt	/*straps-config*
 straps-config-model	straps.txt	/*straps-config-model*
+straps-events	straps.txt	/*straps-events*
 straps-fn	straps.txt	/*straps-fn*
 straps-guards	straps.txt	/*straps-guards*
 straps-health	straps.txt	/*straps-health*

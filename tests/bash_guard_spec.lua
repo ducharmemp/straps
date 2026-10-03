@@ -2,8 +2,10 @@
 --   busted tests/bash_guard_spec.lua
 -- No network. Registers the real tools and calls tool.bash directly. Bare
 -- read (cat/head/tail/sed -n), search (grep/rg) and list (ls/find/fd)
--- commands must be refused with a pointer to the vim-native tool; anything
--- with shell logic, and unrelated commands, must run.
+-- commands must be refused with a pointer to the vim-native tool, also behind
+-- a leading `cd X &&` and when piped only into pure filters; anything with
+-- other shell logic, and unrelated commands, must run. Also covers the cwd
+-- the command runs in and the repeat-command nudge.
 
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(here, ":p"), ":h:h")
@@ -88,8 +90,76 @@ end)
 
 it("shell logic exempts a command from the guard", function()
   assert_ran("echo hi | cat")
-  assert_ran("ls | wc -l")
+  assert_ran("ls | xargs echo")
   assert_ran("grep -c x /dev/null; true")
+end)
+
+it("a leading cd prefix does not hide a read", function()
+  assert_refused("cd /tmp && cat foo.lua", "tool.read_file")
+  assert_refused("cd '/tmp/a b'; grep -rn x .", "tool.grep")
+  assert_refused("cd /tmp&&ls", "tool.tree")
+end)
+
+it("reads piped only into filters are refused", function()
+  assert_refused("cat foo.lua | head -50", "tool.read_file")
+  assert_refused("sed -n '1,9p' f | sort | uniq -c", "tool.read_file")
+  assert_refused("wc -l foo.lua", "tool.read_file")
+  assert_refused("grep -rn x lua/ | wc -l", "tool.grep")
+  assert_refused("cd /x && rg foo | cut -d: -f1 | sort -u | tr a b | tail -3", "tool.grep")
+  assert_refused("ls lua | wc -l", "tool.tree")
+end)
+
+it("reads with a non-filter stage, redirect, or shell logic run", function()
+  assert_ran("cat /dev/null | xargs echo")
+  assert_ran("cat /dev/null > /dev/null")
+  assert_ran("grep -c x /dev/null | awk '{print $1}'")
+  assert_ran("cat /dev/null | head -1 && true")
+  assert_ran("cat /dev/null | head -1 || true")
+  assert_ran("cd /tmp && cd / && cat /dev/null")
+  assert_ran("cd /tmp && sudo -n cat /dev/null")
+  assert_ran("grep -c x /dev/null | xargs echo '|'")
+end)
+
+it("a single-quoted pipe is an argument, not a stage", function()
+  assert_refused("grep 'a|b' foo.lua", "tool.grep")
+  assert_refused("rg 'x|y' lua | wc -l", "tool.grep")
+end)
+
+it("runs in the editor's working directory", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  dir = vim.uv.fs_realpath(dir)
+  local real_getcwd = vim.fn.getcwd
+  vim.fn.getcwd = function() return dir end
+  local ok, out = pcall(bash, "pwd -P")
+  vim.fn.getcwd = real_getcwd
+  assert(ok, out)
+  assert(out:find("stdout:\n" .. dir .. "\n", 1, true), "pwd was not " .. dir .. ": " .. out)
+  assert(dir ~= vim.uv.cwd(), "test needs the process cwd to differ from the stubbed getcwd")
+end)
+
+it("nudges on the second identical command in a session", function()
+  local buf = vim.api.nvim_create_buf(false, true)
+  local sctx = { await = ctx.await, bufnr = buf }
+  local function run(c)
+    return registry.call("tool.bash", { command = c }, sctx)
+  end
+  local nudge = "this exact command has run"
+  local first = run("echo nudge-check")
+  assert(not first:find(nudge, 1, true), "nudged on first run: " .. first)
+  local second = run("  echo nudge-check ")
+  assert(second:find("[straps: this exact command has run 2 times this session", 1, true),
+    "no nudge on second run: " .. second)
+  local last_line = second:match("([^\n]*)$")
+  assert(last_line:find(nudge, 1, true), "nudge is not the final line: " .. second)
+  assert(run("echo nudge-check"):find("run 3 times", 1, true), "count did not advance")
+  run("echo hi")
+  assert(not run("echo hi"):find(nudge, 1, true), "short command was nudged")
+  local other = vim.api.nvim_create_buf(false, true)
+  local ok = registry.call("tool.bash", { command = "echo nudge-check" }, { await = ctx.await, bufnr = other })
+  assert(not ok:find(nudge, 1, true), "count leaked across sessions: " .. ok)
+  vim.api.nvim_buf_delete(buf, { force = true })
+  assert(not run("echo nudge-check"):find(nudge, 1, true), "count survived buffer wipe")
 end)
 
 it("prefix lookalikes and unrelated commands run", function()

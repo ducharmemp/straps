@@ -5,9 +5,8 @@
 -- context, show_user, help_search) and run_in_terminal; the graceful "no LSP
 -- client" fallbacks; context reporting windows/cursor/selection; show_user
 -- moving the user's view; help_search excerpting :help; run_in_terminal
--- round-tripping output through a real :terminal split; ask_user's
--- structured { label, preview } options (snacks picker items when snacks is
--- present, labeled preview splits when it is not); hook.confirm's new
+-- round-tripping output through a real :terminal split; ask_user's inline
+-- virt_lines question, its keymaps and live preview split; hook.confirm's new
 -- auto-allows, code_action list-vs-apply gating, and the diff-preview split
 -- being cleaned up after the dialog; fn.autocmd_bridge queueing a hook's
 -- string return onto a session buffer.
@@ -420,86 +419,245 @@ end)
 
 -- -------------------------------------------------------------------- ask_user
 
-it("ask_user routes options through vim.ui.select and shows content alongside", function()
-  local seen = { items = nil, prompt = nil, content_visible = false, wins = 0 }
+local function transcript_buf()
+  local b = vim.api.nvim_create_buf(false, true)
+  vim.b[b].straps_session = true
+  state.append(b, "user", nil, "pick an approach")
+  state.append(b, "assistant", nil, "thinking first\nLAST-ASSISTANT-LINE")
+  state.append(b, "tool_use", { id = "ask1", name = "ask_user" },
+    '{\n  "question": "Which?",\n  "options": ["A", "B"]\n}')
+  vim.cmd("botright split")
+  local w = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(w, b)
+  return b, w
+end
+
+local function press(b, lhs)
+  vim.api.nvim_buf_call(b, function()
+    local m = vim.fn.maparg(lhs, "n", false, true)
+    assert(m.callback, "no buffer map for " .. lhs)
+    m.callback()
+  end)
+end
+
+local function ask(b, input, during, ctx_extra)
+  vim.schedule(during)
+  local extra = { bufnr = b }
+  for k, v in pairs(ctx_extra or {}) do extra[k] = v end
+  return pcall(drive, function(ctx)
+    return registry.call("tool.ask_user", input, ctx)
+  end, 5000, extra)
+end
+
+local function ask_ns_marks(b)
+  return vim.api.nvim_buf_get_extmarks(b, vim.api.nvim_create_namespace("straps_ask_user"),
+    0, -1, { details = true })
+end
+
+it("ask_user renders inline under the last assistant line; 2 chooses; prior <CR> map restored", function()
+  local b, w = transcript_buf()
+  local prior_hit = false
+  vim.keymap.set("n", "<CR>", function() prior_hit = true end, { buffer = b, desc = "prior-cr" })
   local wins_before = #vim.api.nvim_list_wins()
-  local real_select = vim.ui.select
-  vim.ui.select = function(items, opts, on_choice)
-    seen.items = items
-    seen.prompt = opts and opts.prompt
+  local seen = {}
+  local ok, out = ask(b, {
+    question = "Which approach?",
+    options = { "Approach A", "Approach B" },
+    content = "PROPOSED-CONTENT line\nmore",
+  }, function()
+    seen.marks = ask_ns_marks(b)
     seen.wins = #vim.api.nvim_list_wins()
     for _, win in ipairs(vim.api.nvim_list_wins()) do
-      local b = vim.api.nvim_win_get_buf(win)
-      local text = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
+      local text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false), "\n")
       if text:find("PROPOSED-CONTENT", 1, true) then seen.content_visible = true end
     end
-    on_choice(items[2], 2)
-  end
-  local ok, out = pcall(drive, function(ctx)
-    return registry.call("tool.ask_user", {
-      question = "Which approach?",
-      options = { "Approach A", "Approach B" },
-      content = "PROPOSED-CONTENT line\nmore",
-    }, ctx)
+    vim.api.nvim_buf_call(b, function()
+      seen.cr_desc = vim.fn.maparg("<CR>", "n", false, true).desc
+    end)
+    press(b, "2")
   end)
-  vim.ui.select = real_select
   assert(ok, "ask_user errored: " .. tostring(out))
+  assert(out == "user chose option 2: Approach B", "unexpected: " .. out)
 
-  assert(out:find("user chose option 2: Approach B", 1, true), "unexpected: " .. out)
-  assert(seen.prompt == "Which approach?", "question not used as prompt: " .. tostring(seen.prompt))
-  assert(#seen.items == 3 and seen.items[3]:find("other", 1, true),
-    "an 'other' entry should be appended: " .. vim.inspect(seen.items))
-  assert(seen.content_visible, "content split not visible while the picker was up")
-  assert(seen.wins == wins_before + 2, "content split + question banner missing at pick time")
-  assert(#vim.api.nvim_list_wins() == wins_before,
-    "content split leaked after answering")
+  local want_row
+  for i, l in ipairs(vim.api.nvim_buf_get_lines(b, 0, -1, false)) do
+    if l == "LAST-ASSISTANT-LINE" then want_row = i - 1 end
+  end
+  assert(seen.marks and #seen.marks == 1, "expected one virt_lines extmark: " .. vim.inspect(seen.marks))
+  assert(seen.marks[1][2] == want_row,
+    ("extmark on row %d, want last assistant row %d"):format(seen.marks[1][2], want_row))
+  local flat = {}
+  for _, vl in ipairs(seen.marks[1][4].virt_lines) do
+    local parts = {}
+    for _, chunk in ipairs(vl) do parts[#parts + 1] = chunk[1] end
+    flat[#flat + 1] = table.concat(parts)
+  end
+  local text = table.concat(flat, "\n")
+  assert(text:find("question · 2 options", 1, true), "header missing:\n" .. text)
+  assert(text:find("Which approach?", 1, true), "question missing:\n" .. text)
+  assert(text:find("▸ 1. Approach A", 1, true) and text:find("2. Approach B", 1, true),
+    "options missing:\n" .. text)
+  assert(text:find("o. (other: type your own answer)", 1, true), "other line missing:\n" .. text)
+  assert(text:find("j/k move · <CR> choose · 1-9 pick · o other · <Esc> dismiss", 1, true),
+    "hint missing:\n" .. text)
+  assert(seen.cr_desc == "straps: ask_user", "<CR> not taken over: " .. tostring(seen.cr_desc))
+  assert(seen.content_visible and seen.wins == wins_before + 1, "content split missing while asking")
+
+  assert(#vim.api.nvim_list_wins() == wins_before, "content split leaked")
+  assert(#ask_ns_marks(b) == 0, "virt_lines left behind")
+  vim.api.nvim_buf_call(b, function()
+    local m = vim.fn.maparg("<CR>", "n", false, true)
+    assert(m.desc == "prior-cr", "prior <CR> map not restored: " .. vim.inspect(m))
+    m.callback()
+    assert(vim.fn.maparg("j", "n", false, true).buffer ~= 1, "j map left behind")
+  end)
+  assert(prior_hit, "restored <CR> callback is not the original")
+  pcall(vim.api.nvim_win_close, w, true)
 end)
 
-it("ask_user shows the full question in a wrapped float above the picker", function()
-  local long = "Should we hoist the guard into the caller so every entry point shares it,"
-    .. " or keep it at the leaf where the nil actually shows up and accept the duplication?"
+it("ask_user <Esc> dismisses; cancellation also dismisses", function()
+  local b, w = transcript_buf()
+  local ok, out = ask(b, { question = "Pick?", options = { "a", "b" } },
+    function() press(b, "<Esc>") end)
+  assert(ok, "ask_user errored: " .. tostring(out))
+  assert(out == "user dismissed the question without choosing — proceed on your best judgment or ask differently",
+    "unexpected: " .. out)
+
+  local cancel_fn
+  ok, out = ask(b, { question = "Pick?", options = { "a", "b" } },
+    function() cancel_fn() end, { on_cancel = function(fn) cancel_fn = fn end })
+  assert(ok, "ask_user errored: " .. tostring(out))
+  assert(out:find("dismissed the question", 1, true), "on_cancel did not dismiss: " .. out)
+  assert(#ask_ns_marks(b) == 0, "virt_lines left behind after cancel")
+  pcall(vim.api.nvim_win_close, w, true)
+end)
+
+it("ask_user previews swap in one split as j moves; preview buffers are deleted after", function()
+  local b, w = transcript_buf()
   local wins_before = #vim.api.nvim_list_wins()
-  local real_select, seen = vim.ui.select, {}
-  vim.ui.select = function(items, _, on_choice)
+  local seen = {}
+  local function snap(tag)
     for _, win in ipairs(vim.api.nvim_list_wins()) do
-      local cfg = vim.api.nvim_win_get_config(win)
-      if cfg.relative == "editor" then
-        local text = table.concat(vim.api.nvim_buf_get_lines(
-          vim.api.nvim_win_get_buf(win), 0, -1, false), "\n")
-        if text == long then
-          seen.banner = { wrap = vim.wo[win].wrap, linebreak = vim.wo[win].linebreak,
-            width = cfg.width, height = cfg.height, zindex = cfg.zindex,
-            focusable = cfg.focusable }
-        end
+      local wb = vim.wo[win].winbar
+      if wb:match("^preview of option") then
+        local pb = vim.api.nvim_win_get_buf(win)
+        seen[tag] = { winbar = wb, buf = pb, ft = vim.bo[pb].filetype,
+          text = table.concat(vim.api.nvim_buf_get_lines(pb, 0, -1, false), "\n") }
       end
     end
-    on_choice(items[1], 1)
+    seen[tag .. "_wins"] = #vim.api.nvim_list_wins()
   end
-  local ok, out = pcall(drive, function(ctx)
-    return registry.call("tool.ask_user", { question = long, options = { "hoist", "leaf" } }, ctx)
+  local ok, out = ask(b, {
+    question = "Which implementation?",
+    options = {
+      { label = "Guard clause", preview = "GUARD-SKETCH", filetype = "lua" },
+      { label = "100% push", preview = "PUSH-SKETCH" },
+      "plain",
+    },
+    filetype = "markdown",
+  }, function()
+    snap("first")
+    press(b, "j")
+    snap("second")
+    press(b, "j")
+    snap("third")
+    press(b, "k")
+    press(b, "<CR>")
   end)
-  vim.ui.select = real_select
   assert(ok, "ask_user errored: " .. tostring(out))
-  local b = seen.banner
-  assert(b, "the full question was not shown in a float while the picker was up")
-  assert(b.wrap and b.linebreak, "the question float must wrap so long questions stay readable")
-  assert(b.width >= 1 and b.height >= 1, "degenerate float geometry: " .. vim.inspect(b))
-  assert(b.zindex and b.zindex > 100, "the question must sit above picker floats, zindex=" .. tostring(b.zindex))
-  assert(b.focusable == false, "the question float must not steal focus from the picker")
-  assert(#vim.api.nvim_list_wins() == wins_before, "question float leaked after answering")
+  assert(out == "user chose option 2: 100% push", "unexpected: " .. out)
+  assert(seen.first_wins == wins_before + 1, "expected exactly one preview split")
+  assert(seen.first.winbar == "preview of option 1: Guard clause", seen.first.winbar)
+  assert(seen.first.text == "GUARD-SKETCH" and seen.first.ft == "lua", vim.inspect(seen.first))
+  assert(seen.second.winbar == "preview of option 2: 100%% push", seen.second.winbar)
+  assert(seen.second.text == "PUSH-SKETCH" and seen.second.ft == "markdown", vim.inspect(seen.second))
+  assert(seen.third.text:find("no preview", 1, true), vim.inspect(seen.third))
+  assert(#vim.api.nvim_list_wins() == wins_before, "preview split leaked")
+  for _, tag in ipairs({ "first", "second", "third" }) do
+    assert(not vim.api.nvim_buf_is_valid(seen[tag].buf), "preview buffer not deleted: " .. tag)
+  end
+  pcall(vim.api.nvim_win_close, w, true)
 end)
-it("ask_user 'other' choice falls through to free-text input", function()
-  local real_select, real_input = vim.ui.select, vim.ui.input
-  vim.ui.select = function(items, _, on_choice) on_choice(items[#items], #items) end
+
+it("ask_user o goes to free-text input; opens a window when the buffer has none and closes it after", function()
+  local b, w = transcript_buf()
+  vim.api.nvim_win_close(w, true)
+  local wins_before = #vim.api.nvim_list_wins()
+  local real_input = vim.ui.input
   vim.ui.input = function(_, on_confirm) on_confirm("my custom answer") end
-  local ok, out = pcall(drive, function(ctx)
-    return registry.call("tool.ask_user",
-      { question = "Name?", options = { "foo", "bar" } }, ctx)
+  local had_win
+  local ok, out = ask(b, { question = "Name?", options = { "foo", "bar" } }, function()
+    had_win = vim.fn.bufwinid(b) ~= -1
+    press(b, "o")
   end)
-  vim.ui.select, vim.ui.input = real_select, real_input
+  vim.ui.input = real_input
   assert(ok, "ask_user errored: " .. tostring(out))
-  assert(out:find("free text", 1, true) and out:find("my custom answer", 1, true),
-    "unexpected: " .. out)
+  assert(had_win, "ask_user should open a window for a hidden session buffer")
+  assert(out == "user answered (free text): my custom answer", "unexpected: " .. out)
+  assert(#vim.api.nvim_list_wins() == wins_before, "the window ask_user opened leaked")
+end)
+
+it("ask_user refuses a buffer that is not a straps session", function()
+  local b = vim.api.nvim_create_buf(false, true)
+  local ok, out = ask(b, { question = "Pick?", options = { "a", "b" } }, function() end)
+  assert(ok, "ask_user errored: " .. tostring(out))
+  assert(out == "ask_user: no session buffer", "unexpected: " .. out)
+  vim.api.nvim_buf_call(b, function()
+    assert(vim.fn.maparg("j", "n", false, true).buffer ~= 1, "j map bound on a non-session buffer")
+  end)
+end)
+
+it("ask_user keeps drawing after the session window is closed and reopened", function()
+  local b, w = transcript_buf()
+  local text_after
+  local ok, out = ask(b, { question = "Pick?", options = { "a", "b" } }, function()
+    vim.api.nvim_win_close(w, true)
+    vim.cmd("botright split")
+    vim.api.nvim_win_set_buf(0, b)
+    press(b, "j")
+    local flat = {}
+    for _, vl in ipairs(ask_ns_marks(b)[1][4].virt_lines) do
+      for _, chunk in ipairs(vl) do flat[#flat + 1] = chunk[1] end
+    end
+    text_after = table.concat(flat)
+    press(b, "<CR>")
+  end)
+  assert(ok, "ask_user errored: " .. tostring(out))
+  assert(out == "user chose option 2: b", "unexpected: " .. out)
+  assert(text_after and text_after:find("▸ 2. b", 1, true), "selection not redrawn in the new window: " .. tostring(text_after))
+  pcall(vim.api.nvim_win_close, vim.fn.bufwinid(b), true)
+end)
+
+it("ask_user survives the user closing the preview split", function()
+  local b, w = transcript_buf()
+  local ok, out = ask(b, {
+    question = "Which?",
+    options = { { label = "x", preview = "X" }, { label = "y", preview = "Y" } },
+  }, function()
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.wo[win].winbar:match("^preview of option") then vim.api.nvim_win_close(win, true) end
+    end
+    press(b, "j")
+    press(b, "<CR>")
+  end)
+  assert(ok, "ask_user errored: " .. tostring(out))
+  assert(out == "user chose option 2: y", "unexpected: " .. out)
+  pcall(vim.api.nvim_win_close, w, true)
+end)
+
+it("ask_user restores the user's window after the answer", function()
+  local b, w = transcript_buf()
+  vim.cmd("botright split")
+  local user_win = vim.api.nvim_get_current_win()
+  local ok, out = ask(b, { question = "Pick?", options = { "a", "b" } }, function()
+    assert(vim.api.nvim_get_current_win() == w, "focus should be on the session window while asking")
+    press(b, "1")
+  end)
+  assert(ok, "ask_user errored: " .. tostring(out))
+  assert(out == "user chose option 1: a", "unexpected: " .. out)
+  assert(vim.api.nvim_get_current_win() == user_win, "user window not restored")
+  pcall(vim.api.nvim_win_close, user_win, true)
+  pcall(vim.api.nvim_win_close, w, true)
 end)
 
 it("ask_user without options is a free-text prompt; dismissal is reported", function()
@@ -508,199 +666,21 @@ it("ask_user without options is a free-text prompt; dismissal is reported", func
   local ok, out = pcall(drive, function(ctx)
     return registry.call("tool.ask_user", { question = "Anything?" }, ctx)
   end)
+  assert(ok, "ask_user errored: " .. tostring(out))
+  assert(out == "user answered: just typing", "unexpected: " .. out)
+  vim.ui.input = function(_, on_confirm) on_confirm(nil) end
+  ok, out = pcall(drive, function(ctx)
+    return registry.call("tool.ask_user", { question = "Anything?" }, ctx)
+  end)
   vim.ui.input = real_input
   assert(ok, "ask_user errored: " .. tostring(out))
-  assert(out:find("user answered: just typing", 1, true), "unexpected: " .. out)
-
-  local real_select = vim.ui.select
-  vim.ui.select = function(_, _, on_choice) on_choice(nil, nil) end
-  ok, out = pcall(drive, function(ctx)
-    return registry.call("tool.ask_user",
-      { question = "Pick?", options = { "a", "b" } }, ctx)
-  end)
-  vim.ui.select = real_select
-  assert(ok, "ask_user errored: " .. tostring(out))
-  assert(out:find("dismissed the picker", 1, true), "unexpected: " .. out)
+  assert(out == "user dismissed the input without answering — do not re-ask the identical question",
+    "unexpected: " .. out)
 end)
 
 it("ask_user is auto-allowed by hook.confirm", function()
   assert(registry.call("hook.confirm", "ask_user", { question = "?" }, { bufnr = 0 }) == true,
     "ask_user should be auto-allowed — it IS the user interaction")
-end)
-
-it("ask_user structured options without snacks: labeled preview splits + vim.ui.select", function()
-  local real_select = vim.ui.select
-  local real_snacks = package.loaded.snacks
-  package.loaded.snacks = true -- require('snacks') returns a non-table: fallback path
-  local wins_before = #vim.api.nvim_list_wins()
-  local seen = { items = nil, wins = 0, winbars = {}, previews = {}, fts = {} }
-  vim.ui.select = function(items, _, on_choice)
-    seen.items = items
-    seen.wins = #vim.api.nvim_list_wins()
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
-      local wb = vim.wo[win].winbar
-      if wb and wb:match("^%d+: ") then -- only the option-preview splits
-        seen.winbars[#seen.winbars + 1] = wb
-        local b = vim.api.nvim_win_get_buf(win)
-        seen.previews[wb] = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
-        seen.fts[wb] = vim.bo[b].filetype
-      end
-    end
-    table.sort(seen.winbars)
-    on_choice(items[2], 2)
-  end
-  local ok, out = pcall(drive, function(ctx)
-    return registry.call("tool.ask_user", {
-      question = "Which implementation?",
-      options = {
-        { label = "Guard clause", preview = "GUARD-SKETCH if x == nil then return end", filetype = "lua" },
-        { label = "Push check down", preview = "PUSH-SKETCH assert(x)" },
-      },
-      filetype = "markdown",
-    }, ctx)
-  end)
-  vim.ui.select = real_select
-  package.loaded.snacks = real_snacks
-  assert(ok, "ask_user errored: " .. tostring(out))
-  assert(out:find("user chose option 2: Push check down", 1, true), "unexpected: " .. out)
-  assert(#seen.items == 3 and seen.items[1] == "Guard clause" and seen.items[2] == "Push check down",
-    "labels + 'other' expected in the picker: " .. vim.inspect(seen.items))
-  assert(seen.wins == wins_before + 3,
-    "expected 2 preview splits + question banner at pick time, got +" .. (seen.wins - wins_before))
-  assert(seen.winbars[1] == "1: Guard clause" and seen.winbars[2] == "2: Push check down",
-    "winbar labels wrong: " .. vim.inspect(seen.winbars))
-  assert(seen.previews["1: Guard clause"]:find("GUARD-SKETCH", 1, true), "option 1 preview not shown")
-  assert(seen.previews["2: Push check down"]:find("PUSH-SKETCH", 1, true), "option 2 preview not shown")
-  assert(seen.fts["1: Guard clause"] == "lua", "per-option filetype not applied")
-  assert(seen.fts["2: Push check down"] == "markdown", "input.filetype fallback not applied to previews")
-  assert(#vim.api.nvim_list_wins() == wins_before, "preview splits leaked after answering")
-end)
-
-it("ask_user with previews uses the snacks picker when available", function()
-  local real_snacks = package.loaded.snacks
-  local captured
-  package.loaded.snacks = {
-    picker = {
-      pick = function(opts)
-        captured = opts
-        -- Real snacks fires on_close from picker:close(); mirror that so the
-        -- tool's finish-before-close ordering is actually exercised — a tool
-        -- that resolved on close first would report a dismissal here.
-        local fake = {}
-        fake.close = function() opts.on_close(fake) end
-        opts.confirm(fake, opts.items[2])
-      end,
-    },
-  }
-  local ok, out = pcall(drive, function(ctx)
-    return registry.call("tool.ask_user", {
-      question = "Which implementation?",
-      options = {
-        { label = "Guard clause", preview = "if x == nil then return end", filetype = "lua" },
-        "Push check down", -- mixed: a plain option rides along with a placeholder preview
-      },
-      filetype = "markdown",
-    }, ctx)
-  end)
-  package.loaded.snacks = real_snacks
-  assert(ok, "ask_user errored: " .. tostring(out))
-  assert(out:find("user chose option 2: Push check down", 1, true), "unexpected: " .. out)
-  assert(captured.title == "Which implementation?", "question should title the picker")
-  assert(captured.preview == "preview" and captured.format == "text",
-    "picker must render item-data previews (preview='preview', format='text')")
-  assert(#captured.items == 3, "2 options + 'other' expected: " .. vim.inspect(captured.items))
-  assert(captured.items[1].text == "Guard clause"
-    and captured.items[1].preview.text:find("x == nil", 1, true)
-    and captured.items[1].preview.ft == "lua",
-    "item 1 must carry its preview text and filetype: " .. vim.inspect(captured.items[1]))
-  assert(captured.items[2].preview.text:find("no preview", 1, true),
-    "a preview-less option should get a placeholder preview")
-  assert(captured.items[3].text:find("other", 1, true), "'other' item missing")
-end)
-
-it("ask_user snacks dismissal is reported; a snacks failure falls back to vim.ui.select", function()
-  local real_snacks = package.loaded.snacks
-  package.loaded.snacks = { picker = { pick = function(opts) opts.on_close({}) end } }
-  local opts_in = {
-    question = "Pick?",
-    options = { { label = "A", preview = "aaa" }, { label = "B", preview = "bbb" } },
-  }
-  local ok, out = pcall(drive, function(ctx)
-    return registry.call("tool.ask_user", opts_in, ctx)
-  end)
-  package.loaded.snacks = real_snacks -- restore before asserting: a failure must not leak the stub
-  assert(ok, "ask_user errored: " .. tostring(out))
-  assert(out:find("dismissed the picker", 1, true), "unexpected: " .. out)
-
-  -- pick() raising must not lose the question: splits + vim.ui.select take over.
-  package.loaded.snacks = { picker = { pick = function() error("boom") end } }
-  local real_select = vim.ui.select
-  local wins_before = #vim.api.nvim_list_wins()
-  local wins_at_pick = 0
-  vim.ui.select = function(items, _, on_choice)
-    wins_at_pick = #vim.api.nvim_list_wins()
-    on_choice(items[1], 1)
-  end
-  ok, out = pcall(drive, function(ctx)
-    return registry.call("tool.ask_user", opts_in, ctx)
-  end)
-  vim.ui.select = real_select
-  package.loaded.snacks = real_snacks
-  assert(ok, "ask_user errored: " .. tostring(out))
-  assert(out:find("user chose option 1: A", 1, true), "unexpected: " .. out)
-  assert(wins_at_pick == wins_before + 3,
-    "fallback preview splits + question banner missing after snacks failure")
-  assert(#vim.api.nvim_list_wins() == wins_before, "fallback preview splits leaked")
-end)
-
-it("ask_user snacks 'other' choice falls through to free text; content split closes", function()
-  local real_snacks = package.loaded.snacks
-  local real_input = vim.ui.input
-  local wins_before = #vim.api.nvim_list_wins()
-  local wins_at_pick = 0
-  package.loaded.snacks = {
-    picker = {
-      pick = function(opts)
-        wins_at_pick = #vim.api.nvim_list_wins()
-        local fake = {}
-        fake.close = function() opts.on_close(fake) end
-        opts.confirm(fake, opts.items[#opts.items]) -- the appended 'other' item
-      end,
-    },
-  }
-  vim.ui.input = function(_, on_confirm) on_confirm("hand-rolled answer") end
-  local ok, out = pcall(drive, function(ctx)
-    return registry.call("tool.ask_user", {
-      question = "Which?",
-      options = { { label = "A", preview = "aaa" } },
-      content = "SHARED-CONTEXT",
-    }, ctx)
-  end)
-  vim.ui.input = real_input
-  package.loaded.snacks = real_snacks
-  assert(ok, "ask_user errored: " .. tostring(out))
-  assert(out:find("free text", 1, true) and out:find("hand-rolled answer", 1, true),
-    "unexpected: " .. out)
-  assert(wins_at_pick == wins_before + 2,
-    "content split + question banner missing while the snacks picker was up")
-  assert(#vim.api.nvim_list_wins() == wins_before,
-    "content split leaked after answering through the snacks picker")
-end)
-
-it("ask_user plain string options never take the snacks path", function()
-  local real_snacks = package.loaded.snacks
-  local pick_called = false
-  package.loaded.snacks = { picker = { pick = function() pick_called = true end } }
-  local real_select = vim.ui.select
-  vim.ui.select = function(items, _, on_choice) on_choice(items[1], 1) end
-  local ok, out = pcall(drive, function(ctx)
-    return registry.call("tool.ask_user", { question = "Pick?", options = { "a", "b" } }, ctx)
-  end)
-  vim.ui.select = real_select
-  package.loaded.snacks = real_snacks
-  assert(ok, "ask_user errored: " .. tostring(out))
-  assert(not pick_called, "the snacks picker should only be used when previews exist")
-  assert(out:find("user chose option 1: a", 1, true), "unexpected: " .. out)
 end)
 
 -- ------------------------------------------------------------------- undo_edit

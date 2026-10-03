@@ -100,6 +100,20 @@ local function log(bufnr, ev)
   pcall(registry.try_call, "fn.log", ev)
 end
 
+local function finish_events(bufnr, reason, turns)
+  pcall(function() vim.b[bufnr].straps_status = "idle" end)
+  pcall(vim.api.nvim_exec_autocmds, "User",
+    { pattern = "StrapsStatusChanged", data = { bufnr = bufnr, status = "idle" } })
+  pcall(vim.api.nvim_exec_autocmds, "User",
+    { pattern = "StrapsRunEnd", data = { bufnr = bufnr, reason = reason, turns = turns } })
+end
+
+local function crashed(bufnr, run, err)
+  runs[bufnr] = nil
+  finish_events(bufnr, "error", run and run.turns or 0)
+  vim.notify("straps: run crashed: " .. tostring(err), vim.log.levels.ERROR)
+end
+
 local function new_ctx(bufnr, run)
   local ctx
   ctx = {
@@ -131,8 +145,7 @@ local function new_ctx(bufnr, run)
           local ok, err = coroutine.resume(co, unpack(args, 1, args.n))
           registry.set_active_scope(prev_scope)
           if not ok then
-            runs[bufnr] = nil
-            vim.notify("straps: run crashed: " .. tostring(err), vim.log.levels.ERROR)
+            crashed(bufnr, run, err)
           end
         end)
       end)
@@ -700,6 +713,9 @@ function M.start(bufnr)
   local run = { cancelled = false, cancel_fns = {}, await_seq = 0, done = false, turns = 0 }
   runs[bufnr] = run
   pcall(function() vim.b[bufnr].straps_status = "running" end)
+  pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "StrapsRunStart", data = { bufnr = bufnr } })
+  pcall(vim.api.nvim_exec_autocmds, "User",
+    { pattern = "StrapsStatusChanged", data = { bufnr = bufnr, status = "running" } })
   -- all windows: a subagent run changes the parent's agent count
   pcall(function() require("straps.ui").redraw_status(true) end)
 
@@ -731,7 +747,7 @@ function M.start(bufnr)
     end
     pcall(state.ensure_trailing_user, bufnr)
     runs[bufnr] = nil
-    pcall(function() vim.b[bufnr].straps_status = "idle" end)
+    finish_events(bufnr, reason, run.turns)
     -- all windows: subagent finishing updates the parent's count
     pcall(function() require("straps.ui").redraw_status(true) end)
   end)
@@ -744,6 +760,7 @@ function M.start(bufnr)
   registry.set_active_scope(prev_scope)
   if not ok then
     runs[bufnr] = nil
+    finish_events(bufnr, "error", run.turns)
     error(err)
   end
 end
@@ -814,8 +831,7 @@ function M.stop(bufnr)
     local resumed, err = coroutine.resume(run.co)
     registry.set_active_scope(prev_scope)
     if not resumed then
-      runs[bufnr] = nil
-      vim.notify("straps: run crashed: " .. tostring(err), vim.log.levels.ERROR)
+      crashed(bufnr, run, err)
     end
   end, delay)
 end

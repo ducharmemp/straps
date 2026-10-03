@@ -622,8 +622,7 @@ it("agents window options are per-(window,buffer), never per-window", function()
 end)
 
 -- The two cases above cover the windows a test can open and inspect. The
--- remaining write sites (editor.lua's ask_user float) live behind a blocking
--- picker, so they are pinned statically instead: every window-option write in
+-- remaining write sites are pinned statically instead: every window-option write in
 -- the plugin's own source must use the `vim.wo[...][0]` form. This also catches
 -- a NEW site added later, which a per-window case never would.
 it("every window-option write in the source uses the :setlocal form", function()

@@ -115,6 +115,88 @@ end
   assert(last_marker(bufnr):find("user", 1, true), "no trailing user block after run")
 end)
 
+it("fires StrapsRunStart, StrapsRunEnd and StrapsStatusChanged User autocmds", function()
+  define("fn.provider", "fn", "test: one-turn text provider", [==[
+return function(req, ctx)
+  ctx.emit({ type = "text_delta", text = "hi" })
+  return { stop_reason = "end_turn", content = { { type = "text", text = "hi" } } }
+end
+]==])
+  local seen = { start = {}, finish = {}, status = {}, order = {} }
+  local group = vim.api.nvim_create_augroup("straps_test_run_events", { clear = true })
+  vim.api.nvim_create_autocmd("User", { group = group, pattern = "StrapsRunStart",
+    callback = function(a) table.insert(seen.start, a.data) end })
+  vim.api.nvim_create_autocmd("User", { group = group, pattern = "StrapsRunEnd",
+    callback = function(a) table.insert(seen.finish, a.data) table.insert(seen.order, "end") end })
+  vim.api.nvim_create_autocmd("User", { group = group, pattern = "StrapsStatusChanged",
+    callback = function(a) table.insert(seen.status, a.data) table.insert(seen.order, a.data.status) end })
+
+  local bufnr = new_session_with_prompt("say hi")
+  loop.start(bufnr)
+  wait_done(bufnr)
+  vim.api.nvim_del_augroup_by_id(group)
+
+  assert(#seen.start == 1, "StrapsRunStart fired " .. #seen.start .. " times, want 1")
+  assert(seen.start[1].bufnr == bufnr, "StrapsRunStart data.bufnr wrong")
+  assert(#seen.finish == 1, "StrapsRunEnd fired " .. #seen.finish .. " times, want 1")
+  assert(seen.finish[1].bufnr == bufnr, "StrapsRunEnd data.bufnr wrong")
+  assert(seen.finish[1].reason == "ok", "StrapsRunEnd reason " .. tostring(seen.finish[1].reason))
+  assert(type(seen.finish[1].turns) == "number", "StrapsRunEnd data.turns not a number")
+  assert(#seen.status == 2, "StrapsStatusChanged fired " .. #seen.status .. " times, want 2")
+  assert(seen.status[1].status == "running" and seen.status[2].status == "idle",
+    "StrapsStatusChanged order wrong")
+  assert(seen.status[1].bufnr == bufnr and seen.status[2].bufnr == bufnr,
+    "StrapsStatusChanged data.bufnr wrong")
+  assert(vim.b[bufnr].straps_status == "idle", "b:straps_status not idle after run")
+  assert(table.concat(seen.order, ",") == "running,idle,end",
+    "idle StatusChanged must precede StrapsRunEnd, got " .. table.concat(seen.order, ","))
+end)
+
+it("StrapsRunEnd carries reason=cancelled on stop and lets a callback start the next run cleanly", function()
+  define("fn.provider", "fn", "test: provider that awaits until cancelled", [==[
+return function(req, ctx)
+  ctx.await(function(resolve)
+    ctx.on_cancel(function() resolve("killed") end)
+    vim.defer_fn(function() resolve("timeout") end, 3000)
+  end)
+  if ctx.cancelled() then return { content = {}, stop_reason = "cancelled" } end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "x" } } }
+end
+]==])
+  local reasons, mismatches, restarted = {}, 0, false
+  local group = vim.api.nvim_create_augroup("straps_test_run_events_2", { clear = true })
+  vim.api.nvim_create_autocmd("User", { group = group, pattern = "StrapsRunEnd",
+    callback = function(a)
+      table.insert(reasons, a.data.reason)
+      if not restarted then
+        restarted = true
+        define("fn.provider", "fn", "test: one-turn", [==[
+return function(req, ctx)
+  ctx.emit({ type = "text_delta", text = "hi" })
+  return { stop_reason = "end_turn", content = { { type = "text", text = "hi" } } }
+end
+]==])
+        state.append_text(a.data.bufnr, "again")
+        require("straps.loop").start(a.data.bufnr)
+      end
+    end })
+  vim.api.nvim_create_autocmd("User", { group = group, pattern = "StrapsStatusChanged",
+    callback = function(a)
+      if vim.b[a.data.bufnr].straps_status ~= a.data.status then mismatches = mismatches + 1 end
+    end })
+
+  local bufnr = new_session_with_prompt("hang")
+  loop.start(bufnr)
+  assert(loop.running(bufnr), "run should be active while awaiting")
+  loop.stop(bufnr)
+  assert(vim.wait(5000, function() return #reasons == 2 and not loop.running(bufnr) end, 10),
+    "expected two run ends, got " .. vim.inspect(reasons))
+  vim.api.nvim_del_augroup_by_id(group)
+  assert(reasons[1] == "cancelled", "first StrapsRunEnd reason: " .. tostring(reasons[1]))
+  assert(reasons[2] == "ok", "second StrapsRunEnd reason: " .. tostring(reasons[2]))
+  assert(mismatches == 0, mismatches .. " StrapsStatusChanged events disagreed with b:straps_status")
+end)
+
 it("a batched tool response replays as ONE assistant message with all tool_use blocks", function()
   allow_all()
   define("tool.ping", "tool", "ping",

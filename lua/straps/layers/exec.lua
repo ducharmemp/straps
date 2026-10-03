@@ -14,20 +14,21 @@ function M.register()
     name = "tool.bash",
     kind = "tool",
     doc = "Run a shell command via `bash -lc` and return its result with"
-      .. " clearly labeled sections: exit code, stdout, stderr. Never use this"
-      .. " tool to search, read, or inspect files: use the grep tool instead of shell"
-      .. " grep/rg (it also populates this session's findings list), tree/path_info/glob"
-      .. " instead of find/ls, and read_file instead of cat/head/tail. For a"
-      .. " build/test/lint command whose output is compiler/linter-style"
-      .. " diagnostics, prefer run_quickfix — it parses them into this session's"
-      .. " findings list and returns a compact summary instead of a wall of text."
-      .. " Parameters:"
-      .. " command (required) — the shell command line to execute; timeout_ms"
-      .. " (optional, default 120000) — the process tree is killed if it runs"
-      .. " longer than this many milliseconds (the result notes the timeout)."
-      .. " Refuses bare read/search/list/stat/fetch commands (cat/head/tail/sed -n,"
-      .. " grep/rg, ls/find/fd/stat/file, curl/wget with no pipe or redirect) in favor"
-      .. " of the vim-native read_file, grep, tree/path_info, and fetch_url tools.",
+      .. " clearly labeled sections: exit code, stdout, stderr. The command already"
+      .. " runs in the project's working directory, so a leading `cd <project> &&` is"
+      .. " unnecessary. Never use this tool to search, read, or inspect files: use"
+      .. " grep instead of shell grep/rg (it caps results and populates this session's"
+      .. " findings list), tree/path_info/glob instead of find/ls, and read_file"
+      .. " (offset/limit) instead of cat/head/tail/sed -n/wc. For build/test/lint"
+      .. " diagnostics, prefer run_quickfix. Parameters: command (required) — the"
+      .. " shell command line; timeout_ms (optional, default 120000) — the process"
+      .. " tree is killed after this many milliseconds. Refuses read/search/list"
+      .. " commands (cat/head/tail/sed -n/wc, grep/rg, ls/find/fd/stat/file) run bare"
+      .. " or piped only into head/tail/wc/sort/uniq/cut/tr, and bare curl/wget, even"
+      .. " behind a leading `cd <dir> &&`; any redirect, `;`, `&&`, `||`, `$(`, sudo or"
+      .. " other pipeline stage lets the command run. When the same command runs a"
+      .. " second time in a session, the result ends with a note suggesting a"
+      .. " dedicated tool via registry_define.",
     input_schema = {
       type = "object",
       properties = {
@@ -37,35 +38,83 @@ function M.register()
       required = { "command" },
     },
     source = [==[
-return function(input, ctx)
-  local cmd = input.command or ""
-  -- Redirect plain read/search/list commands to the vim-native tools. Only
-  -- bare invocations are refused: any pipe, redirect, or shell logic means
-  -- the command does more than the dedicated tool could, so it runs.
-  local trimmed = cmd:match("^%s*(.-)%s*$")
-  local has_shell_logic = trimmed:find("[|><;&`$(]") or trimmed:find("%f[%a]sudo%f[%A]")
-  if not has_shell_logic then
-    local redirect
-    if trimmed:match("^cat%s+%S")
-      or trimmed:match("^head%s+%S")
-      or trimmed:match("^tail%s+%S")
-      or trimmed:match("^sed%s+%-n%s") then
-      redirect = "tool.read_file (supports offset/limit, gives line numbers)"
-    elseif trimmed:match("^grep%s+%S") or trimmed:match("^rg%s+%S") then
-      redirect = "tool.grep (regex search, also populates this session's findings list)"
-    elseif trimmed == "ls" or trimmed:match("^ls%s")
-      or trimmed:match("^find%s+%S") or trimmed:match("^fd%s+%S") then
-      redirect = "tool.tree or tool.glob (bounded file listings)"
-    elseif trimmed:match("^stat%s+%S") or trimmed:match("^file%s+%S") then
-      redirect = "tool.path_info (filesystem metadata without shelling out)"
-    elseif trimmed:match("^curl%s+https?://") or trimmed:match("^wget%s+https?://") then
-      redirect = "tool.fetch_url (bounded web fetch without ambient shell state)"
-    end
-    if redirect then
-      return "bash: refusing plain read/search/list command (" .. trimmed ..
-        "). Use " .. redirect .. " instead."
+local run_counts = {}
+
+local function strip_cd(s)
+  for _, dir in ipairs({ '"[^"]*"', "'[^']*'", "[^%s;&|]+" }) do
+    for _, sep in ipairs({ "&&", ";" }) do
+      local rest = s:match("^cd%s+" .. dir .. "%s*" .. vim.pesc(sep) .. "%s*(.*)$")
+      if rest then return rest end
     end
   end
+  return s
+end
+
+local function head_redirect(s, piped)
+  if s:match("^cat%s+%S")
+    or s:match("^head%s+%S")
+    or s:match("^tail%s+%S")
+    or s:match("^sed%s+%-n%s")
+    or s:match("^wc%s+%S") then
+    return "tool.read_file (supports offset/limit, gives line numbers)"
+  elseif s:match("^grep%s+%S") or s:match("^rg%s+%S") then
+    return "tool.grep (regex search, caps results, also populates this session's findings list)"
+  elseif s == "ls" or s:match("^ls%s")
+    or s:match("^find%s+%S") or s:match("^fd%s+%S") then
+    return "tool.tree or tool.glob (bounded file listings)"
+  elseif s:match("^stat%s+%S") or s:match("^file%s+%S") then
+    return "tool.path_info (filesystem metadata without shelling out)"
+  elseif not piped and (s:match("^curl%s+https?://") or s:match("^wget%s+https?://")) then
+    return "tool.fetch_url (bounded web fetch without ambient shell state)"
+  end
+end
+
+local filters = { head = true, tail = true, wc = true, sort = true, uniq = true, cut = true, tr = true }
+
+local function redirect_for(trimmed)
+  local s = strip_cd(trimmed):gsub("'[^']*'", "''")
+  if s:find("[><;&`$(]") or s:find("%f[%a]sudo%f[%A]") then return nil end
+  local stages = vim.split(s, "|", { plain = true })
+  for i, stage in ipairs(stages) do
+    stage = vim.trim(stage)
+    if stage == "" then return nil end
+    if i > 1 and not filters[stage:match("^(%S+)")] then return nil end
+    stages[i] = stage
+  end
+  return head_redirect(stages[1], #stages > 1)
+end
+
+local function note_run(bufnr, trimmed)
+  if not bufnr or #trimmed < 12 then return nil end
+  local key = bufnr
+  local counts = run_counts[key]
+  if not counts then
+    counts = {}
+    run_counts[key] = counts
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      vim.api.nvim_create_autocmd("BufWipeout", {
+        buffer = bufnr,
+        once = true,
+        callback = function() run_counts[key] = nil end,
+      })
+    end
+  end
+  counts[trimmed] = (counts[trimmed] or 0) + 1
+  local n = counts[trimmed]
+  if n < 2 then return nil end
+  return "[straps: this exact command has run " .. n .. " times this session; registry_define"
+    .. " a tool for it (e.g. tool.run_tests) so it stops costing a bash round trip]"
+end
+
+return function(input, ctx)
+  local cmd = input.command or ""
+  local trimmed = cmd:match("^%s*(.-)%s*$")
+  local redirect = redirect_for(trimmed)
+  if redirect then
+    return "bash: refusing plain read/search/list command (" .. trimmed ..
+      "). Use " .. redirect .. " instead."
+  end
+  local nudge = note_run(ctx.bufnr, trimmed)
 
   local timeout_ms = tonumber(input.timeout_ms) or 120000
   local cap = 262144
@@ -101,6 +150,7 @@ return function(input, ctx)
       { "bash", "-lc", cmd },
       {
         text = true,
+        cwd = vim.fn.getcwd(),
         detach = true,
         stdout = function(_, chunk) take(stdout, "out", chunk) end,
         stderr = function(_, chunk) take(stderr, "err", chunk) end,
@@ -136,6 +186,7 @@ return function(input, ctx)
   lines[#lines + 1] = table.concat(stdout)
   lines[#lines + 1] = "stderr:"
   lines[#lines + 1] = table.concat(stderr)
+  if nudge then lines[#lines + 1] = nudge end
   return table.concat(lines, "\n")
 end
 ]==],

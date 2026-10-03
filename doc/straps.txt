@@ -21,6 +21,7 @@ CONTENTS						*straps* *straps.nvim*
 	13. Auto mode ............................ |straps-auto|
 	14. Health ............................... |straps-health|
 	15. Highlight groups ..................... |straps-highlights|
+	16. Events ............................... |straps-events|
 
 ==============================================================================
 1. INTRODUCTION						*straps-introduction*
@@ -505,6 +506,27 @@ side quest stops being replayed in later requests. It cannot delete a block,
 cannot write text other than the receipt, and never touches the system block or
 the turn in flight. `session` targets a subagent's transcript instead.
 
+`ask_user` renders the question and its numbered options as virtual lines
+under the last assistant block of the session transcript, so the agent's
+reasoning stays visible above the question. While it is up, the session
+buffer takes over these normal-mode keys: `j`/`k`/<Down>/<Up> move, <CR>
+chooses, `1`-`9` choose by number, `o` types a free-text answer, <Esc>
+dismisses. Any prior buffer-local map on those keys (the session's own <CR>
+send/steer map included) is restored when the question is answered. Options
+with a preview share one split beside the session window, swapped as the
+selection moves; `content` opens a bottom scratch split. Focus returns to
+the window the user was in before the question.
+
+`bash` runs `bash -lc` in Neovim's current directory (|getcwd()|), so a
+leading `cd <project> &&` is unnecessary. It refuses read/search/list
+commands (cat/head/tail/sed -n/wc, grep/rg, ls/find/fd, stat/file) run bare
+or piped only into head/tail/wc/sort/uniq/cut/tr, and bare curl/wget of a URL,
+also behind one leading `cd <dir> &&`, and names the native tool to use
+instead. A redirect,
+`;`, `&&`, `||`, `$(`, backtick, `sudo` or any other pipeline stage lets the
+command run. From the second identical command (12+ characters) in a
+session, the result ends with a note suggesting a `registry_define`d tool.
+
 Writes (write_file/edit_file and the LSP refactors) apply THROUGH the file's
 buffer, so they land in the file's native undo tree — the user reverts with
 |u|, |:earlier| or undotree, and `undo_edit` can revert a specific past edit.
@@ -648,6 +670,24 @@ hook.on_run_end.notify_parent(ctx, reason)
 		|straps-subagents|. Silent for an ordinary run, a child the
 		user stopped, a child `spawn_wait` already collected, and when
 		`spawn_notify` is false. Text comes from |fn.spawn_notice|.
+
+					*hook.on_run_end.reply_refs*
+hook.on_run_end.reply_refs(ctx, reason)
+		Builtin subscriber: when a run ends "ok" and the session has a
+		window, collect the `path:line[:col]` references in the final
+		assistant block that resolve to readable files, deduped on
+		path and line. With two or more, load them into the session
+		window's location list titled "straps: reply refs", without
+		opening it. Each entry's text is the reply line it came from.
+		A windowless session (every subagent) is skipped, so the global
+		quickfix list is never touched. Leaves the list alone when it
+		changed during the run, whatever its title: the companion
+		`hook.on_run_start.reply_refs` records the list's
+		`id:changedtick` in `b:straps_refs_list_at_start`. Disable
+		with >lua
+		  require("straps.registry").remove(
+		    "hook.on_run_end.reply_refs", { scope = "global" })
+<		or redefine it to a no-op.
 
 						*fn.session_notify*
 fn.session_notify({bufnr}, {text}, {opts})
@@ -1029,4 +1069,42 @@ follow your colorscheme; a user `hi link` wins and survives a re-apply.
 The `@straps.marker.*` and `@straps.esc` tree-sitter captures mirror these for
 the parser-based highlighting engine.
 
+==============================================================================
+16. EVENTS						*straps-events*
+
+						*b:straps_status*
+b:straps_status		"running" while a run is active in the session
+			buffer, "idle" once it has ended.
+
+The loop fires these |User| autocmds on every run, from the loop itself, so
+redefining `hook.on_run_start` or `hook.on_run_end` does not silence them.
+Each callback receives the fields below in `args.data`.
+
+						*StrapsRunStart*
+StrapsRunStart		A run started. `data = { bufnr }`.
+						*StrapsRunEnd*
+StrapsRunEnd		A run ended. `data = { bufnr, reason, turns }`.
+			`reason` is "ok", "cancelled", "max_turns",
+			"stalled", "blank" or "error"; `turns` is the
+			number of turns the run took.
+						*StrapsStatusChanged*
+StrapsStatusChanged	Fired right after each |b:straps_status| change.
+			`data = { bufnr, status }`. At run end it fires
+			before |StrapsRunEnd|, so a StrapsRunEnd callback
+			that starts another run sees no stale idle event.
+
+Example: notify when an agent finishes, and a bufferline component: >lua
+	vim.api.nvim_create_autocmd("User", {
+	  pattern = "StrapsRunEnd",
+	  callback = function(args)
+	    vim.b[args.data.bufnr].straps_done = true
+	    vim.notify(("straps: buffer %d done (%s)")
+	      :format(args.data.bufnr, args.data.reason))
+	  end,
+	})
+	local function straps_component(buf)
+	  local s = vim.b[buf].straps_status
+	  return s == "running" and "●" or (vim.b[buf].straps_done and "✓" or "")
+	end
+<
  vim:tw=78:ts=8:noet:ft=help:norl:

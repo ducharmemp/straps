@@ -31,7 +31,7 @@ function M.register()
   agents.register_peers()     -- fn.peer_agents
   exec.register()             -- bash, run_in_terminal, run_quickfix
   agents.register_spawn()     -- spawn, spawn_wait
-  session.register()          -- transcript_excise
+  session.register()          -- transcript_excise, hook.on_run_start.reply_refs, hook.on_run_end.reply_refs
   search.register()           -- glob, path_info, tree, grep, bulk_replace
   selfext.register()          -- registry_list, registry_get, registry_define, skill, eval_lua
   net.register()              -- fetch_url

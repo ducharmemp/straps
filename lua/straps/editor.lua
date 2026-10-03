@@ -2364,24 +2364,24 @@ end
   define({
     name = "tool.ask_user",
     kind = "tool",
-    doc = "Ask the user a question through their own picker UI (vim.ui.select,"
-      .. " so Telescope/fzf-lua/dressing pickers apply automatically). Use it"
-      .. " to propose concrete options — approaches, fixes, names — instead of"
-      .. " guessing or asking in prose. An option is a plain string, or a"
-      .. " { label, preview, filetype } object when the choice is between"
-      .. " competing implementations: put a sketch of what that option's code"
-      .. " or outcome looks like in preview, so the user picks between things"
-      .. " they can see. Previews render in a live preview pane beside the"
-      .. " picker (snacks.nvim) or in labeled splits while the question is up."
-      .. " The question is also shown, wrapped, in a float above the picker, so"
-      .. " it stays readable however long it is."
-      .. " An '(other: type your own answer)' entry is always appended (routed"
-      .. " through vim.ui.input); without options: a free-text vim.ui.input"
-      .. " prompt. content (optional) is displayed in a scratch split while"
-      .. " the question is up — one proposal shared by the whole question —"
-      .. " with optional filetype for highlighting; it closes when the user"
-      .. " answers. The run blocks until the user responds; a dismissal is"
-      .. " reported as such (do not re-ask the identical question)."
+    doc = "Ask the user a question INLINE in the session transcript: the"
+      .. " question and numbered options render as virtual lines under the"
+      .. " last assistant block, so the conversation above stays visible. Use"
+      .. " it to propose concrete options — approaches, fixes, names — instead"
+      .. " of guessing or asking in prose. Keys in the session window while"
+      .. " the question is up: j/k move, <CR> chooses, 1-9 choose by number,"
+      .. " o types a free-text answer (vim.ui.input), <Esc> dismisses. An"
+      .. " option is a plain string, or a { label, preview, filetype } object"
+      .. " when the choice is between competing implementations: put a sketch"
+      .. " of what that option's code or outcome looks like in preview, so the"
+      .. " user picks between things they can see; the selected option's"
+      .. " preview renders live in a split beside the session window. Without"
+      .. " options: a free-text vim.ui.input prompt. content (optional) is"
+      .. " displayed in a scratch split while the question is up — one"
+      .. " proposal shared by the whole question — with optional filetype for"
+      .. " highlighting; it closes when the user answers. The run blocks until"
+      .. " the user responds; a dismissal is reported as such (do not re-ask"
+      .. " the identical question)."
       .. " Parameters: question (required); options (optional array of"
       .. " strings or { label, preview, filetype } objects); content"
       .. " (optional); filetype (optional — highlights content, and is the"
@@ -2398,7 +2398,7 @@ end
               {
                 type = "object",
                 properties = {
-                  label = { type = "string", description = "Option text shown in the picker." },
+                  label = { type = "string", description = "Option text shown in the question." },
                   preview = {
                     type = "string",
                     description = "Sketch of what choosing this option looks like — code, a diff, a plan.",
@@ -2410,7 +2410,7 @@ end
             },
           },
           description = "Choices to offer, as strings or { label, preview, filetype } objects;"
-            .. " an 'other' free-text entry is appended automatically.",
+            .. " a free-text 'other' answer is always reachable with o.",
         },
         content = { type = "string", description = "Content shown in a scratch split while the question is up." },
         filetype = {
@@ -2427,9 +2427,6 @@ return function(input, ctx)
     return "ask_user: question is required"
   end
 
-  -- Normalize options: plain strings, or { label, preview, filetype } objects
-  -- for choices between competing implementations. previews[i] belongs to
-  -- options[i]; input.filetype is the fallback highlight for every preview.
   local options, previews = {}, {}
   local default_ft = (type(input.filetype) == "string" and input.filetype ~= "")
     and input.filetype or nil
@@ -2448,10 +2445,39 @@ return function(input, ctx)
     end
   end
 
-  -- Scratch-split plumbing, shared by the content pane and the fallback
-  -- per-option previews. Every window opened for this question lands in
-  -- `wins` and is closed the moment the user answers.
-  local wins = {}
+  local function free_text(prefix)
+    local typed = ctx.await(function(resolve)
+      local resolved = false
+      local function finish(v)
+        if resolved then return end
+        resolved = true
+        resolve(v)
+      end
+      if type(ctx.on_cancel) == "function" then
+        ctx.on_cancel(function() finish(nil) end)
+      end
+      vim.ui.input({ prompt = question .. " " }, function(text) finish(text) end)
+    end)
+    if typed == nil or typed == "" then
+      return "user dismissed the input without answering — do not re-ask the identical question"
+    end
+    return "user answered" .. prefix .. ": " .. typed
+  end
+
+  if #options == 0 then
+    return free_text("")
+  end
+
+  local bufnr = ctx.bufnr
+  if bufnr == 0 or bufnr == nil then
+    bufnr = vim.api.nvim_get_current_buf()
+  end
+  if not vim.api.nvim_buf_is_valid(bufnr) or not vim.b[bufnr].straps_session then
+    return "ask_user: no session buffer"
+  end
+  local user_win = vim.api.nvim_get_current_win()
+
+  local wins, bufs = {}, {}
   local function capped_lines(text)
     local lines = vim.split(text, "\n", { plain = true })
     if #lines > 200 then
@@ -2463,202 +2489,210 @@ return function(input, ctx)
     return lines
   end
   local function scratch_buf(lines, ft)
-    local pbuf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_lines(pbuf, 0, -1, false, lines)
-    vim.bo[pbuf].bufhidden = "wipe"
+    local b = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
+    vim.bo[b].bufhidden = "hide"
     if type(ft) == "string" and ft ~= "" then
-      pcall(function() vim.bo[pbuf].filetype = ft end)
+      pcall(function() vim.bo[b].filetype = ft end)
     end
-    return pbuf
-  end
-  local function done(result)
-    for _, w in ipairs(wins) do pcall(vim.api.nvim_win_close, w, true) end
-    return result
+    bufs[#bufs + 1] = b
+    return b
   end
 
-  -- The question itself, in a float above the picker. A picker's title/prompt
-  -- is one truncated line, and the transcript copy of the question is hidden
-  -- under a full-screen picker — so the question is rendered here, wrapped,
-  -- for every path below (snacks picker, vim.ui.select, free-text input).
-  -- zindex 150: Snacks.win.zindex() counts up from 50 and ignores windows at
-  -- or above its max of 100, so this stays on top without pushing picker
-  -- zindexes higher (verified in snacks.nvim lua/snacks/win.lua M.zindex).
-  pcall(function()
-    local qlines = capped_lines(question)
-    local width = math.max(1, math.min(100, vim.o.columns - 4))
-    local rows = 0
-    for _, l in ipairs(qlines) do
-      rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(l) / width))
-    end
-    local height = math.max(1, math.min(rows, math.max(1, math.floor(vim.o.lines / 3))))
-    local qwin = vim.api.nvim_open_win(scratch_buf(qlines), false, {
-      relative = "editor",
-      row = 0,
-      col = math.max(0, math.floor((vim.o.columns - width) / 2)),
-      width = width,
-      height = height,
-      style = "minimal",
-      border = "rounded",
-      focusable = false,
-      noautocmd = true,
-      zindex = 150,
-    })
-    wins[#wins + 1] = qwin
-    vim.wo[qwin][0].wrap = true
-    vim.wo[qwin][0].linebreak = true
-    vim.cmd("redraw")
-  end)
+  local win = vim.fn.bufwinid(bufnr)
+  if win == -1 then
+    vim.cmd("botright split")
+    win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(win, bufnr)
+    wins[#wins + 1] = win
+  end
+  local function session_win()
+    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == bufnr then return win end
+    local w = vim.fn.bufwinid(bufnr)
+    if w ~= -1 then win = w end
+    return w ~= -1 and w or nil
+  end
 
-  -- Optional content split, shown while the question is up (same pattern as
-  -- the confirm diff preview) and closed as soon as the user answers.
+  local function anchor_row()
+    local blocks = require("straps.state").list_blocks(bufnr)
+    local last_assistant
+    for _, b in ipairs(blocks) do
+      if b.kind == "assistant" then last_assistant = b end
+    end
+    local n = vim.api.nvim_buf_line_count(bufnr)
+    if not last_assistant then return n - 1 end
+    local next_marker = n + 1
+    for _, b in ipairs(blocks) do
+      if b.marker_lnum > last_assistant.marker_lnum and b.marker_lnum < next_marker then
+        next_marker = b.marker_lnum
+      end
+    end
+    local lines = vim.api.nvim_buf_get_lines(bufnr, last_assistant.marker_lnum - 1, next_marker - 1, false)
+    local i = #lines
+    while i > 1 and lines[i]:match("^%s*$") do i = i - 1 end
+    return last_assistant.marker_lnum - 1 + i - 1
+  end
+
   if type(input.content) == "string" and input.content ~= "" then
     pcall(function()
       local lines = capped_lines(input.content)
-      local prev = vim.api.nvim_get_current_win()
+      vim.api.nvim_set_current_win(win)
       vim.cmd("botright " .. math.min(#lines + 1, 15) .. "split")
       local cwin = vim.api.nvim_get_current_win()
       wins[#wins + 1] = cwin
       vim.api.nvim_win_set_buf(cwin, scratch_buf(lines, default_ft))
-      pcall(vim.api.nvim_set_current_win, prev)
-      vim.cmd("redraw")
+      vim.wo[cwin].winbar = "ask_user content"
     end)
   end
 
-  local function free_text(prefix)
-    local typed = ctx.await(function(resolve)
-      vim.ui.input({ prompt = question .. " " }, function(text) resolve(text) end)
-    end)
-    if typed == nil or typed == "" then
-      return done("user dismissed the input without answering — do not re-ask the identical question")
-    end
-    return done("user answered" .. prefix .. ": " .. typed)
-  end
-
-  if #options == 0 then
-    return free_text("")
-  end
-
-  local OTHER = "(other: type your own answer)"
-
-  -- snacks.nvim path: options with previews become native picker items whose
-  -- preview pane renders live as the selection moves (opts.preview =
-  -- "preview" renders each item's own { text, ft }). Only taken when at
-  -- least one option carries a preview — plain choices stay on
-  -- vim.ui.select, whichever picker the user has wired to it.
+  local pwin, pbufs = nil, {}
   if next(previews) ~= nil then
-    local ok_snacks, snacks = pcall(require, "snacks")
-    local pick = ok_snacks and type(snacks) == "table"
-      and type(snacks.picker) == "table" and snacks.picker.pick or nil
-    if pick then
-      -- Resolves { label = s } on a choice, { dismissed = true } on close
-      -- without one, false when the pick call itself failed (then the
-      -- split-based fallback below still asks the question).
-      local res = ctx.await(function(resolve)
-        local resolved = false
-        local function finish(v)
-          if not resolved then
-            resolved = true
-            resolve(v)
-          end
-        end
-        local items = {}
-        for i, label in ipairs(options) do
-          local p = previews[i]
-          items[#items + 1] = {
-            text = label,
-            preview = p and { text = p.text, ft = p.ft, loc = false }
-              or { text = "(no preview for this option)", loc = false },
-          }
-        end
-        items[#items + 1] = {
-          text = OTHER,
-          preview = { text = "(type your own answer)", loc = false },
-        }
-        local ok_pick = pcall(pick, {
-          title = question,
-          items = items,
-          format = "text",
-          preview = "preview",
-          -- finish BEFORE close: closing fires on_close, and the first
-          -- resolution must be the user's choice, not the dismissal.
-          confirm = function(picker, item)
-            finish(item and { label = item.text } or { dismissed = true })
-            picker:close()
-          end,
-          on_close = function()
-            finish({ dismissed = true })
-          end,
-        })
-        if not ok_pick then
-          finish(false)
-        end
-      end)
-      if res ~= false then
-        if type(res) ~= "table" or res.dismissed or res.label == nil then
-          return done("user dismissed the picker without choosing — proceed on your best judgment or ask differently")
-        end
-        if res.label == OTHER then
-          return free_text(" (free text)")
-        end
-        for i, o in ipairs(options) do
-          if o == res.label then
-            return done(string.format("user chose option %d: %s", i, o))
-          end
-        end
-        return done("user chose: " .. res.label)
-      end
-      -- res == false: the snacks call itself failed; fall through to the
-      -- split-based rendering below and ask via vim.ui.select instead.
-    end
-
-    -- No snacks (or snacks failed): show every option's preview at once in
-    -- labeled splits — one bottom row, one vertical window per preview —
-    -- while vim.ui.select is up. Best effort; the question works without
-    -- them.
     pcall(function()
-      local prev = vim.api.nvim_get_current_win()
-      local height, panes = 3, {}
+      vim.api.nvim_set_current_win(win)
+      vim.cmd("rightbelow vsplit")
+      pwin = vim.api.nvim_get_current_win()
+      wins[#wins + 1] = pwin
       for i = 1, #options do
         local p = previews[i]
-        if p then
-          local lines = capped_lines(p.text)
-          height = math.max(height, math.min(#lines + 1, 15))
-          panes[#panes + 1] = {
-            buf = scratch_buf(lines, p.ft),
-            label = i .. ": " .. options[i],
-          }
-        end
+        pbufs[i] = scratch_buf(p and capped_lines(p.text) or { "(no preview for this option)" },
+          p and p.ft or nil)
       end
-      for n, pane in ipairs(panes) do
-        if n == 1 then
-          vim.cmd("botright " .. height .. "split")
-        else
-          vim.cmd("rightbelow vsplit")
-        end
-        local w = vim.api.nvim_get_current_win()
-        wins[#wins + 1] = w
-        vim.api.nvim_win_set_buf(w, pane.buf)
-        -- winbar interprets % codes; the label is plain text.
-        pcall(function() vim.wo[w].winbar = pane.label:gsub("%%", "%%%%") end)
-      end
-      pcall(vim.api.nvim_set_current_win, prev)
-      vim.cmd("redraw")
     end)
   end
 
-  local items = {}
-  for _, o in ipairs(options) do items[#items + 1] = o end
-  items[#items + 1] = OTHER
-  local choice, idx = ctx.await(function(resolve)
-    vim.ui.select(items, { prompt = question }, function(item, i) resolve(item, i) end)
-  end)
-  if choice == nil then
-    return done("user dismissed the picker without choosing — proceed on your best judgment or ask differently")
+  local ns = vim.api.nvim_create_namespace("straps_ask_user")
+  local selected = 1
+  local HINT = "j/k move · <CR> choose · 1-9 pick · o other · <Esc> dismiss"
+
+  local function build_lines()
+    local w = session_win()
+    local width = math.max(20, (w and vim.api.nvim_win_get_width(w) or vim.o.columns) - 6)
+    local vl = { { { " ", "Normal" } } }
+    vl[#vl + 1] = { { "┌ ? ", "DiagnosticInfo" },
+      { ("question · %d options"):format(#options), "Title" } }
+    for _, l in ipairs(capped_lines(question)) do
+      if l == "" then vl[#vl + 1] = { { "│", "DiagnosticInfo" } } end
+      while #l > 0 do
+        local piece = l:sub(1, width)
+        if #l > width then
+          local cut = piece:match("^.*()%s") or (width + 1)
+          piece = l:sub(1, cut - 1)
+        end
+        vl[#vl + 1] = { { "│ ", "DiagnosticInfo" }, { piece, "Normal" } }
+        l = l:sub(#piece + 1):gsub("^%s+", "")
+      end
+    end
+    vl[#vl + 1] = { { "│", "DiagnosticInfo" } }
+    for i, o in ipairs(options) do
+      local sel = i == selected
+      vl[#vl + 1] = {
+        { "│ ", "DiagnosticInfo" },
+        { sel and "▸ " or "  ", "DiagnosticOk" },
+        { ("%d. "):format(i), sel and "Number" or "Comment" },
+        { o, sel and "CursorLineNr" or "Normal" },
+        { previews[i] and "  ◧ preview →" or "", "Comment" },
+      }
+    end
+    vl[#vl + 1] = { { "│ ", "DiagnosticInfo" }, { "  o. ", "Comment" },
+      { "(other: type your own answer)", "Comment" } }
+    vl[#vl + 1] = { { "└ ", "DiagnosticInfo" }, { HINT, "Comment" } }
+    return vl
   end
-  if choice == OTHER then
+
+  local function draw()
+    if not vim.api.nvim_buf_is_valid(bufnr) then return end
+    local w = session_win()
+    vim.api.nvim_buf_clear_namespace(bufnr, ns, 0, -1)
+    vim.api.nvim_buf_set_extmark(bufnr, ns, anchor_row(), 0,
+      { virt_lines = build_lines(), virt_lines_above = false })
+    if pwin and vim.api.nvim_win_is_valid(pwin) and pbufs[selected]
+      and vim.api.nvim_buf_is_valid(pbufs[selected]) then
+      vim.api.nvim_win_set_buf(pwin, pbufs[selected])
+      pcall(function()
+        vim.wo[pwin].winbar = ("preview of option %d: %s"):format(selected,
+          (options[selected]:gsub("%%", "%%%%")))
+      end)
+    end
+    if w then
+      pcall(vim.api.nvim_win_call, w, function()
+        vim.api.nvim_win_set_cursor(w, { vim.api.nvim_buf_line_count(bufnr), 0 })
+        vim.cmd("normal! zb")
+      end)
+    end
+    vim.cmd("redraw")
+  end
+
+  local keys = { "j", "k", "<CR>", "<Esc>", "o", "<Down>", "<Up>" }
+  for i = 1, math.min(9, #options) do keys[#keys + 1] = tostring(i) end
+  local saved = {}
+  vim.api.nvim_buf_call(bufnr, function()
+    for _, lhs in ipairs(keys) do
+      local m = vim.fn.maparg(lhs, "n", false, true)
+      if type(m) == "table" and next(m) and m.buffer == 1 then saved[lhs] = m end
+    end
+  end)
+
+  local function restore()
+    pcall(vim.api.nvim_buf_clear_namespace, bufnr, ns, 0, -1)
+    for _, lhs in ipairs(keys) do pcall(vim.keymap.del, "n", lhs, { buffer = bufnr }) end
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      vim.api.nvim_buf_call(bufnr, function()
+        for _, m in pairs(saved) do pcall(vim.fn.mapset, "n", false, m) end
+      end)
+    end
+    for _, w in ipairs(wins) do pcall(vim.api.nvim_win_close, w, true) end
+    for _, b in ipairs(bufs) do pcall(vim.api.nvim_buf_delete, b, { force = true }) end
+    if vim.api.nvim_win_is_valid(user_win) then pcall(vim.api.nvim_set_current_win, user_win) end
+  end
+
+  local ok_wait, res = pcall(ctx.await, function(resolve)
+    local resolved = false
+    local function finish(v)
+      if resolved then return end
+      resolved = true
+      resolve(v)
+    end
+    local function map(lhs, fn)
+      vim.keymap.set("n", lhs, function()
+        local ok, err = pcall(fn)
+        if not ok then
+          vim.notify("ask_user: " .. tostring(err), vim.log.levels.ERROR)
+        end
+      end, { buffer = bufnr, nowait = true, desc = "straps: ask_user" })
+    end
+    local function move(d)
+      selected = ((selected - 1 + d) % #options) + 1
+      draw()
+    end
+    map("j", function() move(1) end)
+    map("<Down>", function() move(1) end)
+    map("k", function() move(-1) end)
+    map("<Up>", function() move(-1) end)
+    map("<CR>", function() finish({ idx = selected }) end)
+    map("<Esc>", function() finish({ dismissed = true }) end)
+    map("o", function() finish({ other = true }) end)
+    for i = 1, math.min(9, #options) do
+      map(tostring(i), function() finish({ idx = i }) end)
+    end
+    if type(ctx.on_cancel) == "function" then
+      ctx.on_cancel(function() finish({ dismissed = true }) end)
+    end
+    pcall(vim.api.nvim_set_current_win, win)
+    local ok_draw, err = pcall(draw)
+    if not ok_draw then
+      vim.notify("ask_user: " .. tostring(err), vim.log.levels.ERROR)
+    end
+  end)
+
+  restore()
+  if not ok_wait then error(res, 0) end
+  if type(res) ~= "table" or res.dismissed then
+    return "user dismissed the question without choosing — proceed on your best judgment or ask differently"
+  end
+  if res.other then
     return free_text(" (free text)")
   end
-  return done(string.format("user chose option %d: %s", idx, choice))
+  return string.format("user chose option %d: %s", res.idx, options[res.idx])
 end
 ]==]),
   })

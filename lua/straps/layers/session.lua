@@ -358,6 +358,98 @@ return function(input, ctx)
 end
 ]==],
   })
+
+  define({
+    name = "hook.on_run_start.reply_refs",
+    kind = "hook",
+    doc = "Subscriber to hook.on_run_start: record the id of the session's"
+      .. " findings list at run start in b:straps_refs_list_at_start, so"
+      .. " hook.on_run_end.reply_refs can tell whether the agent set its own"
+      .. " list during the run.",
+    source = [==[
+return function(ctx)
+  pcall(function()
+    local bufnr = ctx and ctx.bufnr
+    if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then return end
+    local win = require("straps.findings").session_win(bufnr)
+    if not win then
+      vim.b[bufnr].straps_refs_list_at_start = nil
+      return
+    end
+    local info = vim.fn.getloclist(win, { id = 0, changedtick = 1 })
+    vim.b[bufnr].straps_refs_list_at_start = (info.id or 0) .. ":" .. (info.changedtick or 0)
+  end)
+end
+]==],
+  })
+
+  define({
+    name = "hook.on_run_end.reply_refs",
+    kind = "hook",
+    doc = "Subscriber to hook.on_run_end: after a run that ends \"ok\", load the"
+      .. " readable path:line references in the final assistant block into the"
+      .. " session window's location list, titled \"straps: reply refs\", without"
+      .. " opening it. Skipped when the session has no window (so a subagent never"
+      .. " touches the global quickfix list), when the reply has fewer than 2"
+      .. " distinct refs, or when the list changed during the run (the agent set"
+      .. " its own). Disable by removing or redefining this entry.",
+    source = [==[
+return function(ctx, reason)
+  pcall(function()
+    if reason ~= "ok" then return end
+    local bufnr = ctx and ctx.bufnr
+    if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then return end
+    local state = require("straps.state")
+    local findings = require("straps.findings")
+
+    local blocks = state.list_blocks(bufnr)
+    local last
+    for i = #blocks, 1, -1 do
+      if blocks[i].kind == "assistant" then
+        last = blocks[i]
+        break
+      end
+    end
+    if not last then return end
+
+    local lines = vim.api.nvim_buf_get_lines(bufnr, last.marker_lnum - 1,
+      math.max(last.last_lnum, last.marker_lnum), false)
+    if lines[1] then
+      lines[1] = lines[1]:gsub("^%%%%%[straps:[a-z_]+%]%%%%%s?", "")
+    end
+
+    local items, seen = {}, {}
+    for i, line in ipairs(lines) do
+      if i > 1 then line = line:gsub("^%%%%%[%[esc%]%]", "") end
+      local text = vim.trim(line):sub(1, 120)
+      for path, lnum, col in line:gmatch("([%w_%.%/~%-]+):(%d+):?(%d*)") do
+        local full = vim.fn.fnamemodify(path, ":p")
+        local key = full .. ":" .. lnum
+        if not seen[key] and vim.fn.filereadable(full) == 1 then
+          seen[key] = true
+          items[#items + 1] = {
+            filename = full,
+            lnum = tonumber(lnum),
+            col = tonumber(col) or 0,
+            text = text,
+          }
+        end
+      end
+    end
+    if #items < 2 then return end
+
+    local win = findings.session_win(bufnr)
+    if not win then return end
+    local info = vim.fn.getloclist(win, { id = 0, changedtick = 1 })
+    local now = (info.id or 0) .. ":" .. (info.changedtick or 0)
+    local at_start = vim.b[bufnr].straps_refs_list_at_start
+    if at_start ~= nil and now ~= at_start then return end
+
+    findings.set_locations(bufnr, { title = "straps: reply refs", items = items }, false)
+  end)
+end
+]==],
+  })
 end
 
 return M

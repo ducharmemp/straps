@@ -86,6 +86,7 @@ it("highlight groups resolve to their default link targets", function()
     StrapsRoleUser = "Function",
     StrapsRoleAgent = "Keyword",
     StrapsRoleSystem = "Comment",
+    StrapsRoleNotice = "Identifier",
     StrapsTool = "Special",
     StrapsToolOk = "DiagnosticOk",
     StrapsToolError = "DiagnosticError",
@@ -653,4 +654,92 @@ it("every window-option write in the source uses the :setlocal form", function()
   assert(#offenders == 0,
     "window options written with the :set form (use vim.wo[w][0]): "
     .. table.concat(offenders, ", "))
+end)
+
+-- ---------------------------------------------------------- notice overlays
+-- A user block that carries a harness notice or a peer-agent message (the
+-- `[straps] ` content convention, state.notice_of) is not the user's turn and
+-- must not render as `you`. The marker-line inline form and an indented
+-- lookalike are covered: the classifier reads the raw first content line.
+local nbuf
+local NLN = {}
+step(function()
+  nbuf = vim.api.nvim_create_buf(false, true)
+  vim.bo[nbuf].filetype = "straps"
+  local long_label = string.rep("x", 70) .. ".straps"
+  vim.api.nvim_buf_set_lines(nbuf, 0, -1, false, {
+    "%%[straps:user]%%",                                              -- 1 you
+    "plain words",                                                    -- 2
+    "",                                                               -- 3
+    "%%[straps:user]%%",                                              -- 4 harness
+    "",                                                               -- 5 (leading blank)
+    "[straps] subagent buffer 9: finished — task: x.",                -- 6
+    "",                                                               -- 7
+    "%%[straps:user]%%",                                              -- 8 agent 104
+    state.agent_message(long_label, 104, "hold off on loop.lua"),     -- 9
+    "",                                                               -- 10
+    "%%[straps:user]%% [straps] Multiplayer: inline on the marker",  -- 11 harness (inline)
+    "",                                                               -- 12
+    "%%[straps:user]%%",                                              -- 13 you (indented lookalike)
+    "  [straps] not a notice",                                        -- 14
+    "",                                                               -- 15
+    "%%[straps:user]%%",                                              -- 16 you (colon form)
+    "[straps: orphaned tool result (id t9) — ...]",                   -- 17
+    "",                                                               -- 18
+    "%%[straps:assistant]%%",                                         -- 19
+    "ok",                                                             -- 20
+  })
+  NLN = { you = 1, harness = 4, agent = 8, inline = 11, indented = 13, colon = 16 }
+  registry.call("fn.render", nbuf)
+end)
+
+local function overlay_of(lnum)
+  for _, m in ipairs(marks_on_row(nbuf, lnum)) do
+    local d = m[4]
+    if d.virt_text and d.virt_text_pos == "overlay" then
+      return d.virt_text
+    end
+  end
+end
+
+it("a harness notice in a user block renders as `harness`, not `you`", function()
+  for _, lnum in ipairs({ NLN.harness, NLN.inline }) do
+    local v = overlay_of(lnum)
+    assert(v, "no overlay on line " .. lnum)
+    assert(v[2][1] == "harness", ("line %d label: %s"):format(lnum, v[2][1]))
+    assert(v[2][2] == "StrapsRoleNotice" and v[1][2] == "StrapsRoleNotice",
+      "notice label and lead must carry StrapsRoleNotice")
+    assert(v[1][1]:find("┄", 1, true), "notice lead must use the ┄ bar")
+  end
+end)
+
+it("a peer-agent message renders as `agent N` with the buffer number", function()
+  local v = overlay_of(NLN.agent)
+  assert(v, "no overlay on the agent-message marker")
+  assert(v[2][1] == "agent 104", "label: " .. tostring(v[2][1]))
+  assert(v[2][2] == "StrapsRoleNotice", "agent label must carry StrapsRoleNotice")
+end)
+
+it("the user's own words keep the `you` rule, lookalikes included", function()
+  for _, lnum in ipairs({ NLN.you, NLN.indented, NLN.colon }) do
+    local v = overlay_of(lnum)
+    assert(v, "no overlay on line " .. lnum)
+    assert(v[2][1] == "you" and v[2][2] == "StrapsRoleUser",
+      ("line %d should render as you/StrapsRoleUser, got %s/%s"):format(lnum, v[2][1], v[2][2]))
+  end
+end)
+
+it("gO labels notices as harness / agent N and aligns the label column", function()
+  vim.cmd("split")
+  local win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(win, nbuf)
+  local n = ui.outline(nbuf)
+  assert(n == 7, "expected 7 turns, got " .. tostring(n))
+  local items = vim.fn.getloclist(win)
+  -- Column width is the widest label ("agent 104", 9 cells) plus one space.
+  assert(items[1].text:match("^you       plain words"), "you row misaligned: " .. items[1].text)
+  assert(items[2].text:match("^harness   %[straps%]"), "harness row: " .. items[2].text)
+  assert(items[3].text:match("^agent 104 %[straps%]"), "agent row: " .. items[3].text)
+  assert(items[5].text:match("^you       "), "indented lookalike should be you: " .. items[5].text)
+  vim.api.nvim_win_close(win, true)
 end)

@@ -106,7 +106,7 @@
           # inside a headless Neovim, so the specs see vim.* like the plugin does.
           # procps: agent_ux_spec's process-tree kill cases poll pgrep/pkill.
           nativeBuildInputs = [
-            pkgs.neovim pkgs.git pkgs.ripgrep pkgs.curl pkgs.procps
+            pkgs.neovim pkgs.git pkgs.ripgrep pkgs.curl pkgs.gzip pkgs.procps
             pkgs.luajitPackages.busted pkgs.luajitPackages.nlua
           ];
           dontBuild = true;
@@ -143,7 +143,7 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = [
-            pkgs.neovim pkgs.ripgrep pkgs.curl
+            pkgs.neovim pkgs.ripgrep pkgs.curl pkgs.gzip
             pkgs.luajitPackages.busted pkgs.luajitPackages.nlua
           ];
         };

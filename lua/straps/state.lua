@@ -41,6 +41,53 @@ local function unescape_line(line)
   return line
 end
 
+local NOTICE_PREFIX = "[straps] "
+local AGENT_FRAME = "[straps] from agent %s (buffer %d): %s"
+
+--- Classify a user block's content: nil for the user's own words,
+--- { from = "harness" } for a harness notice, or
+--- { from = "agent", bufnr = N, label = "..." } for a peer message built by
+--- M.agent_message. Matches the RAW first non-blank line, untrimmed: parse
+--- keeps leading whitespace, so an indented lookalike is the user's text to
+--- the model and must stay the user's text on screen.
+function M.notice_of(content)
+  if type(content) ~= "string" then
+    return nil
+  end
+  local first
+  for _, line in ipairs(vim.split(content, "\n", { plain = true })) do
+    if not line:match("^%s*$") then
+      first = line
+      break
+    end
+  end
+  if not first or first:sub(1, #NOTICE_PREFIX) ~= NOTICE_PREFIX then
+    return nil
+  end
+  local label, bufnr = first:match("^%[straps%] from agent (.-) %(buffer (%d+)%): ")
+  if label then
+    return { from = "agent", bufnr = tonumber(bufnr), label = label }
+  end
+  return { from = "harness" }
+end
+
+--- The content of a peer message: `[straps] from agent <label> (buffer N):
+--- <text>`. The label is stamped here, at send time, so the block attributes
+--- itself without any lookup — a buffer number alone names a different
+--- session after a restart. A continuation line that itself starts with the
+--- notice prefix is indented one space: only the first line of a message may
+--- speak for its sender, so a body cannot imitate the harness or another
+--- agent further down.
+function M.agent_message(label, bufnr, text)
+  local lines = vim.split(text, "\n", { plain = true })
+  for i = 2, #lines do
+    if lines[i]:sub(1, #NOTICE_PREFIX) == NOTICE_PREFIX then
+      lines[i] = " " .. lines[i]
+    end
+  end
+  return AGENT_FRAME:format(tostring(label), bufnr, table.concat(lines, "\n"))
+end
+
 -- Returns kind, attrs, inline for a marker line, or nil if the line isn't a
 -- marker. Only tool markers carry JSON attrs; for user/assistant/system any
 -- trailing text is treated as the block's first content line (people type
@@ -201,25 +248,57 @@ end
 --- ARE included in the range. Compact implementations replace the whole
 --- range, so that's fine. Empty content => first_lnum > last_lnum.
 --- Reuses the marker matcher; parse behavior is unchanged.
+---
+--- Cached per buffer on changedtick: foldtext asks for the index once per
+--- closed fold on every redraw, and each call scanned the whole transcript.
+--- The outer array is fresh on every call (sort or truncate it freely); the
+--- block tables inside are shared until the buffer next changes, so callers
+--- must treat them as read-only. Every mutation path (nvim_buf_set_lines,
+--- set_text, undo, reload) bumps the tick and invalidates the entry.
+local blocks_cache = {}
+
 function M.list_blocks(bufnr)
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  local blocks = {}
-  for lnum, line in ipairs(lines) do
-    local kind, attrs = match_marker(line)
-    if kind then
-      if blocks[#blocks] then
-        blocks[#blocks].last_lnum = lnum - 1
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
+  local hit = blocks_cache[bufnr]
+  if not (hit and hit.tick == tick) then
+    for b in pairs(blocks_cache) do
+      if not vim.api.nvim_buf_is_valid(b) then
+        blocks_cache[b] = nil
       end
-      blocks[#blocks + 1] = {
-        kind = kind,
-        attrs = attrs,
-        marker_lnum = lnum,
-        first_lnum = lnum + 1,
-        last_lnum = #lines,
-      }
     end
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local blocks = {}
+    for lnum, line in ipairs(lines) do
+      local kind, attrs = match_marker(line)
+      if kind then
+        if blocks[#blocks] then
+          blocks[#blocks].last_lnum = lnum - 1
+        end
+        blocks[#blocks + 1] = {
+          kind = kind,
+          attrs = attrs,
+          marker_lnum = lnum,
+          first_lnum = lnum + 1,
+          last_lnum = #lines,
+        }
+      end
+    end
+    hit = { tick = tick, blocks = blocks }
+    blocks_cache[bufnr] = hit
   end
-  return blocks
+  local out = {}
+  for i, b in ipairs(hit.blocks) do
+    out[i] = b
+  end
+  return out
+end
+
+function M._blocks_cache_size()
+  local n = 0
+  for _ in pairs(blocks_cache) do
+    n = n + 1
+  end
+  return n
 end
 
 -- Windows showing bufnr with the cursor on the last line stay pinned to the
@@ -365,10 +444,13 @@ function M.session_summary(path)
       end
       return false
     end
+    local function is_prompt()
+      return has_content() and not M.notice_of(table.concat(collected, "\n"))
+    end
     for _, line in ipairs(lines) do
       local kind = match_marker(line)
       if kind then
-        if has_content() then
+        if is_prompt() then
           break -- first non-empty user block ended
         end
         in_user = (kind == "user")
@@ -376,6 +458,9 @@ function M.session_summary(path)
       elseif in_user then
         collected[#collected + 1] = unescape_line(line)
       end
+    end
+    if not is_prompt() then
+      return nil
     end
     local text = vim.trim(table.concat(collected, " "))
     text = text:gsub("%s+", " ")

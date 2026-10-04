@@ -27,6 +27,10 @@ straps.config.session_dir = vim.fn.tempname()
 -- fn.provider would otherwise consult) can't route these turns to OpenAI. The
 -- OpenAI-specific sections set config.provider = "openai" locally and restore it.
 straps.config.provider = "anthropic"
+-- The fake curls below capture the request body with `cat > file` and the
+-- tests json-decode it, so request compression stays off here; the gz
+-- fixture further down turns it on for its own step and restores it.
+straps.config.gzip = false
 local registry = require("straps.registry")
 local state = require("straps.state")
 local loop = require("straps.loop")
@@ -528,6 +532,140 @@ it("long conversations get a 4th intermediate breakpoint within lookback", funct
   local bridge = 0
   for mi = marked[1], #decoded.messages - 1 do bridge = bridge + #decoded.messages[mi].content end
   assert(bridge >= 15, "intermediate breakpoint too close to tail: bridges " .. bridge .. " blocks")
+end)
+
+-- ------------------------------------------------------- gzip request body
+-- A fake that gunzips what curl would have sent and logs argv, so both the
+-- Content-Encoding header and the compressed bytes are checked end to end.
+local gz_argv, gz_body
+step(function()
+  vim.env.PATH = real_path
+  if vim.fn.executable("gzip") == 1 then
+    vim.fn.mkdir(tmp .. "/gz", "p")
+    write_exec(tmp .. "/gz/curl", ([[#!/usr/bin/env bash
+D=%q
+printf '%%s\n' "$*" > "$D/gz_argv"
+gunzip -c > "$D/gz_body"
+echo "STRAPS_HTTP_STATUS:200" >&2
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start","message":{"usage":{}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"gz ok"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+EOF
+]]):format(tmp))
+    vim.env.PATH = tmp .. "/gz:" .. real_path
+    straps.config.base_url = "http://straps-fake.invalid"
+    straps.config.gzip = true
+    straps.config.log_file = tmp .. "/gz_events.log"
+    local gb = state.new_session()
+    state.append(gb, "user", nil, "compress me")
+    loop.start(gb)
+    vim.wait(15000, function() return not loop.running(gb) end, 50)
+    straps.config.gzip = false
+    straps.config.log_file = nil
+    gz_argv = table.concat(vim.fn.readfile(tmp .. "/gz_argv"), "\n")
+    gz_body = table.concat(vim.fn.readfile(tmp .. "/gz_body"), "\n")
+  end
+end)
+
+it("config.gzip compresses the request body and sets Content-Encoding: gzip", function()
+  if vim.fn.executable("gzip") == 0 then
+    print("SKIP  no gzip on PATH — request compression case skipped")
+    return
+  end
+  assert(gz_argv:find("Content-Encoding: gzip", 1, true), "gzip header missing from argv:\n" .. gz_argv)
+  local decoded = vim.json.decode(gz_body) -- the fake gunzipped the wire bytes
+  assert(decoded.model, "gunzipped body missing model")
+  assert(type(decoded.messages) == "table" and #decoded.messages >= 1, "gunzipped body missing messages")
+  assert(decoded.messages[1].content[1].text == "compress me", "user text did not survive compression")
+  local last_request
+  for _, line in ipairs(vim.fn.readfile(tmp .. "/gz_events.log")) do
+    local ev = vim.json.decode(line)
+    if ev.ev == "request" then last_request = ev end
+  end
+  assert(last_request and type(last_request.wire_bytes) == "number", "request event missing wire_bytes")
+  assert(last_request.wire_bytes < last_request.bytes,
+    ("wire_bytes should be smaller than bytes: %d vs %d"):format(last_request.wire_bytes, last_request.bytes))
+end)
+
+-- A gzip that fails must not fail the request: the body goes out plain, with
+-- no Content-Encoding header, and the request event reports equal sizes.
+step(function()
+  vim.fn.mkdir(tmp .. "/badgzip", "p")
+  write_exec(tmp .. "/badgzip/gzip", [[#!/usr/bin/env bash
+cat > /dev/null
+exit 1
+]])
+  vim.fn.delete(tmp .. "/gz_argv")
+  vim.fn.delete(tmp .. "/gz_body")
+  write_exec(tmp .. "/badgzip/curl", ([[#!/usr/bin/env bash
+D=%q
+printf '%%s\n' "$*" > "$D/gz_argv"
+cat > "$D/gz_body"
+echo "STRAPS_HTTP_STATUS:200" >&2
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start","message":{"usage":{}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"plain ok"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+EOF
+]]):format(tmp))
+  vim.env.PATH = tmp .. "/badgzip:" .. real_path
+  straps.config.gzip = true
+  straps.config.log_file = tmp .. "/badgzip_events.log"
+  local gb = state.new_session()
+  state.append(gb, "user", nil, "gzip is broken here")
+  loop.start(gb)
+  vim.wait(15000, function() return not loop.running(gb) end, 50)
+  straps.config.gzip = false
+  straps.config.log_file = nil
+  gz_argv = table.concat(vim.fn.readfile(tmp .. "/gz_argv"), "\n")
+  gz_body = table.concat(vim.fn.readfile(tmp .. "/gz_body"), "\n")
+end)
+
+it("a failing gzip falls back to the plain body with no header", function()
+  assert(not gz_argv:find("Content-Encoding", 1, true), "header sent although gzip failed:\n" .. gz_argv)
+  local decoded = vim.json.decode(gz_body) -- plain JSON reached curl
+  assert(decoded.messages[1].content[1].text == "gzip is broken here", "plain body did not reach curl")
+  local last_request
+  for _, line in ipairs(vim.fn.readfile(tmp .. "/badgzip_events.log")) do
+    local ev = vim.json.decode(line)
+    if ev.ev == "request" then last_request = ev end
+  end
+  assert(last_request.wire_bytes == last_request.bytes,
+    ("fallback should log equal sizes: %d vs %d"):format(last_request.wire_bytes, last_request.bytes))
+end)
+
+it("config.gzip = false sends the plain body with no Content-Encoding header", function()
+  local argv = table.concat(vim.fn.readfile(tmp .. "/argv"), "\n")
+  assert(not argv:find("Content-Encoding", 1, true), "header leaked into a gzip=false request:\n" .. argv)
 end)
 
 step(function()

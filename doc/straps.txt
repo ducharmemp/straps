@@ -333,6 +333,11 @@ cache			(boolean) true. Anthropic prompt caching via
 			servers that reject unknown fields.
 cache_ttl		(string|nil) nil (5-minute default TTL). "1h" opts
 			into the 1-hour extended TTL on every breakpoint.
+gzip			(boolean) true. gzip the Anthropic request body
+			(Content-Encoding: gzip), 3-4x fewer upload bytes per
+			turn. Falls back to the plain body when gzip is not on
+			PATH. Set false for a proxy that rejects compressed
+			requests.
 compact_keep_turns	(number) 2. Assistant turns |fn.compact| keeps intact.
 after_write_diagnostics	(boolean) true. Default |hook.after_write|: feed the
 			attached LSP's ERROR/WARN diagnostics for a written file
@@ -497,7 +502,8 @@ Presentation & interaction:
 Self-extension & orchestration:
 	registry_list, registry_get, registry_define, skill, eval_lua,
 	spawn, spawn_wait (|straps-subagents|), agents
-	(|straps-multiplayer|), transcript_excise
+	(|straps-multiplayer|), send_message (|straps-send-message-tool|),
+	transcript_excise
 
 `transcript_excise` is context surgery: with no arguments it lists the
 transcript's blocks; with `blocks`/`range` and a required `note` it replaces
@@ -793,7 +799,8 @@ fn.build_tools() -> tools	Map every tool.* entry to an API tool def.
 fn.capability(name, input) -> category
 				Classify a tool call into a permission category:
 				`read` (auto-allowed), `edit`, `delete`, `exec`,
-				`lua`, `net`, `define`, `spawn`, or `other`. Called
+				`lua`, `net`, `define`, `spawn` (spawn, spawn_wait
+				and send_message), or `other`. Called
 				with no arguments it returns the grantable list
 				({edit, delete, exec, lua, net, spawn}); `read`
 				needs no grant, and `define`/`other` are never
@@ -979,7 +986,34 @@ skill.multiplayer
 		The protocol the notice points at: re-read and reapply after a
 		collision, keep the read-to-write gap short, prefer disjoint
 		files, leave a peer's mid-task work alone, and hand off with
-		`require("straps.loop").steer(bufnr, msg)` rather than racing.
+		`send_message` rather than racing.
+
+Handing off, when one agent needs another to act:
+
+					*straps-send-message-tool*
+send_message	Tool. Send a message to another session in this Neovim:
+		`to` is its buffer number as digits or `"parent"`, `text` at
+		most 4000 bytes. The message arrives in the recipient's
+		transcript as a user-role block framed
+		`[straps] from agent <label> (buffer N): ...`, which renders
+		as `agent N` (see |straps-highlights|, StrapsRoleNotice)
+		rather than as the user, and which the system prompt ranks
+		as a peer's claim below the user's instructions. A running
+		recipient reads it at its next turn boundary (steering); an
+		idle one finds it appended and is NOT started. On an idle
+		session the block lands after any text the user had typed in
+		the trailing prompt. In the `spawn` permission category
+		(|fn.capability|): a top-level session confirms each send
+		unless `:StrapsAuto spawn` is set. A readonly/allow-gated
+		child may always send `to="parent"`; any other target needs
+		a grant and must be its parent or one of its own children.
+
+Harness notices use the same mechanism: a user block beginning `[straps] `
+(the multiplayer notice, a subagent completion notice) renders as `harness`.
+The prefix is a content convention, so a block you type yourself starting
+with `[straps] ` (or with the agent frame above) renders the same way; the
+model is told the prefix is advisory and that a real instruction from you
+overrides it.
 
 All of this is same-instance only: agents in a DIFFERENT Neovim share nothing
 but disk, where the only signal is a file changing underneath you.
@@ -1058,6 +1092,7 @@ follow your colorscheme; a user `hi link` wins and survives a re-apply.
 	StrapsRoleUser		Function	user turn rule + role tag
 	StrapsRoleAgent		Keyword		assistant (Cinch) rule + tag
 	StrapsRoleSystem	Comment		system tag (dim)
+	StrapsRoleNotice	Identifier	harness / agent N tag on a notice
 	StrapsTool		Special		tool glyph + name
 	StrapsToolOk		DiagnosticOk	good result mark
 	StrapsToolError		DiagnosticError	is_error mark

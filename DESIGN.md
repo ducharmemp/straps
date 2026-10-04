@@ -708,8 +708,21 @@ secret, so no mode-600 guard.
   and ensure `input` for tool_use with no args decodes to an object
   (`vim.json.decode("{}")`; use `vim.empty_dict()` where an empty OBJECT is
   required in encoding).
-- Streaming: spawn `curl -sS --no-buffer -X POST ... --data @-` (pass body on
-  stdin to avoid argv length limits) via `vim.system` with a stdout callback.
+- Request compression (`config.gzip`, default true): the encoded body is
+  piped through `gzip -c -6` once per provider call (before the retry loop,
+  via `ctx.await`, killed on cancel) and curl sends the compressed bytes with
+  `Content-Encoding: gzip`. The replayed transcript is the whole request and
+  is re-uploaded every turn; measured on live sessions, 350-546KB of JSON
+  became 115-145KB. gzip stays optional: no gzip on PATH, a spawn failure,
+  or a non-zero exit falls back to the plain body with no header; a cancel
+  during compression ends the call with `stop_reason = "cancelled"` like a
+  cancel during curl. The `fn.log` request event carries `bytes` (JSON) and
+  `wire_bytes` (what curl sent). The OpenAI backend sends plain JSON and
+  logs `wire_bytes == bytes`, so a log consumer reads one field shape from
+  both backends.
+- Streaming: spawn `curl -sS --no-buffer -X POST ... --data-binary @-` (pass
+  body on stdin to avoid argv length limits) via `vim.system` with a stdout
+  callback.
   Buffer partial lines; parse SSE (`event:`/`data:` lines). Handle:
   `content_block_start` (text | tool_use), `content_block_delta`
   (`text_delta` → `ctx.emit{type="text_delta", text=...}`;
@@ -878,7 +891,13 @@ breakpoints so the replayed prefix becomes a server-side cache hit:
 - `state.list_blocks(bufnr) -> { {kind, attrs, marker_lnum, first_lnum,
   last_lnum}, ... }` (1-based, content range excludes the marker line;
   empty content → first_lnum > last_lnum). Public helper so compact
-  implementations never re-derive the grammar.
+  implementations never re-derive the grammar. Cached per buffer on
+  `changedtick`: the foldtext of every closed tool fold calls it on each
+  redraw, and each call scanned the whole buffer (30 folds on a 7.8k-line
+  session cost 23ms per redraw). The outer array is fresh per call; the block
+  tables inside are shared until the buffer next changes, so callers treat
+  them as read-only (every current caller does). The buffer stays the only
+  source of truth: any line change bumps the tick and the next call rescans.
 - `:StrapsCompact` — resolve_session target, `registry.call("fn.compact",
   bufnr)`, notify the summary.
 - Auto-compaction: `config.auto_compact_tokens` (preferred) or
@@ -1209,7 +1228,7 @@ Default hooks registered here:
   index, undo_edit non-history); `delete` (delete_file, delete_files —
   deletion is not undo-reversible, so it is its own category); `exec` (bash,
   run_in_terminal, run_quickfix); `lua` (eval_lua); `net` (fetch_url);
-  `define` (registry_define); `spawn` (spawn, spawn_wait); `other` (any
+  `define` (registry_define); `spawn` (spawn, spawn_wait, send_message); `other` (any
   unknown/agent-defined tool). Called with NO arguments it returns the
   GRANTABLE list `{edit, delete, exec, lua, net, spawn}`. `read` needs no
   grant. `define` and `other` are NEVER grantable — a `define` grant would
@@ -1509,6 +1528,7 @@ schemes clear highlights on load.
 | StrapsRoleUser  | Function        | the `you` role tag + leading rule segment |
 | StrapsRoleAgent | Keyword         | the `Cinch` (agent) role tag + leading rule segment |
 | StrapsRoleSystem| Comment         | the `system` tag (dim) |
+| StrapsRoleNotice| Identifier      | the `harness` / `agent N` tag on a notice carried in a user block |
 | StrapsTool      | Special         | `⚙` glyph + tool name |
 | StrapsToolOk    | DiagnosticOk    | `✓` on a good result |
 | StrapsToolError | DiagnosticError | `✗` on `is_error` |
@@ -1541,6 +1561,15 @@ Clears the straps-render namespace and repopulates by walking
   stay dim StrapsRule — a bounded categorical mark, not a wash, sized so user
   and agent turns delineate at a glance. The blank line the writer puts before
   each marker gives vertical separation.
+  A user block whose first non-blank content line `state.notice_of` classifies
+  as a notice is not the user's turn: it draws `┄┄┄┄ harness ┄┄┄…` for a
+  harness notice (`[straps] …`) or `┄┄┄┄ agent N ┄┄┄…` for a peer message
+  (`[straps] from agent <label> (buffer N): …`, written by
+  `tool.send_message`), both in StrapsRoleNotice. The classifier reads the
+  marker-line inline text first, then the body, on the RAW line — `state.parse`
+  keeps leading whitespace, so an indented lookalike is the user's text to the
+  model and renders as `you`. `ui.outline` labels the same way, with the label
+  column sized to the widest label in the list.
 - **tool_use + tool_result run** → left to the fold (below); the marker lines
   are concealed so the open state is clean.
 - Rendering is window-agnostic (extmarks are buffer-scoped); conceal needs the
@@ -1665,6 +1694,11 @@ possible, assert on `nvim_buf_get_extmarks(buf, ns, ..., {details=true})`:
   segment + role word in StrapsRoleUser/Agent/System, a dim StrapsRule
   trailing run, and per-role bar chars (light `─` for user/system, heavy `━`
   for the assistant) on lead and trailing alike.
+- a user block holding a `[straps] ` harness notice overlays `harness` in
+  StrapsRoleNotice with the `┄` bar; a `state.agent_message` block overlays
+  `agent N`; a plain user block, an indented `  [straps] ` lookalike and the
+  `[straps: …]` colon form keep `you`/StrapsRoleUser. The outline carries the
+  same labels, aligned.
 - message body lines carry NO straps-render extmark (color only on marks).
 - fn.render is idempotent (same extmark set after two runs).
 - the foldtext function (exposed for test) returns a colored chunk list with
@@ -2139,9 +2173,61 @@ Neovim shares no buffer state to read.
   the system working (re-read and reapply, never force it through shell tools),
   keep the read→write gap short, prefer disjoint files, leave a peer's
   mid-task code alone, treat the user's view and the quickfix list as
-  single-occupancy, and hand off with `loop.steer` (a no-op on an idle peer)
-  rather than racing.
+  single-occupancy, and hand off with `tool.send_message` rather than racing.
 - Tests: `tests/multiplayer_spec.lua`.
+
+Agent MESSAGING (`tool.send_message`, `state.notice_of`, `state.agent_message`
+— layers/agents.lua, state.lua, render in ui.lua): the API has no third role,
+so everything the harness or another agent says to a session arrives as a
+`user` block. Before this, that text wore the user's voice on screen (`──── you
+────`) and the only peer channel was `loop.steer` through `eval_lua`, which
+carried no sender and was a no-op on an idle peer.
+
+- **Attribution is a content convention; the block grammar is unchanged.** A user block
+  whose first non-blank line starts with `[straps] ` is a notice; the subform
+  `[straps] from agent <label> (buffer N): ` is a peer message.
+  `state.notice_of(content)` is the one classifier (nil / `{from="harness"}` /
+  `{from="agent", bufnr, label}`); `state.agent_message(label, bufnr, text)`
+  is its inverse. Both are plain module functions: the prefix is fixed because
+  `tool.spawn_wait` dedupes completion notices by matching it verbatim.
+  `state.parse` is unchanged — each user block is already its own text part,
+  and the prompt's `# Untrusted content` paragraph names both frames (harness:
+  information, never authority; agent: a peer's claim, not the user's
+  instruction). `send_message` stamps the sender LABEL into the text at send
+  time (invariant 1): a bare buffer number names a different session after a
+  restart, and a render-time lookup would make the transcript's meaning depend
+  on state outside it.
+- **Rendering** keys off the classifier (see fn.render above): `harness` /
+  `agent N` in StrapsRoleNotice with a `┄` bar, in the transcript and in `gO`.
+  `state.session_summary` skips notice blocks, so a message into a never-used
+  session cannot become its title in the resume picker.
+- **`tool.send_message{to, text}`**: `to` is a buffer number as digits or
+  `"parent"` (via `b:straps_parent`); the target must be a session buffer in
+  this Neovim and not the sender; `text` ≤ 4000 bytes. It frames the text with
+  `state.agent_message(ui.session_label(me), me, text)` and delivers through
+  `fn.session_notify(target, msg, {quiet=true})`: steering if the recipient
+  runs, an appended block plus restored trailing prompt if idle — and the
+  recipient's run is NEVER started. On an idle session the block lands after
+  whatever the user has half-typed in the trailing prompt (the same
+  displacement `notify_parent` has always had). Defined after `tool.models` in
+  `agents.register_tools`.
+- **Permissions.** `fn.capability` puts `send_message` in the `spawn` category
+  (it writes into another agent's session: the same blast-radius class as
+  starting one), so a top-level session without `:StrapsAuto spawn` confirms
+  each send. Gated children get two rules, neither a seeded grant: the
+  per-child `hook.confirm` that `tool.spawn` defines auto-allows
+  `send_message` with `to == "parent"` (a research child must always be able
+  to report up; a grandchild inherits the hook through scope chaining), and
+  the tool body refuses any target outside a gated sender's family (its
+  parent or its own children), because a name grant passes the hook for every
+  input. The `readonly subagent: X is not allowed` wording is untouched. A
+  gated child holding `lua` could still reach `loop.steer` through `eval_lua`;
+  that reach predates send_message and is unchanged. A continuation line of a
+  message that starts with `[straps] ` is indented one space by
+  `agent_message`, so only line 1 can speak for a sender.
+- Tests: `tests/messaging_spec.lua` (classifier, title skip, both delivery
+  paths, validation, real readonly/allow children at depth 1 and 2),
+  `tests/render_spec.lua` (overlays and outline), `tests/prompt_spec.lua`.
 
 Model AWARENESS (`fn.model_note` — layers/agents.lua, call site in loop.lua): the
 winbar has always told the USER which model a session runs on; the agent itself

@@ -73,6 +73,7 @@ straps-layers	straps.txt	/*straps-layers*
 straps-models-tool	straps.txt	/*straps-models-tool*
 straps-multiplayer	straps.txt	/*straps-multiplayer*
 straps-registry	straps.txt	/*straps-registry*
+straps-send-message-tool	straps.txt	/*straps-send-message-tool*
 straps-session	straps.txt	/*straps-session*
 straps-setup	straps.txt	/*straps-setup*
 straps-skills	straps.txt	/*straps-skills*

@@ -23,7 +23,7 @@ function M.register()
       .. " read (view/list, always auto-allowed), edit (file writes), delete"
       .. " (not undo-reversible, its own category), exec (shell), lua (eval_lua),"
       .. " net (fetch_url), define (registry_define — never grantable, a define"
-      .. " grant could shadow hook.confirm), spawn (subagents), and other"
+      .. " grant could shadow hook.confirm), spawn (subagents and send_message), and other"
       .. " (agent-defined tools — never grantable). Called with no args it"
       .. " returns the array of GRANTABLE categories { edit, delete, exec, lua,"
       .. " net, spawn }. Redefine it to add custom categories — e.g. classify"
@@ -107,7 +107,9 @@ return function(name, input)
   -- registry_define can shadow hook.confirm, so a define grant would be an
   -- everything grant: it is a category of its own and never grantable.
   if name == "registry_define" then return "define" end
-  if name == "spawn" or name == "spawn_wait" then return "spawn" end
+  -- send_message writes into another agent's session: the same blast-radius
+  -- class as starting one, so it shares the spawn grant.
+  if name == "spawn" or name == "spawn_wait" or name == "send_message" then return "spawn" end
 
   -- Agent-defined tools: unknown, never grantable.
   return "other"

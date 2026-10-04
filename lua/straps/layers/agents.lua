@@ -352,6 +352,12 @@ return function(name, tin, tctx)
     if cap and allowed["cap:" .. tostring(cap)] then return true end
     if allowed[name] then return true end
   end
+  -- A gated child can always report to its parent: the parent-only shape is
+  -- the one message a research child must be able to send, and the tool body
+  -- confines a gated sender to its own family on every other target.
+  if name == "send_message" and type(tin) == "table" and tin.to == "parent" then
+    return true
+  end
   local names = {}
   if type(allowed) == "table" then
     for k in pairs(allowed) do
@@ -761,6 +767,122 @@ return function(input, ctx)
   lines[#lines + 1] = "Pass an id verbatim as spawn's `model`, and an effort name as"
     .. " `effort`; omitting them copies this session's."
   return table.concat(lines, "\n")
+end
+]==],
+  })
+
+  -- ------------------------------------------------------------ send_message
+
+  -- Framed by state.agent_message rather than sent bare: the recipient's
+  -- transcript can then render the block as `agent N` instead of `you`, and
+  -- its prompt can rank it as a peer's claim. Delivery goes through
+  -- fn.session_notify so the never-start-the-recipient rule lives in one place.
+  define({
+    name = "tool.send_message",
+    kind = "tool",
+    doc = "Send a message to another straps agent session in this Neovim:"
+      .. " your parent, a subagent you spawned, or a peer. It arrives in the"
+      .. " recipient's transcript as a user-role block framed `[straps] from"
+      .. " agent <label> (buffer N): ...` (your session label and buffer"
+      .. " number), rendered as `agent N`, so it is never mistaken for the"
+      .. " user. A running recipient reads it at its next turn boundary"
+      .. " (steering); an idle one finds it appended, and its run is NOT"
+      .. " started. In an ungated session this call prompts for confirmation"
+      .. " unless the spawn category is granted. Use it for a"
+      .. " note that cannot wait for a final answer: a child reporting a"
+      .. " blocker or a collision to its parent, a parent redirecting a running"
+      .. " child, a peer asked to stay out of a file. Write it as an"
+      .. " instruction or a fact the recipient can act on; the frame already"
+      .. " says who it is from. On an idle session the block lands after"
+      .. " whatever the user has half-typed in the trailing prompt. Parameters:"
+      .. " to (required) — the recipient's buffer number as digits, or the"
+      .. " word \"parent\"; text (required) — the message, at most 4000 bytes."
+      .. " A readonly/allow-gated session may message only its parent (or its"
+      .. " own children when granted); messaging to=\"parent\" is always"
+      .. " allowed for a gated child.",
+    input_schema = {
+      type = "object",
+      properties = {
+        to = {
+          type = "string",
+          description = "Recipient: a session buffer number as digits (e.g. \"42\"), or \"parent\".",
+        },
+        text = {
+          type = "string",
+          description = "The message (at most 4000 bytes).",
+        },
+      },
+      required = { "to", "text" },
+    },
+    source = [==[
+return function(input, ctx)
+  local registry = require("straps.registry")
+  local me = ctx and ctx.bufnr
+  if type(me) ~= "number" or not vim.api.nvim_buf_is_valid(me) then
+    error("send_message: no session buffer in context")
+  end
+  local function bvar(b, name)
+    local ok, v = pcall(function() return vim.b[b][name] end)
+    if ok then return v end
+  end
+  local function is_session(b)
+    return type(b) == "number" and b > 0 and vim.api.nvim_buf_is_valid(b)
+      and bvar(b, "straps_session") == true
+  end
+
+  local text = input.text
+  if type(text) ~= "string" or not text:match("%S") then
+    error("send_message: text must be a non-empty string")
+  end
+  if #text > 4000 then
+    error(("send_message: text is %d bytes; the cap is 4000 — a message is a note,"
+      .. " not a report (put a long one in a file and send its path)"):format(#text))
+  end
+
+  local my_parent = bvar(me, "straps_parent")
+  local to = input.to
+  local target
+  if to == "parent" then
+    if not is_session(my_parent) then
+      error("send_message: this session has no parent")
+    end
+    target = my_parent
+  else
+    if type(to) ~= "string" or not to:match("^%d+$") then
+      error("send_message: to must be a buffer number as digits, or \"parent\"")
+    end
+    target = tonumber(to)
+    if not is_session(target) then
+      error(("send_message: buffer %s is not a straps session in this Neovim"):format(tostring(to)))
+    end
+  end
+  if target == me then
+    error("send_message: that is this session")
+  end
+
+  -- A gated session (readonly/allow child) stays inside its own family: its
+  -- confirm hook let the call through on a name grant or the to="parent"
+  -- exception, and neither should reach an unrelated session.
+  local gated = false
+  pcall(function() gated = registry.granted(me)["spawn:gated"] == true end)
+  if gated and target ~= my_parent and bvar(target, "straps_parent") ~= me then
+    error("send_message: a permission-gated session may message only its parent or its own children")
+  end
+
+  local label = "buffer " .. tostring(me)
+  pcall(function() label = require("straps.ui").session_label(me) end)
+  local msg = require("straps.state").agent_message(label, me, text)
+  local how = registry.try_call("fn.session_notify", target, msg, { quiet = true })
+  local target_label = "buffer " .. tostring(target)
+  pcall(function() target_label = require("straps.ui").session_label(target) end)
+  if how == "steer" then
+    return ("queued as steering for %s (buffer %d); it reads it at its next turn boundary")
+      :format(target_label, target)
+  elseif how == "append" then
+    return ("appended to %s (buffer %d); it is idle and its run was not started")
+      :format(target_label, target)
+  end
+  error("send_message: delivery failed (the recipient buffer vanished)")
 end
 ]==],
   })

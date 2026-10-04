@@ -230,6 +230,33 @@ end
   assert(compacts == 1, "growth guard should compact exactly once, got " .. compacts)
 end)
 
+it("state.list_blocks is cached on changedtick and invalidated by any edit", function()
+  local b = state.new_session()
+  state.append(b, "user", nil, "cache me")
+  local a1 = state.list_blocks(b)
+  local a2 = state.list_blocks(b)
+  assert(a1 ~= a2, "each call must return a fresh outer array")
+  assert(#a1 == #a2 and a1[1] == a2[1] and a1[#a1] == a2[#a2],
+    "same changedtick must reuse the cached block tables")
+  table.insert(a1, { kind = "bogus" })
+  assert(#state.list_blocks(b) == #a2, "mutating a returned array must not leak into the cache")
+  local n = #a2
+  state.append(b, "user", nil, "edited")
+  local a3 = state.list_blocks(b)
+  assert(a3[1] ~= a2[1], "an edit must invalidate the cached block tables")
+  assert(#a3 == n + 1 and a3[#a3].kind == "user", "the new block must be indexed after the edit")
+  vim.api.nvim_buf_set_lines(b, 0, -1, false, { "%%[straps:system]%%", "only" })
+  assert(#state.list_blocks(b) == 1, "a direct nvim_buf_set_lines must invalidate too")
+  local other = state.new_session()
+  assert(#state.list_blocks(other) >= 2, "a second live buffer is indexed on its own")
+  local before = state._blocks_cache_size()
+  vim.api.nvim_buf_delete(b, { force = true })
+  state.append(other, "user", nil, "miss")
+  state.list_blocks(other)
+  assert(state._blocks_cache_size() == before - 1,
+    "a miss must sweep the wiped buffer's entry: " .. before .. " -> " .. state._blocks_cache_size())
+end)
+
 it("compacting a BATCHED turn keeps pairing and API-valid alternation", function()
   -- The two-phase loop writes batches as use,use,result,result. Compaction
   -- rewrites old tool blocks in place; the batch shape must survive.

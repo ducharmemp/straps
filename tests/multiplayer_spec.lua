@@ -305,8 +305,10 @@ it("skill.multiplayer ships, is listed, and loads", function()
   local body = registry.call("tool.skill", { name = "multiplayer" }, {})
   assert(body:find("modified by another agent", 1, true),
     "skill should cover the collision error")
-  assert(body:find('require("straps.loop").steer', 1, true),
-    "skill should cover handing off via steering")
+  assert(body:find("send_message{to=<peer bufnr>", 1, true),
+    "skill should cover handing off via send_message")
+  assert(not body:find('require("straps.loop").steer', 1, true),
+    "the unlabelled eval_lua steer recipe must be gone from the skill")
   local prompt = registry.call("fn.system_prompt")
   assert(prompt:find("- skill.multiplayer:", 1, true), "skill missing from the # Skills layer")
 end)

@@ -52,6 +52,11 @@ M.config = {
   stop_backstop_ms = 4000,
   max_tool_result_bytes = 100000,
   cache = true,
+  -- gzip the Anthropic request body (Content-Encoding: gzip). The replayed
+  -- transcript is the whole request and is re-uploaded every turn; gzip cuts
+  -- it 3-4x. Falls back to the plain body when gzip is not on PATH. false for
+  -- a proxy that rejects compressed requests.
+  gzip = true,
   compact_keep_turns = 2,
   -- Default hook.after_write behaviour: after the agent writes a file, wait
   -- briefly for the attached LSP to re-lint it and feed any ERROR/WARN

@@ -22,6 +22,7 @@ local HL_LINKS = {
   StrapsRoleUser = "Function",     -- the `you` role tag + leading rule segment
   StrapsRoleAgent = "Keyword",     -- the `Cinch` (agent) role tag + leading rule segment
   StrapsRoleSystem = "Comment",    -- the `system` tag (dim)
+  StrapsRoleNotice = "Identifier", -- the `harness` / `agent N` tag on a notice in a user block
   StrapsTool = "Special",          -- ⚙ glyph + tool name
   StrapsToolOk = "DiagnosticOk",   -- ✓ on a good result
   StrapsToolError = "DiagnosticError", -- ✗ on is_error
@@ -74,6 +75,35 @@ local ROLE = {
   assistant = { label = "Cinch", hl = "StrapsRoleAgent", bar = "━" },
   system = { label = "system", hl = "StrapsRoleSystem", bar = "─" },
 }
+
+-- Unlike block_headline, this reads the raw untruncated line: the classifier
+-- is anchored at column 1 and a 60-cell cut can drop the `(buffer N): ` tail
+-- that tells an agent message from a harness notice.
+local function role_for(bufnr, blk)
+  local base = ROLE[blk.kind]
+  if blk.kind ~= "user" then
+    return base
+  end
+  local mline = vim.api.nvim_buf_get_lines(bufnr, blk.marker_lnum - 1, blk.marker_lnum, false)[1] or ""
+  local first = mline:match("^%%%%%[straps:[a-z_]+%]%%%% ?(.*)$") or ""
+  if first:match("^%s*$") and blk.first_lnum <= blk.last_lnum then
+    for _, l in ipairs(vim.api.nvim_buf_get_lines(bufnr, blk.first_lnum - 1, blk.last_lnum, false)) do
+      if not l:match("^%s*$") then
+        first = l
+        break
+      end
+    end
+  end
+  local notice = require("straps.state").notice_of(first)
+  if not notice then
+    return base
+  end
+  return {
+    label = notice.from == "agent" and ("agent " .. notice.bufnr) or "harness",
+    hl = "StrapsRoleNotice",
+    bar = "┄",
+  }
+end
 
 -- Overlay chunk list for a role marker line, fixed ~RULE_WIDTH wide. The
 -- leading segment and role word carry the role's StrapsRole* group and the
@@ -280,7 +310,7 @@ local function render_block(bufnr, blk)
   if not line then
     return
   end
-  local role = ROLE[blk.kind]
+  local role = role_for(bufnr, blk)
   if role then
     -- user / assistant / system: conceal the marker, overlay the turn rule.
     conceal_marker(bufnr, row, line)
@@ -2398,19 +2428,27 @@ function M.outline(bufnr)
   local name = vim.api.nvim_buf_get_name(bufnr)
   local blocks = require("straps.state").list_blocks(bufnr)
   local items = {}
+  local width = 6
   for i, b in ipairs(blocks) do
     if TURN_KIND[b.kind] then
       local _, tools = turn_extent(blocks, i)
       local head = block_headline(bufnr, b, 90)
       local suffix = tools > 0 and ("  · %d tool%s"):format(tools, tools == 1 and "" or "s") or ""
+      local label = role_for(bufnr, b).label
+      width = math.max(width, #label)
       items[#items + 1] = {
         bufnr = (name == "") and bufnr or nil,
         filename = (name ~= "") and name or nil,
         lnum = b.marker_lnum,
         col = 1,
-        text = ("%-6s %s%s"):format(ROLE[b.kind].label, head, suffix),
+        label = label,
+        text = head .. suffix,
       }
     end
+  end
+  for _, it in ipairs(items) do
+    it.text = ("%-" .. width .. "s %s"):format(it.label, it.text)
+    it.label = nil
   end
   if #items == 0 then
     vim.notify("straps: no turns to outline")

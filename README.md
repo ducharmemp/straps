@@ -8,7 +8,7 @@ Straps puts a coding agent inside the editor instead of beside it. Agents can in
 - **Tools meet the editor.** File edits respect unsaved buffers. Diagnostics, definitions, references, quickfix lists, diffs, terminals, and undo are first-class tools. When a reply cites two or more `path:line` locations, straps loads them into the session window's location list (titled `straps: reply refs`), so `:lnext` walks the reply.
 - **Tooling can adapt.** Tools, hooks, providers, and core functions live in a runtime registry. You or the agent can inspect and redefine them.
 - **Improvements can persist.** Keep project-specific tools and knowledge in `.straps.lua`, or keep personal entries in your Neovim configuration.
-- **Sessions can work together.** Agents can delegate work to subagents and coordinate through shared Neovim buffers.
+- **Sessions can work together.** Agents can delegate work to subagents, message each other with `send_message`, and coordinate through shared Neovim buffers. A message from the harness or another agent renders as `harness` / `agent N` in the transcript.
 
 ## Requirements
 

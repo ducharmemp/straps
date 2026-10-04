@@ -68,7 +68,7 @@ local function start_server(respond, record)
       end
       if header_end and #buf >= header_end + clen then
         local body = buf:sub(header_end + 1, header_end + clen)
-        if record then record(body) end
+        if record then record(body, buf:sub(1, header_end)) end
         client:write(respond(body), function()
           client:shutdown(function() client:close() end)
         end)
@@ -95,7 +95,7 @@ end
 
 -- ---------------------------------------------------------------- happy path
 
-local got_body = nil
+local got_body, got_headers = nil, nil
 local ok_server, ok_port = start_server(function()
   return sse(table.concat({
     'event: message_start',
@@ -117,7 +117,7 @@ local ok_server, ok_port = start_server(function()
     'data: {"type":"message_stop"}',
     '',
   }, "\n"))
-end, function(body) got_body = body end)
+end, function(body, headers) got_body, got_headers = body, headers end)
 
 straps.config.base_url = "http://127.0.0.1:" .. ok_port
 local buf_ok, text_ok = run_session("answer over real http")
@@ -131,14 +131,29 @@ end)
 
 it("the request body that crossed the wire is complete, valid JSON", function()
   assert(got_body and #got_body > 0, "server captured no request body")
-  local decoded = vim.json.decode(got_body) -- rejects truncation/corruption
+  -- With gzip on PATH the provider compresses the body (config.gzip default
+  -- on), so the wire bytes must be valid gzip of the JSON and the header must
+  -- say so; without gzip it falls back to plain JSON with no header.
+  local wire = got_body
+  if vim.fn.executable("gzip") == 1 then
+    assert(got_headers:lower():find("content%-encoding:%s*gzip"),
+      "Content-Encoding: gzip header missing from the wire request:\n" .. got_headers)
+    assert(got_body:byte(1) == 0x1f and got_body:byte(2) == 0x8b, "wire body is not gzip (bad magic)")
+    local r = vim.system({ "gunzip", "-c" }, { stdin = got_body }):wait(5000)
+    assert(r.code == 0 and r.stdout and #r.stdout > 0, "wire body did not gunzip: " .. tostring(r.stderr))
+    wire = r.stdout
+  else
+    print("SKIP  no gzip on PATH — asserting the plain-body fallback instead")
+    assert(not got_headers:lower():find("content%-encoding"), "header sent without compression")
+  end
+  local decoded = vim.json.decode(wire) -- rejects truncation/corruption
   assert(decoded.model, "body missing model")
   assert(decoded.stream == true, "body should request streaming")
   assert(type(decoded.messages) == "table" and #decoded.messages >= 1, "messages missing")
   assert(type(decoded.tools) == "table" and #decoded.tools > 10,
     "tools missing from the wire body")
   -- The wire payload is where an array-shaped properties would 400 live.
-  assert(not got_body:find('"properties":[]', 1, true),
+  assert(not wire:find('"properties":[]', 1, true),
     "array-shaped properties reached the wire")
 end)
 

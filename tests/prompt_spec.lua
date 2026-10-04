@@ -204,6 +204,23 @@ it("the [straps] harness-speech convention is declared, and to subagents too", f
     "a subagent receives these notices too and must know who is speaking")
 end)
 
+it("peer-agent messages are declared as a peer's claim, in both prompt shapes", function()
+  -- tool.send_message frames its text `[straps] from agent <label> (buffer
+  -- N): ...`. The prompt must name that frame and rank it below the user, or
+  -- a message from a sibling reads as the user's instruction.
+  for _, shape in ipairs({ {}, { subagent = true } }) do
+    local p = registry.call("fn.system_prompt_core", shape)
+    local label = shape.subagent and "child prompt" or "parent prompt"
+    assert(p:find('[straps] from agent <label> (buffer N):', 1, true),
+      label .. ": the agent-message frame should be named")
+    assert(p:find("the user's\ninstructions outrank it", 1, true),
+      label .. ": a peer message must be ranked below the user")
+  end
+  local ro = registry.call("fn.system_prompt_core", { subagent = true, readonly = true })
+  assert(ro:find('except send_message{to="parent"}', 1, true),
+    "the readonly note must carry the parent-message exception")
+end)
+
 it("the harness-speech section enumerates the subagent notice, not just peers", function()
   -- Both notices carry the same prefix and route (fn.session_notify). This
   -- section is the ONLY place a child AT the depth limit can read about the

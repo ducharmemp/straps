@@ -1492,8 +1492,13 @@ Written for agent-ability and ecosystem norms; concise, imperative:
 - Subagent adaptation: with `opts.subagent` the `# Subagents` section
   (spawn/spawn_wait guidance) is dropped and a `# You are a subagent`
   section is appended — the parent sees only the final reply, so it must be
-  complete and follow the task's answer format — plus a READ-ONLY note
-  (`opts.readonly`) and a tool-restriction list (`opts.tools`) when set.
+  complete and follow the task's answer format, and ambiguity goes into
+  that reply (or `send_message{to="parent"}`) rather than to the user —
+  plus a READ-ONLY note (`opts.readonly`) and a tool-restriction list
+  (`opts.tools`) when set. `fn.build_tools` matches the prompt: a session
+  with `straps_parent` set is never offered `ask_user`, because the parent
+  holds the conversation the child lacks and a picker from an unwatched
+  child gives the user a question with no context.
 - Self-extension (kept, tightened): every tool/hook/fn is a registry entry;
   registry_list/registry_get to inspect, registry_define to add or redefine;
   redefinitions are immediate, new tools callable next turn; sources are

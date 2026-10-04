@@ -250,6 +250,8 @@ it("core layer adapts for subagents: no # Subagents, child section appended", fu
   assert(not sub:find("\n# Subagents\n", 1, true), "child prompt should drop # Subagents")
   assert(sub:find("\n# You are a subagent\n", 1, true), "child section missing")
   assert(sub:find("only the single final reply", 1, true), "final-reply rule missing")
+  assert(sub:find("You have\nno ask_user tool", 1, true), "no-ask_user rule missing")
+  assert(not core:find("no ask_user tool", 1, true), "parent prompt should not deny ask_user")
   assert(not sub:find("READ%-ONLY"), "readonly note should be absent by default")
   assert(not sub:find("restricted to", 1, true), "tools note should be absent by default")
   -- Shared sections survive in both shapes.

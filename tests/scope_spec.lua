@@ -261,6 +261,30 @@ it("build_tools honors the child tool filter and hides spawn at depth limit", fu
   assert(ok, err)
 end)
 
+it("build_tools hides ask_user from a subagent and keeps it for a root session", function()
+  local root = vim.api.nvim_create_buf(true, false)
+  registry.ensure_scope(root)
+  local child = vim.api.nvim_create_buf(true, false)
+  registry.ensure_scope(child, root)
+  vim.b[child].straps_parent = root
+  local function names_in(buf)
+    local prev = registry.set_active_scope(buf)
+    local ok, res = pcall(function()
+      local names = {}
+      for _, t in ipairs(registry.call("fn.build_tools")) do names[t.name] = true end
+      return names
+    end)
+    registry.set_active_scope(prev)
+    assert(ok, res)
+    return res
+  end
+  local root_names = names_in(root)
+  assert(root_names.ask_user, "root session should still offer ask_user")
+  local child_names = names_in(child)
+  assert(not child_names.ask_user, "subagent should not be offered ask_user")
+  assert(child_names.read_file, "hiding ask_user should not drop other tools")
+end)
+
 -- ------------------------------------------------------- loop-integrated scope
 
 it("an agent's mid-run registry_define is session-scoped end to end", function()

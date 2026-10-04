@@ -214,9 +214,12 @@ return function()
   end
 
   -- Session shaping (set by tool.spawn on child sessions): an allow-list
-  -- filter, and hiding spawn/spawn_wait entirely once the depth budget is
+  -- filter, hiding spawn/spawn_wait entirely once the depth budget is
   -- spent or the child's own gate would deny spawn (a gated child without
-  -- the spawn category) — a tool the model cannot use should not be offered.
+  -- the spawn category) — a tool the model cannot use should not be offered —
+  -- and hiding ask_user from every subagent (straps_parent set): the parent
+  -- holds the conversation the child lacks, so a child's question belongs
+  -- in its final reply, not in a picker in front of the user.
   local scope = registry.active_scope()
   if scope then
     local filter, depth
@@ -238,6 +241,15 @@ return function()
       local kept = {}
       for _, t in ipairs(tools) do
         if t.name ~= "spawn" and t.name ~= "spawn_wait" then kept[#kept + 1] = t end
+      end
+      tools = kept
+    end
+    local parent
+    pcall(function() parent = vim.b[scope].straps_parent end)
+    if parent ~= nil then
+      local kept = {}
+      for _, t in ipairs(tools) do
+        if t.name ~= "ask_user" then kept[#kept + 1] = t end
       end
       tools = kept
     end
@@ -1787,7 +1799,12 @@ transcript — only the single final reply you end with. Everything that
 matters must be in that reply: make it complete and self-contained,
 follow any answer format the task specifies exactly, and never end on a
 promise of more work. If the task cannot be completed, say so plainly in
-the reply — a truncated or missing answer wastes the whole run.]] }
+the reply — a truncated or missing answer wastes the whole run. You have
+no ask_user tool: the user is not your correspondent, the parent is. When
+the task is ambiguous, state the ambiguity and the assumption you took in
+your reply (or report a blocker with send_message{to="parent"}), and let
+the parent resolve it. Guidance above that says to use ask_user does not
+apply to you.]] }
     if opts.can_spawn then
       sub[#sub + 1] = [[You may spawn subagents of your own (the # Subagents section above
 applies). A child of yours receives at most the permissions you hold: if

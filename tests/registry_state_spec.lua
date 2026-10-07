@@ -545,3 +545,37 @@ it("setup{} with both layers left at their default registers editor + openai", f
   assert(registry.get("tool.definition"), "tool.definition should be present (editor layer default ON)")
   assert(registry.get("fn.provider_openai"), "fn.provider_openai should be present (openai layer default ON)")
 end)
+
+local function utf8_valid(s)
+  local rest = s:gsub("[\194-\223][\128-\191]", ""):gsub("[\224-\239][\128-\191][\128-\191]", "")
+    :gsub("[\240-\244][\128-\191][\128-\191][\128-\191]", "")
+  return not rest:find("[\128-\255]")
+end
+
+it("state.utf8_cut never splits a multi-byte character", function()
+  local e_acute, box = "\195\169", "\226\148\128"
+  local cases = {
+    { "a" .. e_acute:rep(60), 80, 79 },
+    { e_acute:rep(60), 80, 80 },
+    { ("x"):rep(90), 80, 80 },
+    { "x" .. box:rep(40), 80, 79 },
+    { "short" .. box, 80, 8 },
+  }
+  for _, c in ipairs(cases) do
+    local out = state.utf8_cut(c[1], c[2])
+    assert(#out == c[3], ("want %d bytes, got %d"):format(c[3], #out))
+    assert(utf8_valid(out), "cut produced invalid UTF-8")
+  end
+end)
+
+it("state.utf8_scrub replaces invalid sequences and keeps valid ones", function()
+  local fffd = "\239\191\189"
+  local valid = "a\195\169\226\148\128\240\159\152\128z"
+  assert(state.utf8_scrub(valid) == valid, "valid UTF-8 must pass through unchanged")
+  assert(state.utf8_scrub("plain") == "plain")
+  assert(state.utf8_scrub("ab\226\148") == "ab" .. fffd .. fffd, "truncated 3-byte sequence")
+  assert(state.utf8_scrub("x\162\148y") == "x" .. fffd .. fffd .. "y", "stray continuation bytes")
+  assert(state.utf8_scrub("\192\175") == fffd .. fffd, "overlong encoding")
+  assert(state.utf8_scrub("\237\160\128") == fffd .. fffd .. fffd, "surrogate")
+  assert(utf8_valid(state.utf8_scrub("\255\254" .. valid .. "\195")), "scrub output must be valid")
+end)

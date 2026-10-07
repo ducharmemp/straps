@@ -460,6 +460,21 @@ it("thinking_delta stays out of the transcript while visible text remains", func
   assert(text_think:find("thinking test done", 1, true), "visible answer after thinking missing")
 end)
 
+step(function()
+  straps.config.effort = "off"
+  run_session("bad bytes ab\226\148 end")
+end)
+
+it("invalid UTF-8 in the transcript reaches curl scrubbed to U+FFFD", function()
+  local f = assert(io.open(tmp .. "/thinking_body", "rb"))
+  local body = f:read("*a")
+  f:close()
+  local rest = body:gsub("[\194-\223][\128-\191]", ""):gsub("[\224-\239][\128-\191][\128-\191]", "")
+    :gsub("[\240-\244][\128-\191][\128-\191][\128-\191]", "")
+  assert(not rest:find("[\128-\255]"), "request body contains invalid UTF-8")
+  assert(body:find("bad bytes ab\239\191\189\239\191\189 end", 1, true), "scrubbed text missing from body")
+end)
+
 local bp_buf
 step(function()
   straps.config.effort = "off"

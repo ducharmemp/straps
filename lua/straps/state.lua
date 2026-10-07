@@ -41,6 +41,69 @@ local function unescape_line(line)
   return line
 end
 
+function M.utf8_cut(s, n)
+  if #s <= n then
+    return s
+  end
+  return s:sub(1, n + vim.str_utf_start(s, n + 1))
+end
+
+local REPLACEMENT = "\239\191\189"
+
+local function seq_len(s, j)
+  local c = s:byte(j)
+  local len, lo, hi = 0, 0x80, 0xBF
+  if c >= 0xC2 and c <= 0xDF then
+    len = 2
+  elseif c >= 0xE0 and c <= 0xEF then
+    len = 3
+    if c == 0xE0 then lo = 0xA0 elseif c == 0xED then hi = 0x9F end
+  elseif c >= 0xF0 and c <= 0xF4 then
+    len = 4
+    if c == 0xF0 then lo = 0x90 elseif c == 0xF4 then hi = 0x8F end
+  else
+    return nil
+  end
+  local b = s:byte(j + 1)
+  if not b or b < lo or b > hi then
+    return nil
+  end
+  for k = j + 2, j + len - 1 do
+    b = s:byte(k)
+    if not b or b < 0x80 or b > 0xBF then
+      return nil
+    end
+  end
+  return len
+end
+
+function M.utf8_scrub(s)
+  if not s:find("[\128-\255]") then
+    return s
+  end
+  local out, i, start = {}, 1, 1
+  while true do
+    local j = s:find("[\128-\255]", i)
+    if not j then
+      break
+    end
+    local len = seq_len(s, j)
+    if len then
+      i = j + len
+    else
+      out[#out + 1] = s:sub(start, j - 1)
+      out[#out + 1] = REPLACEMENT
+      i = j + 1
+      start = i
+    end
+  end
+  if start == 1 then
+    return s
+  end
+  out[#out + 1] = s:sub(start)
+  return table.concat(out)
+end
+
 local NOTICE_PREFIX = "[straps] "
 local AGENT_FRAME = "[straps] from agent %s (buffer %d): %s"
 

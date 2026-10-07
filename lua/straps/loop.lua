@@ -619,7 +619,7 @@ local function run_turns(bufnr, ctx, run)
       local stalled = (n_errors == n_calls) or (any_repeat and not any_new)
       run.stall = stalled and (run.stall + 1) or 0
       if run.stall >= stall_limit then
-        local why = last_error and (" Last error: " .. last_error:gsub("%s+", " "):sub(1, 200))
+        local why = last_error and (" Last error: " .. require("straps.state").utf8_cut((last_error:gsub("%s+", " ")), 200))
           or " (repeated tool calls with no new progress)"
         state.append(bufnr, "assistant", nil,
           ("[straps: stopped after %d consecutive turns with no apparent progress"

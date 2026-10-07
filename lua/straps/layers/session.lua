@@ -218,8 +218,8 @@ return function(input, ctx)
       else
         reclaimable = reclaimable + nbytes
       end
-      local snippet = first_nonblank(region_lines(b.first_lnum, b.last_lnum))
-        :gsub("%s+", " "):sub(1, 70)
+      local snippet = require("straps.state").utf8_cut(
+        (first_nonblank(region_lines(b.first_lnum, b.last_lnum)):gsub("%s+", " ")), 70)
       out[#out + 1] = ("%4d  %-12s %6d  %s%s"):format(i, b.kind, nbytes, tag, snippet)
     end
     out[#out + 1] = ("%d bytes excisable. To excise: transcript_excise with"
@@ -241,7 +241,7 @@ return function(input, ctx)
   note = note:gsub("%c", " "):gsub("%s+", " ")
   note = vim.trim(note)
   if #note > 200 then
-    note = note:sub(1, 197) .. "..."
+    note = require("straps.state").utf8_cut(note, 197) .. "..."
   end
 
   table.sort(want)

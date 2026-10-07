@@ -453,7 +453,7 @@ return function(req, ctx)
       end
     end
   end
-  local payload = vim.json.encode(body)
+  local payload = require("straps.state").utf8_scrub(vim.json.encode(body))
 
   -- Request-body compression (config.gzip, default on): the replayed
   -- transcript is the whole request and grows every turn, and curl has no
@@ -767,7 +767,7 @@ return function(req, ctx)
         detail = res.body
       end
       if detail and #detail > 2000 then
-        detail = detail:sub(1, 2000) .. "..."
+        detail = require("straps.state").utf8_cut(detail, 2000) .. "..."
       end
       error(("straps provider: request failed (HTTP %s): %s"):format(
         res.status and tostring(res.status) or "?",
@@ -956,7 +956,7 @@ return function(req, ctx)
     end
   end
 
-  local payload = vim.json.encode(body)
+  local payload = require("straps.state").utf8_scrub(vim.json.encode(body))
 
   local function start_request(resolve)
     local content = {}        -- finished blocks in order
@@ -1202,7 +1202,7 @@ return function(req, ctx)
         detail = res.body
       end
       if detail and #detail > 2000 then
-        detail = detail:sub(1, 2000) .. "..."
+        detail = require("straps.state").utf8_cut(detail, 2000) .. "..."
       end
       error(("straps provider (openai): request failed (HTTP %s): %s"):format(
         res.status and tostring(res.status) or "?",
@@ -1408,7 +1408,7 @@ return function(bufnr, opts)
           end
         end
         if not first:find("^%[compacted: was ") then -- idempotent: skip stubs
-          local snippet = first:sub(1, 80)
+          local snippet = require("straps.state").utf8_cut(first, 80)
           if snippet:find("^%%%%%[") then
             snippet = " " .. snippet -- never emit a marker/escape look-alike
           end

@@ -1044,7 +1044,7 @@ return function(input, ctx)
   end
   local text = vim.treesitter.get_node_text(node, buf) or ""
   local cap = math.min(math.max(tonumber(input.max_text_bytes) or 500, 0), 5000)
-  if #text > cap then text = text:sub(1, cap) .. "\n[truncated: node text exceeded " .. cap .. " bytes]" end
+  if #text > cap then text = require("straps.state").utf8_cut(text, cap) .. "\n[truncated: node text exceeded " .. cap .. " bytes]" end
   return string.format("%s  L%d:%d-L%d:%d\nparents: %s\ntext:\n%s",
     node:type(), sr + 1, sc + 1, er + 1, ec + 1, table.concat(chain, " <- "), text)
 end
@@ -2179,7 +2179,7 @@ return function(input, ctx)
       if s[1] > 0 and e[1] >= s[1] then
         local sel = vim.api.nvim_buf_get_lines(attention, s[1] - 1, e[1], false)
         local text = table.concat(sel, "\n")
-        if #text > 2000 then text = text:sub(1, 2000) .. "..." end
+        if #text > 2000 then text = require("straps.state").utf8_cut(text, 2000) .. "..." end
         lines[#lines + 1] = string.format("last visual selection in %s (L%d-%d):\n%s",
           relname(vim.api.nvim_buf_get_name(attention), attention), s[1], e[1], text)
       end

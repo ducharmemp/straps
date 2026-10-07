@@ -332,3 +332,28 @@ it(":StrapsCompact command smoke", function()
   vim.api.nvim_set_current_buf(bufnr)
   vim.cmd.StrapsCompact() -- errors (including resolve failures) fail the case
 end)
+
+it("compaction stubs never split a multi-byte character", function()
+  local b = state.new_session()
+  state.append(b, "user", nil, "go")
+  for turn = 1, 3 do
+    state.append(b, "assistant", nil, "turn " .. turn)
+    state.append(b, "tool_use", { id = "u" .. turn, name = "x" }, "{}")
+    state.append(b, "tool_result", { id = "u" .. turn, is_error = false },
+      "a" .. string.rep("\195\169", 60))
+  end
+  registry.call("fn.compact", b, { keep_turns = 1 })
+  local function utf8_valid(s)
+    local rest = s:gsub("[\194-\223][\128-\191]", ""):gsub("[\224-\239][\128-\191][\128-\191]", "")
+      :gsub("[\240-\244][\128-\191][\128-\191][\128-\191]", "")
+    return not rest:find("[\128-\255]")
+  end
+  local stubs = 0
+  for _, l in ipairs(vim.api.nvim_buf_get_lines(b, 0, -1, false)) do
+    if l:find("^%[compacted: was ") then
+      stubs = stubs + 1
+      assert(utf8_valid(l), "compaction stub is not valid UTF-8")
+    end
+  end
+  assert(stubs == 2, "expected 2 stubs, got " .. stubs)
+end)

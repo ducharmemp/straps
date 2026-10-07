@@ -708,6 +708,13 @@ secret, so no mode-600 guard.
   and ensure `input` for tool_use with no args decodes to an object
   (`vim.json.decode("{}")`; use `vim.empty_dict()` where an empty OBJECT is
   required in encoding).
+- UTF-8 scrub: `vim.json.encode` copies invalid UTF-8 bytes into its output
+  unchanged, and the API rejects such a body ("invalid unicode code point").
+  The transcript replays in full, so one bad byte would fail every later
+  turn of the session. Both backends pass the encoded body through
+  `state.utf8_scrub`, which replaces each invalid sequence with U+FFFD.
+  Code that cuts strings for the transcript uses `state.utf8_cut` and never
+  a raw `s:sub(1, n)`.
 - Request compression (`config.gzip`, default true): the encoded body is
   piped through `gzip -c -6` once per provider call (before the retry loop,
   via `ctx.await`, killed on cancel) and curl sends the compressed bytes with
@@ -878,8 +885,11 @@ breakpoints so the replayed prefix becomes a server-side cache hit:
     block, and everything belonging to the last `opts.keep_turns` (default 2,
     or `config.compact_keep_turns`) assistant turns.
   - Every OLDER tool_result block's content is replaced with a one-line stub:
-    `[compacted: was <N> bytes] <first content line, truncated to ~80 chars>`
-    (never emit a line starting with the marker or escape prefix).
+    `[compacted: was <N> bytes] <first content line, truncated to ~80 bytes>`
+    (never emit a line starting with the marker or escape prefix). The cut
+    goes through `state.utf8_cut`, which backs off to a character boundary.
+    A raw byte cut can split a multi-byte character, and the truncated
+    sequence then fails every later request with HTTP 400.
   - Every older tool_use block's content (the pretty JSON input) is replaced
     with `{}` when larger than ~200 bytes (stays valid JSON for parse).
   - Returns e.g. `"compacted 14 blocks, 61.2KB -> 3.1KB"`; no-op returns a

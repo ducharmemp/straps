@@ -141,7 +141,7 @@ return function(input, ctx)
     local len = (len_name == "out") and out_len or err_len
     if len >= cap then capped = true; stop_for_cap(); return end
     local keep = math.min(#chunk, cap - len)
-    dst[#dst + 1] = chunk:sub(1, keep)
+    dst[#dst + 1] = require("straps.state").utf8_cut(chunk, keep)
     if keep < #chunk then capped = true; stop_for_cap() end
     if len_name == "out" then out_len = len + keep else err_len = len + keep end
   end

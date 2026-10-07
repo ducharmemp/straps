@@ -101,7 +101,7 @@ return function(input, ctx)
         if not chunk or chunk == "" then return end
         if n >= max_bytes then capped = true; if proc then pcall(function() proc:kill(9) end) end; return end
         local keep = math.min(#chunk, max_bytes - n)
-        chunks[#chunks + 1] = chunk:sub(1, keep)
+        chunks[#chunks + 1] = require("straps.state").utf8_cut(chunk, keep)
         n = n + keep
         if keep < #chunk then capped = true; if proc then pcall(function() proc:kill(9) end) end end
       end,

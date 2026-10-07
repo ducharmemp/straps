@@ -486,7 +486,7 @@ function M.after_guards(name, input, result, ok, ctx)
   if block then
     if not ok then
       local orig = tostring(result)
-      if #orig > 200 then orig = orig:sub(1, 200) end
+      if #orig > 200 then orig = require("straps.state").utf8_cut(orig, 200) end
       block = block .. " (tool had already failed: " .. orig .. ")"
     end
     return block, false

@@ -303,7 +303,8 @@ return function(input, ctx)
   -- Parentage lets ui.pick_agents / the statusline show the spawn tree: who
   -- launched this subagent, and a one-line description of its task.
   vim.b[child].straps_parent = ctx.bufnr
-  vim.b[child].straps_task = (task:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")):sub(1, 80)
+  vim.b[child].straps_task = require("straps.state").utf8_cut(
+    (task:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")), 80)
   -- Chain the child's registry scope under THIS session: it reads our
   -- session-scoped entries; its own defines shadow privately.
   registry.ensure_scope(child, ctx.bufnr)

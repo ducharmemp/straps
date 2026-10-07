@@ -288,7 +288,7 @@ return function(input, ctx)
 
   local cap = 100000
   if #out > cap then
-    out = out:sub(1, cap) .. "\n[truncated: output exceeded " .. cap .. " bytes; narrow the pattern or path]"
+    out = require("straps.state").utf8_cut(out, cap) .. "\n[truncated: output exceeded " .. cap .. " bytes; narrow the pattern or path]"
   end
   return out
 end

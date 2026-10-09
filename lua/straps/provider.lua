@@ -2054,15 +2054,13 @@ local SYSTEM_PROMPT_PROJECT_SRC = [==[
 --      ancestor first and the nearest one last (project- and subdir-level);
 --   3. config.instructions_files verbatim, last of all.
 -- Each distinct file is fenced under a "## <absolute path>" header and
--- capped at 20000 bytes with a truncation note; a path seen twice (e.g.
--- $HOME == an ancestor) is included once, at its first (most general)
--- position. Unreadable/missing files are skipped silently. Returns ""
--- when nothing is found.
+-- included whole; a path seen twice (e.g. $HOME == an ancestor) is
+-- included once, at its first (most general) position. Unreadable/missing
+-- files are skipped silently. Returns "" when nothing is found.
 return function()
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
   local cwd = vim.fn.getcwd()
-  local CAP = 20000
   local NAMES = { "AGENTS.md", "CLAUDE.md" }
 
   local paths, seen = {}, {}
@@ -2111,13 +2109,9 @@ return function()
   for _, path in ipairs(paths) do
     local f = io.open(path, "r")
     if f then
-      local content = f:read(CAP)
-      local truncated = f:read(1) ~= nil
+      local content = f:read("*a")
       f:close()
       if type(content) == "string" and content ~= "" then
-        if truncated then
-          content = content .. "\n[straps: truncated]"
-        end
         sections[#sections + 1] = "## " .. path .. "\n" .. content
       end
     end

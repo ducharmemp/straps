@@ -1379,8 +1379,8 @@ of redefining `fn.system_prompt` wholesale) is documented under
   (`vim.fs.find(..., {upward = true, limit = math.huge})`, reversed so the
   farthest ancestor is added first and the nearest last); (3) any explicit
   paths in `config.instructions_files` (list, default {}), last of all.
-  Each distinct file is fenced with a header naming its path and capped at
-  20000 bytes with a truncation note; a path seen twice (e.g. `$HOME` is
+  Each distinct file is fenced with a header naming its path and included
+  whole (no size cap; the user owns the budget); a path seen twice (e.g. `$HOME` is
   also an ancestor) is included once at its most general position;
   unreadable/missing files are silently skipped. Returns "" when nothing
   found.

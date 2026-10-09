@@ -81,7 +81,7 @@ permission path; verify those headless only.
 - The system prompt itself lives as Lua strings in
   `lua/straps/provider.lua` (`SYSTEM_PROMPT_*_SRC`), including the
   project layer that put this file in front of you. That layer injects
-  this file verbatim, capped at 20000 bytes — keep it well under.
+  this file verbatim and whole.
   `tests/prompt_spec.lua` covers the assembly.
 - Target Neovim >= 0.11, LuaJIT / Lua 5.1 semantics, no dependencies
   beyond `curl`. No plenary.

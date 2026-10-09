@@ -2,8 +2,8 @@
 -- _project, wrapped by fn.system_prompt_layer.core/.env/.skills/.project
 -- and composed by fn.system_prompt, which iterates fn.system_prompt_layer.*
 -- entries in registration order). Covers composition, AGENTS.md/CLAUDE.md
--- discovery and upward layering, config.instructions_files, the 20000-byte
--- cap, late-bound layer redefinition, new_session pickup, the env VCS
+-- discovery and upward layering, config.instructions_files, whole-file
+-- inclusion with no size cap, late-bound layer redefinition, new_session pickup, the env VCS
 -- line, and third-party layer contribution via fn.system_prompt_layer.*.
 -- Run: busted tests/prompt_spec.lua
 
@@ -120,17 +120,17 @@ it("upward AGENTS.md files layer, ancestor first and nearest last", function()
   assert(ok, err)
 end)
 
--- -------------------------------------------------------------- truncation
-it("files larger than 20000 bytes are capped with a truncation note", function()
+-- ------------------------------------------------------------- no size cap
+it("large files are included whole with no truncation", function()
   local big = ("x"):rep(30000)
   write_file(deep .. "/AGENTS.md", big)
   cd(deep)
   local ok, err = pcall(function()
     local project = registry.call("fn.system_prompt_project")
-    assert(project:find("[straps: truncated]", 1, true), "truncation note missing")
+    assert(not project:find("[straps: truncated]", 1, true), "unexpected truncation note")
     local section = project:match("## " .. vim.pesc(deep .. "/AGENTS.md") .. "\n(x*)")
     assert(section, "AGENTS.md section missing")
-    assert(#section == 20000, "cap should be 20000 bytes, got " .. #section)
+    assert(#section == 30000, "file should be included whole, got " .. #section)
   end)
   write_file(deep .. "/AGENTS.md", "agents-norm-marker") -- restore for later cases
   cd(orig_cwd)

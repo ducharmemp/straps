@@ -393,7 +393,7 @@ provider		(string|nil) nil. Backend for |fn.provider|: "anthropic"
 			choice (~/.config/straps/provider) else "anthropic".
 			Per session via b:straps_provider.
 openai_base_url		(string|nil) nil -> https://api.openai.com. Prefixes
-			/v1/chat/completions for the OpenAI backend.
+			/v1/responses for the OpenAI backend.
 openai_model		(string|nil) "gpt-5". Model id when provider ==
 			"openai"; kept separate from Anthropic `model`.
 request_timeout_ms	(number) 300000. Idle watchdog: kill a request whose
@@ -776,7 +776,7 @@ fn.provider_anthropic(req, ctx)	The Anthropic Messages API over streaming SSE
 		via curl. Prompt caching, extended thinking, idle watchdog,
 		429/529 retry with backoff.
 						*fn.provider_openai*
-fn.provider_openai(req, ctx)	The OpenAI Chat Completions API over streaming
+fn.provider_openai(req, ctx)	The OpenAI Responses API over streaming
 		SSE via curl. Translates the request/response to and from the
 		same block shape; Bearer auth via |fn.openai_api_key|, endpoint
 		config `openai_base_url`, and model config `openai_model`.

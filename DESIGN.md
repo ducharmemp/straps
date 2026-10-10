@@ -756,41 +756,59 @@ secret, so no mode-600 guard.
   exit callback: children inheriting stdio can delay it indefinitely). This is
   what prevents an open-but-silent stream from hanging a run forever.
 
-### `fn.provider_openai` — the OpenAI Chat Completions backend
+### `fn.provider_openai` — the OpenAI Responses backend
 
 Same `(req, ctx)` contract, OpenAI's wire shape. Selected when
-`config.provider` (or `vim.b straps_provider`) is `"openai"`.
+`config.provider` (or `vim.b straps_provider`) is `"openai"`. It uses
+`/v1/responses` because Chat Completions rejects function tools for models
+that reason by default (gpt-5.6-sol, gpt-6.1-sol) unless `reasoning_effort`
+is `"none"`, while other models reject `"none"`; the Responses API accepts
+function tools together with any reasoning effort.
 
-- POST `{config.openai_base_url}/v1/chat/completions` (default
+- POST `{config.openai_base_url}/v1/responses` (default
   `https://api.openai.com`) with `Authorization: Bearer <key>`
   (from `registry.call("fn.openai_api_key")` — `$OPENAI_API_KEY`, then the
   first line of `$XDG_CONFIG_HOME/straps/openai_api_key`, same mode-600 and
   unreadable-file guards as `fn.api_key`) and `content-type: application/json`.
-- **Request translation** (Anthropic-shaped `req` → OpenAI flat messages):
-  `req.system` → a leading `{role="system"}` message; assistant text blocks →
-  the message's `content` string; `tool_use` blocks → `assistant.tool_calls[]`
-  `{ id, type="function", function={ name, arguments=JSON-string(input) } }`;
-  `tool_result` blocks → their own `{ role="tool", tool_call_id, content }`
-  messages. Tools → `[{ type="function", function={ name, description,
-  parameters=input_schema } }]`. `max_completion_tokens=(config.max_tokens or config.default_max_tokens)` (no per-model discovery for OpenAI),
-  `stream=true`, `stream_options.include_usage=true`. Model id is
-  `vim.b[bufnr].straps_openai_model`, then `config.openai_model`, then `"gpt-5"`; it never falls back to the Anthropic `config.model`.
-- **Response translation** (OpenAI SSE `choices[].delta` → blocks): `delta.content`
-  → `ctx.emit{type="text_delta"}` accumulated into one text block;
-  `delta.tool_calls[].function.arguments` → accumulated per `index` and decoded
-  at the end; `finish_reason` → the Anthropic `stop_reason`
-  (`tool_calls`→`tool_use`, `length`→`max_tokens`, `stop`→`end_turn`);
-  `data: [DONE]` finalizes. `usage.prompt_tokens`/`completion_tokens`/
-  `prompt_tokens_details.cached_tokens` are normalized to the
-  `input_tokens`/`output_tokens`/`cache_read_input_tokens` names the loop reads.
-- Reasoning: OpenAI models receive `reasoning_effort` only when their
-  configured `config.openai_models` entry has `reasoning = true` or
-  `reasoning_effort = true`, the active `config.efforts` entry has a `level`,
-  and the Chat Completions request has no function tools. Untagged models,
-  `"off"`, entries with no level, or tool-bearing requests send none. Reasoning
-  deltas (`delta.reasoning_content`, or `delta.reasoning` on some gateways) are
-  ignored so provider reasoning never enters the durable transcript.
-- Same idle watchdog and backoff scaffolding; retries 429/500/502/503.
+- **Request translation** (Anthropic-shaped `req` → Responses input items, in
+  block order): `req.system` → `instructions`; text blocks → `{ role, content }`
+  message items (text before and after a tool call stays in separate items);
+  `tool_use` blocks → `{ type="function_call", call_id, name,
+  arguments=JSON-string(input) }`; `tool_result` blocks → `{
+  type="function_call_output", call_id, output }`. Tools → `[{ type="function",
+  name, description, parameters=input_schema, strict=false }]`, omitted when
+  empty. `max_output_tokens=(config.max_tokens or config.default_max_tokens or 8192)`
+  (no per-model discovery for OpenAI), `stream=true`, `store=false`. Model id
+  is `vim.b[bufnr].straps_openai_model`, then `config.openai_model`, then
+  `"gpt-5"`; it never falls back to the Anthropic `config.model`.
+- **Response translation** (typed SSE events → blocks):
+  `response.output_text.delta` and `response.refusal.delta` →
+  `ctx.emit{type="text_delta"}` accumulated into one text block (separate output
+  items are joined with a blank line); `function_call` output items and
+  `response.function_call_arguments.delta`/`.done` → one `tool_use` block per
+  `output_index`, arguments decoded at the end. `response.completed` finalizes
+  with `stop_reason` `tool_use` when any function call is present, else
+  `end_turn`. `response.incomplete` keeps only function calls whose
+  `output_item.done` arrived, so a half-written call never runs; reason
+  `max_output_tokens` maps to `max_tokens`, other reasons to `end_turn`.
+  `response.failed` and the `error` event kill curl and
+  fail the request. Usage `input_tokens`/`output_tokens`/
+  `input_tokens_details.cached_tokens` are normalized to the
+  `input_tokens`/`output_tokens`/`cache_read_input_tokens` names the loop
+  reads; OpenAI's `input_tokens` includes cached tokens, so the cached count is
+  subtracted to match Anthropic's meaning.
+- Reasoning: OpenAI models receive `reasoning = { effort = level }` only when
+  their configured `config.openai_models` entry has `reasoning = true` or
+  `reasoning_effort = true` and the active `config.efforts` entry has a
+  `level`, with or without tools. Untagged models, `"off"`, and entries with no
+  level send no `reasoning` field, so the model uses its own default. Reasoning
+  items and reasoning/summary events are ignored so provider reasoning never
+  enters the durable transcript. With `store=false` no reasoning items are
+  passed back between turns.
+- Same idle watchdog and backoff scaffolding; retries HTTP 408/429/500/502/503,
+  curl failures, and stream `error`/`response.failed` events whose code is
+  `rate_limit_exceeded` or `server_error`, provided no text has streamed yet
+  (a retry after streamed text would repeat that text in the transcript).
 
 `fn.system_prompt` default source returns the default system prompt (below).
 
@@ -817,7 +835,7 @@ provider it lists GPT models, not Claude ones.
   (key from `fn.openai_api_key`). OpenAI's catalog carries no display name or
   thinking/reasoning-effort capabilities, so the id doubles as the label and
   `thinking` stays `nil`; static `config.openai_models` entries must opt in to
-  `reasoning_effort` with `reasoning = true` (or `reasoning_effort = true`).
+  `reasoning.effort` with `reasoning = true` (or `reasoning_effort = true`).
 
 It never throws — any failure (no key, curl error, non-2xx, unparseable body)
 returns `(nil, errmsg)` so the picker can fall back to the provider-specific static list.

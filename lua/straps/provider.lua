@@ -1,6 +1,6 @@
 -- straps.provider: registers fn.provider (a backend DISPATCHER selecting
 -- fn.provider_anthropic — Anthropic Messages API — or fn.provider_openai —
--- OpenAI Chat Completions — by config.provider), plus fn.api_key /
+-- OpenAI Responses API — by config.provider), plus fn.api_key /
 -- fn.openai_api_key, fn.build_tools, the layered system prompt
 -- (fn.system_prompt_core/_env/_project composed by fn.system_prompt), fn.log
 -- and fn.compact. Everything is a registry entry (a Lua source string), so any
@@ -149,7 +149,7 @@ return function(provider_override)
       if openai then
         -- OpenAI's /v1/models entries carry no display name or thinking /
         -- reasoning-effort capabilities, so the id doubles as the label and
-        -- static config must opt a model into reasoning_effort explicitly.
+        -- static config must opt a model into reasoning.effort explicitly.
         models[#models + 1] = { id = m.id, label = m.id, thinking = nil }
       else
         local types = (((m.capabilities or {}).thinking or {}).types) or {}
@@ -780,15 +780,16 @@ end
 
 local PROVIDER_OPENAI_SRC = [==[
 -- (req, ctx) -> { content = blocks, stop_reason = s }
--- The OpenAI Chat Completions backend. Same contract as fn.provider_anthropic
+-- The OpenAI Responses backend. Same contract as fn.provider_anthropic
 -- (returns { content = blocks, stop_reason, usage } and streams text via
 -- ctx.emit), but speaks OpenAI's wire shape instead of Anthropic's:
 --   auth      Authorization: Bearer <key>            (fn.openai_api_key)
---   endpoint  {base_url}/v1/chat/completions         (config.openai_base_url)
---   request   flat role messages + tool_calls        (translated from req)
---   stream    choices[].delta {content, tool_calls}  (translated back)
+--   endpoint  {base_url}/v1/responses                (config.openai_base_url)
+--   request   instructions + input items             (translated from req)
+--   stream    typed events (response.*)              (translated back)
 -- fn.provider dispatches here when config.provider (or vim.b straps_provider)
--- is "openai". 429/500/502/503 retry with backoff, like the Anthropic backend.
+-- is "openai". HTTP 408/429/500/502/503, curl failures and stream errors coded
+-- rate_limit_exceeded/server_error retry with backoff.
 return function(req, ctx)
   local registry = require("straps.registry")
   local ok_straps, straps = pcall(require, "straps")
@@ -811,15 +812,12 @@ return function(req, ctx)
   -- to config.model/vim.b.straps_model here: those are Anthropic ids.
   local model_id = b_model or config.openai_model or "gpt-5"
 
-  -- Translate the Anthropic-shaped req.messages into OpenAI's flat role
-  -- messages. Anthropic content blocks map like so:
-  --   text        -> accumulated into the message's string content
-  --   tool_use    -> an assistant message tool_calls[] entry
-  --   tool_result -> a separate { role = "tool", tool_call_id, content } message
-  local messages = {}
-  if req.system ~= nil and req.system ~= "" then
-    messages[#messages + 1] = { role = "system", content = req.system }
-  end
+  -- Translate the Anthropic-shaped req.messages into Responses input items,
+  -- preserving block order:
+  --   text        -> a { role, content } message item
+  --   tool_use    -> a { type = "function_call", call_id, name, arguments } item
+  --   tool_result -> a { type = "function_call_output", call_id, output } item
+  local input = {}
   local function block_text(b)
     -- tool_result content can be a string or an array of {type=text,text=}.
     if type(b) == "string" then return b end
@@ -841,56 +839,40 @@ return function(req, ctx)
     return ""
   end
   for _, m in ipairs(req.messages or {}) do
+    local role = m.role == "assistant" and "assistant" or "user"
     local content = m.content
     if type(content) == "string" then
-      messages[#messages + 1] = { role = m.role, content = content }
+      if content ~= "" then input[#input + 1] = { role = role, content = content } end
     elseif type(content) == "table" then
-      if m.role == "assistant" then
-        local text_parts, tool_calls = {}, {}
-        for _, blk in ipairs(content) do
-          if blk.type == "text" then
-            text_parts[#text_parts + 1] = blk.text or ""
-          elseif blk.type == "tool_use" then
-            tool_calls[#tool_calls + 1] = {
-              id = blk.id,
-              type = "function",
-              ["function"] = {
-                name = blk.name,
-                -- OpenAI wants arguments as a JSON string.
-                arguments = vim.json.encode(blk.input or vim.empty_dict()),
-              },
-            }
-          end
-        end
-        local msg = { role = "assistant" }
+      local text_parts = {}
+      local function flush()
         local text = table.concat(text_parts, "")
-        if text ~= "" then msg.content = text end
-        if #tool_calls > 0 then msg.tool_calls = tool_calls end
-        -- An assistant message must carry content or tool_calls; never both nil.
-        if msg.content == nil and msg.tool_calls == nil then msg.content = "" end
-        messages[#messages + 1] = msg
-      else
-        -- user role: split tool_result blocks into their own tool messages,
-        -- and gather any plain text into a single user message.
-        local text_parts = {}
-        for _, blk in ipairs(content) do
-          if blk.type == "tool_result" then
-            messages[#messages + 1] = {
-              role = "tool",
-              tool_call_id = blk.tool_use_id or blk.id,
-              content = block_text(blk),
-            }
-          elseif blk.type == "text" then
-            text_parts[#text_parts + 1] = blk.text or ""
-          else
-            text_parts[#text_parts + 1] = block_text(blk)
-          end
-        end
-        local text = table.concat(text_parts, "")
-        if text ~= "" then
-          messages[#messages + 1] = { role = "user", content = text }
+        text_parts = {}
+        if text ~= "" then input[#input + 1] = { role = role, content = text } end
+      end
+      for _, blk in ipairs(content) do
+        if blk.type == "tool_use" then
+          flush()
+          input[#input + 1] = {
+            type = "function_call",
+            call_id = blk.id,
+            name = blk.name,
+            arguments = vim.json.encode(blk.input or vim.empty_dict()),
+          }
+        elseif blk.type == "tool_result" then
+          flush()
+          input[#input + 1] = {
+            type = "function_call_output",
+            call_id = blk.tool_use_id or blk.id,
+            output = block_text(blk),
+          }
+        elseif blk.type == "text" then
+          text_parts[#text_parts + 1] = blk.text or ""
+        elseif role == "user" then
+          text_parts[#text_parts + 1] = block_text(blk)
         end
       end
+      flush()
     end
   end
 
@@ -898,35 +880,33 @@ return function(req, ctx)
     model = model_id,
     -- No per-model max-output discovery for OpenAI (the catalog does not expose
     -- it), so an explicit config.max_tokens else default_max_tokens.
-    max_completion_tokens = config.max_tokens or config.default_max_tokens or 8192,
+    max_output_tokens = config.max_tokens or config.default_max_tokens or 8192,
     stream = true,
-    stream_options = { include_usage = true },
-    messages = messages,
+    store = false,
+    input = input,
   }
+  if req.system ~= nil and req.system ~= "" then
+    body.instructions = req.system
+  end
 
-  -- Tools -> OpenAI function tools. Empty Lua arrays JSON-encode as {}, so omit.
-  local has_tools = req.tools and #req.tools > 0
-  if has_tools then
+  -- Tools -> Responses function tools. Empty Lua arrays JSON-encode as {}, so omit.
+  if req.tools and #req.tools > 0 then
     local tools = {}
     for _, t in ipairs(req.tools) do
       tools[#tools + 1] = {
         type = "function",
-        ["function"] = {
-          name = t.name,
-          description = t.description or "",
-          parameters = t.input_schema or { type = "object" },
-        },
+        name = t.name,
+        description = t.description or "",
+        parameters = t.input_schema or { type = "object" },
+        strict = false,
       }
     end
     body.tools = tools
   end
-  -- Tool-bearing requests: omit reasoning_effort entirely.
-  -- Reasoning effort: only OpenAI reasoning-capable models accept
-  -- reasoning_effort, and OpenAI's /v1/models catalog does not expose that
-  -- capability. Require the configured OpenAI model entry to opt in with
-  -- reasoning = true (or reasoning_effort = true). Chat Completions rejects
-  -- reasoning_effort when function tools are present, so tool-bearing requests
-  -- omit it even for opted-in models.
+  -- Reasoning effort: OpenAI's /v1/models catalog does not expose which models
+  -- reason, so the configured OpenAI model entry must opt in with
+  -- reasoning = true (or reasoning_effort = true). Unlisted models get the
+  -- model's own default.
   local reasoning_enabled = false
   for _, m in ipairs(type(config.openai_models) == "table" and config.openai_models or {}) do
     if type(m) == "table" and m.id == model_id then
@@ -934,12 +914,12 @@ return function(req, ctx)
       break
     end
   end
-  if reasoning_enabled and not has_tools then
+  if reasoning_enabled then
     local efforts = type(config.efforts) == "table" and config.efforts or {}
     local effort_name = b_effort or config.effort or "off"
     for _, e in ipairs(efforts) do
       if type(e) == "table" and e.name == effort_name and e.level then
-        body.reasoning_effort = e.level
+        body.reasoning = { effort = e.level }
         break
       end
     end
@@ -950,20 +930,22 @@ return function(req, ctx)
   local function start_request(resolve)
     local content = {}        -- finished blocks in order
     local text_block = nil    -- the single streamed text block (created lazily)
-    local tool_blocks = {}    -- OpenAI tool_calls index -> { block, order }
-    local tool_order = {}     -- preserves first-seen order of tool_calls
-    local stop_reason = nil
+    local text_index = nil    -- output_index of the text item last appended to
+    local tool_blocks = {}    -- output_index -> tool_use block
+    local tool_order = {}     -- preserves first-seen order of function_call items
     local usage = nil
     local function merge_usage(u)
       if type(u) ~= "table" then return end
       usage = usage or {}
       -- Normalize OpenAI usage names to the Anthropic ones the loop reads.
-      if type(u.prompt_tokens) == "number" then usage.input_tokens = u.prompt_tokens end
-      if type(u.completion_tokens) == "number" then usage.output_tokens = u.completion_tokens end
-      local details = u.prompt_tokens_details
-      if type(details) == "table" and type(details.cached_tokens) == "number" then
-        usage.cache_read_input_tokens = details.cached_tokens
-      end
+      -- OpenAI's input_tokens includes cached tokens; Anthropic's excludes them,
+      -- and the loop adds cache_read_input_tokens back on top.
+      local details = u.input_tokens_details
+      local cached = type(details) == "table" and type(details.cached_tokens) == "number"
+        and details.cached_tokens or nil
+      if type(u.input_tokens) == "number" then usage.input_tokens = u.input_tokens - (cached or 0) end
+      if type(u.output_tokens) == "number" then usage.output_tokens = u.output_tokens end
+      if cached then usage.cache_read_input_tokens = cached end
     end
     local line_buf = ""
     local raw, raw_len = {}, 0
@@ -1002,78 +984,103 @@ return function(req, ctx)
       end
     end
 
-    -- OpenAI's finish_reason -> the Anthropic stop_reason the loop expects.
-    local function map_finish(fr)
-      if fr == "tool_calls" then return "tool_use"
-      elseif fr == "length" then return "max_tokens"
-      elseif fr == "stop" then return "end_turn"
-      else return fr end
+    local function tool_slot(idx, item)
+      local slot = tool_blocks[idx]
+      if not slot then
+        slot = { type = "tool_use", partial = "" }
+        tool_blocks[idx] = slot
+        tool_order[#tool_order + 1] = idx
+      end
+      if type(item) == "table" then
+        if type(item.call_id) == "string" and item.call_id ~= "" then slot.id = item.call_id end
+        if type(item.name) == "string" and item.name ~= "" then slot.name = item.name end
+        if type(item.arguments) == "string" and item.arguments ~= "" then slot.partial = item.arguments end
+      end
+      return slot
     end
 
-    local function handle_choice(choice)
-      local delta = choice.delta or {}
-      -- Provider reasoning fields are deliberately ignored. Only visible
-      -- content is emitted into the durable transcript.
-      if type(delta.content) == "string" and delta.content ~= "" then
-        if not text_block then
-          text_block = { type = "text", text = "" }
-        end
-        text_block.text = text_block.text .. delta.content
-        ctx.emit({ type = "text_delta", text = delta.content })
-      end
-      if type(delta.tool_calls) == "table" then
-        for _, tc in ipairs(delta.tool_calls) do
-          local idx = tc.index or 0
-          local slot = tool_blocks[idx]
-          if not slot then
-            slot = { type = "tool_use", id = tc.id, name = nil, partial = "" }
-            tool_blocks[idx] = slot
-            tool_order[#tool_order + 1] = idx
-          end
-          if tc.id and tc.id ~= "" then slot.id = tc.id end
-          local fn = tc["function"] or {}
-          if fn.name and fn.name ~= "" then slot.name = fn.name end
-          if type(fn.arguments) == "string" then
-            slot.partial = slot.partial .. fn.arguments
-          end
-        end
-      end
-      if choice.finish_reason then
-        stop_reason = map_finish(choice.finish_reason)
-      end
-    end
-
-    local function finalize()
-      -- Emit blocks in stream order: text first (OpenAI streams it before or
-      -- interleaved, but a single message has one assistant text), then tools.
+    local function finalize(stop_reason, completed_only)
+      -- Text first (one assistant text block), then tools in output order. A
+      -- truncated response keeps only the function calls the API finished, so a
+      -- half-written call never runs with empty input.
       if text_block and text_block.text ~= "" then
         content[#content + 1] = text_block
       end
+      local tools = 0
       for _, idx in ipairs(tool_order) do
         local b = tool_blocks[idx]
-        local ok, input = pcall(vim.json.decode, b.partial ~= "" and b.partial or "{}")
-        b.input = ok and input or vim.empty_dict()
-        b.partial = nil
-        content[#content + 1] = b
+        if b.done or not completed_only then
+          local ok, input = pcall(vim.json.decode, b.partial ~= "" and b.partial or "{}")
+          b.input = (ok and type(input) == "table") and input or vim.empty_dict()
+          b.partial, b.done = nil, nil
+          content[#content + 1] = b
+          tools = tools + 1
+        end
       end
-      resolve({ ok = true, content = content, stop_reason = stop_reason or "end_turn", usage = usage })
+      if tools > 0 then stop_reason = "tool_use" end
+      resolve({ ok = true, content = content, stop_reason = stop_reason, usage = usage })
+    end
+
+    -- Stream-level failures whose code means "try again" retry like HTTP 429/5xx,
+    -- unless text already streamed into the transcript (a retry would repeat it).
+    local retry_codes = { rate_limit_exceeded = true, server_error = true }
+    local function fail(err)
+      if proc then pcall(function() proc:kill(9) end) end
+      resolve({ ok = false, body = table.concat(raw), err = err,
+        retryable = text_block == nil and type(err) == "table" and retry_codes[err.code] == true })
+    end
+
+    local function append_text(ev)
+      if type(ev.delta) ~= "string" or ev.delta == "" then return end
+      local delta = ev.delta
+      if not text_block then
+        text_block = { type = "text", text = "" }
+      elseif text_index ~= ev.output_index and text_block.text ~= "" then
+        delta = "\n\n" .. delta
+      end
+      text_index = ev.output_index
+      text_block.text = text_block.text .. delta
+      ctx.emit({ type = "text_delta", text = delta })
+    end
+
+    -- Reasoning items and reasoning/summary events are deliberately ignored.
+    -- Only visible output text, refusals and function calls enter the durable
+    -- transcript.
+    local function handle_event(ev)
+      local t = ev.type
+      if t == "response.output_text.delta" or t == "response.refusal.delta" then
+        append_text(ev)
+      elseif t == "response.output_item.added" or t == "response.output_item.done" then
+        if type(ev.item) == "table" and ev.item.type == "function_call" then
+          local slot = tool_slot(ev.output_index or 0, ev.item)
+          if t == "response.output_item.done" and ev.item.status ~= "incomplete" then slot.done = true end
+        end
+      elseif t == "response.function_call_arguments.delta" then
+        local slot = tool_slot(ev.output_index or 0)
+        if type(ev.delta) == "string" then slot.partial = slot.partial .. ev.delta end
+      elseif t == "response.function_call_arguments.done" then
+        if type(ev.arguments) == "string" then tool_slot(ev.output_index or 0).partial = ev.arguments end
+      elseif t == "response.completed" then
+        merge_usage(type(ev.response) == "table" and ev.response.usage)
+        finalize("end_turn", false)
+      elseif t == "response.incomplete" then
+        local r = type(ev.response) == "table" and ev.response or {}
+        merge_usage(r.usage)
+        local reason = type(r.incomplete_details) == "table" and r.incomplete_details.reason
+        finalize(reason == "max_output_tokens" and "max_tokens" or "end_turn", true)
+      elseif t == "response.failed" then
+        local r = type(ev.response) == "table" and ev.response or {}
+        fail(type(r.error) == "table" and r.error or { message = "response.failed with no error detail" })
+      elseif t == "error" then
+        fail(type(ev.error) == "table" and ev.error
+          or { code = ev.code, message = ev.message, param = ev.param })
+      end
     end
 
     local function on_data(data)
-      if data == "[DONE]" then
-        finalize()
-        return
-      end
       local ok, msg = pcall(vim.json.decode, data)
       if not ok or type(msg) ~= "table" then return end
-      if type(msg.choices) == "table" then
-        for _, choice in ipairs(msg.choices) do
-          pcall(handle_choice, choice)
-        end
-      end
-      -- Usage arrives on its own final chunk (choices empty) with
-      -- stream_options.include_usage, and sometimes on each chunk.
-      merge_usage(msg.usage)
+      pcall(handle_event, msg)
     end
 
     local function on_line(line)
@@ -1101,7 +1108,7 @@ return function(req, ctx)
 
     proc = vim.system({
       "curl", "-sS", "--no-buffer",
-      "-X", "POST", base_url .. "/v1/chat/completions",
+      "-X", "POST", base_url .. "/v1/responses",
       "-H", "Authorization: Bearer " .. api_key,
       "-H", "content-type: application/json",
       "-w", "%{stderr}\nSTRAPS_HTTP_STATUS:%{http_code}\n",
@@ -1116,9 +1123,9 @@ return function(req, ctx)
       local stderr = res.stderr or ""
       local status = tonumber(stderr:match("STRAPS_HTTP_STATUS:(%d+)"))
       if status == 0 then status = nil end
-      -- On a clean stream this loses the race with [DONE]/finalize and is a
-      -- no-op. Reaching it live means curl failed, HTTP was non-2xx (the body
-      -- is plain JSON in `raw`), or the stream died before [DONE].
+      -- On a clean stream this loses the race with response.completed/finalize
+      -- and is a no-op. Reaching it live means curl failed, HTTP was non-2xx (the
+      -- body is plain JSON in `raw`), or the stream died before a terminal event.
       resolve({
         ok = false,
         status = status,
@@ -1170,7 +1177,7 @@ return function(req, ctx)
     local curl_failure = res.status == nil and type(res.err) == "string"
     local retryable = res.status == 429 or res.status == 500
       or res.status == 502 or res.status == 503 or res.status == 408
-      or curl_failure
+      or curl_failure or res.retryable == true
 
     if retryable and attempt < 3 then
       local delay_ms = 1000 * attempt * attempt
@@ -2349,7 +2356,7 @@ function M.register()
     define({
       name = "fn.provider_openai",
       kind = "fn",
-      doc = "OpenAI Chat Completions over streaming SSE via curl. (req, ctx) -> { content, stop_reason }.",
+      doc = "OpenAI Responses API (/v1/responses) over streaming SSE via curl. (req, ctx) -> { content, stop_reason }.",
       source = PROVIDER_OPENAI_SRC,
     })
   end

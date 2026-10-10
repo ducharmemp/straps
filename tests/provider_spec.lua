@@ -1220,9 +1220,10 @@ step(function()
   vim.env.ANTHROPIC_API_KEY = saved_key
 
   -- ------------------------------------------------------------ openai backend
-  -- Fake curl serving OpenAI Chat Completions SSE. Turn 1 streams a tool_call
-  -- (echo via bash), turn 2 streams text. Captures argv + request bodies so we
-  -- can assert the translated OpenAI wire shape and the Bearer auth header.
+  -- Fake curl serving OpenAI Responses SSE. Turn 1 streams a reasoning item
+  -- (ignored) and a function_call (echo via bash), turn 2 streams text. A body
+  -- containing "trigger-stream-error" gets an `error` event. Captures argv +
+  -- request bodies so we can assert the translated wire shape and Bearer auth.
   vim.fn.mkdir(tmp .. "/openai", "p")
   write_exec(tmp .. "/openai/curl", ([[#!/usr/bin/env bash
 D=%q
@@ -1230,19 +1231,40 @@ N=$(cat "$D/oai_n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/oai_n"
 printf '%%s\n' "$*" >> "$D/oai_argv"
 cat > "$D/oai_body.$N"
 echo "STRAPS_HTTP_STATUS:200" >&2
-if [ "$N" = 1 ]; then
-  printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}\n\n'
-  printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"command\\":\\"echo "}}]}}]}\n\n'
-  printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"openai-e2e-output\\"}"}}]}}]}\n\n'
-  printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
-  printf 'data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":1100}}}\n\n'
-  printf 'data: [DONE]\n\n'
+if grep -q trigger-stream-error "$D/oai_body.$N"; then
+  printf 'event: error\ndata: {"type":"error","code":"invalid_request_error","message":"fake stream failure","param":"tools","sequence_number":1}\n\n'
+elif grep -q trigger-retry-error "$D/oai_body.$N" && [ ! -e "$D/oai_retry_done" ]; then
+  touch "$D/oai_retry_done"
+  printf 'event: error\ndata: {"type":"error","code":"rate_limit_exceeded","message":"fake rate limit","param":null,"sequence_number":1}\n\n'
+elif grep -q trigger-late-retry "$D/oai_body.$N"; then
+  printf 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"delta":"partial-before-error "}\n\n'
+  printf 'event: error\ndata: {"type":"error","code":"server_error","message":"fake late server error","param":null,"sequence_number":2}\n\n'
+elif grep -q trigger-failed "$D/oai_body.$N"; then
+  printf 'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","error":{"code":"invalid_prompt","message":"fake response failed"}}}\n\n'
+elif grep -q trigger-refusal "$D/oai_body.$N"; then
+  printf 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"delta":"first-item"}\n\n'
+  printf 'event: response.refusal.delta\ndata: {"type":"response.refusal.delta","output_index":1,"delta":"fake-refusal-text"}\n\n'
+  printf 'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":5}}}\n\n'
+elif grep -q trigger-done-only "$D/oai_body.$N" && ! grep -q oai-done-only-output "$D/oai_body.$N"; then
+  printf 'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_d","call_id":"call_d","name":"bash","status":"completed","arguments":"{\\"command\\":\\"echo oai-done-only-output\\"}"}}\n\n'
+  printf 'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":5}}}\n\n'
+elif grep -q trigger-truncated "$D/oai_body.$N"; then
+  printf 'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_t","call_id":"call_t","name":"bash","arguments":""}}\n\n'
+  printf 'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_t","delta":"{\\"command\\":\\"touch '"$D"'/oai_truncated_ran\\"}"}\n\n'
+  printf 'event: response.incomplete\ndata: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":8192}}}\n\n'
+elif [ "$N" = 1 ]; then
+  printf 'event: response.created\ndata: {"type":"response.created","sequence_number":0,"response":{"status":"in_progress"}}\n\n'
+  printf 'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}\n\n'
+  printf 'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"bash","arguments":""}}\n\n'
+  printf 'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","delta":"{\\"command\\":\\"echo "}\n\n'
+  printf 'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","delta":"openai-e2e-output\\"}"}\n\n'
+  printf 'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"bash","arguments":"{\\"command\\":\\"echo openai-e2e-output\\"}"}}\n\n'
+  printf 'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1200,"output_tokens":20,"input_tokens_details":{"cached_tokens":1100}}}}\n\n'
 else
-  printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"openai "}}]}\n\n'
-  printf 'data: {"choices":[{"index":0,"delta":{"content":"done"}}]}\n\n'
-  printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
-  printf 'data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":5}}\n\n'
-  printf 'data: [DONE]\n\n'
+  printf 'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}\n\n'
+  printf 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"openai "}\n\n'
+  printf 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"done"}\n\n'
+  printf 'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":50,"output_tokens":5}}}\n\n'
 fi
 ]]):format(tmp))
 end)
@@ -1250,16 +1272,20 @@ end)
 do
   local saved_provider
   local saved_oai_base
+  local saved_oai_model, saved_model, saved_oai_key_env
   local oai_buf, oai_text
   local initial_oai_n
   step(function()
     saved_provider = straps.config.provider
     saved_oai_base = straps.config.openai_base_url
+    saved_oai_model, saved_model, saved_oai_key_env =
+      straps.config.openai_model, straps.config.model, vim.env.OPENAI_API_KEY
     vim.env.PATH = tmp .. "/openai:" .. real_path
     vim.env.OPENAI_API_KEY = "openai-test-key"
     straps.config.provider = "openai"
     straps.config.openai_base_url = "http://straps-openai.invalid"
     straps.config.openai_model = "gpt-5-test"
+    straps.config.log_file = tmp .. "/oai_events.log"
 
     oai_buf, oai_text = run_session("run echo via bash on openai")
     initial_oai_n = tonumber((vim.fn.readfile(tmp .. "/oai_n")[1] or "0"))
@@ -1276,45 +1302,62 @@ do
     assert(not loop.running(oai_buf), "run still active")
   end)
 
-  it("openai backend: hits base_url/v1/chat/completions with Bearer auth", function()
+  it("openai backend: hits base_url/v1/responses with Bearer auth", function()
     local argv = table.concat(vim.fn.readfile(tmp .. "/oai_argv"), "\n")
-    assert(argv:find("http://straps-openai.invalid/v1/chat/completions", 1, true),
+    assert(argv:find("http://straps-openai.invalid/v1/responses", 1, true),
       "custom openai base_url not in argv:\n" .. argv)
     assert(argv:find("Authorization: Bearer openai-test-key", 1, true),
       "Bearer auth header missing:\n" .. argv)
   end)
 
-  it("openai backend: request 1 is translated OpenAI shape (system + tools + model)", function()
+  it("openai backend: request 1 is translated Responses shape (instructions + input + tools + model)", function()
     local body = read_oai_body(initial_oai_n - 1)
     assert(body.model == "gpt-5-test", "model wrong: " .. tostring(body.model))
     assert(body.stream == true, "stream should be true")
-    assert(body.reasoning_effort == nil,
-      "untagged OpenAI model must not receive reasoning_effort: " .. tostring(body.reasoning_effort))
-    assert(body.messages[1].role == "system", "first message should be the system role")
-    assert(body.messages[2].role == "user", "user message missing")
+    assert(body.store == false, "store should be false")
+    assert(type(body.max_output_tokens) == "number", "max_output_tokens missing")
+    assert(body.reasoning == nil, "untagged OpenAI model must not receive reasoning: " .. vim.inspect(body.reasoning))
+    assert(type(body.instructions) == "string" and body.instructions ~= "", "system prompt not sent as instructions")
+    assert(body.input[1].role == "user" and body.input[1].content:find("run echo via bash on openai", 1, true),
+      "first input item should be the user message: " .. vim.inspect(body.input[1]))
     assert(type(body.tools) == "table" and #body.tools > 0, "tools missing")
     local t1 = body.tools[1]
-    assert(t1.type == "function" and type(t1["function"]) == "table"
-      and type(t1["function"].name) == "string", "tool not in OpenAI function shape")
-    assert(type(t1["function"].parameters) == "table", "tool parameters missing")
+    assert(t1.type == "function" and type(t1.name) == "string", "tool not in Responses function shape")
+    assert(type(t1.parameters) == "table", "tool parameters missing")
+    assert(t1.strict == false, "tool strict should be false")
   end)
 
-  it("openai backend: request 2 carries the tool_call + tool result messages", function()
+  it("openai backend: request 2 carries the function_call + function_call_output items", function()
     local body = read_oai_body(initial_oai_n)
-    local assistant_tc, tool_msg
-    for _, m in ipairs(body.messages) do
-      if m.role == "assistant" and type(m.tool_calls) == "table" then assistant_tc = m end
-      if m.role == "tool" then tool_msg = m end
+    local call_i, out_i
+    for i, item in ipairs(body.input) do
+      if item.type == "function_call" then call_i = i end
+      if item.type == "function_call_output" then out_i = i end
     end
-    assert(assistant_tc, "assistant tool_calls message missing")
-    assert(assistant_tc.tool_calls[1]["function"].name == "bash", "tool_call name lost")
-    local args = vim.json.decode(assistant_tc.tool_calls[1]["function"].arguments)
+    assert(call_i, "function_call item missing: " .. vim.inspect(body.input))
+    local call = body.input[call_i]
+    assert(call.name == "bash", "function_call name lost")
+    assert(call.call_id == "call_1", "function_call call_id lost: " .. tostring(call.call_id))
+    local args = vim.json.decode(call.arguments)
     assert(args.command and args.command:find("openai-e2e-output", 1, true),
-      "tool_call arguments not a JSON string round-trip: " .. vim.inspect(args))
-    assert(tool_msg, "role=tool result message missing")
-    assert(tool_msg.tool_call_id == "call_1", "tool_call_id not threaded back")
-    assert(tostring(tool_msg.content):find("openai-e2e-output", 1, true),
-      "tool output not sent back in the tool message")
+      "function_call arguments not a JSON string round-trip: " .. vim.inspect(args))
+    assert(out_i and out_i > call_i, "function_call_output must follow its function_call")
+    local out = body.input[out_i]
+    assert(out.call_id == "call_1", "call_id not threaded back to the output")
+    assert(tostring(out.output):find("openai-e2e-output", 1, true), "tool output not sent back")
+  end)
+
+  it("openai backend: usage maps to the Anthropic names with cached tokens split out", function()
+    local resp
+    for _, line in ipairs(vim.fn.readfile(tmp .. "/oai_events.log")) do
+      local ev = vim.json.decode(line)
+      if ev.ev == "response" and ev.stop_reason == "tool_use" then resp = ev end
+    end
+    assert(resp, "no response event for the tool_use turn")
+    assert(resp.input_tokens == 100, "input_tokens is " .. tostring(resp.input_tokens) .. ", want 100")
+    assert(resp.cache_read_input_tokens == 1100,
+      "cache_read_input_tokens is " .. tostring(resp.cache_read_input_tokens) .. ", want 1100")
+    assert(resp.output_tokens == 20, "output_tokens is " .. tostring(resp.output_tokens) .. ", want 20")
   end)
 
   it("openai backend: per-buffer OpenAI model slot wins over config.openai_model", function()
@@ -1326,7 +1369,7 @@ do
     assert(body.model == "gpt-5-mini-session", "per-buffer OpenAI model ignored: " .. tostring(body.model))
   end)
 
-  it("openai backend: tool-bearing requests suppress reasoning_effort", function()
+  it("openai backend: opted-in model receives reasoning.effort alongside tools", function()
     local saved_effort, saved_efforts, saved_openai_models =
       straps.config.effort, straps.config.efforts, straps.config.openai_models
     straps.config.effort = "high"
@@ -1342,64 +1385,141 @@ do
       local body = read_latest_oai_body()
       assert(body.model == "gpt-5-mini-session", "reasoning test model wrong: " .. tostring(body.model))
       assert(type(body.tools) == "table" and #body.tools > 0, "tools should be present")
-      assert(body.reasoning_effort == nil,
-        "tool-bearing OpenAI requests must not receive reasoning_effort: " .. tostring(body.reasoning_effort))
+      assert(type(body.reasoning) == "table" and body.reasoning.effort == "high",
+        "opted-in model with tools should receive reasoning.effort=high, got " .. vim.inspect(body.reasoning))
+      assert(body.reasoning_effort == nil, "Chat Completions reasoning_effort must not be sent")
     end)
     straps.config.effort, straps.config.efforts, straps.config.openai_models =
       saved_effort, saved_efforts, saved_openai_models
     if not ok then error(err, 0) end
   end)
 
-  it("openai backend: a reasoning-defaulting model id is not forced to reasoning_effort='none'", function()
-    -- Regression: OpenAI rejects reasoning_effort='none' (400, supported
-    -- values are low/medium/high/xhigh). A tool-bearing request for any model
-    -- id must omit reasoning_effort entirely, never send 'none'.
-    local saved_openai_models = straps.config.openai_models
+  it("openai backend: a model not opted in gets no reasoning field, even with an effort active", function()
+    local saved_effort, saved_efforts, saved_openai_models =
+      straps.config.effort, straps.config.efforts, straps.config.openai_models
+    straps.config.effort = "high"
+    straps.config.efforts = { { name = "high", level = "high" } }
     straps.config.openai_models = {
       { id = "gpt-5.1-codex-sol", label = "sol" },
     }
     local ok, err = pcall(function()
       vim.b[oai_buf].straps_openai_model = "gpt-5.1-codex-sol"
-      state.append_text(oai_buf, "run with a reasoning-defaulting model and tools")
+      state.append_text(oai_buf, "run with an untagged model and tools")
       loop.start(oai_buf)
       vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
       local body = read_latest_oai_body()
       assert(body.model == "gpt-5.1-codex-sol", "model wrong: " .. tostring(body.model))
       assert(type(body.tools) == "table" and #body.tools > 0, "tools should be present")
-      assert(body.reasoning_effort == nil,
-        "tool-bearing request must omit reasoning_effort, got: " .. tostring(body.reasoning_effort))
+      assert(body.reasoning == nil, "untagged model must get no reasoning field, got " .. vim.inspect(body.reasoning))
     end)
-    straps.config.openai_models = saved_openai_models
-    if not ok then error(err, 0) end
-  end)
-
-  it("openai backend: reasoning_effort is sent for opted-in model without tools", function()
-    local saved_effort, saved_efforts, saved_openai_models =
-      straps.config.effort, straps.config.efforts, straps.config.openai_models
-    local saved_build_tools = registry.get("fn.build_tools").source
-    straps.config.effort = "high"
-    straps.config.efforts = { { name = "high", level = "high" } }
-    straps.config.openai_models = {
-      { id = "gpt-5-mini-session", label = "GPT-5 mini", reasoning = true },
-    }
-    registry.define({ name = "fn.build_tools", kind = "fn", doc = "test: no tools",
-      source = [[return function() return {} end]] })
-    local ok, err = pcall(function()
-      vim.b[oai_buf].straps_openai_model = "gpt-5-mini-session"
-      state.append_text(oai_buf, "run with OpenAI reasoning effort and no tools")
-      loop.start(oai_buf)
-      vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
-      local body = read_latest_oai_body()
-      assert(body.model == "gpt-5-mini-session", "reasoning test model wrong: " .. tostring(body.model))
-      assert(body.tools == nil, "empty tool list should be omitted, got: " .. vim.inspect(body.tools))
-      assert(body.reasoning_effort == "high",
-        "opted-in OpenAI model without tools should receive reasoning_effort=high, got "
-          .. tostring(body.reasoning_effort))
-    end)
-    registry.define({ name = "fn.build_tools", kind = "fn", doc = "restored", source = saved_build_tools })
     straps.config.effort, straps.config.efforts, straps.config.openai_models =
       saved_effort, saved_efforts, saved_openai_models
     if not ok then error(err, 0) end
+  end)
+
+  it("openai backend: an empty tool list is omitted from the request", function()
+    local saved_build_tools = registry.get("fn.build_tools").source
+    registry.define({ name = "fn.build_tools", kind = "fn", doc = "test: no tools",
+      source = [[return function() return {} end]] })
+    local ok, err = pcall(function()
+      state.append_text(oai_buf, "run with no tools")
+      loop.start(oai_buf)
+      vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
+      local body = read_latest_oai_body()
+      assert(body.tools == nil, "empty tool list should be omitted, got: " .. vim.inspect(body.tools))
+    end)
+    registry.define({ name = "fn.build_tools", kind = "fn", doc = "restored", source = saved_build_tools })
+    if not ok then error(err, 0) end
+  end)
+
+  it("openai backend: an `error` stream event fails the run with its message", function()
+    local n_before = tonumber(vim.fn.readfile(tmp .. "/oai_n")[1])
+    local _, text = run_session("trigger-stream-error please")
+    assert(text:find("fake stream failure", 1, true), "stream error message not surfaced:\n" .. text:sub(-600))
+    assert(tonumber(vim.fn.readfile(tmp .. "/oai_n")[1]) == n_before + 1, "non-retryable stream error was retried")
+  end)
+
+  it("openai backend: a rate_limit_exceeded stream event is retried", function()
+    local n_before = tonumber(vim.fn.readfile(tmp .. "/oai_n")[1])
+    local _, text = run_session("trigger-retry-error please")
+    assert(not text:find("fake rate limit", 1, true), "retryable stream error surfaced as a run error")
+    assert(tonumber(vim.fn.readfile(tmp .. "/oai_n")[1]) == n_before + 2, "rate-limited request was not retried once")
+  end)
+
+  it("openai backend: a retryable stream error after streamed text is not retried", function()
+    local n_before = tonumber(vim.fn.readfile(tmp .. "/oai_n")[1])
+    local _, text = run_session("trigger-late-retry please")
+    assert(text:find("fake late server error", 1, true), "late stream error not surfaced:\n" .. text:sub(-600))
+    assert(tonumber(vim.fn.readfile(tmp .. "/oai_n")[1]) == n_before + 1, "stream error after streamed text was retried")
+  end)
+
+  it("openai backend: response.failed fails the run with the response error", function()
+    local _, text = run_session("trigger-failed please")
+    assert(text:find("fake response failed", 1, true), "response.failed error not surfaced:\n" .. text:sub(-600))
+  end)
+
+  it("openai backend: refusal text streams, and separate output items are joined by a blank line", function()
+    local _, text = run_session("trigger-refusal please")
+    assert(text:find("first-item\n\nfake-refusal-text", 1, true), "refusal/second item text wrong:\n" .. text:sub(-600))
+  end)
+
+  it("openai backend: a function call whose arguments arrive only in output_item.done runs", function()
+    local _, text = run_session("trigger-done-only please")
+    assert(text:find("oai-done-only-output", 1, true), "done-only function call did not run:\n" .. text:sub(-600))
+  end)
+
+  it("openai backend: text around a tool_use becomes separate input items in block order", function()
+    local before = tonumber(vim.fn.readfile(tmp .. "/oai_n")[1])
+    local co = coroutine.create(function()
+      registry.call("fn.provider_openai", {
+        system = "sys",
+        messages = {
+          { role = "user", content = "start" },
+          { role = "assistant", content = {
+            { type = "text", text = "before" },
+            { type = "tool_use", id = "call_x", name = "bash", input = { command = "true" } },
+            { type = "text", text = "after" },
+          } },
+          { role = "user", content = {
+            { type = "tool_result", tool_use_id = "call_x", content = "ok" },
+            { type = "text", text = "next" },
+          } },
+        },
+      }, {
+        bufnr = nil,
+        emit = function() end,
+        cancelled = function() return false end,
+        on_cancel = function() end,
+        await = function(start)
+          local res, done
+          start(function(r) if not done then done, res = true, r end end)
+          vim.wait(10000, function() return done end, 20)
+          return res
+        end,
+      })
+    end)
+    local ok, err = coroutine.resume(co)
+    assert(ok, tostring(err))
+    assert(tonumber(vim.fn.readfile(tmp .. "/oai_n")[1]) == before + 1, "provider made no request")
+    local input = read_latest_oai_body().input
+    local shape = {}
+    for _, item in ipairs(input) do
+      shape[#shape + 1] = item.type or (item.role .. ":" .. item.content)
+    end
+    local want = { "user:start", "assistant:before", "function_call", "assistant:after", "function_call_output", "user:next" }
+    assert(vim.deep_equal(shape, want), "input item order wrong: " .. vim.inspect(shape))
+  end)
+
+  it("openai backend: a function call cut off by max_output_tokens is not run", function()
+    run_session("trigger-truncated please")
+    assert(vim.fn.filereadable(tmp .. "/oai_truncated_ran") == 0, "truncated function call was executed")
+    local resp
+    for _, line in ipairs(vim.fn.readfile(tmp .. "/oai_events.log")) do
+      local ev = vim.json.decode(line)
+      if ev.ev == "response" then resp = ev end
+    end
+    assert(resp and resp.stop_reason == "max_tokens",
+      "incomplete response should map to max_tokens, got " .. tostring(resp and resp.stop_reason))
   end)
 
   it("openai backend: unset openai_model does not fall through to the Claude default", function()
@@ -1416,9 +1536,11 @@ do
   step(function()
     straps.config.provider = saved_provider
     straps.config.openai_base_url = saved_oai_base
-    straps.config.openai_model = nil
+    straps.config.openai_model = saved_oai_model
+    straps.config.model = saved_model
+    straps.config.log_file = nil
     vim.env.PATH = real_path
-    vim.env.OPENAI_API_KEY = nil
+    vim.env.OPENAI_API_KEY = saved_oai_key_env
   end)
 end
 

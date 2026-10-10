@@ -7,8 +7,8 @@ local M = {}
 
 M.config = {
   -- Which backend fn.provider dispatches to: "anthropic" (the Anthropic
-  -- Messages API via fn.provider_anthropic) or "openai" (OpenAI Chat
-  -- Completions via fn.provider_openai). nil (the default) means "not pinned
+  -- Messages API via fn.provider_anthropic) or "openai" (the OpenAI
+  -- Responses API via fn.provider_openai). nil (the default) means "not pinned
   -- here" — fn.provider then reads the persisted choice written by
   -- :StrapsProvider ($XDG_CONFIG_HOME/straps/provider), falling back to
   -- "anthropic". Setting it here PINS the provider and wins over that file.
@@ -151,9 +151,9 @@ M.config = {
 
   -- :StrapsEffort picker choices. `level` feeds output_config.effort for
   -- "adaptive" Anthropic models, thinking.budget_tokens for "budget"
-  -- Anthropic models, and reasoning_effort for OpenAI models only when the
-  -- matching config.openai_models entry opts in, the active effort has a
-  -- level, and no function tools are present.
+  -- Anthropic models, and reasoning.effort for OpenAI models only when the
+  -- matching config.openai_models entry opts in and the active effort has a
+  -- level.
   -- config.effort names the currently active entry (by `name`).
   effort = "off",
   efforts = {

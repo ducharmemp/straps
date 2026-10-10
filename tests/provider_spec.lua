@@ -1350,6 +1350,29 @@ do
     if not ok then error(err, 0) end
   end)
 
+  it("openai backend: a reasoning-defaulting model id is not forced to reasoning_effort='none'", function()
+    -- Regression: OpenAI rejects reasoning_effort='none' (400, supported
+    -- values are low/medium/high/xhigh). A tool-bearing request for any model
+    -- id must omit reasoning_effort entirely, never send 'none'.
+    local saved_openai_models = straps.config.openai_models
+    straps.config.openai_models = {
+      { id = "gpt-5.1-codex-sol", label = "sol" },
+    }
+    local ok, err = pcall(function()
+      vim.b[oai_buf].straps_openai_model = "gpt-5.1-codex-sol"
+      state.append_text(oai_buf, "run with a reasoning-defaulting model and tools")
+      loop.start(oai_buf)
+      vim.wait(15000, function() return not loop.running(oai_buf) end, 50)
+      local body = read_latest_oai_body()
+      assert(body.model == "gpt-5.1-codex-sol", "model wrong: " .. tostring(body.model))
+      assert(type(body.tools) == "table" and #body.tools > 0, "tools should be present")
+      assert(body.reasoning_effort == nil,
+        "tool-bearing request must omit reasoning_effort, got: " .. tostring(body.reasoning_effort))
+    end)
+    straps.config.openai_models = saved_openai_models
+    if not ok then error(err, 0) end
+  end)
+
   it("openai backend: reasoning_effort is sent for opted-in model without tools", function()
     local saved_effort, saved_efforts, saved_openai_models =
       straps.config.effort, straps.config.efforts, straps.config.openai_models

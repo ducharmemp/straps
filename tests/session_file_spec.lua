@@ -17,14 +17,15 @@ local function step(fn)
   describe("step@" .. info.short_src .. ":" .. info.linedefined, function() setup(fn) end)
 end
 
+local function with_ui(body)
+  return body(require("straps.ui"))
+end
 
 local straps = require("straps")
 local state = require("straps.state")
 -- Hermetic session dir; register the real provider so new_session uses the
 -- real fn.system_prompt (new_session also has a fallback prompt if absent).
 straps.config.session_dir = vim.fn.tempname()
-
--- Before the real provider registers, the registry is bare: this exercises
 -- new_session's built-in fallback prompt.
 local function case_fallback()
   local bufnr = require("straps.state").new_session()
@@ -177,130 +178,173 @@ end)
 
 -- ------------------------------------------------- ui.resume_session(path)
 it("ui.resume_session(path) rebuilds the stack with the transcript content", function()
-  local bufnr = state.new_session()
-  state.append(bufnr, "user", nil, "ui-resume-content-xyz")
-  local path = vim.api.nvim_buf_get_name(bufnr)
-  local re = require("straps.ui").resume_session(path)
-  assert(re and vim.api.nvim_buf_is_valid(re), "resume_session returned an invalid buffer")
-  local text = table.concat(vim.api.nvim_buf_get_lines(re, 0, -1, false), "\n")
-  assert(text:find("ui-resume-content-xyz", 1, true), "resumed transcript missing its content")
+  with_ui(function(ui)
+    local bufnr = state.new_session()
+    state.append(bufnr, "user", nil, "ui-resume-content-xyz")
+    local path = vim.api.nvim_buf_get_name(bufnr)
+    local re = ui.resume_session(path)
+    assert(re and vim.api.nvim_buf_is_valid(re), "resume_session returned an invalid buffer")
+    local text = table.concat(vim.api.nvim_buf_get_lines(re, 0, -1, false), "\n")
+    assert(text:find("ui-resume-content-xyz", 1, true), "resumed transcript missing its content")
+  end)
 end)
 
 it("ui.resume_session heals a transcript interrupted mid-tool", function()
-  -- persist() runs at block boundaries, so a session whose Neovim died while a
-  -- tool was in flight is on disk with a tool_use and no tool_result — a shape
-  -- the API rejects. Resuming must repair it, or the resumed session cannot be
-  -- sent at all.
-  local bufnr = state.new_session()
-  state.append(bufnr, "user", nil, "resume-heal-content")
-  state.append(bufnr, "tool_use", { id = "z1", name = "bash" }, '{"command":"sleep 99"}')
-  local path = vim.api.nvim_buf_get_name(bufnr)
-  state.persist(bufnr)
-  -- Wipe the buffer so resume_session reloads from the file, as a restart would.
-  vim.api.nvim_buf_delete(bufnr, { force = true })
+  with_ui(function(ui)
+    local bufnr = state.new_session()
+    state.append(bufnr, "user", nil, "resume-heal-content")
+    state.append(bufnr, "tool_use", { id = "z1", name = "bash" }, '{"command":"sleep 99"}')
+    local path = vim.api.nvim_buf_get_name(bufnr)
+    state.persist(bufnr)
+    vim.api.nvim_buf_delete(bufnr, { force = true })
 
-  local re = require("straps.ui").resume_session(path)
-  local uses, results = 0, 0
-  for _, m in ipairs(state.parse(re).messages) do
-    for _, part in ipairs(m.content) do
-      if part.type == "tool_use" then uses = uses + 1 end
-      if part.type == "tool_result" then results = results + 1 end
+    local re = ui.resume_session(path)
+    local uses, results = 0, 0
+    for _, m in ipairs(state.parse(re).messages) do
+      for _, part in ipairs(m.content) do
+        if part.type == "tool_use" then uses = uses + 1 end
+        if part.type == "tool_result" then results = results + 1 end
+      end
     end
-  end
-  assert(uses == 1 and results == 1,
-    "resumed transcript still unpaired: " .. uses .. " uses, " .. results .. " results")
-  local parsed = state.parse(re)
-  assert(parsed.messages[#parsed.messages].role == "user",
-    "resumed transcript must not end on an assistant message (unsendable)")
-  local text = table.concat(vim.api.nvim_buf_get_lines(re, 0, -1, false), "\n")
-  assert(text:find("resume-heal-content", 1, true), "healing lost the original user message")
-  -- The repair must reach the FILE, not just the buffer: the point is that the
-  -- next restart resumes a sendable transcript, and heal's appends persist.
-  local on_disk = table.concat(vim.fn.readfile(path), "\n")
-  assert(on_disk:find("run interrupted before this tool finished", 1, true),
-    "the healed result was not persisted to the transcript file")
+    assert(uses == 1 and results == 1,
+      "resumed transcript still unpaired: " .. uses .. " uses, " .. results .. " results")
+    local parsed = state.parse(re)
+    assert(parsed.messages[#parsed.messages].role == "user",
+      "resumed transcript must not end on an assistant message (unsendable)")
+    local text = table.concat(vim.api.nvim_buf_get_lines(re, 0, -1, false), "\n")
+    assert(text:find("resume-heal-content", 1, true), "healing lost the original user message")
+    local on_disk = table.concat(vim.fn.readfile(path), "\n")
+    assert(on_disk:find("run interrupted before this tool finished", 1, true),
+      "the healed result was not persisted to the transcript file")
+  end)
 end)
 
 -- ------------------------------------------------------- ui.pick_session
 it("ui.pick_session offers list_sessions() items and resumes the picked one", function()
-  local saved = straps.config.session_dir
-  -- Isolated so only this session appears. Pre-create and canonicalize the
-  -- dir (macOS /var -> /private/var, see the list_sessions case) so the
-  -- stub's path comparison can actually match and exercise the resume branch.
-  local dir = vim.fn.tempname()
-  vim.fn.mkdir(dir, "p")
-  straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
-  local bufnr = state.new_session()
-  state.append(bufnr, "user", nil, "pick-session-content-abc")
-  local path = vim.api.nvim_buf_get_name(bufnr)
+  with_ui(function(ui)
+    local saved = straps.config.session_dir
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
+    local bufnr = state.new_session()
+    state.append(bufnr, "user", nil, "pick-session-content-abc")
+    local path = vim.api.nvim_buf_get_name(bufnr)
 
-  local ui = require("straps.ui")
-  local real_pick = ui.pick
-  -- Force the plain vim.ui.select path so this stub is the picker under test
-  -- (a preview-capable snacks picker may be on the rtp even headless).
-  local real_rich = ui._pick_session_rich
-  ui._pick_session_rich = function() return false end
-  local seen_items, picked
-  ui.pick = function(items, opts, on_choice)
-    seen_items = items
-    for _, s in ipairs(items) do
-      if s.path == path then
-        picked = s
-        return on_choice(s)
+    local real_pick = ui.pick
+    local real_rich = ui._pick_session_rich
+    ui._pick_session_rich = function() return false end
+    local seen_items, picked
+    ui.pick = function(items, opts, on_choice)
+      seen_items = items
+      for _, s in ipairs(items) do
+        if s.path == path then
+          picked = s
+          return on_choice(s)
+        end
       end
+      on_choice(nil)
     end
-    on_choice(nil)
-  end
-  local ok, err = pcall(ui.pick_session)
-  ui.pick = real_pick
-  ui._pick_session_rich = real_rich
-  straps.config.session_dir = saved
-  if not ok then
-    error(err, 0)
-  end
+    local ok, err = pcall(ui.pick_session)
+    ui.pick = real_pick
+    ui._pick_session_rich = real_rich
+    straps.config.session_dir = saved
+    if not ok then
+      error(err, 0)
+    end
 
-  assert(seen_items and #seen_items >= 1, "pick_session did not offer list_sessions() items")
-  assert(picked, "list_sessions never offered the created session")
-  local cur = vim.api.nvim_get_current_buf()
-  assert(vim.api.nvim_buf_get_name(cur) == path,
-    "current window does not show the resumed session")
-  local text = table.concat(vim.api.nvim_buf_get_lines(cur, 0, -1, false), "\n")
-  assert(text:find("pick-session-content-abc", 1, true), "resumed transcript missing its content")
+    assert(seen_items and #seen_items >= 1, "pick_session did not offer list_sessions() items")
+    assert(picked, "list_sessions never offered the created session")
+    local cur = vim.api.nvim_get_current_buf()
+    assert(vim.api.nvim_buf_get_name(cur) == path,
+      "current window does not show the resumed session")
+    local text = table.concat(vim.api.nvim_buf_get_lines(cur, 0, -1, false), "\n")
+    assert(text:find("pick-session-content-abc", 1, true), "resumed transcript missing its content")
+  end)
 end)
 
 it("ui.pick_session falls back to open_session when there are no saved sessions", function()
-  local saved = straps.config.session_dir
-  straps.config.session_dir = vim.fn.tempname() -- empty dir: never populated
-  vim.fn.mkdir(straps.config.session_dir, "p")
+  with_ui(function(ui)
+    local saved = straps.config.session_dir
+    straps.config.session_dir = vim.fn.tempname()
+    vim.fn.mkdir(straps.config.session_dir, "p")
 
-  local ui = require("straps.ui")
-  local real_pick = ui.pick
-  local pick_called = false
-  ui.pick = function(_, _, on_choice)
-    pick_called = true
-    on_choice(nil)
-  end
-  local ok, bufnr = pcall(ui.pick_session)
-  ui.pick = real_pick
-  straps.config.session_dir = saved
+    local real_pick = ui.pick
+    local pick_called = false
+    ui.pick = function(_, _, on_choice)
+      pick_called = true
+      on_choice(nil)
+    end
+    local ok, bufnr = pcall(ui.pick_session)
+    ui.pick = real_pick
+    straps.config.session_dir = saved
 
-  assert(ok, "pick_session threw: " .. tostring(bufnr))
-  assert(not pick_called, "pick_session should not open a picker with zero saved sessions")
-  assert(bufnr and vim.api.nvim_buf_is_valid(bufnr), "pick_session fallback did not return a valid buffer")
+    assert(ok, "pick_session threw: " .. tostring(bufnr))
+    assert(not pick_called, "pick_session should not open a picker with zero saved sessions")
+    assert(bufnr and vim.api.nvim_buf_is_valid(bufnr), "pick_session fallback did not return a valid buffer")
+  end)
 end)
 
--- ------------------------------------------- session_summary = first prompt
+-- ---------------------------------------------------------- ui.grep_sessions
+it("ui.grep_sessions loads content matches into the quickfix list", function()
+  with_ui(function(ui)
+    local savedir = straps.config.session_dir
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
+    local b = state.new_session()
+    state.append(b, "user", nil, "please find the needle xyzzy here")
+    state.append(b, "assistant", nil, "unrelated content")
+    local n = ui.grep_sessions("xyzzy")
+    local qf = vim.fn.getqflist({ title = 1, items = 1 })
+    straps.config.session_dir = savedir
+
+    assert(n >= 1, "grep_sessions found no matches for a known needle")
+    assert(qf.title:find("xyzzy", 1, true), "quickfix title missing the pattern: " .. tostring(qf.title))
+    local hit
+    for _, it in ipairs(qf.items) do
+      if it.text and it.text:find("xyzzy", 1, true) then hit = it end
+    end
+    assert(hit, "quickfix items missing the matching line")
+  end)
+end)
+
+it("ui.grep_sessions skips transcript marker lines", function()
+  with_ui(function(ui)
+    local savedir = straps.config.session_dir
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
+    local b = state.new_session()
+    state.append(b, "user", nil, "some ordinary content")
+    local n = ui.grep_sessions("straps:user")
+    straps.config.session_dir = savedir
+    assert(n == 0, "grep_sessions matched transcript marker lines (should skip them): " .. n)
+  end)
+end)
+
+-- ------------------------------------------- session_summary behavior
+it("session_summary caches and hits on a second call to the same path", function()
+  local bufnr = state.new_session()
+  state.append(bufnr, "user", nil, "cache-hit-one\ncache-hit-two")
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  state.clear_session_summary_cache()
+  local s1 = state.session_summary(path)
+  local s2 = state.session_summary(path)
+  local st = state._session_summary_cache_stats()
+  assert(s1 and s2 and s2:find("cache-hit-two", 1, true), "multiline prompt should be collapsed, not truncated")
+  assert(st.hits >= 1, "second call should hit the cache")
+end)
+
 it("session_summary returns the first user prompt when no title is set", function()
   local bufnr = state.new_session()
-  state.append(bufnr, "user", nil, "how do I search sessions?\nsecond line ignored")
+  state.append(bufnr, "user", nil, "how do I search sessions?\nsecond line included")
   local path = vim.api.nvim_buf_get_name(bufnr)
   local summary = state.session_summary(path)
-  assert(summary and summary:find("how do I search sessions", 1, true),
-    "summary did not surface the first user prompt: " .. tostring(summary))
+  assert(summary and summary:find("how do I search sessions%? second line included"),
+    "summary did not surface the full first user prompt: " .. tostring(summary))
 end)
 
 it("session_summary is nil for a transcript with no user prompt yet", function()
-  -- new_session appends a trailing EMPTY user block; that must not count.
   local bufnr = state.new_session()
   local path = vim.api.nvim_buf_get_name(bufnr)
   assert(state.session_summary(path) == nil,
@@ -315,11 +359,9 @@ it("set_session_title / session_title round-trip via the companion .meta file", 
   assert(state.set_session_title(path, "My named session"), "set_session_title failed")
   assert(vim.fn.filereadable(path .. ".meta") == 1, "companion .meta file not written")
   assert(state.session_title(path) == "My named session", "title did not round-trip")
-  -- Title wins over the first-prompt summary.
   state.append(bufnr, "user", nil, "an actual prompt")
   assert(state.session_summary(path) == "My named session",
     "session_summary should prefer the durable title over the prompt")
-  -- Clearing removes the .meta file.
   assert(state.set_session_title(path, ""), "clearing title failed")
   assert(state.session_title(path) == nil, "title not cleared")
   assert(vim.fn.filereadable(path .. ".meta") == 0, ".meta file should be removed on clear")
@@ -346,55 +388,291 @@ end)
 
 -- --------------------------------------------------------- ui.rename_session
 it("ui.rename_session with an explicit title writes it", function()
-  local bufnr = state.new_session()
-  local path = vim.api.nvim_buf_get_name(bufnr)
-  require("straps.ui").rename_session(bufnr, "explicit title here")
-  assert(state.session_title(path) == "explicit title here",
-    "rename_session did not persist the explicit title")
+  with_ui(function(ui)
+    local bufnr = state.new_session()
+    local path = vim.api.nvim_buf_get_name(bufnr)
+    ui.rename_session(bufnr, "explicit title here")
+    assert(state.session_title(path) == "explicit title here",
+      "rename_session did not persist the explicit title")
+  end)
 end)
 
--- ---------------------------------------------------------- ui.grep_sessions
-it("ui.grep_sessions loads content matches into the quickfix list", function()
-  local savedir = straps.config.session_dir
-  local dir = vim.fn.tempname()
-  vim.fn.mkdir(dir, "p")
-  straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
-  local b = state.new_session()
-  state.append(b, "user", nil, "please find the needle xyzzy here")
-  state.append(b, "assistant", nil, "unrelated content")
-  local n = require("straps.ui").grep_sessions("xyzzy")
-  local qf = vim.fn.getqflist({ title = 1, items = 1 })
-  straps.config.session_dir = savedir
+-- ---------------------------------------- streaming: stops early and closes on error
+it("session_summary streams only until the next marker and closes the file", function()
+  local tmp = vim.fn.tempname() .. ".straps"
+  local lines = {
+    "%%[straps:system]%%", "sys", "",
+    "%%[straps:user]%%", "the prompt here", "second line included",
+    "%%[straps:assistant]%%", "assistant body", "TAIL-1", "TAIL-2",
+  }
+  vim.fn.writefile(lines, tmp)
 
-  assert(n >= 1, "grep_sessions found no matches for a known needle")
-  assert(qf.title:find("xyzzy", 1, true), "quickfix title missing the pattern: " .. tostring(qf.title))
-  local hit
-  for _, it in ipairs(qf.items) do
-    if it.text and it.text:find("xyzzy", 1, true) then hit = it end
+  local real_open = io.open
+  local opened, reads, closed = 0, 0, 0
+  io.open = function(path, mode)
+    if path ~= tmp then return real_open(path, mode) end
+    opened = opened + 1
+    local i = 0
+    local obj = {}
+    function obj:lines()
+      return function()
+        i = i + 1
+        if i <= #lines then reads = reads + 1; return lines[i] end
+        return nil
+      end
+    end
+    function obj:close() closed = closed + 1 end
+    return obj
   end
-  assert(hit, "quickfix items missing the matching line")
+
+  state.clear_session_summary_cache()
+  local sum = state.session_summary(tmp)
+  io.open = real_open
+
+  assert(sum == "the prompt here second line included", "summary did not reflect the first user prompt: " .. tostring(sum))
+  assert(reads == 7, "stream did not stop at next marker; reads= " .. reads)
+  assert(closed == 1 and opened == 1, "file not closed exactly once; opened=" .. opened .. " closed=" .. closed)
 end)
 
-it("ui.grep_sessions skips transcript marker lines", function()
-  local savedir = straps.config.session_dir
-  local dir = vim.fn.tempname()
-  vim.fn.mkdir(dir, "p")
-  straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
+it("session_summary closes the file when streaming errors", function()
+  local tmp = vim.fn.tempname() .. ".straps"
+  local lines = { "%%[straps:system]%%", "sys", "", "%%[straps:user]%%", "prefix", "RAISEERR", "suffix" }
+  vim.fn.writefile(lines, tmp)
+  local real_open = io.open
+  local closed = 0
+  io.open = function(path, mode)
+    if path ~= tmp then return real_open(path, mode) end
+    local i = 0
+    local obj = {}
+    function obj:lines()
+      return function()
+        i = i + 1
+        if i > #lines then return nil end
+        if lines[i] == "RAISEERR" then error("boom") end
+        return lines[i]
+      end
+    end
+    function obj:close() closed = closed + 1 end
+    return obj
+  end
+
+  local ok, res = pcall(state.session_summary, tmp)
+  io.open = real_open
+  assert(ok and res == nil, "error during streaming should yield nil summary")
+  assert(closed == 1, "file must be closed when streaming errors")
+end)
+
+-- ---------------------------------------- meta edits/removals and same-size titles
+it("session_summary tracks external .meta edits/removals and same-size title changes", function()
   local b = state.new_session()
-  state.append(b, "user", nil, "some ordinary content")
-  -- "straps:user" appears on every user marker line; a naive grep would hit
-  -- the scaffolding. grep_sessions must skip marker lines.
-  local n = require("straps.ui").grep_sessions("straps:user")
-  straps.config.session_dir = savedir
-  assert(n == 0, "grep_sessions matched transcript marker lines (should skip them): " .. n)
+  local path = vim.api.nvim_buf_get_name(b)
+  state.append(b, "user", nil, "first")
+  local mp = path .. ".meta"
+  vim.fn.writefile({ vim.json.encode({ title = "Alpha" }) }, mp)
+  state.clear_session_summary_cache()
+  assert(state.session_summary(path) == "Alpha", "external .meta title should be read")
+
+  vim.fn.writefile({ vim.json.encode({ title = "Bravo" }) }, mp)
+  assert(state.session_summary(path) == "Bravo", "same-size .meta change must refresh via times")
+
+  os.remove(mp)
+  local sum = state.session_summary(path)
+  assert(sum == "first", "removing .meta should fall back to prompt; got " .. tostring(sum))
 end)
 
+-- ---------------------------------------- inline prompt on marker line
+it("session_summary uses inline text on a user marker plus body lines as the first prompt", function()
+  local tmp = vim.fn.tempname() .. ".straps"
+  local lines = {
+    "%%[straps:system]%%", "sys",
+    "%%[straps:user]%% inline-here", "and body",
+    "%%[straps:assistant]%%", "tail",
+  }
+  vim.fn.writefile(lines, tmp)
+  state.clear_session_summary_cache()
+  local sum = state.session_summary(tmp)
+  assert(sum == "inline-here and body", "inline+body should be used; got " .. tostring(sum))
+end)
+
+-- ------------------------------------------- list_sessions exclude + pruning
+it("list_sessions excludes before summary and prunes vanished cache entries under the current dir", function()
+  local savedir = straps.config.session_dir
+  local dirA = vim.fn.tempname(); vim.fn.mkdir(dirA, "p"); dirA = assert(vim.uv.fs_realpath(dirA))
+  local dirB = vim.fn.tempname(); vim.fn.mkdir(dirB, "p"); dirB = assert(vim.uv.fs_realpath(dirB))
+
+  straps.config.session_dir = dirA
+  state.clear_session_summary_cache()
+  local a1 = state.new_session(); state.append(a1, "user", nil, "A-one"); local pA1 = vim.api.nvim_buf_get_name(a1)
+  local a2 = state.new_session(); state.append(a2, "user", nil, "A-two"); local pA2 = vim.api.nvim_buf_get_name(a2)
+  assert(state.session_summary(pA1) and state.session_summary(pA2))
+
+  straps.config.session_dir = dirB
+  local b1 = state.new_session(); state.append(b1, "user", nil, "B-one"); local pB1 = vim.api.nvim_buf_get_name(b1)
+  assert(state.session_summary(pB1))
+
+  straps.config.session_dir = dirA
+  state.clear_session_summary_cache()
+  local ex = {}; ex[pA1] = true
+  local list = state.list_sessions({ exclude = ex })
+  local seen = {}; for _, s in ipairs(list) do seen[s.path] = true end
+  assert(seen[pA2] and not seen[pA1], "excluded path should be omitted from list")
+  local st = state._session_summary_cache_stats()
+  assert(st.size == 1, "excluded entry must not populate cache (only one remaining computed)")
+
+  assert(os.remove(pA2))
+  local before = state._session_summary_cache_stats()
+  _ = state.list_sessions()
+  local after = state._session_summary_cache_stats()
+  assert(after.prunes == before.prunes + 1 or after.size == (before.size - 1),
+    "list_sessions should prune vanished entries under the current dir")
+
+  straps.config.session_dir = savedir
+end)
+
+-- ------------------------------------------- relative_time buckets
 it("relative_time buckets ages sensibly", function()
-  local rt = require("straps.ui")._relative_time
-  local now = os.time()
-  assert(rt(now) == "just now", "0s should be 'just now'")
-  assert(rt(now - 300):find("m ago"), "5m should be minutes")
-  assert(rt(now - 7200):find("h ago"), "2h should be hours")
-  assert(rt(now - 3 * 86400):find("d ago"), "3d should be days")
-  assert(rt(now - 30 * 86400):match("%d%d%d%d%-"), "30d should be an absolute date")
+  with_ui(function(ui)
+    local rt = ui._relative_time
+    local now = os.time()
+    assert(rt(now) == "just now", "0s should be 'just now'")
+    assert(rt(now - 300):find("m ago"), "5m should be minutes")
+    assert(rt(now - 7200):find("h ago"), "2h should be hours")
+    assert(rt(now - 3 * 86400):find("d ago"), "3d should be days")
+    assert(rt(now - 30 * 86400):match("%d%d%d%d%-"), "30d should be an absolute date")
+  end)
+end)
+
+-- ------------------------------------------- notice first line = not a prompt
+it("session_summary skips a user block whose first non-blank line is a harness/agent notice", function()
+  local tmp = vim.fn.tempname() .. ".straps"
+  local lines = {
+    "%%[straps:system]%%", "sys",
+    "%%[straps:user]%%", "[straps] Multiplayer: hello", "but this is body text",
+    "%%[straps:assistant]%%", "tail",
+  }
+  vim.fn.writefile(lines, tmp)
+  state.clear_session_summary_cache()
+  local sum = state.session_summary(tmp)
+  assert(sum == nil, "notice-looking first line must not count as a prompt; got " .. tostring(sum))
+end)
+
+-- ------------------------------------------- cache key: abs and rel are same
+it("session_summary caches by absolute path (rel and abs hit the same entry)", function()
+  local b = state.new_session()
+  state.append(b, "user", nil, "absrel-one\nabsrel-two")
+  local abs = vim.api.nvim_buf_get_name(b)
+  local rel = vim.fn.fnamemodify(abs, ":.")
+  state.clear_session_summary_cache()
+  local _ = state.session_summary(abs)
+  local _ = state.session_summary(rel)
+  local st = state._session_summary_cache_stats()
+  assert(st.size == 1 and st.hits >= 1, "abs+rel should share one cache entry; stats=" .. vim.inspect(st))
+end)
+it("session_summary does not re-open the transcript on a cache hit", function()
+  local tmp = vim.fn.tempname() .. ".straps"
+  local lines = {
+    "%%[straps:system]%%", "sys", "",
+    "%%[straps:user]%%", "first line", "second line",
+  }
+  vim.fn.writefile(lines, tmp)
+  state.clear_session_summary_cache()
+  local real_open = io.open
+  local opened = 0
+  io.open = function(path, mode)
+    if path == tmp then opened = opened + 1 end
+    return real_open(path, mode)
+  end
+  _ = state.session_summary(tmp)
+  _ = state.session_summary(tmp)
+  io.open = real_open
+  assert(opened == 1, "io.open called on cache hit; opened=" .. opened)
+end)
+
+it("session_summary caches title and avoids re-reading .meta on a hit", function()
+  local tmp = vim.fn.tempname() .. ".straps"
+  local mp = tmp .. ".meta"
+  vim.fn.writefile({"%%[straps:system]%%", "sys", "", "%%[straps:user]%%", "body"}, tmp)
+  vim.fn.writefile({ vim.json.encode({ title = "CachedTitle" }) }, mp)
+  state.clear_session_summary_cache()
+  local real_readfile = vim.fn.readfile
+  local reads = 0
+  vim.fn.readfile = function(path)
+    if path == mp then reads = reads + 1 end
+    return real_readfile(path)
+  end
+  local s1 = state.session_summary(tmp)
+  local s2 = state.session_summary(tmp)
+  vim.fn.readfile = real_readfile
+  assert(s1 == "CachedTitle" and s2 == "CachedTitle", "summary should use durable title; got " .. tostring(s1) .. ", " .. tostring(s2))
+  assert(reads == 1, ".meta was re-read on cache hit; reads=" .. reads)
+end)
+
+it("session_summary refreshes when transcript content changes with same byte size", function()
+  local tmp = vim.fn.tempname() .. ".straps"
+  vim.fn.writefile({
+    "%%[straps:system]%%", "sys", "",
+    "%%[straps:user]%%", "alpha"
+  }, tmp)
+  state.clear_session_summary_cache()
+  local a = state.session_summary(tmp)
+  assert(a == "alpha", "precondition failed: got " .. tostring(a))
+  vim.fn.writefile({
+    "%%[straps:system]%%", "sys", "",
+    "%%[straps:user]%%", "omega"
+  }, tmp)
+  local b = state.session_summary(tmp)
+  assert(b == "omega", "summary did not refresh on same-size change; got " .. tostring(b))
+end)
+
+it("clear_session_summary_cache forces a re-read on next call", function()
+  local tmp = vim.fn.tempname() .. ".straps"
+  vim.fn.writefile({
+    "%%[straps:system]%%", "sys", "",
+    "%%[straps:user]%%", "one two"
+  }, tmp)
+  state.clear_session_summary_cache()
+  local real_open = io.open
+  local opened = 0
+  io.open = function(path, mode)
+    if path == tmp then opened = opened + 1 end
+    return real_open(path, mode)
+  end
+  _ = state.session_summary(tmp)
+  state.clear_session_summary_cache()
+  _ = state.session_summary(tmp)
+  io.open = real_open
+  assert(opened == 2, "clear_session_summary_cache should force a fresh read; opened=" .. opened)
+end)
+
+it("clearing a durable title switches session_summary back to the first prompt", function()
+  local b = state.new_session()
+  local path = vim.api.nvim_buf_get_name(b)
+  state.append(b, "user", nil, "prompt after title")
+  assert(state.set_session_title(path, "KeepMe") and state.session_summary(path) == "KeepMe")
+  assert(state.set_session_title(path, ""))
+  local sum = state.session_summary(path)
+  assert(sum == "prompt after title", "summary did not fall back to prompt after clear; got " .. tostring(sum))
+end)
+
+it("session_summary unescapes a body line that looks like a marker", function()
+  local tmp = vim.fn.tempname() .. ".straps"
+  vim.fn.writefile({
+    "%%[straps:system]%%", "sys", "",
+    "%%[straps:user]%%", "%%[[esc]]%%[straps:assistant]%% pretend this is text"
+  }, tmp)
+  state.clear_session_summary_cache()
+  local sum = state.session_summary(tmp)
+  assert(sum == "%%[straps:assistant]%% pretend this is text", "escaped content not unescaped; got " .. tostring(sum))
+end)
+
+it("session_summary skips a notice-looking first line and uses a later real prompt", function()
+  local tmp = vim.fn.tempname() .. ".straps"
+  vim.fn.writefile({
+    "%%[straps:system]%%", "sys", "",
+    "%%[straps:user]%%", "[straps] Multiplayer: hello", "still body that should be ignored",
+    "%%[straps:user]%%", "second real prompt here"
+  }, tmp)
+  state.clear_session_summary_cache()
+  local sum = state.session_summary(tmp)
+  assert(sum == "second real prompt here", "later real prompt should be used; got " .. tostring(sum))
 end)

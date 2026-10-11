@@ -102,6 +102,7 @@ end
 
 local function finish_events(bufnr, reason, turns)
   pcall(function() vim.b[bufnr].straps_status = "idle" end)
+  pcall(function() vim.b[bufnr].straps_run_reason = reason end)
   pcall(vim.api.nvim_exec_autocmds, "User",
     { pattern = "StrapsStatusChanged", data = { bufnr = bufnr, status = "idle" } })
   pcall(vim.api.nvim_exec_autocmds, "User",
@@ -709,6 +710,8 @@ function M.start(bufnr)
   registry.ensure_scope(bufnr)
   registry.freeze_guards()
   local state = require("straps.state")
+
+  pcall(function() vim.b[bufnr].straps_run_reason = nil end)
 
   local run = { cancelled = false, cancel_fns = {}, await_seq = 0, done = false, turns = 0 }
   runs[bufnr] = run

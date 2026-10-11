@@ -111,15 +111,24 @@ Both files contain Lua and run with your Neovim process's privileges. Review the
 | `:StrapsStop` | Stop the active run. |
 | `:StrapsContinue [instruction]` | Continue a stopped run. |
 | `:StrapsResume[!] [session]` | Resume a saved session. `!` opens a picker. |
+| `:StrapsAgents` | Open the agent dashboard: session trees, status, details, and management actions. |
 | `:StrapsProvider` | Choose Anthropic or OpenAI. In a session buffer, the choice affects that session. Elsewhere, it persists globally. |
 | `:StrapsModel` | Choose a model for the active provider. |
 | `:StrapsRegistry` | List registry entries. |
 | `:StrapsEdit {name}` | Edit and redefine a registry entry. |
 | `:StrapsHelp [tag]` | Open the reference documentation. |
 
+## Agent dashboard
+
+**`:StrapsAgents` keeps loaded agents in a parent/child tree, including children whose runs have finished.** Native folds collapse trees and the saved-transcript archive. Titles and tasks fit the dashboard window, with metadata omitted before titles in narrow splits. Refresh retains selection, scroll position, and folds; highlights use your colorscheme's linked groups.
+
+Press `p` for a read-only detail split, or `P` to toggle follow-selection. Details show the assigned task, model, context, parent, status, and a bounded assistant-text preview. The preview searches the last 256 transcript lines and shows up to 12 assistant-text lines; open the transcript for older or longer text. `<CR>` opens the transcript; `<C-o>` returns to the dashboard. Use native window splits before `<CR>` when you want both views.
+
+Send a targeted message with `i`; messaging an idle agent does not start it. Use `g<CR>` to start or continue, `x` to stop, `r` to rename its durable title, and `R` to force a summary rescan. `<F1>` opens the full key reference. Native search, Visual mode, and window commands remain available.
+
 ## Run events
 
-Each session buffer carries `b:straps_status` ("running" or "idle"), and every run fires the `User` autocmds `StrapsRunStart`, `StrapsRunEnd` and `StrapsStatusChanged`, so a statusline or bufferline can show when an agent finishes. See `:help straps-events` for the `data` fields and an example.
+Each session buffer carries `b:straps_status` ("running" or "idle"). `b:straps_run_reason` records the last observed run ending and clears when a new run starts. Every run fires the `User` autocmds `StrapsRunStart`, `StrapsRunEnd` and `StrapsStatusChanged`, so a statusline or bufferline can show when an agent finishes. See `:help straps-events` for the `data` fields and an example.
 
 ## Security
 

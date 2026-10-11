@@ -204,19 +204,16 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 :StrapsEval		Execute the current buffer as Lua.
 
 							*:StrapsAgents* *straps-agents*
-:StrapsAgents		Open the agents buffer (straps://agents): one ordinary
-			buffer listing every session in three sections —
-			running, loaded (idle, with age and context fill when
-			known), and saved (on disk). Manage them with a small
-			keymap grammar: <CR> open, x stop, i steer,
-			r rename, R refresh — shown in the window's winbar
-			(config `agents_winbar = false` puts it on the first
-			line instead). <CR> replaces the agents buffer in
-			its own window (oil-style), so <C-o>/<C-i> step back to
-			the list and forward again. It re-renders as runs start,
-			work and finish. Takes the same |<mods>| as |:Straps|
-			(:vertical StrapsAgents for a vsplit).
-			See |straps-agents| and |straps-subagents|.
+:StrapsAgents		Open the agent dashboard (straps://agents): loaded
+			session trees and a saved-transcript archive with
+			native folds, search, and selected-agent details.
+			The winbar shows management keys; config
+			`agents_winbar = false` puts the legend in the buffer.
+			<CR> replaces the dashboard in its window, so
+			<C-o>/<C-i> navigate back and forward. Refresh retains
+			selection and folds. Takes the same |<mods>| as
+			|:Straps| (:vertical StrapsAgents for a vsplit).
+			See the dashboard keys below and |straps-subagents|.
 
 							*:StrapsModel*
 :StrapsModel		Pick the provider-specific model for the current session
@@ -939,8 +936,33 @@ tool. An ungated session (the user's confirm dialog or |:StrapsAuto| is its
 gate) is under no ceiling. |:StrapsStop| on a session stops every running
 descendant.
 
-|:StrapsAgents| opens the agents buffer, which lists running sessions (and
-their parents), loaded-but-idle sessions, and saved transcripts on disk.
+|:StrapsAgents| opens the agent dashboard. Loaded sessions retain their
+parent/child tree when a run finishes. Saved transcripts appear separately.
+Use native folds to collapse trees and sections, and native search to find
+rows. Rows fit the narrowest dashboard window; long titles and tasks collapse
+whitespace and truncate with an ellipsis instead of overflowing.
+
+Dashboard keys:
+  <CR>       Open the selected transcript in the dashboard window.
+  g<CR>      Start or continue the selected idle session.
+  i          Message the selected session; an idle recipient does not start.
+  x          Stop a running session; confirm descendant cancellation.
+  r          Rename the durable title without changing the transcript path.
+  R          Clear cached saved summaries and refresh.
+  p          Open selected-agent details in a read-only split.
+  P          Toggle detail follow-selection; disabled initially.
+  <F1>       Open dashboard help.
+
+The detail split shows task, status, model, context, parent, and a bounded
+assistant-text preview from the loaded buffer. The preview searches the last
+256 lines and shows at most 12 assistant-text lines, capped at 240 display cells
+per line. Open the transcript for text outside those bounds. The detail split
+does not generate a summary.
+Use <C-w>s or <C-w>v followed by <CR> to open a transcript in another split.
+Native /, ?, Visual mode, and window commands retain their meanings.
+Refresh preserves selection, viewport, and folds. Status uses observed run
+phases and ending reasons; a tool phase alone does not imply user input is
+needed. Saved summaries use a display-only memory cache; R forces a rescan.
 
 ==============================================================================
 12. MULTIPLAYER						*straps-multiplayer*
@@ -1110,6 +1132,12 @@ the parser-based highlighting engine.
 						*b:straps_status*
 b:straps_status		"running" while a run is active in the session
 			buffer, "idle" once it has ended.
+
+						*b:straps_run_reason*
+b:straps_run_reason	The last observed run-ending reason: "ok",
+			"cancelled", "max_turns", "stalled", "blank", or
+			"error". Cleared when a new run starts. This value
+			belongs to the loaded buffer and is not persisted.
 
 The loop fires these |User| autocmds on every run, from the loop itself, so
 redefining `hook.on_run_start` or `hook.on_run_end` does not silence them.

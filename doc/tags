@@ -18,6 +18,7 @@
 StrapsRunEnd	straps.txt	/*StrapsRunEnd*
 StrapsRunStart	straps.txt	/*StrapsRunStart*
 StrapsStatusChanged	straps.txt	/*StrapsStatusChanged*
+b:straps_run_reason	straps.txt	/*b:straps_run_reason*
 b:straps_status	straps.txt	/*b:straps_status*
 fn.api_key	straps.txt	/*fn.api_key*
 fn.autocmd_bridge	straps.txt	/*fn.autocmd_bridge*

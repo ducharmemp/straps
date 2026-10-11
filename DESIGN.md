@@ -48,6 +48,7 @@ lua/straps/layers/*.lua    -- layer manifests: builtin tools/hooks/fns grouped b
 lua/straps/editor.lua      -- editor-native tools (LSP + tree-sitter)
 lua/straps/findings.lua    -- per-session findings-list service (loclist/quickfix)
 lua/straps/ui.lua          -- registry edit buffers, listing, keymaps, folds; findings.lua delegations kept for back-compat
+lua/straps/agents.lua      -- agent dashboard trees, folds, details and management actions
 lua/straps/health.lua      -- :checkhealth straps (install/environment probes)
 plugin/straps.lua          -- user commands (guarded, no heavy requires at load)
 doc/straps.txt             -- :help straps (vimdoc; tags via :helptags doc)
@@ -1801,74 +1802,14 @@ Existing suites must all still pass.
   sets nomodified. This works generically because render output is executable.
 - `:StrapsRegistry` — scratch listing, `<CR>` on a line opens `:StrapsEdit`.
 - `:StrapsEval` — execute current buffer as Lua (eval-buffer).
-- `:StrapsAgents` — opens the **agents buffer** (`straps://agents`), a single
-  ordinary buffer listing ALL sessions in three sections: **running** (an
-  active run), **loaded** (a `straps_session` buffer with no run), and
-  **saved** (a `*.straps` transcript on disk with no loaded buffer). The
-  union is `ui.all_sessions()` → `{ running, loaded, saved }`, each session in
-  exactly one set (running = `ui.running_agents()`; loaded = valid buffers
-  with `vim.b.straps_session` and not `loop.running`; saved =
-  `state.list_sessions()` whose absolute path has no loaded buffer — matched
-  by exact `nvim_buf_get_name`, never `vim.fn.bufnr`, which pattern-matches).
-  The buffer is `buftype=nofile`, `filetype=strapsagents`, nomodifiable
-  (invariant 1: buffers are state). Two presentation seams, both
-  `define_default` registry fns (invariant 2: redefinable at runtime): the
-  content is drawn by `fn.agents_render` (logic in `ui._agents_render`, like
-  `fn.render` → `ui._render`), and the window's winbar — the keymap legend,
-  right-aligned — by `fn.agents_winbar` (logic in `ui._agents_winbar`; it
-  must stay cheap, a winbar expression re-evaluates per redraw). The winbar
-  is installed as the `ui.winbar()` dispatcher (below).
-  `config.agents_winbar = false` skips the winbar install and
-  `fn.agents_render` puts the legend on the FIRST buffer line instead
-  (config-derived, never window-derived: `fn.agents_render` is a redefinable
-  registry fn and can be called on a windowless buffer). A section with zero
-  rows is omitted; when all are empty a single
-  empty-state line shows. A line→entry map
-  (`{ [lnum] = { kind, bufnr?, path? } }`) is a MODULE-LEVEL Lua table keyed
-  by bufnr, NOT `vim.b` (which cannot hold a sparse integer-keyed table
-  through msgpack); it is rebuilt on every render. Highlights are extmarks in
-  a `straps_agents` namespace, cleared before each repopulate (N renders ==
-  1 render's extmarks). Buffer-local normal-mode keymaps: `<CR>` opens
-  (`show_session` for running/loaded, `resume_session` for saved), `x` stops
-  a running run (`loop.stop`), `i` steers it (`vim.ui.input` → `loop.steer`),
-  `r` renames (loaded → `rename_session`, saved → set durable title), `R`
-  refreshes; `q` is NOT mapped. `<CR>` reuses the agents-buffer window
-  (oil-style): `show_session`/`resume_session` take the split_cmd sentinel
-  `"none"`, which swaps the session buffer in via `:buffer` (recording a
-  jumplist entry) instead of opening a split — so `<C-o>`/`<C-i>` step back to
-  the agents buffer and forward again. (Any other split_cmd, e.g. `<mods>`
-  from the user commands, still splits.) Two refresh seams keep it live: the loop's
-  internal `progress()` calls `ui.agents_refresh()` on any session's progress
-  event (mechanism beside the phase mirror, not the redefinable
-  `hook.on_progress`), and a BufEnter/BufWinEnter autocmd on the buffer
-  catches saved/idle churn that emits no progress (BufWinEnter covers a
-  window opened without entering it). `agents_refresh()` is a trailing
-  ~100ms debounce over a module-level uv timer whose callback re-renders
-  inside `vim.schedule` (re-checking `nvim_buf_is_valid`, like
-  `schedule_render`). It no-ops unless the agents buffer is displayed in a
-  window in some tabpage. It checks that condition on the call and again in
-  the scheduled render. Without the check, a hidden agents buffer re-rendered
-  (measured at ~500ms with 682 saved transcripts) on every progress event of
-  every running agent. The BufEnter/BufWinEnter seam re-renders it when it
-  is shown again. A BufWipeout
-  autocmd stops the timer and clears the line map. Every row is a single
-  line capped at a fixed 76-cell width (`AGENTS_WIDTH`): variable-length
-  fields (a running row's task, a loaded row's title, a saved row's
-  summary/name) collapse whitespace to one line and truncate with `…`; a
-  saved row's age is right-aligned. A loaded row also carries its
-  transcript's relative age (file-backed buffers only) and, when the session
-  has non-persisted usage (`vim.b.straps_usage`), a `ctx N%` context-fill
-  field from `ui.session_info().context_pct` — both omitted when absent.
-  The window opens with `nowrap` and
-  `cursorline`, and the cursor lands on the first row rather than line 1, so
-  a split narrower than 76 cells right-clips rows without an ellipsis rather
-  than wrapping into dozens of screen lines. Section headers carry each
-  set's row count (`running (N)`, `loaded (N)`, `saved (N)`). The picker
-  `ui.pick_agents()` and `ui.agents_status()` (the statusline component,
-  `""` when idle, `🤖 N` / `🤖 N+M` otherwise) remain exported and
-  unchanged. Backed by `ui.running_agents()` (a snapshot from
-  `loop.running_sessions()` + the child's `straps_parent`/`straps_task`
-  buffer vars, which `tool.spawn` sets).
+- `:StrapsAgents` opens the **agent dashboard** (`straps://agents`), an ordinary searchable, nomodifiable scratch buffer with session trees and a separate saved-transcript section. `ui.all_sessions()` retains its disjoint `{ running, loaded, saved }` classification API. Presentation combines running and loaded sessions into a stable forest ordered by buffer identity, retaining finished children under their parents. Parent links must reference valid session buffers; traversal guards against cycles. Saved files have no reconstructed ancestry.
+  The presentation seams remain `fn.agents_render` → `ui._agents_render` and `fn.agents_winbar` → `ui._agents_winbar`. Implementations may delegate to the dashboard module. The winbar dispatcher respects `agents_winbar`; disabling it moves the legend into the buffer.
+  Rows, headers, and legends remain bounded: collapse whitespace, measure display cells, and truncate with an ellipsis. Fit the narrowest window showing the dashboard, with a 76-cell fallback when no window displays it. Titles and tasks precede metadata; omit metadata before consuming title space in narrow splits. This replaces the fixed-width policy while retaining its purpose of preventing transcript content from overflowing the layout. Resize triggers a debounced refresh.
+  Native section and subtree folds retain per-window state. Live trees start open; saved transcripts start collapsed. Refresh and reopening preserve selected session identity, cursor column, and viewport anchor. If the selected session disappears, select the nearest remaining actionable row. The module-owned line-to-entry table updates on every render, including same-text identity changes. Identical rendered lines and highlight descriptors cause no text or extmark writes. Highlight groups retain default links and user overrides.
+  `<CR>` opens the transcript in the dashboard window through the existing `"none"` split sentinel, preserving jumplist navigation. `i` sends a targeted message through `fn.session_notify`: running sessions receive steering, idle sessions receive a user block without starting. `g<CR>` explicitly starts or continues an idle session. `r` changes the durable title, including during a run, without renaming the file. `x` stops a running session with explicit descendant-cancellation confirmation. `R` clears saved-summary caches and renders immediately. `<F1>` opens help; native search, Visual mode, and window commands remain available.
+  `p` opens selected-agent details in an ordinary read-only scratch split without taking focus. `P` toggles follow-selection, disabled initially. Details separate task, model, context, parent, observed status, and a bounded latest-assistant preview. Buffer-derived preview data uses changedtick caching and bounded lookup rather than full transcript parsing on every progress update. No generated summaries or inferred input-wait states appear. Ending reasons distinguish finished, stopped, failed, and other observed termination states; a new run clears stale termination metadata.
+  Progress, dashboard buffer entry, and resize request a trailing debounced refresh. Hidden dashboards do not render. Saved listing excludes loaded paths before summary work. First-prompt extraction streams through the first real complete user block, preserving title preference, notice filtering, and marker escaping, and closes its file handle on every exit. A display-only in-memory cache stores summaries, including nil, keyed by absolute path and transcript/metadata file signatures (size and modification/change timestamps). Title writes invalidate cached summaries; listing prunes vanished entries. No cache changes the transcript or metadata schema.
+  `ui.pick_agents()`, `ui.running_agents()`, and `ui.agents_status()` remain available with their existing meanings.
 - Statusline hints: `vim.b[bufnr].straps_status` = "running"|"idle" (+ redraw)
   is the PER-buffer state; `ui.agents_status()` is the buffer-independent
   cross-session count (loop does a `redrawstatus!` on run start/end so a

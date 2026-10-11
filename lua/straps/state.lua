@@ -4,6 +4,7 @@
 -- (callers schedule as needed).
 
 local registry = require("straps.registry")
+local uv = vim.uv
 
 local M = {}
 
@@ -449,11 +450,109 @@ local function meta_path(transcript_path)
   return transcript_path .. ".meta"
 end
 
+local function _canon_path(path)
+  if not path or path == "" then return path end
+  local abs = vim.fn.fnamemodify(path, ":p")
+  return abs
+end
+local summary_cache = {}
+local _cache_hits, _cache_misses, _cache_stores, _cache_prunes = 0, 0, 0, 0
+
+local function _stat_fields(p)
+  local st = p and uv.fs_stat(p) or nil
+  if not st then
+    return 0, 0, 0, 0, 0
+  end
+  local ms, mns = 0, 0
+  if type(st.mtime) == "table" then
+    ms = st.mtime.sec or 0
+    mns = st.mtime.nsec or 0
+  end
+  local cs, cns = 0, 0
+  if type(st.ctime) == "table" then
+    cs = st.ctime.sec or 0
+    cns = st.ctime.nsec or 0
+  end
+  return st.size or 0, ms, mns, cs, cns
+end
+
+local function _cache_key_stats(path)
+  local t_size, t_ms, t_mns, t_cs, t_cns = _stat_fields(path)
+  local mp = meta_path(path)
+  local m_size, m_ms, m_mns, m_cs, m_cns = _stat_fields(mp)
+  return t_size, t_ms, t_mns, t_cs, t_cns, m_size, m_ms, m_mns, m_cs, m_cns
+end
+
+function M.clear_session_summary_cache()
+  summary_cache = {}
+  _cache_hits, _cache_misses, _cache_stores, _cache_prunes = 0, 0, 0, 0
+end
+
+function M._session_summary_cache_stats()
+  local n = 0
+  for _ in pairs(summary_cache) do n = n + 1 end
+  return { hits = _cache_hits, misses = _cache_misses, stores = _cache_stores, prunes = _cache_prunes, size = n }
+end
+
+local function _stream_first_prompt(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local in_user = false
+  local first = nil
+  local have_inline = false
+  local body = {}
+  local function has_content()
+    return first ~= nil and first:match("%S") ~= nil
+  end
+  local function is_prompt()
+    if not has_content() then return false end
+    return not M.notice_of(first)
+  end
+  local ok, res = pcall(function()
+    for line in f:lines() do
+      local kind, _, inline = match_marker(line)
+      if kind then
+        if is_prompt() then
+          break
+        end
+        in_user = (kind == "user")
+        have_inline = false
+        first = nil
+        body = {}
+        if in_user and inline and inline ~= "" then
+          first = inline
+          have_inline = true
+          body[#body + 1] = inline
+        end
+      elseif in_user then
+        local s = unescape_line(line)
+        if not have_inline or s:match("%S") then
+          if not first and s:match("%S") then
+            first = s
+          end
+          body[#body + 1] = s
+        end
+      end
+    end
+    if not is_prompt() then
+      return nil
+    end
+    local text = table.concat(body, "\n")
+    text = vim.trim(text)
+    text = text:gsub("%s+", " ")
+    return text ~= "" and text or nil
+  end)
+  pcall(function() f:close() end)
+  if ok then return res end
+  return nil
+end
+
 --- The user-set title for a session transcript, or nil. Read from the
 --- companion "<path>.meta" JSON file ({ title = "..." }). pcall-safe.
 function M.session_title(path)
+  local ap = _canon_path(path)
   local ok, title = pcall(function()
-    local mp = meta_path(path)
+    local mp = meta_path(ap)
     if vim.fn.filereadable(mp) == 0 then
       return nil
     end
@@ -471,63 +570,54 @@ end
 --- Set (or clear, with nil/"") the durable title for a session transcript,
 --- written to its companion "<path>.meta" JSON file. Returns true on success.
 function M.set_session_title(path, title)
+  local ap = _canon_path(path)
   local ok = pcall(function()
-    local mp = meta_path(path)
+    local mp = meta_path(ap)
     if title == nil or title == "" then
       if vim.fn.filereadable(mp) == 1 then
         os.remove(mp)
       end
-      return
+    else
+      vim.fn.writefile({ vim.json.encode({ title = title }) }, mp)
     end
-    vim.fn.writefile({ vim.json.encode({ title = title }) }, mp)
+    summary_cache[ap] = nil
   end)
   return ok
 end
-
 --- A one-line summary of a transcript, read directly from disk (no buffer
 --- load): the durable title when set, else the first non-empty user prompt,
---- else nil. The first user block is typically past a long system prompt, so
---- the whole file is read; the scan stops as soon as that block is captured.
---- Escaped/marker lines are unescaped; the summary is trimmed and collapsed
---- to a single line. pcall-safe; nil on any error.
+--- else nil. Escaped/marker lines are unescaped; the summary is trimmed and
+--- collapsed to a single line. pcall-safe; nil on any error.
 function M.session_summary(path)
-  local title = M.session_title(path)
-  if title then
-    return title
-  end
+  local ap = _canon_path(path)
   local ok, summary = pcall(function()
-    if vim.fn.filereadable(path) == 0 then
+    if vim.fn.filereadable(ap) == 0 then
       return nil
     end
-    local lines = vim.fn.readfile(path)
-    local in_user, collected = false, {}
-    local function has_content()
-      for _, c in ipairs(collected) do
-        if c:match("%S") then return true end
-      end
-      return false
+    local t_size, t_ms, t_mns, t_cs, t_cns, m_size, m_ms, m_mns, m_cs, m_cns = _cache_key_stats(ap)
+    local hit = summary_cache[ap]
+    if hit and hit.t_size == t_size and hit.t_mtime_s == t_ms and hit.t_mtime_ns == t_mns
+      and hit.t_ctime_s == t_cs and hit.t_ctime_ns == t_cns
+      and hit.m_size == m_size and hit.m_mtime_s == m_ms and hit.m_mtime_ns == m_mns
+      and hit.m_ctime_s == m_cs and hit.m_ctime_ns == m_cns then
+      _cache_hits = _cache_hits + 1
+      return hit.sum
     end
-    local function is_prompt()
-      return has_content() and not M.notice_of(table.concat(collected, "\n"))
+    _cache_misses = _cache_misses + 1
+    local title = M.session_title(ap)
+    local sum
+    if title then
+      sum = title
+    else
+      sum = _stream_first_prompt(ap)
     end
-    for _, line in ipairs(lines) do
-      local kind = match_marker(line)
-      if kind then
-        if is_prompt() then
-          break -- first non-empty user block ended
-        end
-        in_user = (kind == "user")
-        collected = {} -- reset across empty user/other blocks
-      elseif in_user then
-        collected[#collected + 1] = unescape_line(line)
-      end
-    end
-    if not is_prompt() then
-      return nil
-    end
-    local text = vim.trim(table.concat(collected, " "))
-    text = text:gsub("%s+", " ")
-    return text ~= "" and text or nil
+    summary_cache[ap] = {
+      sum = sum,
+      t_size = t_size, t_mtime_s = t_ms, t_mtime_ns = t_mns, t_ctime_s = t_cs, t_ctime_ns = t_cns,
+      m_size = m_size, m_mtime_s = m_ms, m_mtime_ns = m_mns, m_ctime_s = m_cs, m_ctime_ns = m_cns,
+    }
+    _cache_stores = _cache_stores + 1
+    return sum
   end)
   return ok and summary or nil
 end
@@ -536,21 +626,30 @@ end
 --- { {path, name, mtime, summary}, ... }, sorted most-recent first. `summary`
 --- is the durable title or first user prompt (state.session_summary), nil when
 --- the transcript has no prompt yet. pcall-safe; {} on any error or missing dir.
-function M.list_sessions()
+function M.list_sessions(opts)
   local ok, result = pcall(function()
     local dir = M.session_dir()
     if not dir then
       return {}
     end
+    for p, _ in pairs(summary_cache) do
+      if vim.startswith(p, dir .. "/") and not uv.fs_stat(p) then
+        summary_cache[p] = nil
+        _cache_prunes = _cache_prunes + 1
+      end
+    end
+    local exclude = (type(opts) == "table" and type(opts.exclude) == "table") and opts.exclude or nil
     local entries = {}
     for _, p in ipairs(vim.fn.glob(dir .. "/*.straps", false, true)) do
       local abs = vim.fn.fnamemodify(p, ":p")
-      entries[#entries + 1] = {
-        path = abs,
-        name = vim.fn.fnamemodify(abs, ":t"),
-        mtime = vim.fn.getftime(abs),
-        summary = M.session_summary(abs),
-      }
+      if not (exclude and exclude[abs]) then
+        entries[#entries + 1] = {
+          path = abs,
+          name = vim.fn.fnamemodify(abs, ":t"),
+          mtime = vim.fn.getftime(abs),
+          summary = M.session_summary(abs),
+        }
+      end
     end
     table.sort(entries, function(a, b)
       return a.mtime > b.mtime

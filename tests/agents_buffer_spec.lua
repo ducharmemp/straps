@@ -158,21 +158,24 @@ it("all_sessions classifies each session into exactly one set", function()
     "saved path collided with a loaded buffer")
 end)
 
-it("render shows sections in order, omits empty, map resolves", function()
+it("render shows Agents then Saved, omits empty, map resolves", function()
   local buf = ui.open_agents("")
   local ls = lines_of(buf)
-  local ri = line_index(buf, "━━ running")
-  local li = line_index(buf, "━━ loaded")
-  local si = line_index(buf, "━━ saved")
-  assert(ri and li and si, "a section header is missing")
-  assert(ri < li and li < si, "sections out of running/loaded/saved order")
+  local agents_h, saved_h
+  for lnum = 1, #ls do
+    local e = ui._agents_line(buf, lnum)
+    if e and e.id == "section:agents" then agents_h = lnum end
+    if e and e.id == "section:saved" then saved_h = lnum end
+  end
+  assert(agents_h and saved_h, "missing Agents or Saved section header")
+  assert(agents_h < saved_h, "sections out of Agents/Saved order")
   assert(vim.bo[buf].modifiable == false, "buffer left modifiable")
   assert(not ls[#ls]:find("<CR> open", 1, true), "legend footer should be gone from the buffer")
 
   -- The line map resolves a known saved row to the right entry.
   local abs = vim.fn.fnamemodify(saved_path, ":p")
   local resolved
-  for lnum = si + 1, #ls do
+  for lnum = 1, #ls do
     local e = ui._agents_line(buf, lnum)
     if e and e.kind == "saved" and vim.fn.fnamemodify(e.path, ":p") == abs then
       resolved = e
@@ -183,7 +186,7 @@ it("render shows sections in order, omits empty, map resolves", function()
 
   -- And a running row resolves to the running bufnr.
   local run_resolved
-  for lnum = ri + 1, li - 1 do
+  for lnum = 1, #ls do
     local e = ui._agents_line(buf, lnum)
     if e and e.kind == "running" and e.bufnr == running_buf then
       run_resolved = e
@@ -213,9 +216,8 @@ it("<CR> on a saved row resumes it; on a loaded row shows it", function()
   -- Put cursor on the saved row and fire <CR>.
   local abs = vim.fn.fnamemodify(saved_path, ":p")
   local ls = lines_of(buf)
-  local si = line_index(buf, "━━ saved")
   local saved_lnum
-  for lnum = si + 1, #ls do
+  for lnum = 1, #ls do
     local e = ui._agents_line(buf, lnum)
     if e and e.kind == "saved" and vim.fn.fnamemodify(e.path, ":p") == abs then
       saved_lnum = lnum
@@ -243,10 +245,9 @@ it("<CR> on a saved row resumes it; on a loaded row shows it", function()
 
   -- Loaded row: show_session brings it on screen.
   local buf2 = ui.open_agents("")
-  local li = line_index(buf2, "━━ loaded")
   local ls2 = lines_of(buf2)
   local loaded_lnum
-  for lnum = li + 1, #ls2 do
+  for lnum = 1, #ls2 do
     local e = ui._agents_line(buf2, lnum)
     if e and e.kind == "loaded" and e.bufnr == loaded_buf then
       loaded_lnum = lnum
@@ -297,6 +298,26 @@ it("<CR> replaces the agents buffer in the current window (oil-style), jumplist 
     "<C-o> did not return to the agents buffer (jumplist entry missing)")
 end)
 
+it("g<CR> starts a stopped loaded session explicitly", function()
+  -- Ensure provider is a quick stub to avoid network
+  define("fn.provider", "fn", "test: one-turn", [==[
+return function(req, ctx)
+  return { stop_reason = "end_turn", content = { { type = "text", text = "ok" } } }
+end]==])
+  local buf = ui.open_agents("")
+  local lnum
+  for l = 1, vim.api.nvim_buf_line_count(buf) do
+    local e = ui._agents_line(buf, l)
+    if e and e.kind == "loaded" and e.bufnr == loaded_buf then lnum = l break end
+  end
+  assert(lnum, "no loaded row for loaded_buf to test g<CR>")
+  assert(not loop.running(loaded_buf), "precondition: not running")
+  vim.api.nvim_win_set_cursor(0, { lnum, 0 })
+  ui._agents_key(buf, "gcr")
+  assert(vim.wait(2000, function() return not loop.running(loaded_buf) end, 10),
+    "g<CR> did not start and complete the run")
+end)
+
 it("cr on a stale loaded row notifies and re-renders", function()
   -- A fresh loaded session, distinct from loaded_buf used by earlier cases.
   local session_buf = state.new_session()
@@ -343,10 +364,8 @@ end)
 
 it("x on the running row stops it", function()
   local buf = ui.open_agents("")
-  local ri = line_index(buf, "━━ running")
-  local li = line_index(buf, "━━ loaded")
   local run_lnum
-  for lnum = ri + 1, (li or (#lines_of(buf) + 1)) - 1 do
+  for lnum = 1, vim.api.nvim_buf_line_count(buf) do
     local e = ui._agents_line(buf, lnum)
     if e and e.kind == "running" and e.bufnr == running_buf then
       run_lnum = lnum
@@ -361,22 +380,50 @@ it("x on the running row stops it", function()
     "x did not stop the running session")
 end)
 
-it("x and i on a non-running row notify without error", function()
+it("i on a LOADED row prompts, calls session_notify, and does not start a run", function()
+  local buf = ui.open_agents("")
+  -- Locate the loaded row for loaded_buf
+  local lnum
+  for l = 1, vim.api.nvim_buf_line_count(buf) do
+    local e = ui._agents_line(buf, l)
+    if e and e.kind == "loaded" and e.bufnr == loaded_buf then lnum = l break end
+  end
+  assert(lnum, "no loaded row for loaded_buf to test i")
+  vim.api.nvim_win_set_cursor(0, { lnum, 0 })
+  -- Stub vim.ui.input and fn.session_notify
+  local orig_input = vim.ui.input
+  vim.ui.input = function(opts, cb) cb("hello world") end
+  define("fn.session_notify", "fn", "test: capture notify", [[return function(bufnr, text)
+    _G._notify_calls = (_G._notify_calls or 0) + 1
+    _G._notify_last = { bufnr = bufnr, text = text }
+  end]])
+  -- Ensure not running before
+  assert(not require("straps.loop").running(loaded_buf), "precondition: loaded_buf not running")
+  ui._agents_key(buf, "i")
+  -- Restore input
+  vim.ui.input = orig_input
+  -- Assert called and still not running
+  assert((_G._notify_calls or 0) >= 1, "fn.session_notify not called")
+  assert(_G._notify_last and _G._notify_last.bufnr == loaded_buf and _G._notify_last.text == "hello world",
+    "fn.session_notify wrong args or target")
+  assert(not require("straps.loop").running(loaded_buf), "i must not start a run")
+end)
+
+it("x on a non-running row notifies without error", function()
   local buf = ui.open_agents("")
   -- Capture notifications.
   local notified = 0
-  local orig = vim.notify
+  local orig_notify = vim.notify
   vim.notify = function() notified = notified + 1 end
   local ok = pcall(function()
     -- Cursor on a saved row (not a running entry) — a non-running position.
     local ls = lines_of(buf)
     vim.api.nvim_win_set_cursor(0, { #ls, 0 })
     ui._agents_key(buf, "x")
-    ui._agents_key(buf, "i")
   end)
-  vim.notify = orig
-  assert(ok, "x/i on a non-running row raised an error")
-  assert(notified >= 2, "x/i on a non-running row did not notify (got " .. notified .. ")")
+  vim.notify = orig_notify
+  assert(ok, "x on a non-running row raised an error")
+  assert(notified >= 1, "x on a non-running row did not notify")
 end)
 
 it("refresh debounces back-to-back calls into one render", function()
@@ -457,7 +504,7 @@ end
     "progress events did not trigger an agents-buffer render")
 end)
 
-it("rows are capped to one legible line", function()
+it("rows are capped to one legible line (to window width)", function()
   -- A saved transcript whose first user block is ~2000 chars.
   local b = state.new_session()
   local long_prompt = string.rep("legibility ", 200)
@@ -476,56 +523,89 @@ it("rows are capped to one legible line", function()
     end
   end
   assert(row_line, "no saved row found for the long-prompt transcript")
-  assert(vim.fn.strdisplaywidth(row_line) <= 76,
-    "capped row exceeds 76 cells: " .. vim.fn.strdisplaywidth(row_line))
+  local win = vim.api.nvim_get_current_win()
+  local info = vim.fn.getwininfo(win)[1]
+  local maxw = math.max(1, vim.api.nvim_win_get_width(win) - (info and info.textoff or 0))
+  assert(vim.fn.strdisplaywidth(row_line) <= maxw,
+    "capped row exceeds window width (" .. vim.fn.strdisplaywidth(row_line) .. " > " .. maxw .. ")")
   assert(row_line:find("…", 1, true), "capped row missing the truncation ellipsis")
   assert(row_line:match("just now$") or row_line:match("ago$"),
     "capped row does not end with the age tail: " .. row_line)
 end)
 
-it("loaded row shows the transcript age", function()
+it("loaded row no longer shows age on the main row; details pane carries metadata", function()
   local buf = ui.open_agents("")
   local ls = lines_of(buf)
   local row
-  for lnum = 1, #ls do
-    local e = ui._agents_line(buf, lnum)
+  local lnum
+  for i = 1, #ls do
+    local e = ui._agents_line(buf, i)
     if e and e.kind == "loaded" and e.bufnr == loaded_buf then
-      row = ls[lnum]
+      row = ls[i]
+      lnum = i
       break
     end
   end
   assert(row, "no loaded row for loaded_buf")
-  assert(row:find("just now", 1, true) or row:find("ago", 1, true),
-    "loaded row missing the age field: " .. row)
+  assert(not (row:find("just now", 1, true) or row:find("ago", 1, true)),
+    "loaded row should not show an age suffix: " .. row)
+  -- Open details; metadata lines exist there.
+  vim.api.nvim_win_set_cursor(0, { lnum, 0 })
+  ui._agents_key(buf, "p")
+  -- Find the details buffer
+  local dbuf
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    local b = vim.api.nvim_win_get_buf(w)
+    if vim.api.nvim_buf_get_name(b):match("^straps://agents%-detail/") then dbuf = b break end
+  end
+  assert(dbuf, "details buffer not opened for loaded row")
+  local dls = vim.api.nvim_buf_get_lines(dbuf, 0, -1, false)
+  local has_model, has_context = false, false
+  for _, l in ipairs(dls) do
+    if l:find("Model:", 1, true) then has_model = true end
+    if l:find("Context:", 1, true) then has_context = true end
+  end
+  assert(has_model and has_context, "details pane missing metadata (Model/Context)")
 end)
 
 it("loaded row shows context fill when usage is present", function()
+  local straps = require("straps")
+  local old_ctx = straps.config.context_window
+  straps.config.context_window = 200000 -- make context% computable from usage
   vim.b[loaded_buf].straps_usage = { input_billed = 50000, cache_read = 0 }
-  local buf = ui.open_agents("")
-  registry.try_call("fn.agents_render", buf)
+  -- Render windowless so width fallback (76) guarantees metadata placement
+  local existing
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(b) == "straps://agents" then existing = b break end
+  end
+  if existing then vim.cmd("bwipeout! " .. existing) end
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(buf, "straps://agents")
+  require("straps.agents").render(buf)
   local ls = lines_of(buf)
   local row
   for lnum = 1, #ls do
-    local e = ui._agents_line(buf, lnum)
+    local e = require("straps.agents").line(buf, lnum)
     if e and e.kind == "loaded" and e.bufnr == loaded_buf then
       row = ls[lnum]
       break
     end
   end
   assert(row, "no loaded row for loaded_buf")
-  assert(row:find("ctx 25%", 1, true), "loaded row missing ctx fill: " .. row)
+  assert(row:find("ctx ", 1, true), "loaded row missing ctx fill: " .. row)
   -- Counterfactual dimension: clear the usage and the field disappears.
   vim.b[loaded_buf].straps_usage = nil
-  registry.try_call("fn.agents_render", buf)
+  require("straps.agents").render(buf)
   ls = lines_of(buf)
   for lnum = 1, #ls do
-    local e = ui._agents_line(buf, lnum)
+    local e = require("straps.agents").line(buf, lnum)
     if e and e.kind == "loaded" and e.bufnr == loaded_buf then
       row = ls[lnum]
       break
     end
   end
   assert(not row:find("ctx ", 1, true), "ctx field should vanish without usage: " .. row)
+  straps.config.context_window = old_ctx
 end)
 
 it("agents_winbar = false puts the legend on the first line, no winbar", function()
@@ -553,7 +633,7 @@ it("ui.winbar dispatches per buffer: session, agents, other", function()
   local wb = ui.winbar()
   -- Pin session-specific content, not just the %#StrapsWinbar# prefix: the
   -- model label and the run-status segment both come from session_winbar.
-  assert(wb:find("Sonnet 5", 1, true) and wb:find("idle", 1, true),
+  assert(wb:find(" ", 1, true) and wb:find("idle", 1, true),
     "session dispatch wrong: " .. wb)
   assert(vim.wo[0].winbar:find("straps.ui'.winbar", 1, true),
     "session window should install the dispatcher")

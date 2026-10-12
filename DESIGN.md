@@ -747,7 +747,10 @@ secret, so no mode-600 guard.
 - Transient failures → retry with backoff, max 3 attempts (sleep via
   `vim.defer_fn` + await, not blocking). Retryable: HTTP 429/529/500/502/503/408,
   the typed `rate_limit_error`/`overloaded_error`, and a curl-level failure
-  with no HTTP status (connection refused, DNS, TLS, timeout). The OpenAI
+  with no HTTP status (connection refused, DNS, TLS, timeout). A `vim.system`
+  spawn that raises (EAGAIN with the process table full, ENOMEM) is pcall'd
+  in both backends and resolved as the same curl-level failure, so it
+  retries with backoff instead of escaping as `straps: run error`. The OpenAI
   backend retries the same status set (429/500/502/503/408 + curl failures).
 - `config.base_url` (default `https://api.anthropic.com`) prefixes
   `/v1/messages` so Anthropic-compatible servers/proxies are a config knob.
@@ -1067,9 +1070,43 @@ API names (registry names prefixed `tool.`):
   ends with a
   `[straps: this exact command has run N times ...]` line suggesting a
   registry_define'd tool. Tests in `tests/bash_guard_spec.lua`.
+  Holds a subprocess slot (below) for the life of the process.
 - `glob {pattern}` — `vim.fn.glob(pattern, false, true)`, cap 500 entries.
-- `grep {pattern, path?}` — prefer `rg` if executable, else `grep -rn`, cap
-  output.
+- `grep {pattern, path?, timeout_ms?}` — prefer `rg` if executable, else
+  `grep -rn`, cap output. Holds a subprocess slot; under `rg` passes
+  `--threads` from `fn.subprocess_threads`; killed after `timeout_ms`
+  (default 30000) with a timeout result carrying partial output.
+- **Subprocess gate** (`layers/exec.lua`, state in
+  `registry.subprocess_state()`): N sessions together start N times the
+  processes one session would; a 43-session fan-out searching a monorepo ran
+  enough 14-thread `rg` processes at once that `fork` returned EAGAIN
+  system-wide. A counting semaphore shared by `bash`, `run_in_terminal`,
+  `run_quickfix` and `grep` bounds straps-launched processes across the whole
+  Neovim. Four redefinable entries so a plugin shadows the one it wants:
+  `fn.subprocess_in_flight()` (read accessor over the counter),
+  `fn.subprocess_limit()` (policy: `config.max_subprocesses`, nil → 2 × CPU
+  count, halved while the 1-minute load average exceeds 2 × CPU count;
+  consulted at every admission), `fn.subprocess_threads()` (CPU count ÷
+  in-flight, floor 1), `fn.subprocess_acquire(ctx, info) -> release`
+  (mechanism: FIFO waiters parked in `ctx.await`; `info = { tool, bufnr, cmd
+  }`; release is idempotent and registered via `ctx.on_cancel`, so a
+  cancelled or backstop-resumed holder frees its slot; release runs before
+  the kill, so a process that survives its group kill runs uncounted and the
+  gate stays open; a parked waiter whose run was cancelled declines its slot,
+  its cancel handler releases a slot it was admitted to but will never resume
+  into, and a run cancelled between admission and resume errors instead of
+  starting its process; admission from a `vim.system` exit callback is
+  deferred through `vim.schedule` and runs in the global scope, while
+  admission from a tool body runs in that session's scope, so a limit fn is
+  defined globally; acquire drains the queue first, so a raised limit admits
+  waiters without waiting for a release; a ctx without `await` is admitted at
+  once and may exceed the limit by one, and `grep` refuses such a ctx before
+  acquiring). Each tool pcalls its `vim.system`/`jobstart` and the terminal
+  split, releasing on failure, so the EAGAIN the gate exists to prevent
+  cannot itself leak a slot. The tools call acquire through `try_call`, so a
+  build with the fn removed runs ungated. The counter lives in `registry`
+  module state, not a buffer variable, so a redefined limit fn reads the
+  same number the default does. Tests in `tests/exec_gate_spec.lua`.
 - `registry_list {kind?}` — names + kind + doc + version, one per line.
 - `registry_get {name}` — returns `registry.render(name)` (full definition).
 - `registry_define {name, kind, doc?, input_schema?, source}` — calls

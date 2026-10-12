@@ -38,6 +38,10 @@ fn.render	straps.txt	/*fn.render*
 fn.session_notify	straps.txt	/*fn.session_notify*
 fn.spawn_depth_limit	straps.txt	/*fn.spawn_depth_limit*
 fn.spawn_notice	straps.txt	/*fn.spawn_notice*
+fn.subprocess_acquire	straps.txt	/*fn.subprocess_acquire*
+fn.subprocess_in_flight	straps.txt	/*fn.subprocess_in_flight*
+fn.subprocess_limit	straps.txt	/*fn.subprocess_limit*
+fn.subprocess_threads	straps.txt	/*fn.subprocess_threads*
 fn.system_prompt	straps.txt	/*fn.system_prompt*
 fn.system_prompt_layer	straps.txt	/*fn.system_prompt_layer*
 fn.tool_display	straps.txt	/*fn.tool_display*
@@ -80,6 +84,7 @@ straps-setup	straps.txt	/*straps-setup*
 straps-skills	straps.txt	/*straps-skills*
 straps-steering	straps.txt	/*straps-steering*
 straps-subagents	straps.txt	/*straps-subagents*
+straps-subprocesses	straps.txt	/*straps-subprocesses*
 straps-tools	straps.txt	/*straps-tools*
 straps.nvim	straps.txt	/*straps.nvim*
 straps.setup()	straps.txt	/*straps.setup()*

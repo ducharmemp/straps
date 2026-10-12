@@ -870,6 +870,42 @@ it("persistent 429 exhausts retries with a readable error", function()
   assert(textx:find("still rate limited", 1, true), "API message not surfaced")
 end)
 
+-- A vim.system that raises on the curl spawn (EAGAIN with the process table
+-- full) must resolve as a curl-level failure and retry, not escape the run.
+local bufs, texts, spawn_raised
+step(function()
+  vim.fn.mkdir(tmp .. "/spawnfail", "p")
+  write_exec(tmp .. "/spawnfail/curl", [[#!/usr/bin/env bash
+cat > /dev/null
+echo "STRAPS_HTTP_STATUS:200" >&2
+printf 'event: message_start\ndata: {"type":"message_start"}\n\n'
+printf 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+printf 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"survived the spawn failure"}}\n\n'
+printf 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+printf 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+printf 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+]])
+  vim.env.PATH = tmp .. "/spawnfail:" .. real_path
+  local real_system = vim.system
+  spawn_raised = 0
+  vim.system = function(argv, ...)
+    if argv[1] == "curl" and spawn_raised == 0 then
+      spawn_raised = 1
+      error("EAGAIN: resource temporarily unavailable")
+    end
+    return real_system(argv, ...)
+  end
+  bufs, texts = run_session("spawn fails once")
+  vim.system = real_system
+end)
+
+it("a raising curl spawn is retried as a transport failure, not a run error", function()
+  assert(spawn_raised == 1, "the stub never fired")
+  assert(not loop.running(bufs), "run still active")
+  assert(texts:find("survived the spawn failure", 1, true), "retry after spawn failure did not complete:\n" .. texts:sub(-400))
+  assert(not texts:find("run error", 1, true), "spawn failure escaped as a run error:\n" .. texts:sub(-400))
+end)
+
 -- ------------------------------------------------- chunked multi-tool stream
 -- Fake curl #7: one response carrying TWO tool_use blocks, streamed rudely —
 -- the data line for block 0 is split mid-JSON across writes (line_buf

@@ -123,6 +123,8 @@ return function(input, ctx)
   local capped = false
   local proc
   local finished, timed_out = false, false
+  local release = require("straps.registry").try_call("fn.subprocess_acquire", ctx,
+    { tool = "bash", bufnr = ctx.bufnr, cmd = cmd }) or function() end
   -- proc:kill only signals the direct bash child; a compound command's
   -- grandchildren (and anything holding the stdout/stderr pipes open)
   -- survive and on_exit never fires. detach=true makes the child a process
@@ -146,19 +148,29 @@ return function(input, ctx)
     if len_name == "out" then out_len = len + keep else err_len = len + keep end
   end
   local res = ctx.await(function(resolve)
-    proc = vim.system(
-      { "bash", "-lc", cmd },
-      {
-        text = true,
-        cwd = vim.fn.getcwd(),
-        detach = true,
-        stdout = function(_, chunk) take(stdout, "out", chunk) end,
-        stderr = function(_, chunk) take(stderr, "err", chunk) end,
-      },
-      function(out)
-        finished = true
-        resolve(out)
-      end)
+    local ok_spawn, spawned = pcall(function()
+      return vim.system(
+        { "bash", "-lc", cmd },
+        {
+          text = true,
+          cwd = vim.fn.getcwd(),
+          detach = true,
+          stdout = function(_, chunk) take(stdout, "out", chunk) end,
+          stderr = function(_, chunk) take(stderr, "err", chunk) end,
+        },
+        function(out)
+          finished = true
+          release()
+          resolve(out)
+        end)
+    end)
+    if not ok_spawn then
+      finished = true
+      release()
+      resolve({ code = -1, stderr = "bash: could not spawn: " .. tostring(spawned) })
+      return
+    end
+    proc = spawned
     if ctx.on_cancel then
       ctx.on_cancel(function() kill_tree("sigkill") end)
     end
@@ -185,7 +197,7 @@ return function(input, ctx)
   lines[#lines + 1] = "stdout:"
   lines[#lines + 1] = table.concat(stdout)
   lines[#lines + 1] = "stderr:"
-  lines[#lines + 1] = table.concat(stderr)
+  lines[#lines + 1] = table.concat(stderr) .. (res.stderr or "")
   if nudge then lines[#lines + 1] = nudge end
   return table.concat(lines, "\n")
 end
@@ -225,15 +237,22 @@ return function(input, ctx)
     error("run_in_terminal: command must be a non-empty string")
   end
   local timeout_ms = tonumber(input.timeout_ms) or 300000
+  local release = require("straps.registry").try_call("fn.subprocess_acquire", ctx,
+    { tool = "run_in_terminal", bufnr = ctx.bufnr, cmd = cmd }) or function() end
 
   local prev_win = vim.api.nvim_get_current_win()
-  vim.cmd("botright 15new")
+  local ok_split, split_err = pcall(vim.cmd, "botright 15new")
+  if not ok_split then
+    release()
+    error("run_in_terminal: could not open the terminal split: " .. tostring(split_err))
+  end
   local term_buf = vim.api.nvim_get_current_buf()
 
   local timed_out, finished = false, false
   local code, start_err = ctx.await(function(resolve)
     local function on_exit(_, c)
       finished = true
+      release()
       resolve(c)
     end
     -- nvim 0.11+: jobstart {term=true}; older: termopen. Both must run with
@@ -248,6 +267,7 @@ return function(input, ctx)
       if okt and type(t) == "number" and t > 0 then job = t end
     end
     if job <= 0 then
+      release()
       resolve(nil, "could not start the terminal job")
       return
     end
@@ -357,6 +377,8 @@ return function(input, ctx)
     error("run_quickfix: command must be a non-empty string")
   end
   local timeout_ms = tonumber(input.timeout_ms) or 300000
+  local release = require("straps.registry").try_call("fn.subprocess_acquire", ctx,
+    { tool = "run_quickfix", bufnr = ctx.bufnr, cmd = cmd }) or function() end
 
   local proc
   local finished, timed_out = false, false
@@ -370,13 +392,21 @@ return function(input, ctx)
     if not ok then pcall(function() proc:kill(sig) end) end
   end
   local res = ctx.await(function(resolve)
-    proc = vim.system(
+    local ok_spawn, spawned = pcall(vim.system,
       { "bash", "-lc", cmd },
       { text = true, detach = true },
       function(out)
         finished = true
+        release()
         resolve(out)
       end)
+    if not ok_spawn then
+      finished = true
+      release()
+      resolve({ code = -1, stdout = "", stderr = "", spawn_error = tostring(spawned) })
+      return
+    end
+    proc = spawned
     if ctx.on_cancel then
       ctx.on_cancel(function() kill_tree("sigkill") end)
     end
@@ -389,6 +419,9 @@ return function(input, ctx)
       end, 2000)
     end, timeout_ms)
   end)
+  if res.spawn_error then
+    return "exit code: " .. tostring(res.code) .. " (could not spawn: " .. res.spawn_error .. ")"
+  end
 
   -- Diagnostics land on either stream (compilers use stderr, many test
   -- runners stdout); feed both, in that order, to the errorformat parser.
@@ -464,6 +497,160 @@ return function(input, ctx)
     end
   end
   return table.concat(out, "\n")
+end
+]==],
+  })
+
+  -- --------------------------------------------------------- subprocess gate
+  --
+  -- A counting semaphore shared by the shell tools and grep bounds how many
+  -- straps-launched processes run at once across every session in this
+  -- Neovim. Four redefinable entries: fn.subprocess_in_flight reads the
+  -- counter, fn.subprocess_limit is the policy (how many may run), fn.
+  -- subprocess_threads derives rg's --threads from the same numbers, and fn.
+  -- subprocess_acquire is the mechanism (counter, FIFO waiters, release). A
+  -- plugin replaces any one of them; the default acquire consults the default
+  -- limit at every admission, so the two compose through the registry.
+
+  define({
+    name = "fn.subprocess_in_flight",
+    kind = "fn",
+    doc = "Number of straps-launched subprocesses holding a slot right now"
+      .. " (bash, run_in_terminal, run_quickfix, grep), across every session in"
+      .. " this Neovim. A read accessor over registry.subprocess_state(), the"
+      .. " counter fn.subprocess_acquire's take/release write; fn.subprocess_threads"
+      .. " reads it, and a redefined fn.subprocess_limit can.",
+    source = [==[
+return function()
+  return require("straps.registry").subprocess_state().in_flight
+end
+]==],
+  })
+
+  define({
+    name = "fn.subprocess_limit",
+    kind = "fn",
+    doc = "Policy: how many straps-launched subprocesses may run at once."
+      .. " Default config.max_subprocesses (nil => 2 * CPU count), halved while"
+      .. " the 1-minute load average exceeds 2 * CPU count. Consulted at every"
+      .. " admission, so a redefinition takes effect on the next waiter."
+      .. " Redefine for session-count weighting, a time budget, or an external"
+      .. " signal; return a number >= 1.",
+    source = [==[
+return function()
+  local ncpu = vim.uv.available_parallelism() or 1
+  local raw
+  pcall(function() raw = require("straps").config.max_subprocesses end)
+  local limit = math.floor(tonumber(raw) or (2 * ncpu))
+  local load = vim.uv.loadavg() or 0
+  if load > 2 * ncpu then
+    limit = math.floor(limit / 2)
+  end
+  return math.max(1, limit)
+end
+]==],
+  })
+
+  define({
+    name = "fn.subprocess_threads",
+    kind = "fn",
+    doc = "Thread count for a search process started now (grep passes it as"
+      .. " rg --threads): CPU count divided by the slots in flight, floor 1."
+      .. " A lone session gets every core; a fan-out shares them.",
+    source = [==[
+return function()
+  local ncpu = vim.uv.available_parallelism() or 1
+  local busy = require("straps.registry").try_call("fn.subprocess_in_flight") or 0
+  return math.max(1, math.floor(ncpu / math.max(1, busy)))
+end
+]==],
+  })
+
+  define({
+    name = "fn.subprocess_acquire",
+    kind = "fn",
+    doc = "Mechanism: take one subprocess slot, waiting (through ctx.await)"
+      .. " while fn.subprocess_in_flight >= fn.subprocess_limit. Called as"
+      .. " (ctx, info) with info = { tool, bufnr, cmd }; returns a release"
+      .. " function that is idempotent and also registered via ctx.on_cancel,"
+      .. " so a cancelled or backstop-resumed holder frees its slot. Release"
+      .. " runs before the kill, so a process that survives its group kill runs"
+      .. " uncounted and the gate stays open. FIFO admission; a parked waiter"
+      .. " whose run was cancelled declines its slot, and a run cancelled between"
+      .. " admission and resume errors instead of starting its process. Waiters"
+      .. " admitted from a vim.system exit callback are admitted on the main loop"
+      .. " in the global registry scope; admissions from a tool body run in that"
+      .. " session's scope, so define fn.subprocess_limit globally. A ctx without"
+      .. " await (direct registry.call) is admitted at once and may exceed the"
+      .. " limit by one. Redefine for priority or"
+      .. " per-session fairness; keep the (ctx, info) -> release contract. Tool"
+      .. " bodies pcall the spawn and release on the error path, so a spawn that"
+      .. " raises (EAGAIN) cannot leak the slot.",
+    source = [==[
+return function(ctx, info)
+  local registry = require("straps.registry")
+  local st = registry.subprocess_state()
+  local function drain()
+    local limit = registry.try_call("fn.subprocess_limit") or math.huge
+    while st.in_flight < limit and #st.waiters > 0 do
+      local admit = table.remove(st.waiters, 1)
+      admit()
+    end
+  end
+  local held = false
+  local function release()
+    if not held then return end
+    held = false
+    st.in_flight = st.in_flight - 1
+    if #st.waiters > 0 then
+      if vim.in_fast_event() then vim.schedule(drain) else drain() end
+    end
+  end
+  local function take()
+    held = true
+    st.in_flight = st.in_flight + 1
+  end
+  drain()
+  local limit = registry.try_call("fn.subprocess_limit") or math.huge
+  if st.in_flight < limit and #st.waiters == 0 then
+    take()
+  elseif not (ctx and ctx.await) then
+    take()
+  else
+    local waiter
+    local function drop()
+      for i, w in ipairs(st.waiters) do
+        if w == waiter then table.remove(st.waiters, i) break end
+      end
+    end
+    local admitted = ctx.await(function(resolve)
+      waiter = function()
+        if ctx.cancelled and ctx.cancelled() then
+          resolve(false)
+          return
+        end
+        take()
+        resolve(true)
+      end
+      st.waiters[#st.waiters + 1] = waiter
+      if ctx.on_cancel then
+        ctx.on_cancel(function()
+          drop()
+          release()
+          resolve(false)
+        end)
+      end
+    end)
+    if not admitted or (ctx.cancelled and ctx.cancelled()) then
+      drop()
+      release()
+      error("subprocess slot wait cancelled" .. (info and info.tool and (" (" .. info.tool .. ")") or ""))
+    end
+  end
+  if ctx and ctx.on_cancel then
+    ctx.on_cancel(release)
+  end
+  return release
 end
 ]==],
   })

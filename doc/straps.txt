@@ -353,6 +353,12 @@ max_spawn_depth		(number) 1. How deep subagents nest: 1 lets a
 			everywhere. Clamped to [0, 6] by |fn.spawn_depth_limit|.
 			See |straps-subagents| for the permission ceiling a
 			nested spawner is under.
+max_subprocesses	(number|nil) nil -> 2 * CPU count. How many
+			straps-launched subprocesses (`bash`, `run_in_terminal`,
+			`run_quickfix`, `grep`) may run at once across every
+			session in this Neovim. Read by |fn.subprocess_limit| at
+			every admission; a call past the limit parks in
+			ctx.await until a slot frees. See |straps-subprocesses|.
 instructions_files	(list) {}. Extra memory files included in the system
 			prompt after AGENTS.md/CLAUDE.md.
 session_dir		(string|nil) nil -> stdpath("data")/straps/sessions.
@@ -867,6 +873,52 @@ fn.log(ev)			Append a JSONL event to |straps-config|
 fn.autocmd_bridge(spec)		Bridge a Neovim autocmd back into a session as
 				a user/steering message — the "editor talks to
 				the agent" seam.
+
+						*straps-subprocesses*
+SUBPROCESS GATE~
+
+A counting semaphore shared by `bash`, `run_in_terminal`, `run_quickfix` and
+`grep` bounds how many straps-launched processes run at once across every
+session in this Neovim. Without it, N sessions together start N times the
+processes one session would. Four entries, each redefinable on its own; a
+plugin shadows the one it wants:
+
+						*fn.subprocess_in_flight*
+fn.subprocess_in_flight()
+		Slots held right now: a read accessor over the counter that
+		|fn.subprocess_acquire|'s take/release write.
+		|fn.subprocess_threads| reads it; a redefined limit fn can.
+
+						*fn.subprocess_limit*
+fn.subprocess_limit()
+		Policy: how many may run. Default `max_subprocesses` (nil
+		-> 2 * CPU count), halved while the 1-minute load average
+		exceeds 2 * CPU count. Consulted at every admission.
+
+						*fn.subprocess_threads*
+fn.subprocess_threads()
+		CPU count divided by the slots in flight, floor 1. `grep`
+		passes it as `rg --threads`, so a lone session searches
+		with every core and a fan-out shares them.
+
+						*fn.subprocess_acquire*
+fn.subprocess_acquire({ctx}, {info})
+		Mechanism: take a slot, waiting through `ctx.await` while
+		in_flight >= limit (FIFO). `info` is `{ tool, bufnr, cmd }`.
+		Returns an idempotent release function, also registered via
+		`ctx.on_cancel`, so a cancelled or backstop-resumed holder
+		frees its slot. Release runs before the kill, so a process
+		that survives its group kill runs uncounted; the gate stays
+		open. A parked waiter whose run was cancelled declines its
+		slot, and a run cancelled between admission and resume errors
+		instead of starting its process. Waiters admitted from a
+		`vim.system` exit callback are admitted on the main loop in
+		the global registry scope; admissions from a tool body run in
+		that session's scope, so define a replacement limit fn
+		globally. A ctx without await is admitted at once and may
+		exceed the limit by one. The tools pcall the spawn and release
+		on failure, so EAGAIN cannot leak a slot. Redefine for
+		priority or per-session fairness.
 
 ==============================================================================
 10. SKILLS						*straps-skills*

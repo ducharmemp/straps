@@ -33,6 +33,16 @@ local guards_frozen = false
 -- variable is writable by any Lua the agent runs; a module upvalue is not.
 local grants = {}
 
+-- The subprocess semaphore's state: slots in flight and the FIFO of waiters
+-- (fn.subprocess_acquire in layers/exec.lua). One table per Neovim, shared
+-- by every session, kept here so a redefined acquire or limit fn reads the
+-- same counter as the default.
+local subprocess = { in_flight = 0, waiters = {} }
+
+function M.subprocess_state()
+  return subprocess
+end
+
 -- Which tool.* body is executing, two views:
 --   executing_name[co]      coroutine -> tool name (for info.executing)
 --   executing_for[bufnr]    session -> weak set of coroutines running a tool

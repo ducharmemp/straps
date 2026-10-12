@@ -136,6 +136,8 @@ Straps is not a sandbox. Approved commands, Lua, file changes, and trusted regis
 
 Every tool call passes a guard chain you install in `stdpath("config")/straps/init.lua` and the agent cannot modify (`:help straps-guards`). No guard ships by default. A guard is a filter and a tripwire, not a boundary: an approved `eval_lua` or `bash` call runs in the same Lua state as the guard.
 
+Subprocesses the tools `bash`, `run_in_terminal`, `run_quickfix` and `grep` start share one semaphore across every session in the Neovim, default 2 × CPU count (`max_subprocesses`), halved while the load average exceeds 2 × CPU count, so N sessions together do not start N times one session's processes. The limit, the counter and the admission mechanism are each a redefinable `fn` (`:help straps-subprocesses`). Outside the gate: the provider's `curl` and `gzip`, `fetch_url`'s `curl`, and whatever a gated command starts on its own (`xargs -P`, `parallel`, `for … & done`).
+
 Providers receive API credentials and full conversation payloads. Session transcripts persist under Neovim's data directory and can contain prompts, source code, and tool output.
 
 Read [SECURITY.md](SECURITY.md) before you use custom endpoints or trust project configuration.

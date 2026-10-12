@@ -80,6 +80,12 @@ M.config = {
   -- fits the registry's scope-chain walk. A gated child (readonly/allow) can
   -- only grant its own children a subset of its own grants.
   max_spawn_depth = 1,
+  -- How many straps-launched subprocesses (bash, run_in_terminal,
+  -- run_quickfix, grep) may run at once across every session in this Neovim.
+  -- nil means 2 * CPU count. fn.subprocess_limit reads it at every admission
+  -- and halves it while the 1-minute load average exceeds 2 * CPU count; a
+  -- waiter parks in ctx.await until a slot frees.
+  max_subprocesses = nil,
   -- Extra instruction files for fn.system_prompt_project, included verbatim
   -- after the auto-discovered AGENTS.md/CLAUDE.md. Paths, absolute or
   -- relative to cwd; unreadable entries are skipped silently.

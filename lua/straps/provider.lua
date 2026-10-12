@@ -662,7 +662,7 @@ return function(req, ctx)
       "-w", "%{stderr}\nSTRAPS_HTTP_STATUS:%{http_code}\n",
       "--data-binary", "@-",
     })
-    proc = vim.system(argv, { stdin = wire, stdout = on_stdout }, function(res)
+    local ok_spawn, spawned = pcall(vim.system, argv, { stdin = wire, stdout = on_stdout }, function(res)
       watchdog_close()
       if ctx.cancelled() then
         resolve({ ok = true, cancelled = true, content = {}, stop_reason = "cancelled" })
@@ -690,6 +690,15 @@ return function(req, ctx)
           or nil,
       })
     end)
+    -- A vim.system that raises (EAGAIN, ENOMEM) resolves as a curl-level
+    -- failure, so the retry loop below backs off and retries instead of the
+    -- run dying on an escaped error.
+    if not ok_spawn then
+      watchdog_close()
+      resolve({ ok = false, err = "curl could not be spawned: " .. tostring(spawned) })
+      return
+    end
+    proc = spawned
 
     watchdog_reset() -- arm at spawn: a server that never sends a byte still trips it
 
@@ -1106,7 +1115,7 @@ return function(req, ctx)
       end
     end
 
-    proc = vim.system({
+    local ok_spawn, spawned = pcall(vim.system, {
       "curl", "-sS", "--no-buffer",
       "-X", "POST", base_url .. "/v1/responses",
       "-H", "Authorization: Bearer " .. api_key,
@@ -1136,6 +1145,12 @@ return function(req, ctx)
           or nil,
       })
     end)
+    if not ok_spawn then
+      watchdog_close()
+      resolve({ ok = false, err = "curl could not be spawned: " .. tostring(spawned) })
+      return
+    end
+    proc = spawned
 
     watchdog_reset()
     ctx.on_cancel(function()

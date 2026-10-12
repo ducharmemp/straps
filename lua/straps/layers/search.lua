@@ -181,7 +181,8 @@ end
       .. " — only search files matching this glob, e.g. '*.lua'; case_insensitive"
       .. " (optional, default false); fixed_string (optional, default false) —"
       .. " treat pattern as a literal string, not a regex; context (optional) —"
-      .. " show this many lines around each match.",
+      .. " show this many lines around each match; timeout_ms (optional, default"
+      .. " 30000) — the search is killed after this long and reports a timeout.",
     input_schema = {
       type = "object",
       properties = {
@@ -191,15 +192,27 @@ end
         case_insensitive = { type = "boolean", description = "Match case-insensitively (default false)." },
         fixed_string = { type = "boolean", description = "Treat pattern as a literal string, not a regex (default false)." },
         context = { type = "integer", description = "Lines of context to show around each match." },
+        timeout_ms = { type = "integer", description = "Kill the search after this many milliseconds (default 30000)." },
       },
       required = { "pattern" },
     },
     source = [==[
 return function(input, ctx)
   local context = tonumber(input.context)
+  local registry = require("straps.registry")
+  if not (ctx and ctx.await) then
+    error("grep: requires a run ctx (ctx.await)")
+  end
+  local release = registry.try_call("fn.subprocess_acquire", ctx,
+    { tool = "grep", bufnr = ctx.bufnr, cmd = input.pattern }) or function() end
   local cmd
   if vim.fn.executable("rg") == 1 then
+    local ok_threads, threads = pcall(registry.try_call, "fn.subprocess_threads")
     cmd = { "rg", "--line-number", "--no-heading", "--color=never" }
+    if ok_threads and type(threads) == "number" then
+      cmd[#cmd + 1] = "--threads"
+      cmd[#cmd + 1] = tostring(math.max(1, math.floor(threads)))
+    end
     if input.case_insensitive then cmd[#cmd + 1] = "-i" end
     if input.fixed_string then cmd[#cmd + 1] = "-F" end
     if context and context > 0 then
@@ -225,13 +238,33 @@ return function(input, ctx)
   cmd[#cmd + 1] = "--"
   cmd[#cmd + 1] = input.pattern
   cmd[#cmd + 1] = input.path or "."
+  local timeout_ms = tonumber(input.timeout_ms) or 30000
+  local timed_out = false
   local res = ctx.await(function(resolve)
-    local proc = vim.system(cmd, { text = true }, function(out) resolve(out) end)
+    local ok_spawn, proc = pcall(vim.system, cmd, { text = true }, function(out)
+      release()
+      resolve(out)
+    end)
+    if not ok_spawn then
+      release()
+      resolve({ code = -1, stdout = "", stderr = "could not spawn: " .. tostring(proc) })
+      return
+    end
     if ctx.on_cancel then
       ctx.on_cancel(function() pcall(function() proc:kill(9) end) end)
     end
+    vim.defer_fn(function()
+      if proc and not proc:is_closing() then
+        timed_out = true
+        pcall(function() proc:kill(9) end)
+      end
+    end, timeout_ms)
   end)
   local out = res.stdout or ""
+  if timed_out then
+    return ("grep timed out after %d ms (killed); narrow the pattern or path, or pass timeout_ms"):format(timeout_ms)
+      .. (out ~= "" and ("\npartial output:\n" .. require("straps.state").utf8_cut(out, 20000)) or "")
+  end
 
   -- Populate the session's findings list from the matches so the user can step
   -- them and bulk_replace over them. This is a pure side effect: the text summary

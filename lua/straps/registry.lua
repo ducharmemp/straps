@@ -714,6 +714,20 @@ function M.clear_grants(bufnr, prefix)
   return removed
 end
 
+--- The grant-set key for a tool-name grant: "<name>@v<version>" of the entry
+--- the active scope resolves ("<name>@v<version>@<bufnr>" for a session-scoped
+--- entry), or the bare name when no such tool exists. A name grant names a
+--- definition: a session shadow or a redefinition bumps the version (define
+--- reuses the shadowed entry's version as its base), and the scope suffix keeps
+--- a shadow's key apart from a later global redefinition at the same version.
+function M.tool_grant_key(name)
+  local e = resolve("tool." .. tostring(name))
+  if not e then return tostring(name) end
+  local key = tostring(name) .. "@v" .. tostring(e.version)
+  if e.scope ~= nil then key = key .. "@" .. tostring(e.scope) end
+  return key
+end
+
 --- A copy of the grant set for bufnr (key -> true); empty when none.
 function M.granted(bufnr)
   local out = {}

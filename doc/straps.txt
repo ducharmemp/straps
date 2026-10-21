@@ -476,7 +476,11 @@ table, so writes to it change nothing. To chain onto a previous definition
 the guard chain (|hook.guard|). Entry storage is private to the module;
 `registry.entries` and `registry.scopes` do not exist. Grants live in the
 registry too (`registry.grant`, `registry.granted`, `registry.clear_grants`;
-see |straps-auto|). A scope's parent is fixed when the scope is created.
+see |straps-auto|). A tool-name grant is keyed `<name>@v<version>`, plus
+`@<bufnr>` for a session-scoped entry (`registry.tool_grant_key(name)`), so a
+session shadow or a redefinition of that tool no longer matches the grant:
+the default |hook.confirm| prompts again, a subagent's gate denies. A scope's
+parent is fixed when the scope is created.
 
 ==============================================================================
 7. TOOLS						*straps-tools*
@@ -581,8 +585,11 @@ hook.confirm(name, input, ctx) -> allowed, reason
 		|:StrapsAuto| or a subagent `allow`); otherwise prompt
 		(Yes / No / Always this tool / for edits, Always in <dir>
 		/ Always all edits), showing a diff for file edits. Grants
-		persist via `registry.grant`. Never loosen this on the
-		agent's initiative. See |straps-auto|.
+		persist via `registry.grant`; "Always this tool" stores
+		`registry.tool_grant_key(name)` (`<name>@v<version>[@<bufnr>]`), so a
+		redefinition or session shadow of the tool prompts again.
+		Never loosen this on the agent's initiative. See
+		|straps-auto|.
 
 						*hook.guard* *straps-guards*
 hook.guard.<suffix>(op, ...) -> verdict, reason
@@ -803,10 +810,12 @@ fn.capability(name, input) -> category
 				Classify a tool call into a permission category:
 				`read` (auto-allowed), `edit`, `delete`, `exec`,
 				`lua`, `net`, `define`, `spawn` (spawn, spawn_wait
-				and send_message), or `other`. Called
+				and send_message), or `agent_tool` (an unknown
+				tool, or any tool resolved from a session scope
+				without a trusted `capability` field). Called
 				with no arguments it returns the grantable list
 				({edit, delete, exec, lua, net, spawn}); `read`
-				needs no grant, and `define`/`other` are never
+				needs no grant, and `define`/`agent_tool` are never
 				grantable. |hook.confirm|, |fn.readonly_policy|,
 				|:StrapsAuto|, and subagent `allow` all read it, so
 				redefine it to add a custom category. See
@@ -1099,7 +1108,7 @@ Auto mode grants whole permission categories so the matching tool calls run
 without a confirm prompt. |fn.capability| classifies every call into a
 category. The grantable categories are `edit`, `delete`, `exec`, `lua`, `net`,
 and `spawn`. The `read` category is always auto-allowed. The `define` and
-`other` categories are never grantable.
+`agent_tool` categories are never grantable.
 
 Grant categories to the current session with |:StrapsAuto|: >vim
 	:StrapsAuto edit,exec   " allow edits and shell commands

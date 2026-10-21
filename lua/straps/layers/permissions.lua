@@ -23,8 +23,8 @@ function M.register()
       .. " read (view/list, always auto-allowed), edit (file writes), delete"
       .. " (not undo-reversible, its own category), exec (shell), lua (eval_lua),"
       .. " net (fetch_url), define (registry_define — never grantable, a define"
-      .. " grant could shadow hook.confirm), spawn (subagents and send_message), and other"
-      .. " (agent-defined tools — never grantable). Called with no args it"
+      .. " grant could shadow hook.confirm), spawn (subagents and send_message), and agent_tool"
+      .. " (agent-defined tools, including session shadows of builtin names — never grantable). Called with no args it"
       .. " returns the array of GRANTABLE categories { edit, delete, exec, lua,"
       .. " net, spawn }. Redefine it to add custom categories — e.g. classify"
       .. " bash inputs matching ^git%s into a \"vcs\" category. A tool.* entry's"
@@ -41,6 +41,7 @@ return function(name, input)
   -- self-declare "read").
   local e = require("straps.registry").get("tool." .. tostring(name))
   if e and type(e.capability) == "string" then return e.capability end
+  if e and e.scope ~= nil then return "agent_tool" end
 
   local read = {
     read_file = true, glob = true, tree = true, path_info = true, grep = true,
@@ -83,7 +84,7 @@ return function(name, input)
 
   -- transcript_excise with no blocks/range only lists the transcript's blocks
   -- (read-only); an actual excision rewrites the transcript, which is the most
-  -- consequential write in the system and always prompts (the "other"
+  -- consequential write in the system and always prompts (the "agent_tool"
   -- fallthrough below, never grantable).
   if name == "transcript_excise" and type(input) == "table"
     and input.blocks == nil and input.range == nil then
@@ -112,7 +113,7 @@ return function(name, input)
   if name == "spawn" or name == "spawn_wait" or name == "send_message" then return "spawn" end
 
   -- Agent-defined tools: unknown, never grantable.
-  return "other"
+  return "agent_tool"
 end
 ]==],
   })
@@ -165,7 +166,8 @@ end
       .. " directory (not just that one file), the project choice grants every"
       .. " edit anywhere under the detected project root, and 'Always all edits'"
       .. " grants every future write_file/edit_file/patch_file call regardless of path."
-      .. " Other tools get Yes / No / 'Always this tool', scoped to the tool name. All"
+      .. " Other tools get Yes / No / 'Always this tool', scoped to the tool's current definition"
+      .. " (registry.tool_grant_key: <name>@v<version>[@<bufnr>], so a redefinition or session shadow prompts again). All"
       .. " grants persist in the registry's per-session grant set (registry.granted). A cap:<category> key"
       .. " in that allow-set (written by :StrapsAuto or spawn's allow arg) silently"
       .. " permits every call fn.capability puts in that category. Redefine to"
@@ -263,7 +265,7 @@ return function(name, input, ctx)
       end
     end
   else
-    if have_allowed and allowed[name] then
+    if have_allowed and allowed[require("straps.registry").tool_grant_key(name)] then
       return true
     end
   end
@@ -418,7 +420,7 @@ return function(name, input, ctx)
     return true
   end
   if (not is_edit) and choice == 3 then
-    grant(name)
+    grant(require("straps.registry").tool_grant_key(name))
     return true
   end
 

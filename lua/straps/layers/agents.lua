@@ -136,7 +136,9 @@ function M.register_spawn()
       .. " allow (optional array) — grant these permission categories (edit,"
       .. " delete, exec, lua, net, spawn) or specific tool names to the child:"
       .. " granted calls run without prompting, everything else is DENIED"
-      .. " (no prompt), readonly and allow are mutually exclusive — a session"
+      .. " (no prompt); a tool-name grant covers the tool's current definition, so"
+      .. " a child that shadows that tool, or any redefinition of it, is denied under it;"
+      .. " readonly and allow are mutually exclusive — a session"
       .. " that is itself readonly/allow-gated can grant only a subset of its"
       .. " own grants, and its children default to readonly; nesting depth is"
       .. " capped by config.max_spawn_depth; show (optional boolean) —"
@@ -183,7 +185,7 @@ return function(input, ctx)
   -- allow: grant permission categories or specific tool names to the child.
   -- readonly is the same mechanism with an empty grant set, so the two are
   -- mutually exclusive. Validate every entry up front: it must be a grantable
-  -- category or an existing tool, so "define"/"other" (not grantable) and typos
+  -- category or an existing tool, so "define"/"agent_tool" (not grantable) and typos
   -- error here instead of silently granting nothing.
   if input.readonly and type(input.allow) == "table" then
     error("spawn: readonly and allow are mutually exclusive (readonly is allow={})")
@@ -230,7 +232,7 @@ return function(input, ctx)
           -- every input.
           local cap = registry.try_call("fn.capability", entry)
           if cap == "read" then cap = registry.try_call("fn.capability", entry, { index = 1 }) end
-          within = cap == "read" or parent_grants[entry] == true
+          within = cap == "read" or parent_grants[registry.tool_grant_key(entry)] == true
             or (type(cap) == "string" and parent_grants["cap:" .. cap] == true)
         end
         if not within then
@@ -325,7 +327,7 @@ return function(input, ctx)
         if is_grantable[entry] then
           registry.grant(child, "cap:" .. entry)
         else
-          registry.grant(child, entry) -- tool-name grant
+          registry.grant(child, registry.tool_grant_key(entry))
         end
       end
     end
@@ -351,7 +353,7 @@ return function(name, tin, tctx)
   end)
   if type(allowed) == "table" then
     if cap and allowed["cap:" .. tostring(cap)] then return true end
-    if allowed[name] then return true end
+    if allowed[reg.tool_grant_key(name)] then return true end
   end
   -- A gated child can always report to its parent: the parent-only shape is
   -- the one message a research child must be able to send, and the tool body

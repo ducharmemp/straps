@@ -922,6 +922,28 @@ it("a gated child can grant its own children only a subset of its grants", funct
     ok, err = try({ task = "N-WIDER", allow = { "lua" } }, named)
     assert(not ok and err:find("exceeds this session's own grants", 1, true),
       "a tool name must not widen into its category: " .. err)
+    assert(registry.granted(named)["eval_lua@v1"],
+      "the name grant is versioned: " .. vim.inspect(registry.granted(named)))
+    local prev_named = registry.set_active_scope(named)
+    registry.define({ name = "tool.eval_lua", kind = "tool", doc = "shadow",
+      source = "return function() return 'shadowed' end" })
+    registry.set_active_scope(prev_named)
+    ok, err = try({ task = "N-SHADOW", allow = { "eval_lua" } }, named)
+    assert(not ok and err:find("exceeds this session's own grants (cap:spawn, eval_lua@v1)", 1, true),
+      "a shadowed tool name must not delegate under the old key: " .. err)
+    registry.grant(named, "eval_lua@v2@" .. named)
+    local shadow_gc
+    ok, err, shadow_gc = try({ task = "N-SHADOW-OK", allow = { "eval_lua" } }, named)
+    assert(ok and err:find("subagent started", 1, true),
+      "a held session-scoped tool should delegate under its own key: " .. err)
+    assert(registry.granted(shadow_gc)["eval_lua@v2@" .. named],
+      "the grandchild holds the parent-scoped key: " .. vim.inspect(registry.granted(shadow_gc)))
+    local prev_gc = registry.set_active_scope(shadow_gc)
+    local ok_gc, allowed_gc = pcall(registry.call, "hook.confirm", "eval_lua", { code = "return 1" },
+      { bufnr = shadow_gc })
+    registry.set_active_scope(prev_gc)
+    assert(ok_gc, allowed_gc)
+    assert(allowed_gc == true, "the grandchild's gate must pass the parent's session-scoped tool")
     -- A non-array allow is an error, never a silently ungated child.
     ok, err = try({ task = "N-STRING", allow = "edit" }, named)
     assert(not ok and err:find("allow must be an array", 1, true),
@@ -1240,7 +1262,7 @@ it("fn.capability classifies every category and its input-split arms", function(
   assert(cap("fetch_url") == "net", "fetch_url -> net")
   assert(cap("registry_define") == "define", "registry_define -> define")
   assert(cap("spawn") == "spawn", "spawn -> spawn")
-  assert(cap("some_unknown_tool") == "other", "unknown -> other")
+  assert(cap("some_unknown_tool") == "agent_tool", "unknown -> agent_tool")
   -- input-split tools, both arms each.
   assert(cap("code_action", {}) == "read", "code_action list -> read")
   assert(cap("code_action", { index = 1 }) == "edit", "code_action apply -> edit")
@@ -1330,6 +1352,94 @@ end
   local ctext = buf_text(child)
   assert(ctext:find("is not covered by this child's grants", 1, true),
     "bash should be denied as not covered:\n" .. ctext:sub(-400))
+end)
+
+it("spawn allow={write_file}: the child's own shadow of write_file is denied under the name grant", function()
+  allow_all()
+  local orig_confirm = vim.fn.confirm
+  vim.fn.confirm = function() error("confirm prompt reached in the gated child") end
+  local target = vim.fn.tempname()
+  _G.__shadow_target = target
+  define("fn.provider", "fn", "test: allow=write_file child writes, shadows write_file, writes again", [==[
+return function(req, ctx)
+  local first_user
+  for _, m in ipairs(req.messages) do
+    if m.role == "user" then
+      for _, p in ipairs(m.content) do
+        if p.type == "text" then first_user = p.text; break end
+      end
+      break
+    end
+  end
+  if not (first_user and first_user:find("SHADOW-TASK", 1, true)) then
+    error("unexpected non-child request in shadow test")
+  end
+  local n = #req.messages
+  ctx.await(function(resolve)
+    vim.defer_fn(function()
+      if n >= 5 then ctx.emit({ type = "text_delta", text = "shadow-done" }) end
+      resolve()
+    end, 5)
+  end)
+  if n == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "w1", name = "write_file",
+        input = { path = _G.__shadow_target, content = "first" } },
+    } }
+  elseif n == 3 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "d1", name = "registry_define",
+        input = { name = "tool.write_file", kind = "tool", doc = "shadow",
+          source = "return function() _G.__shadow_ran = true return 'shadow ran' end" } },
+    } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "shadow-done" } } }
+end
+]==])
+
+  local parent = vim.api.nvim_create_buf(true, false)
+  local ok, out = pcall(function()
+    return drive(function(ctx)
+      ctx.bufnr = parent
+      local started = registry.call("tool.spawn",
+        { task = "SHADOW-TASK: write, shadow, write.", allow = { "write_file" } }, ctx)
+      local child = tonumber(started:match("buffer (%d+)"))
+      return registry.call("tool.spawn_wait", { buffers = { child } }, ctx)
+    end)
+  end)
+  vim.fn.confirm = orig_confirm
+  assert(ok, "drive errored (confirm prompt reached?): " .. tostring(out))
+  assert(out:find("shadow-done", 1, true), "child did not finish: " .. out)
+  assert(table.concat(vim.fn.readfile(target), "\n") == "first",
+    "the builtin write_file ran once under the name grant")
+  local child
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) and buf_text(b):find("SHADOW-TASK", 1, true)
+      and vim.b[b].straps_session then
+      child = b
+    end
+  end
+  assert(child, "shadow child buffer not found")
+  assert(registry.granted(child)["write_file@v1"], "the child holds the versioned name key: "
+    .. vim.inspect(registry.granted(child)))
+  local ctext = buf_text(child)
+  assert(ctext:find("registry_define is not covered by this child's grants", 1, true),
+    "registry_define is denied in the child:\n" .. ctext:sub(-600))
+  assert(_G.__shadow_ran == nil, "no shadow body should have run")
+  local prev = registry.set_active_scope(child)
+  local ok_d, derr = pcall(registry.define, {
+    name = "tool.write_file", kind = "tool", doc = "shadow",
+    source = "return function() _G.__shadow_ran = true return 'shadow ran' end" })
+  local key = registry.tool_grant_key("write_file")
+  local ok_c, allowed, reason = pcall(registry.call, "hook.confirm", "write_file",
+    { path = target, content = "third" }, { bufnr = child })
+  registry.set_active_scope(prev)
+  assert(ok_d, derr)
+  assert(key == "write_file@v2@" .. child, "the session shadow bumps the key: " .. key)
+  assert(ok_c, allowed)
+  assert(allowed == false, "the child's shadow of write_file must not pass under the name grant")
+  assert(tostring(reason):find("write_file is not covered by this child's grants (write_file@v1)", 1, true),
+    "the denial lists the versioned key, got: " .. tostring(reason))
 end)
 
 it("spawn allow validation rejects bad entries and readonly+allow", function()

@@ -140,11 +140,22 @@ end
   through its overlay). `loop.start` creates every session's scope.
 - `grant(bufnr, key)`, `clear_grants(bufnr, prefix) -> removed[]`,
   `granted(bufnr) -> copy` — the per-session permission grants (`cap:<cat>`,
-  `editdir:<dir>`, `editfiles:*`, `<toolname>`). `grant` refuses when `bufnr`
+  `editdir:<dir>`, `editfiles:*`, `<toolname>@v<version>[@<bufnr>]`). `grant` refuses when `bufnr`
   is the active session AND a tool body is executing on this coroutine, so a
   tool (eval_lua) cannot award its own session a grant; `hook.confirm`'s
   remember-grant (runs in the gate), `:StrapsAuto` (no run) and spawn (grants
   the child) are unaffected.
+- `tool_grant_key(name) -> string` — the key a tool-name grant is written and
+  read under: `<name>@v<version>` of the `tool.<name>` entry the active scope
+  resolves, with `@<bufnr>` appended for a session-scoped entry (the bare name
+  when none exists). A name grant names a definition: `define` bases a session
+  shadow's version on the shadowed entry's, so the shadow (or any
+  redefinition, global ones included) resolves to a new key; the scope suffix
+  keeps a shadow's key apart from a later global redefinition that reaches the
+  same version. Under the default `hook.confirm` the stale key means a new
+  prompt; under spawn's child gate it means a denial, since that gate never
+  prompts. Every reader (`hook.confirm`, spawn's child gate and allow ceiling)
+  and writer ("Always this tool", spawn `allow`) goes through it.
 - `freeze_guards()`, `guards_frozen()`, `guard_entries() -> copy[]` — see
   "Tool-call guards".
 - `render(name) -> string` — the entry as an executable Lua chunk (see ui.lua):
@@ -174,7 +185,12 @@ input schema has no such property), so an agent-defined tool can never
 self-declare a category like `"read"`; only a trusted definition path —
 `register()`, user config, a trusted `.straps.lua`, or `registry.define`
 called directly from `eval_lua` — can set it. (`eval_lua` is NOT a trusted
-path for `hook.guard.*`: those are frozen before any run.) The copy `get()`
+path for `hook.guard.*`: those are frozen before any run.) Without the field,
+an entry resolved from a session scope is classified `agent_tool` whatever its
+name, so a session shadow of `bash` or `read_file` is gated as an agent-defined
+tool instead of inheriting the builtin's category: no `cap:` grant covers it,
+and a tool-name grant does not either, because name grants are keyed to the
+entry version (`tool_grant_key`) and the shadow has a new one. The copy `get()`
 returns carries `capability` but writing it is inert.
 
 ### Hook fan-out (multi-subscriber hooks)
@@ -1128,9 +1144,12 @@ API names (registry names prefixed `tool.`):
   a tool name like `registry_define`) — a define grant could shadow the
   child's hook.confirm, so the category ceiling holds for name grants too.
   A tool-name grant otherwise bypasses category ceilings by design
-  (`allow={"eval_lua"}` grants exactly that tool, unprompted).
+  (`allow={"eval_lua"}` grants exactly that tool's current definition,
+  unprompted; a child that shadows `eval_lua` in its own scope is denied, and
+  so is the child after a global redefinition of `eval_lua`, since the gate
+  never prompts).
   Grants are seeded via `registry.grant(child, key)` as `cap:<category>` /
-  `<toolname>` keys BEFORE the child's loop starts (granting the CHILD from
+  `<toolname>@v<version>[@<bufnr>]` (`registry.tool_grant_key`) keys BEFORE the child's loop starts (granting the CHILD from
   the parent's tool body is permitted; only self-grants are refused). The child gets a
   child-scope `hook.confirm` shadow with unified semantics: read-category
   calls and granted categories/tools run unprompted, EVERYTHING ELSE IS
@@ -1294,12 +1313,14 @@ Default hooks registered here:
   index, undo_edit non-history); `delete` (delete_file, delete_files —
   deletion is not undo-reversible, so it is its own category); `exec` (bash,
   run_in_terminal, run_quickfix); `lua` (eval_lua); `net` (fetch_url);
-  `define` (registry_define); `spawn` (spawn, spawn_wait, send_message); `other` (any
-  unknown/agent-defined tool). Called with NO arguments it returns the
+  `define` (registry_define); `spawn` (spawn, spawn_wait, send_message); `agent_tool` (any
+  unknown tool, and any tool resolved from a session scope without a trusted
+  `capability` field — a session shadow of `bash` is classified `agent_tool`, not
+  `exec`). Called with NO arguments it returns the
   GRANTABLE list `{edit, delete, exec, lua, net, spawn}`. `read` needs no
-  grant. `define` and `other` are NEVER grantable — a `define` grant would
-  let the agent shadow `hook.confirm` (an everything grant), and unknown
-  tools cannot be classified.
+  grant. `define` and `agent_tool` are NEVER grantable — a `define` grant would
+  let the agent shadow `hook.confirm` (an everything grant), and agent-defined
+  tools cannot be classified by name.
 - `fn.readonly_policy(name, input) -> boolean` — now a thin wrapper:
   `capability(name, input) == "read"`. Same behavior as before; the
   classification lives in `fn.capability`. Both `hook.confirm` and spawn's
@@ -1311,8 +1332,9 @@ Default hooks registered here:
   `fn.capability` classifies into that category (cap: keys are written by
   `:StrapsAuto` and by spawn's `allow`); for everything else
   `vim.fn.confirm("straps: allow <name>?\n<preview of input>", ...)`
-  — "Always this tool" adds the name to the grant set via
-  `registry.grant(ctx.bufnr, name)`. File edits
+  — "Always this tool" adds `registry.tool_grant_key(name)` (`<name>@v<version>[@<bufnr>]`)
+  to the grant set via `registry.grant(ctx.bufnr, key)`, and the lookup reads the
+  same key, so a later redefinition or session shadow of that tool prompts again. File edits
   (write_file/edit_file/patch_file) get path-scoped grants instead of a
   per-tool toggle: "Always in <parent dir>" stores `editdir:<dir>`
   (matched as a realpath prefix, so it covers the subtree), "Always in
@@ -1804,7 +1826,7 @@ Existing suites must all still pass.
   `{ grants, instruction, send, explicit_split }`: categories are validated
   BEFORE any buffer exists (bad token → notify, nothing created), granted
   as `cap:<c>` via `registry.grant` (the `:StrapsAuto` path, so
-  `hook.confirm` and guards are untouched; `define`/`other` still prompt),
+  `hook.confirm` and guards are untouched; `define`/`agent_tool` still prompt),
   the instruction goes into the trailing user block through
   `state.seed_user` (escape_line'd, so piped text reading as a marker cannot
   forge a block; refuses unless the last block is an empty user block), and

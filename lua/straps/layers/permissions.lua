@@ -366,12 +366,16 @@ return function(name, input, ctx)
     -- Don't offer the project choice when it would be identical to the
     -- immediate parent (editing a file directly in the repo root).
     if root == dir then root = nil end
-    choices = "&Yes\n&No\n&Always in " .. dir
+    -- confirm() hotkeys are case-insensitive: each choice needs a distinct
+    -- letter (an "&Always" here would steal the `a` of "Always &all edits").
+    -- Paths are shown literally, so escape any "&" in them.
+    local function esc(s) return (s:gsub("&", "&&")) end
+    choices = "&Yes\n&No\nAlways in &dir " .. esc(dir)
     local idx = 3
     if root then
       idx = idx + 1
       root_choice_idx = idx
-      choices = choices .. "\nAlways in this &project (" .. root .. ")"
+      choices = choices .. "\nAlways in this &project (" .. esc(root) .. ")"
     end
     idx = idx + 1
     all_choice_idx = idx

@@ -892,7 +892,9 @@ second backend.
   `vim.wait(opts.wait_ms or 50000)` (`fn.list_models` passes 15000);
   `opts.refresh = false` never refreshes (health).
 - **Secrets.** Form bodies go to curl on stdin (`fn.openai_oauth_post`), never
-  argv. Errors carry the HTTP status and the server's `error` code only.
+  argv. A failed token request reports the HTTP status and the full response
+  body (capped at 2000 bytes), with any request form value of 8 or more
+  characters that the server echoes replaced by `[redacted]`.
 
 `fn.system_prompt` default source returns the default system prompt (below).
 

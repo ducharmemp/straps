@@ -1587,16 +1587,19 @@ return function(form, cb)
     end
     local okj, data = pcall(vim.json.decode, out)
     if not status or status < 200 or status > 299 then
-      local detail
-      if okj and type(data) == "table" then
-        if type(data.error) == "string" then
-          detail = data.error
-        elseif type(data.error) == "table" then
-          detail = data.error.code or data.error.type
+      local body = vim.trim(out)
+      for _, v in pairs(oauth.parse_query(form)) do
+        if #v >= 8 then
+          local s, e = body:find(v, 1, true)
+          while s do
+            body = body:sub(1, s - 1) .. "[redacted]" .. body:sub(e + 1)
+            s, e = body:find(v, s + 10, true)
+          end
         end
       end
-      return cb(nil, ("OpenAI OAuth token request failed (HTTP %s)%s"):format(
-        status and tostring(status) or "?", detail and (": " .. tostring(detail)) or ""))
+      if #body > 2000 then body = require("straps.state").utf8_cut(body, 2000) .. "..." end
+      return cb(nil, ("OpenAI OAuth token request failed (HTTP %s): %s"):format(
+        status and tostring(status) or "?", body ~= "" and body or "no response body"))
     end
     if not okj or type(data) ~= "table" then
       return cb(nil, "OpenAI OAuth token response is not a JSON object")

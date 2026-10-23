@@ -35,6 +35,8 @@ case "$*" in
     sleep "$SLEEP"
     if [ "$MODE" = fail ]; then
       printf '{"error":"invalid_grant","error_description":"secret-detail"}\nSTRAPS_HTTP_STATUS:400\n'
+    elif [ "$MODE" = echo ]; then
+      printf '{"error":"invalid_grant","echo":"%%s"}\nSTRAPS_HTTP_STATUS:400\n' "$BODY"
     elif [ "$MODE" = noscope ]; then
       printf '{"access_token":"acc-%%s","refresh_token":"ref-%%s","id_token":"idt","expires_in":3600,"scope":"openid"}\nSTRAPS_HTTP_STATUS:200\n' "$N" "$N"
     else
@@ -283,17 +285,28 @@ it("rejected_access forces a refresh only when it matches the stored token", fun
   assert(c.access ~= "acc-stored" and post_count() == before + 1)
 end)
 
-it("a failed refresh releases the lock, keeps secrets out of the error, and the next call POSTs", function()
+it("a failed refresh releases the lock, reports the full server body, and the next call POSTs", function()
   store(cred_fixture({ expires = 0 }))
   set_mode("fail")
   local c, err = refresh_sync()
   set_mode("ok")
   assert(c == nil and tostring(err):find("HTTP 400", 1, true) and tostring(err):find("invalid_grant", 1, true), tostring(err))
+  assert(tostring(err):find("secret-detail", 1, true), "error_description missing: " .. tostring(err))
   assert(tostring(err):find(":StrapsLogin openai", 1, true))
-  assert(not tostring(err):find("secret-detail", 1, true) and not tostring(err):find("ref-stored", 1, true))
+  assert(not tostring(err):find("ref-stored", 1, true))
   assert(vim.uv.fs_stat(xdg .. "/straps/openai_oauth.lock") == nil, "lock not released after failure")
   local before = post_count()
   assert(refresh_sync() and post_count() == before + 1)
+end)
+
+it("a server body that echoes request secrets is redacted in the error", function()
+  store(cred_fixture({ expires = 0, refresh = "ref-echo-secret-123" }))
+  set_mode("echo")
+  local _, err = refresh_sync()
+  set_mode("ok")
+  assert(tostring(err):find("HTTP 400", 1, true) and tostring(err):find("[redacted]", 1, true), tostring(err))
+  assert(not tostring(err):find("ref-echo-secret-123", 1, true), tostring(err))
+  assert(not tostring(err):find("cid-issued", 1, true), tostring(err))
 end)
 
 it("a refresh with no client_id or a logged-out file fails cleanly", function()

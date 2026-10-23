@@ -1252,6 +1252,58 @@ do
   end)
 end
 
+-- A ChatGPT login is served the Codex catalog shape instead of {data:[{id}]}:
+-- {models:[{slug, display_name, context_window, visibility}]}.
+step(function()
+  vim.fn.mkdir(tmp .. "/models_chatgpt", "p")
+  write_exec(tmp .. "/models_chatgpt/curl", [[#!/usr/bin/env bash
+cat <<'EOF'
+{"models":[
+  {"slug":"gpt-6-sol","display_name":"GPT-6-Sol","context_window":272000,"visibility":"list"},
+  {"slug":"gpt-reserve","display_name":"GPT-Reserve","context_window":272000,"visibility":"hide"},
+  {"slug":"gpt-6-luna","context_window":128000}
+]}
+EOF
+printf '\nSTRAPS_HTTP_STATUS:200\n'
+]])
+end)
+
+do
+  local saved_path, saved_oai_base, saved_oai_key
+  local models, err
+  step(function()
+    saved_path = vim.env.PATH
+    saved_oai_base = straps.config.openai_base_url
+    saved_oai_key = vim.env.OPENAI_API_KEY
+    vim.env.PATH = tmp .. "/models_chatgpt:" .. real_path
+    straps.config.openai_base_url = "http://straps-chatgpt-models.invalid"
+    vim.env.OPENAI_API_KEY = "openai-test-key"
+    models, err = registry.call("fn.list_models", "openai")
+  end)
+
+  it("fn.list_models (openai) parses the ChatGPT catalog: slug as id, display_name as label", function()
+    assert(type(models) == "table", "expected a model list, got err: " .. tostring(err))
+    assert(models[1].id == "gpt-6-sol" and models[1].label == "GPT-6-Sol", "id/label wrong: " .. vim.inspect(models[1]))
+    assert(models[1].thinking == nil, "openai models carry no thinking tag")
+    assert(models[1].context == 272000, "context_window not mapped: " .. vim.inspect(models[1]))
+    assert(models[2].id == "gpt-6-luna" and models[2].label == "gpt-6-luna", "label fallback wrong: " .. vim.inspect(models[2]))
+  end)
+
+  it("fn.list_models (openai) drops ChatGPT catalog entries with visibility=hide", function()
+    assert(type(models) == "table", "expected a model list, got err: " .. tostring(err))
+    assert(#models == 2, "expected 2 visible models, got " .. vim.inspect(models))
+    for _, m in ipairs(models) do
+      assert(m.id ~= "gpt-reserve", "hidden model gpt-reserve was listed: " .. vim.inspect(models))
+    end
+  end)
+
+  step(function()
+    vim.env.PATH = saved_path
+    straps.config.openai_base_url = saved_oai_base
+    vim.env.OPENAI_API_KEY = saved_oai_key
+  end)
+end
+
 step(function()
   vim.env.ANTHROPIC_API_KEY = saved_key
 

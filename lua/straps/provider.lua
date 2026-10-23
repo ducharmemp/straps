@@ -55,6 +55,9 @@ end
 -- reads the same tag): adaptive.supported -> "adaptive", else enabled.supported
 -- -> "budget", else nil (send no thinking block). Returns a list on success, or
 -- (nil, errmsg) on any failure so callers can fall back to the static list.
+-- OpenAI returns {data:[{id}]} for an API key and {models:[{slug,
+-- display_name, context_window, visibility}]} for a ChatGPT login; hidden
+-- ChatGPT entries are dropped.
 local LIST_MODELS_SRC = [==[
 return function(provider_override)
   local registry = require("straps.registry")
@@ -140,15 +143,29 @@ return function(provider_override)
     return nil, "HTTP " .. status .. ": " .. out:sub(1, 300)
   end
   local ok_json, body = pcall(vim.json.decode, out)
-  if not ok_json or type(body) ~= "table" or type(body.data) ~= "table" then
+  if not ok_json or type(body) ~= "table" then
     return nil, "could not parse /v1/models response"
   end
 
   local models = {}
-  for _, m in ipairs(body.data) do
+  local chatgpt_catalog = openai and type(body.data) ~= "table" and type(body.models) == "table"
+  if not chatgpt_catalog and type(body.data) ~= "table" then
+    return nil, "could not parse /v1/models response"
+  end
+  for _, m in ipairs(chatgpt_catalog and body.models or {}) do
+    if type(m) == "table" and type(m.slug) == "string" and m.visibility ~= "hide" then
+      models[#models + 1] = {
+        id = m.slug,
+        label = type(m.display_name) == "string" and m.display_name or m.slug,
+        thinking = nil,
+        context = tonumber(m.context_window),
+      }
+    end
+  end
+  for _, m in ipairs(chatgpt_catalog and {} or body.data) do
     if type(m) == "table" and type(m.id) == "string" then
       if openai then
-        -- OpenAI's /v1/models entries carry no display name or thinking /
+        -- OpenAI API-key catalog entries carry no display name or thinking /
         -- reasoning-effort capabilities, so the id doubles as the label and
         -- static config must opt a model into reasoning.effort explicitly.
         models[#models + 1] = { id = m.id, label = m.id, thinking = nil }
@@ -916,8 +933,9 @@ return function(req, ctx)
     end
     body.tools = tools
   end
-  -- Reasoning effort: OpenAI's /v1/models catalog does not expose which models
-  -- reason, so the configured OpenAI model entry must opt in with
+  -- Reasoning effort: the API-key /v1/models catalog does not expose which
+  -- models reason (the ChatGPT-login catalog does, but fn.list_models does not
+  -- read it), so the configured OpenAI model entry must opt in with
   -- reasoning = true (or reasoning_effort = true). Unlisted models get the
   -- model's own default.
   local reasoning_enabled = false

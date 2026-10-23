@@ -919,9 +919,14 @@ provider it lists GPT models, not Claude ones.
   `max_tokens` for that model.
 - **OpenAI**: `GET {openai_base_url}/v1/models` with `Authorization: Bearer`
   (key from `fn.openai_api_key` with `{ base_url, wait_ms = 15000 }`, so a
-  ChatGPT login token is refused for a custom base URL). OpenAI's catalog carries no display name or
-  thinking/reasoning-effort capabilities, so the id doubles as the label and
-  `thinking` stays `nil`; static `config.openai_models` entries must opt in to
+  ChatGPT login token is refused for a custom base URL). With an API key the
+  catalog is `{data:[{id}]}` and carries no display name or
+  thinking/reasoning-effort capabilities, so the id doubles as the label. With
+  a ChatGPT login the same endpoint returns `{models:[{slug, display_name,
+  context_window, visibility}]}`: `slug` becomes the id, `display_name` the
+  label (falling back to the slug), `context_window` the context, and entries
+  with `visibility = "hide"` are dropped. `thinking` stays `nil` for both
+  shapes; static `config.openai_models` entries must opt in to
   `reasoning.effort` with `reasoning = true` (or `reasoning_effort = true`).
 
 It never throws — any failure (no key, curl error, non-2xx, unparseable body)

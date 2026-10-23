@@ -1690,11 +1690,12 @@ do
     assert(not tostring(err):find("leaky-oai", 1, true), "key must not leak into the error")
   end)
 
-  it("fn.openai_api_key: no env and no file errors naming OPENAI_API_KEY", function()
+  it("fn.openai_api_key: no env and no file errors naming OPENAI_API_KEY and :StrapsLogin", function()
     vim.fn.delete(kd .. "/straps/openai_api_key")
     vim.env.OPENAI_API_KEY = nil
     local ok, err = pcall(registry.call, "fn.openai_api_key")
     assert(not ok and tostring(err):find("OPENAI_API_KEY", 1, true), "wrong error: " .. tostring(err))
+    assert(tostring(err):find(":StrapsLogin openai", 1, true), "error should mention :StrapsLogin: " .. tostring(err))
   end)
 
   step(function()

@@ -14,7 +14,7 @@ Straps puts a coding agent inside the editor instead of beside it. Agents can in
 
 - Neovim >= 0.11
 - `curl` on `PATH`
-- An Anthropic or OpenAI API key
+- An Anthropic or OpenAI API key, or a ChatGPT subscription for the OpenAI provider
 
 Set a key in the environment:
 
@@ -35,6 +35,14 @@ Key files must not be accessible by group or other users. With the default confi
 chmod 600 ~/.config/straps/api_key
 chmod 600 ~/.config/straps/openai_api_key
 ```
+
+To use the OpenAI provider with a ChatGPT subscription instead of an API key, sign in with ChatGPT:
+
+1. Run `:StrapsLogin openai`. Straps opens the ChatGPT sign-in page and prints its URL.
+2. Sign in. The browser then fails to load a `http://127.0.0.1:1455/auth/callback?...` page; that is expected.
+3. Copy the full URL from the address bar and run `:StrapsLogin openai <url>`.
+
+Straps stores the login in `$XDG_CONFIG_HOME/straps/openai_oauth.json` (mode 600) and refreshes it automatically. While a login is stored it takes precedence over `$OPENAI_API_KEY` and the key file; `:StrapsLogout openai` removes it. `:checkhealth straps` reports which source is in use. The login token is only sent to `https://api.openai.com`, so it does not work with a custom `openai_base_url`.
 
 Ripgrep is optional. Straps has no required Lua dependencies.
 
@@ -114,6 +122,8 @@ Both files contain Lua and run with your Neovim process's privileges. Review the
 | `:StrapsAgents` | Open the agent dashboard: session trees, status, details, and management actions. |
 | `:StrapsProvider` | Choose Anthropic or OpenAI. In a session buffer, the choice affects that session. Elsewhere, it persists globally. |
 | `:StrapsModel` | Choose a model for the active provider. |
+| `:StrapsLogin openai [url]` | Sign in with ChatGPT for the OpenAI provider; run again with the browser's redirect URL to finish. |
+| `:StrapsLogout openai` | Cancel a pending ChatGPT login and delete the stored one. |
 | `:StrapsRegistry` | List registry entries. |
 | `:StrapsEdit {name}` | Edit and redefine a registry entry. |
 | `:StrapsHelp [tag]` | Open the reference documentation. |

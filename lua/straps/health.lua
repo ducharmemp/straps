@@ -102,7 +102,7 @@ local function check_api_key()
   if vim.env[env_var] and vim.env[env_var] ~= "" then
     health.ok("$" .. env_var .. " is set (" .. #vim.env[env_var] .. " chars)")
   else
-    health.info("$" .. env_var .. " is not set — falling back to the key file")
+    health.info("$" .. env_var .. " is not set")
   end
 
   -- The key file gets its own probe because its failure mode (mode 600) is
@@ -126,13 +126,38 @@ local function check_api_key()
     health.info("no key file at " .. path)
   end
 
+  if openai and entry and config_home then
+    local login = config_home .. "/straps/openai_oauth.json"
+    local lst = try(function() return vim.uv.fs_stat(login) end)
+    if lst and lst.type == "file" then
+      if lst.mode % 64 ~= 0 then
+        health.error(("%s is accessible by group/other (mode %03o)"):format(login, lst.mode % 4096),
+          { "run: chmod 600 " .. login })
+      end
+      local cred = registry and try(function() return registry.call("fn.openai_oauth_credential") end)
+      if type(cred) == "table" then
+        if type(cred.client_id) ~= "string" or cred.client_id == "" then
+          health.error("ChatGPT login at " .. login .. " has no client id", { "run :StrapsLogin openai" })
+        else
+          local sec = vim.uv.gettimeofday()
+          local left = (tonumber(cred.expires) or 0) / 1000 - sec
+          health.ok(("ChatGPT login: %s (access token %s)"):format(login,
+            left > 0 and ("valid for " .. math.ceil(left / 60) .. " min") or "expired; refreshes on next request"))
+        end
+      end
+    else
+      health.info("no ChatGPT login (run :StrapsLogin openai to sign in)")
+    end
+  end
+
   -- The verdict that matters: does the registered entry actually yield a key?
   if entry then
-    local key, err = try(function() return registry.call(entry_name) end)
-    if type(key) == "string" and key ~= "" then
-      health.ok(entry_name .. " resolves a key (" .. #key .. " chars)")
+    local ok, key, source = pcall(registry.call, entry_name, { refresh = false })
+    if ok and type(key) == "string" and key ~= "" then
+      health.ok(entry_name .. " resolves a key (" .. #key .. " chars"
+        .. (source and (", source: " .. tostring(source)) or "") .. ")")
     else
-      health.error(entry_name .. " did not return a key", { err or "unknown error" })
+      health.error(entry_name .. " did not return a key", { ok and "unknown error" or tostring(key) })
     end
   end
 end

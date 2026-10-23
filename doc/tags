@@ -7,6 +7,8 @@
 :StrapsEffort	straps.txt	/*:StrapsEffort*
 :StrapsEval	straps.txt	/*:StrapsEval*
 :StrapsHelp	straps.txt	/*:StrapsHelp*
+:StrapsLogin	straps.txt	/*:StrapsLogin*
+:StrapsLogout	straps.txt	/*:StrapsLogout*
 :StrapsModel	straps.txt	/*:StrapsModel*
 :StrapsRegistry	straps.txt	/*:StrapsRegistry*
 :StrapsRename	straps.txt	/*:StrapsRename*
@@ -29,6 +31,13 @@ fn.list_models	straps.txt	/*fn.list_models*
 fn.log	straps.txt	/*fn.log*
 fn.model_note	straps.txt	/*fn.model_note*
 fn.openai_api_key	straps.txt	/*fn.openai_api_key*
+fn.openai_device_id	straps.txt	/*fn.openai_device_id*
+fn.openai_oauth_credential	straps.txt	/*fn.openai_oauth_credential*
+fn.openai_oauth_lock	straps.txt	/*fn.openai_oauth_lock*
+fn.openai_oauth_login	straps.txt	/*fn.openai_oauth_login*
+fn.openai_oauth_logout	straps.txt	/*fn.openai_oauth_logout*
+fn.openai_oauth_post	straps.txt	/*fn.openai_oauth_post*
+fn.openai_oauth_refresh	straps.txt	/*fn.openai_oauth_refresh*
 fn.provider	straps.txt	/*fn.provider*
 fn.provider_anthropic	straps.txt	/*fn.provider_anthropic*
 fn.provider_openai	straps.txt	/*fn.provider_openai*

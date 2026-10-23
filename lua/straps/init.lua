@@ -14,8 +14,9 @@ M.config = {
   -- "anthropic". Setting it here PINS the provider and wins over that file.
   -- Overridable per session buffer with vim.b[bufnr].straps_provider, so two
   -- sessions can talk to different backends. "openai" reads fn.openai_api_key
-  -- ($OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key), posts to
-  -- openai_base_url, and uses openai_model.
+  -- (a :StrapsLogin openai ChatGPT login first, else $OPENAI_API_KEY, then
+  -- $XDG_CONFIG_HOME/straps/openai_api_key), posts to openai_base_url, and
+  -- uses openai_model.
   provider = nil,
   openai_base_url = "https://api.openai.com",
   -- Model id sent when provider == "openai". Keep this separate from the
@@ -175,8 +176,9 @@ M.config = {
   -- LATER setup() call does not remove entries a previous setup() already
   -- registered — restart Neovim to actually drop them. editor = false skips
   -- require("straps.editor").register() (the LSP/tree-sitter tool group);
-  -- openai = false skips the two OpenAI-only entries inside
-  -- provider.lua's register() (fn.openai_api_key, fn.provider_openai) —
+  -- openai = false skips the OpenAI-only entries inside provider.lua's
+  -- register() (fn.openai_api_key, fn.provider_openai and the
+  -- fn.openai_oauth_* / fn.openai_device_id login entries) —
   -- fn.provider then errors with a clear message if asked to dispatch to
   -- "openai", and fn.list_models returns (nil, err) instead of raising.
   layers = {

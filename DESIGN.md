@@ -42,6 +42,7 @@ lua/straps/init.lua        -- setup(), config, wires everything together
 lua/straps/registry.lua    -- the late-bound registry (heart of the plugin)
 lua/straps/state.lua       -- transcript buffer format: create/append/parse
 lua/straps/provider.lua    -- registers fn.provider plus Anthropic/OpenAI curl backends
+lua/straps/oauth.lua       -- Sign in with ChatGPT: constants, PKCE/URL helpers, pending-login state
 lua/straps/loop.lua        -- coroutine agent loop
 lua/straps/tools.lua       -- registration dispatcher; composes builtin-tool layer manifests
 lua/straps/layers/*.lua    -- layer manifests: builtin tools/hooks/fns grouped by layer (files, agents, exec, session, search, selfext, net, permissions)
@@ -680,7 +681,7 @@ edit.
 - Context is the transcript, so pruning old tool results is deleting buffer
   lines. `config.log_file` enables structured event logs for long runs.
 
-## provider.lua — registers `fn.provider` (+ `fn.provider_anthropic`, `fn.provider_openai`, `fn.provider_pref`, `fn.api_key`, `fn.openai_api_key`, `fn.list_models`, `fn.build_tools`, `fn.system_prompt`)
+## provider.lua — registers `fn.provider` (+ `fn.provider_anthropic`, `fn.provider_openai`, `fn.provider_pref`, `fn.api_key`, `fn.openai_api_key`, `fn.openai_oauth_*`, `fn.openai_device_id`, `fn.list_models`, `fn.build_tools`, `fn.system_prompt`)
 
 `fn.provider` is a thin **dispatcher**: `function(req, ctx) -> { content =
 blocks, stop_reason = s }` that selects a backend and delegates. Resolution
@@ -787,9 +788,15 @@ function tools together with any reasoning effort.
 
 - POST `{config.openai_base_url}/v1/responses` (default
   `https://api.openai.com`) with `Authorization: Bearer <key>`
-  (from `registry.call("fn.openai_api_key")` — `$OPENAI_API_KEY`, then the
-  first line of `$XDG_CONFIG_HOME/straps/openai_api_key`, same mode-600 and
-  unreadable-file guards as `fn.api_key`) and `content-type: application/json`.
+  (from `registry.call("fn.openai_api_key", { ctx, base_url })`; see "Sign in
+  with ChatGPT" below for the order of sources) and
+  `content-type: application/json`.
+- **HTTP 401 with a ChatGPT login token** (`source == "oauth"`): one
+  `fn.openai_oauth_refresh{ rejected_access = <token> }` through `ctx.await`,
+  then one retry with the refreshed token; the retry does not consume one of
+  the three backoff attempts. A second 401, or a failed refresh, raises. A
+  redefined `fn.openai_api_key` that returns no `source` never takes this
+  path.
 - **Request translation** (Anthropic-shaped `req` → Responses input items, in
   block order): `req.system` → `instructions`; text blocks → `{ role, content }`
   message items (text before and after a tool call stays in separate items);
@@ -830,6 +837,63 @@ function tools together with any reasoning effort.
   `rate_limit_exceeded` or `server_error`, provided no text has streamed yet
   (a retry after streamed text would repeat that text in the transcript).
 
+### Sign in with ChatGPT (`fn.openai_oauth_*`, `lua/straps/oauth.lua`)
+
+A port of Pi's "Sign in with ChatGPT" flow (earendil-works/pi,
+`packages/ai/src/auth/oauth/openai-chatgpt.ts`). The token it yields is a
+Bearer token for `https://api.openai.com/v1`, so `fn.provider_openai` needs no
+second backend.
+
+- **Login, paste only.** `:StrapsLogin openai` calls `fn.openai_oauth_login{}`:
+  a PKCE verifier/challenge (S256), a random `state` and `nonce`, and the
+  authorize URL `https://auth.openai.com/api/accounts/authorize` with
+  `client_id=dynamic_agent_client`, `agent_name_hint=straps`,
+  `ext_agent_host_id=urn:uuid:<fn.openai_device_id>`,
+  `redirect_uri=http://127.0.0.1:1455/auth/callback`,
+  `resource=https://api.openai.com/v1`, and scope
+  `openid profile email offline_access resource.invoke chatgpt.tokens.use.direct`.
+  No local server listens: the browser fails to load the redirect, and the
+  user pastes its URL into `:StrapsLogin openai <url>`. The pasted URL must
+  match the redirect origin and path, carry no `error`, match `state`, and
+  carry `code` and the issued `client_id`. The code exchange POSTs to
+  `https://auth.openai.com/api/accounts/oauth/token` and requires
+  `access_token`, `refresh_token`, `id_token`, `expires_in > 0` and the
+  `chatgpt.tokens.use.direct` scope. A login expires after 15 minutes.
+- **State.** The pending login (verifier, state, cancel flag) is the only
+  mutable state, kept in `require("straps.oauth").pending_login` so that
+  redefining an entry does not lose it. A login finishing after it was
+  replaced clears the field only when it still holds its own record.
+- **Storage.** `fn.openai_oauth_credential` writes
+  `$XDG_CONFIG_HOME/straps/openai_oauth.json` `{ access, refresh, expires,
+  client_id, scopes }` through a `"wx"` mode-600 temp file and a rename, in a
+  directory created 0700 or tightened to 0700 if group/other could access it;
+  reads refuse group/other access. `expires` is epoch ms minus
+  a 3-minute margin.
+- **Lock.** `fn.openai_oauth_lock(cb)` makes the directory
+  `openai_oauth.lock` with an `owner` token; waiters back off (jittered,
+  20 ms doubling to 1 s) up to 30 s; a lock whose mtime is 20 s old is renamed
+  away (only if its owner token is unchanged) and removed; release removes the
+  directory only if the token is still ours. Holders: refresh, login save,
+  logout.
+- **Refresh.** `fn.openai_oauth_refresh(opts, done)` takes the lock, re-reads
+  the file, and refreshes only when the token is within 5 minutes of
+  `expires`, or, with `opts.rejected_access`, only when the stored token is
+  the rejected one; otherwise it returns the stored credential. Concurrent
+  callers in one or many Neovims therefore produce one POST. The result is
+  saved from the curl exit callback, independent of any coroutine, so
+  `:StrapsStop` during a refresh cannot lose a rotated refresh token. A file
+  deleted mid-refresh (logout) wins.
+- **Key order.** `fn.openai_api_key(opts?) -> key, source`: a stored login
+  wins (Pi's rule), then `$OPENAI_API_KEY`, then the key file. With a login
+  stored, a failed refresh raises naming `:StrapsLogin openai` and never falls
+  back to an API key. The login token is refused for any `base_url` other
+  than `https://api.openai.com`. `opts.ctx` waits for a refresh through
+  `ctx.await` (cancel returns `nil, "cancelled"`); without ctx it waits with
+  `vim.wait(opts.wait_ms or 50000)` (`fn.list_models` passes 15000);
+  `opts.refresh = false` never refreshes (health).
+- **Secrets.** Form bodies go to curl on stdin (`fn.openai_oauth_post`), never
+  argv. Errors carry the HTTP status and the server's `error` code only.
+
 `fn.system_prompt` default source returns the default system prompt (below).
 
 ### Live model discovery (`fn.list_models`)
@@ -852,7 +916,8 @@ provider it lists GPT models, not Claude ones.
   is the model's own response cap, which `fn.provider` uses as the default
   `max_tokens` for that model.
 - **OpenAI**: `GET {openai_base_url}/v1/models` with `Authorization: Bearer`
-  (key from `fn.openai_api_key`). OpenAI's catalog carries no display name or
+  (key from `fn.openai_api_key` with `{ base_url, wait_ms = 15000 }`, so a
+  ChatGPT login token is refused for a custom base URL). OpenAI's catalog carries no display name or
   thinking/reasoning-effort capabilities, so the id doubles as the label and
   `thinking` stays `nil`; static `config.openai_models` entries must opt in to
   `reasoning.effort` with `reasoning = true` (or `reasoning_effort = true`).
@@ -1916,6 +1981,11 @@ Existing suites must all still pass.
   `fn.provider_pref`, so it survives restarts — the durable twin of the key
   files in the same directory. `effective_provider` mirrors
   `effective_model`/`effective_effort` for the picker's current-* marker.
+- `:StrapsLogin openai [url]` / `:StrapsLogout openai` (`ui.login`,
+  `ui.logout`) call `fn.openai_oauth_login` / `fn.openai_oauth_logout` and
+  report through `vim.notify`. Any provider other than `openai`, or
+  `layers.openai = false`, is an error message. A completed paste removes the
+  `:StrapsLogin` line from command history, since it carries the code.
 - Folding for the session buffer: foldexpr folds `tool_use`/`tool_result`
   pairs and the system block (level 1); user/assistant turns never fold.
   `foldlevel=0` so tool calls start closed and the conversation stays visible.
@@ -1944,8 +2014,9 @@ info}` rather than throwing. It runs even when `setup()` never ran (it reports
 that as the error) and when the data dir is unwritable.
 
 Sections: nvim version (>= 0.11), dependencies (curl required, ripgrep
-optional), API key (env, key-file mode 600, and whether `fn.api_key` actually
-resolves), sessions (dir writable + transcript count), transcript rendering
+optional), API key (env, key-file mode 600, for OpenAI the ChatGPT login file's
+mode, expiry and client id, and whether `fn.api_key` / `fn.openai_api_key`
+resolves a key and from which source, without refreshing), sessions (dir writable + transcript count), transcript rendering
 (tree-sitter `straps` parser + queries, `config.render`), project registry
 (`.straps.lua` trust state against the sha256 store), registry (entry counts,
 redefinitions, missing core entries, `fn.log`), layers (each `config.layers`
@@ -1990,9 +2061,10 @@ Expose `M.registry`, `M.state`, `M.loop` for user config files.
 `M.config.layers` (`{ editor = true, openai = true }`, both default on) gates
 which default registration groups `setup()` performs, at GROUP granularity:
 `editor = false` skips `require("straps.editor").register()` entirely;
-`openai = false` skips the two openai-only entries registered inside
-`provider.lua`'s `register()` (`fn.openai_api_key`, `fn.provider_openai`;
-guarded individually since they are not adjacent in that function). This is a
+`openai = false` skips the openai-only entries registered inside
+`provider.lua`'s `register()` (`fn.openai_api_key`, the `fn.openai_oauth_*`
+login entries, `fn.openai_device_id`, `fn.provider_openai`; guarded in two
+blocks since they are not adjacent in that function). This is a
 registration gate, not a kill switch — toggling a layer off in a LATER
 `setup()` call does not remove entries an earlier `setup()` already
 registered; toggling one back on registers its missing entries then. Not

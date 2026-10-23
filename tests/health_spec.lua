@@ -159,6 +159,8 @@ it("API key health follows the persisted OpenAI provider preference", function()
   vim.env.OPENAI_API_KEY = saved_oai
   assert(find(rec, "start", "straps: API key (openai)"), "health did not select OpenAI")
   assert(find(rec, "ok", "fn.openai_api_key resolves a key"), "OpenAI key should resolve")
+  assert(find(rec, "ok", "source: env"), "health should name the key source")
+  assert(find(rec, "info", "no ChatGPT login"), "health should report the missing ChatGPT login")
 end)
 
 it("curl section present (dependency probe)", function()

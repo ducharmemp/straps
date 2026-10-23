@@ -1,7 +1,8 @@
 -- straps.provider: registers fn.provider (a backend DISPATCHER selecting
 -- fn.provider_anthropic — Anthropic Messages API — or fn.provider_openai —
 -- OpenAI Responses API — by config.provider), plus fn.api_key /
--- fn.openai_api_key, fn.build_tools, the layered system prompt
+-- fn.openai_api_key, the Sign in with ChatGPT entries (fn.openai_oauth_*,
+-- fn.openai_device_id), fn.build_tools, the layered system prompt
 -- (fn.system_prompt_core/_env/_project composed by fn.system_prompt), fn.log
 -- and fn.compact. Everything is a registry entry (a Lua source string), so any
 -- of it can be inspected and redefined at runtime.
@@ -102,7 +103,7 @@ return function(provider_override)
     return nil, "openai layer disabled (setup{ layers = { openai = false } })"
   end
 
-  local ok_key, api_key = pcall(registry.call, key_fn)
+  local ok_key, api_key = pcall(registry.call, key_fn, { base_url = base_url, wait_ms = 15000 })
   if not ok_key or type(api_key) ~= "string" or api_key == "" then
     return nil, "no API key (" .. tostring(api_key) .. ")"
   end
@@ -792,7 +793,7 @@ local PROVIDER_OPENAI_SRC = [==[
 -- The OpenAI Responses backend. Same contract as fn.provider_anthropic
 -- (returns { content = blocks, stop_reason, usage } and streams text via
 -- ctx.emit), but speaks OpenAI's wire shape instead of Anthropic's:
---   auth      Authorization: Bearer <key>            (fn.openai_api_key)
+--   auth      Authorization: Bearer <key>            (fn.openai_api_key: ChatGPT login, env, key file)
 --   endpoint  {base_url}/v1/responses                (config.openai_base_url)
 --   request   instructions + input items             (translated from req)
 --   stream    typed events (response.*)              (translated back)
@@ -804,8 +805,11 @@ return function(req, ctx)
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
 
-  local api_key = registry.call("fn.openai_api_key")
   local base_url = config.openai_base_url or "https://api.openai.com"
+  local api_key, key_source = registry.call("fn.openai_api_key", { ctx = ctx, base_url = base_url })
+  if ctx.cancelled() or (api_key == nil and key_source == "cancelled") then
+    return { content = {}, stop_reason = "cancelled" }
+  end
 
   -- Per-buffer overrides (a subagent under a different model/effort), same as
   -- the Anthropic backend.
@@ -1158,7 +1162,8 @@ return function(req, ctx)
     end)
   end
 
-  for attempt = 1, 3 do
+  local attempt, refreshed = 1, false
+  while attempt <= 3 do
     pcall(registry.try_call, "fn.log",
       { ev = "request", bytes = #payload, wire_bytes = #payload, model = body.model, buf = ctx.bufnr })
     local t0 = vim.uv.hrtime()
@@ -1194,7 +1199,20 @@ return function(req, ctx)
       or res.status == 502 or res.status == 503 or res.status == 408
       or curl_failure or res.retryable == true
 
-    if retryable and attempt < 3 then
+    if res.status == 401 and key_source == "oauth" and not refreshed then
+      refreshed = true
+      local cred, rerr = ctx.await(function(resolve)
+        registry.call("fn.openai_oauth_refresh", { rejected_access = api_key }, resolve)
+        ctx.on_cancel(function() resolve(nil, "cancelled") end)
+      end)
+      if ctx.cancelled() or (cred == nil and (rerr == nil or rerr == "cancelled")) then
+        return { content = {}, stop_reason = "cancelled" }
+      end
+      if not cred then
+        error("straps provider (openai): HTTP 401 and " .. tostring(rerr), 0)
+      end
+      api_key = cred.access
+    elseif retryable and attempt < 3 then
       local delay_ms = 1000 * attempt * attempt
       ctx.await(function(resolve)
         vim.defer_fn(function() resolve() end, delay_ms)
@@ -1203,6 +1221,7 @@ return function(req, ctx)
       if ctx.cancelled() then
         return { content = {}, stop_reason = "cancelled" }
       end
+      attempt = attempt + 1
     else
       local detail
       if type(res.err) == "table" then
@@ -1320,10 +1339,46 @@ end
 ]==]
 
 local OPENAI_API_KEY_SRC = [==[
-return function()
+return function(opts)
+  opts = type(opts) == "table" and opts or {}
+  local registry = require("straps.registry")
+  local oauth = require("straps.oauth")
+  local cred = registry.call("fn.openai_oauth_credential")
+  if cred then
+    local ok_straps, straps = pcall(require, "straps")
+    local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+    local base = tostring(opts.base_url or config.openai_base_url or oauth.API_ORIGIN):gsub("/+$", "")
+    if base ~= oauth.API_ORIGIN then
+      error("straps: the ChatGPT login token is only sent to " .. oauth.API_ORIGIN
+        .. "; unset openai_base_url, or run :StrapsLogout openai to use an API key.", 0)
+    end
+    if opts.refresh == false or oauth.now_ms() + oauth.REFRESH_WINDOW_MS < (tonumber(cred.expires) or 0) then
+      return cred.access, "oauth"
+    end
+    local ctx = opts.ctx
+    local got, err
+    if type(ctx) == "table" and ctx.await then
+      got, err = ctx.await(function(resolve)
+        registry.call("fn.openai_oauth_refresh", {}, resolve)
+        if ctx.on_cancel then ctx.on_cancel(function() resolve(nil, "cancelled") end) end
+      end)
+      if (ctx.cancelled and ctx.cancelled()) or (got == nil and (err == nil or err == "cancelled")) then
+        return nil, "cancelled"
+      end
+    else
+      local finished = false
+      registry.call("fn.openai_oauth_refresh", {}, function(c, e) finished, got, err = true, c, e end)
+      if not vim.wait(opts.wait_ms or 50000, function() return finished end, 20) then
+        error("straps: ChatGPT token refresh still running; retry.", 0)
+      end
+    end
+    if not got then error("straps: " .. tostring(err), 0) end
+    return got.access, "oauth"
+  end
+
   local key = vim.env.OPENAI_API_KEY
   if key and key ~= "" then
-    return key
+    return key, "env"
   end
   local config_home = vim.env.XDG_CONFIG_HOME
   if not config_home or config_home == "" then
@@ -1347,12 +1402,386 @@ return function()
     f:close()
     key = key and vim.trim(key) or ""
     if key ~= "" then
-      return key
+      return key, "file"
     end
   end
-  error("straps: no OpenAI API key found. Export OPENAI_API_KEY in your shell, "
+  error("straps: no OpenAI API key found. Run :StrapsLogin openai to sign in with ChatGPT, "
+    .. "export OPENAI_API_KEY in your shell, "
     .. "write the key to " .. (path or "$XDG_CONFIG_HOME/straps/openai_api_key")
     .. ", or redefine fn.openai_api_key to fetch the key from somewhere else.")
+end
+]==]
+
+local OPENAI_OAUTH_CREDENTIAL_SRC = [==[
+return function(value)
+  local oauth = require("straps.oauth")
+  local dir = oauth.config_dir()
+  if not dir then
+    if value == nil or value == false then return nil end
+    error("straps: no $XDG_CONFIG_HOME or $HOME to store the ChatGPT login under", 0)
+  end
+  local path = dir .. "/openai_oauth.json"
+  if value == false then
+    local ok, err, code = vim.uv.fs_unlink(path)
+    if not ok and code ~= "ENOENT" then error("straps: could not delete " .. path .. " (" .. tostring(err) .. ")", 0) end
+    return true
+  end
+  if value == nil then
+    local st = vim.uv.fs_stat(path)
+    if not (st and st.type == "file") then return nil end
+    if st.mode % 64 ~= 0 then
+      error(("straps: %s is accessible by group/other (mode %03o); run chmod 600 on it."):format(path, st.mode % 4096), 0)
+    end
+    local f = io.open(path, "r")
+    if not f then error("straps: " .. path .. " exists but could not be read", 0) end
+    local text = f:read("*a")
+    f:close()
+    local ok, cred = pcall(vim.json.decode, text)
+    if not ok or type(cred) ~= "table" or type(cred.access) ~= "string" or type(cred.refresh) ~= "string" then
+      error("straps: " .. path .. " is not a valid ChatGPT login; run :StrapsLogin openai", 0)
+    end
+    return cred
+  end
+  oauth.ensure_dir(dir)
+  local tmp = path .. ".tmp." .. oauth.random_b64url(8)
+  local fd, oerr = vim.uv.fs_open(tmp, "wx", 384)
+  if not fd then error("straps: could not write " .. tmp .. " (" .. tostring(oerr) .. ")", 0) end
+  local _, werr = vim.uv.fs_write(fd, vim.json.encode(value))
+  vim.uv.fs_close(fd)
+  if werr then
+    vim.uv.fs_unlink(tmp)
+    error("straps: could not write " .. tmp .. " (" .. tostring(werr) .. ")", 0)
+  end
+  local ok, rerr = vim.uv.fs_rename(tmp, path)
+  if not ok then
+    vim.uv.fs_unlink(tmp)
+    error("straps: could not save " .. path .. " (" .. tostring(rerr) .. ")", 0)
+  end
+  return value
+end
+]==]
+
+local OPENAI_DEVICE_ID_SRC = [==[
+return function()
+  local oauth = require("straps.oauth")
+  local bit = require("bit")
+  local dir = oauth.config_dir()
+  if not dir then error("straps: no $XDG_CONFIG_HOME or $HOME to store the device id under", 0) end
+  local path = dir .. "/device_id"
+  local pattern = "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$"
+  local f = io.open(path, "r")
+  if f then
+    local id = vim.trim(f:read("*l") or ""):lower()
+    f:close()
+    if id:match(pattern) then return id end
+  end
+  local b = { vim.uv.random(16):byte(1, 16) }
+  b[7] = bit.bor(bit.band(b[7], 0x0f), 0x40)
+  b[9] = bit.bor(bit.band(b[9], 0x3f), 0x80)
+  local hex = {}
+  for i = 1, 16 do hex[i] = ("%02x"):format(b[i]) end
+  local h = table.concat(hex)
+  local id = h:sub(1, 8) .. "-" .. h:sub(9, 12) .. "-" .. h:sub(13, 16) .. "-" .. h:sub(17, 20) .. "-" .. h:sub(21, 32)
+  oauth.ensure_dir(dir)
+  local out = io.open(path, "w")
+  if not out then error("straps: could not write " .. path, 0) end
+  out:write(id .. "\n")
+  out:close()
+  return id
+end
+]==]
+
+local OPENAI_OAUTH_LOCK_SRC = [==[
+return function(cb)
+  local oauth = require("straps.oauth")
+  local called = false
+  local function reply(...)
+    if called then return end
+    called = true
+    local args = { n = select("#", ...), ... }
+    vim.schedule(function() cb(unpack(args, 1, args.n)) end)
+  end
+  local dir = oauth.config_dir()
+  if not dir then return reply(nil, "no $XDG_CONFIG_HOME or $HOME") end
+  local lock = dir .. "/openai_oauth.lock"
+  local token = oauth.random_b64url(16)
+  local deadline = oauth.now_ms() + oauth.LOCK_DEADLINE_MS
+  local attempt = 0
+  local function read_owner(d)
+    local f = io.open(d .. "/owner", "r")
+    if not f then return "" end
+    local s = f:read("*a") or ""
+    f:close()
+    return s
+  end
+  local function remove_dir(d)
+    vim.uv.fs_unlink(d .. "/owner")
+    vim.uv.fs_rmdir(d)
+  end
+  local function release()
+    if read_owner(lock) == token then remove_dir(lock) end
+  end
+  local try
+  local function retry()
+    if oauth.now_ms() >= deadline then return reply(nil, "timed out waiting for " .. lock) end
+    attempt = attempt + 1
+    local delay = math.min(10 * 2 ^ attempt, 1000) + math.random(0, 50)
+    vim.defer_fn(function()
+      local ok, err = pcall(try)
+      if not ok then reply(nil, tostring(err)) end
+    end, delay)
+  end
+  try = function()
+    local ok, err, code = vim.uv.fs_mkdir(lock, 448)
+    if ok then
+      local fd, ferr, fcode = vim.uv.fs_open(lock .. "/owner", "w", 384)
+      if not fd then
+        remove_dir(lock)
+        if fcode == "ENOENT" then return retry() end
+        return reply(nil, tostring(ferr))
+      end
+      vim.uv.fs_write(fd, token)
+      vim.uv.fs_close(fd)
+      return reply(release)
+    end
+    if code ~= "EEXIST" then return reply(nil, tostring(err)) end
+    local st = vim.uv.fs_stat(lock)
+    local age = st and (oauth.now_ms() - (st.mtime.sec * 1000 + math.floor(st.mtime.nsec / 1e6))) or 0
+    if st and age >= oauth.LOCK_STALE_MS then
+      local seen = read_owner(lock)
+      local stale = lock .. ".stale." .. oauth.random_b64url(8)
+      if vim.uv.fs_rename(lock, stale) then
+        if read_owner(stale) == seen then
+          remove_dir(stale)
+          return try()
+        end
+        vim.uv.fs_rename(stale, lock)
+      end
+    end
+    retry()
+  end
+  local ok, err = pcall(function()
+    oauth.ensure_dir(dir)
+    try()
+  end)
+  if not ok then reply(nil, tostring(err)) end
+end
+]==]
+
+local OPENAI_OAUTH_POST_SRC = [==[
+return function(form, cb)
+  local oauth = require("straps.oauth")
+  local argv = {
+    "curl", "-sS", "--max-time", "15", "-X", "POST", oauth.TOKEN_URL,
+    "-H", "accept: application/json",
+    "-H", "content-type: application/x-www-form-urlencoded",
+    "--data-binary", "@-",
+    "-w", "\nSTRAPS_HTTP_STATUS:%{http_code}\n",
+  }
+  local ok, err = pcall(vim.system, argv, { stdin = form, text = true }, vim.schedule_wrap(function(res)
+    local out = res.stdout or ""
+    local status = tonumber(out:match("STRAPS_HTTP_STATUS:(%d+)"))
+    out = out:gsub("%s*STRAPS_HTTP_STATUS:%d+%s*$", "")
+    if res.code ~= 0 then
+      return cb(nil, "OpenAI OAuth token request failed: curl exited with code " .. res.code)
+    end
+    local okj, data = pcall(vim.json.decode, out)
+    if not status or status < 200 or status > 299 then
+      local detail
+      if okj and type(data) == "table" then
+        if type(data.error) == "string" then
+          detail = data.error
+        elseif type(data.error) == "table" then
+          detail = data.error.code or data.error.type
+        end
+      end
+      return cb(nil, ("OpenAI OAuth token request failed (HTTP %s)%s"):format(
+        status and tostring(status) or "?", detail and (": " .. tostring(detail)) or ""))
+    end
+    if not okj or type(data) ~= "table" then
+      return cb(nil, "OpenAI OAuth token response is not a JSON object")
+    end
+    cb(data)
+  end))
+  if not ok then
+    vim.schedule(function() cb(nil, "curl could not be spawned: " .. tostring(err)) end)
+  end
+end
+]==]
+
+local OPENAI_OAUTH_REFRESH_SRC = [==[
+return function(opts, done)
+  opts = type(opts) == "table" and opts or {}
+  local registry = require("straps.registry")
+  local oauth = require("straps.oauth")
+  local relogin = "; run :StrapsLogin openai"
+  local finished, release = false, nil
+  local function finish(err, cred)
+    if finished then return end
+    finished = true
+    vim.schedule(function() done(cred, err) end)
+    if release then pcall(release) end
+  end
+  local function body()
+    local cred = registry.call("fn.openai_oauth_credential")
+    if not cred then return finish("logged out of ChatGPT" .. relogin) end
+    if type(cred.client_id) ~= "string" or vim.trim(cred.client_id) == "" then
+      return finish("the stored ChatGPT login has no client id" .. relogin)
+    end
+    if opts.rejected_access then
+      if cred.access ~= opts.rejected_access then return finish(nil, cred) end
+    elseif oauth.now_ms() + oauth.REFRESH_WINDOW_MS < (tonumber(cred.expires) or 0) then
+      return finish(nil, cred)
+    end
+    local form = oauth.form_encode({
+      { "grant_type", "refresh_token" },
+      { "client_id", cred.client_id },
+      { "refresh_token", cred.refresh },
+      { "resource", oauth.RESOURCE },
+    })
+    registry.call("fn.openai_oauth_post", form, function(token, perr)
+      local ok, err = pcall(function()
+        if not token then return finish("ChatGPT token refresh failed: " .. tostring(perr) .. relogin) end
+        local fresh = oauth.credential_from_token(token, cred.client_id, false)
+        if not registry.call("fn.openai_oauth_credential") then
+          return finish("logged out of ChatGPT" .. relogin)
+        end
+        registry.call("fn.openai_oauth_credential", fresh)
+        finish(nil, fresh)
+      end)
+      if not ok then finish(tostring(err)) end
+    end)
+  end
+  local ok, err = pcall(registry.call, "fn.openai_oauth_lock", function(rel, lerr)
+    if not rel then return finish("could not lock the ChatGPT login: " .. tostring(lerr)) end
+    release = rel
+    local ok_body, berr = pcall(body)
+    if not ok_body then finish(tostring(berr)) end
+  end)
+  if not ok then finish(tostring(err)) end
+end
+]==]
+
+local OPENAI_OAUTH_LOGIN_SRC = [==[
+return function(opts)
+  opts = type(opts) == "table" and opts or {}
+  local registry = require("straps.registry")
+  local oauth = require("straps.oauth")
+  local function report(err)
+    if opts.on_done then
+      pcall(opts.on_done, err)
+    elseif err then
+      vim.notify("straps: " .. tostring(err):gsub("^straps: ", ""), vim.log.levels.ERROR)
+    else
+      vim.notify("straps: signed in with ChatGPT")
+    end
+  end
+
+  local current = oauth.pending_login
+  if opts.cancel then
+    if current then
+      current.cancelled = true
+      oauth.pending_login = nil
+    end
+    return current ~= nil
+  end
+
+  if not opts.callback_url then
+    if current then current.cancelled = true end
+    local verifier, challenge = oauth.pkce()
+    local rec = {
+      verifier = verifier,
+      state = oauth.random_b64url(32),
+      expires_at = oauth.now_ms() + oauth.LOGIN_TTL_MS,
+    }
+    rec.url = oauth.AUTHORIZE_URL .. "?" .. oauth.form_encode({
+      { "client_id", oauth.DYNAMIC_CLIENT_ID },
+      { "agent_name_hint", oauth.AGENT_NAME_HINT },
+      { "ext_agent_host_id", "urn:uuid:" .. registry.call("fn.openai_device_id") },
+      { "response_type", "code" },
+      { "redirect_uri", oauth.REDIRECT_URI },
+      { "resource", oauth.RESOURCE },
+      { "scope", oauth.SCOPE },
+      { "state", rec.state },
+      { "code_challenge", challenge },
+      { "code_challenge_method", "S256" },
+      { "nonce", oauth.random_b64url(32) },
+    })
+    oauth.pending_login = rec
+    local open = opts.open or vim.ui.open
+    local ok_open, opened, open_err = pcall(open, rec.url)
+    return rec.url, ok_open and opened ~= nil and open_err == nil
+  end
+
+  local rec = current
+  if not rec or rec.cancelled or oauth.now_ms() > rec.expires_at then
+    oauth.pending_login = nil
+    error("straps: no pending ChatGPT login; run :StrapsLogin openai first", 0)
+  end
+  if rec.exchanging then error("straps: this ChatGPT login is already being completed", 0) end
+  local parsed = oauth.parse_callback(opts.callback_url, rec.state)
+  rec.exchanging = true
+
+  local finished, release = false, nil
+  local function finish_login(err)
+    if finished then return end
+    finished = true
+    if oauth.pending_login == rec then oauth.pending_login = nil end
+    if release then pcall(release) end
+    report(err)
+  end
+  local cancelled_msg = "ChatGPT login cancelled"
+  local form = oauth.form_encode({
+    { "grant_type", "authorization_code" },
+    { "client_id", parsed.client_id },
+    { "code", parsed.code },
+    { "code_verifier", rec.verifier },
+    { "redirect_uri", oauth.REDIRECT_URI },
+    { "resource", oauth.RESOURCE },
+  })
+  local ok, err = pcall(registry.call, "fn.openai_oauth_post", form, function(token, perr)
+    local ok_cb, cb_err = pcall(function()
+      if not token then return finish_login(perr) end
+      if rec.cancelled then return finish_login(cancelled_msg) end
+      local cred = oauth.credential_from_token(token, parsed.client_id, true)
+      registry.call("fn.openai_oauth_lock", function(rel, lerr)
+        local ok_save, save_err = pcall(function()
+          if not rel then
+            return finish_login("could not save the ChatGPT login (" .. tostring(lerr)
+              .. "); run :StrapsLogin openai again")
+          end
+          release = rel
+          if rec.cancelled then return finish_login(cancelled_msg) end
+          registry.call("fn.openai_oauth_credential", cred)
+          finish_login(nil)
+        end)
+        if not ok_save then finish_login(save_err) end
+      end)
+    end)
+    if not ok_cb then finish_login(cb_err) end
+  end)
+  if not ok then finish_login(err) end
+end
+]==]
+
+local OPENAI_OAUTH_LOGOUT_SRC = [==[
+return function(cb)
+  local registry = require("straps.registry")
+  local oauth = require("straps.oauth")
+  cb = cb or function() end
+  local cancelled = registry.call("fn.openai_oauth_login", { cancel = true })
+  local dir = oauth.config_dir()
+  if not dir or not vim.uv.fs_stat(dir .. "/openai_oauth.json") then
+    vim.schedule(function() cb(nil, cancelled and "cancelled" or "none") end)
+    return
+  end
+  local ok_lock, lock_err = pcall(registry.call, "fn.openai_oauth_lock", function(release, lerr)
+    if not release then return cb("could not lock the ChatGPT login: " .. tostring(lerr)) end
+    local ok, err = pcall(registry.call, "fn.openai_oauth_credential", false)
+    pcall(release)
+    cb(not ok and tostring(err) or nil, "deleted")
+  end)
+  if not ok_lock then vim.schedule(function() cb(tostring(lock_err)) end) end
 end
 ]==]
 
@@ -2331,8 +2760,50 @@ function M.register()
     define({
       name = "fn.openai_api_key",
       kind = "fn",
-      doc = "Return the OpenAI API key (default: $OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key; the file must be chmod 600).",
+      doc = "(opts?) -> key, source. The OpenAI key: a stored ChatGPT login (:StrapsLogin openai) wins and is refreshed; else $OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key (chmod 600). source is oauth/env/file.",
       source = OPENAI_API_KEY_SRC,
+    })
+    define({
+      name = "fn.openai_oauth_credential",
+      kind = "fn",
+      doc = "Read (no arg), write (table) or delete (false) the ChatGPT login at $XDG_CONFIG_HOME/straps/openai_oauth.json (mode 600).",
+      source = OPENAI_OAUTH_CREDENTIAL_SRC,
+    })
+    define({
+      name = "fn.openai_device_id",
+      kind = "fn",
+      doc = "Return this installation's UUIDv4 ($XDG_CONFIG_HOME/straps/device_id), creating it on first use.",
+      source = OPENAI_DEVICE_ID_SRC,
+    })
+    define({
+      name = "fn.openai_oauth_lock",
+      kind = "fn",
+      doc = "(cb) -> cb(release) or cb(nil, err): take the cross-process lock directory guarding the ChatGPT login file.",
+      source = OPENAI_OAUTH_LOCK_SRC,
+    })
+    define({
+      name = "fn.openai_oauth_post",
+      kind = "fn",
+      doc = "(form, cb) -> cb(json) or cb(nil, err): POST a form to the OpenAI OAuth token endpoint; the body goes on stdin, never argv.",
+      source = OPENAI_OAUTH_POST_SRC,
+    })
+    define({
+      name = "fn.openai_oauth_refresh",
+      kind = "fn",
+      doc = "(opts, done) -> done(cred) or done(nil, err): refresh the ChatGPT login under the lock; opts.rejected_access forces a refresh after a 401.",
+      source = OPENAI_OAUTH_REFRESH_SRC,
+    })
+    define({
+      name = "fn.openai_oauth_login",
+      kind = "fn",
+      doc = "Sign in with ChatGPT. {} starts a login and returns the authorize URL; { callback_url } completes it; { cancel = true } cancels.",
+      source = OPENAI_OAUTH_LOGIN_SRC,
+    })
+    define({
+      name = "fn.openai_oauth_logout",
+      kind = "fn",
+      doc = "(cb?) cancel a pending ChatGPT login and delete the stored one under the lock.",
+      source = OPENAI_OAUTH_LOGOUT_SRC,
     })
   end
   define({

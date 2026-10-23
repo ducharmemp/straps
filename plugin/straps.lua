@@ -272,6 +272,21 @@ vim.api.nvim_create_user_command("StrapsProvider", function()
   require("straps.ui").pick_provider()
 end, { desc = "straps: pick the API backend (anthropic/openai); persists the global choice to ~/.config/straps/provider" })
 
+vim.api.nvim_create_user_command("StrapsLogin", function(opts)
+  require("straps.ui").login(opts.fargs)
+end, { nargs = "+", complete = function(arglead, line)
+  local after = line:match("StrapsLogin!?%s+(.*)$") or ""
+  if after:find("%s") then return {} end
+  return vim.startswith("openai", arglead) and { "openai" } or {}
+end, desc = "straps: sign in with ChatGPT (:StrapsLogin openai, then :StrapsLogin openai <redirect-url>)" })
+
+vim.api.nvim_create_user_command("StrapsLogout", function(opts)
+  require("straps.ui").logout(opts.fargs)
+end, { nargs = 1, complete = function(arglead)
+  return vim.startswith("openai", arglead) and { "openai" } or {}
+end,
+  desc = "straps: cancel a pending ChatGPT login and delete the stored one" })
+
 vim.api.nvim_create_user_command("StrapsAuto", function(opts)
   require("straps.ui").auto(opts.args)
 end, { nargs = "?", complete = function(arglead)

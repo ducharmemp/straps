@@ -42,6 +42,10 @@ end)
 it("openai = false: openai-only fns absent, anthropic stays", function()
   assert(registry.get("fn.provider_openai") == nil, "fn.provider_openai should be absent")
   assert(registry.get("fn.openai_api_key") == nil, "fn.openai_api_key should be absent")
+  for _, name in ipairs({ "fn.openai_oauth_credential", "fn.openai_device_id", "fn.openai_oauth_lock",
+    "fn.openai_oauth_post", "fn.openai_oauth_refresh", "fn.openai_oauth_login", "fn.openai_oauth_logout" }) do
+    assert(registry.get(name) == nil, name .. " should be absent")
+  end
   assert(registry.get("fn.provider_anthropic"), "fn.provider_anthropic should be present")
 end)
 

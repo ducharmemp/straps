@@ -1869,6 +1869,60 @@ function M.pick_provider()
   end)
 end
 
+local function oauth_entry(provider, name)
+  if provider ~= "openai" then
+    notify_err("straps: only `openai` supports login (got " .. tostring(provider) .. ")")
+    return nil
+  end
+  if not require("straps.registry").get(name) then
+    notify_err("straps: the openai layer is disabled (setup{ layers = { openai = false } })")
+    return nil
+  end
+  return name
+end
+
+local function strip_prefix(msg)
+  return "straps: " .. (tostring(msg):gsub("^straps: ", ""))
+end
+
+function M.login(fargs)
+  local name = oauth_entry(fargs[1], "fn.openai_oauth_login")
+  if not name then return end
+  if #fargs > 2 then
+    return notify_err("straps: usage: :StrapsLogin openai [redirect-url]")
+  end
+  local url = fargs[2]
+  local ok, res, opened = pcall(require("straps.registry").call, name, url and { callback_url = url } or {})
+  if not ok then
+    return notify_err(strip_prefix(res))
+  end
+  if url then
+    pcall(vim.fn.histdel, ":", -1)
+    vim.notify("straps: exchanging the ChatGPT authorization code...")
+  else
+    vim.notify("straps: " .. (opened and "sign in at the page that opened (URL below)" or "open this URL and sign in")
+      .. ". The browser then fails to load " .. require("straps.oauth").REDIRECT_ORIGIN
+      .. "; copy that page's full URL from the address bar and run :StrapsLogin openai <url>\n" .. tostring(res))
+  end
+end
+
+function M.logout(fargs)
+  local name = oauth_entry(fargs[1], "fn.openai_oauth_logout")
+  if not name then return end
+  local ok, err = pcall(require("straps.registry").call, name, function(lerr, what)
+    if lerr then
+      notify_err(strip_prefix(lerr))
+    elseif what == "none" then
+      vim.notify("straps: no ChatGPT login stored")
+    elseif what == "cancelled" then
+      vim.notify("straps: pending ChatGPT login cancelled")
+    else
+      vim.notify("straps: signed out of ChatGPT")
+    end
+  end)
+  if not ok then notify_err(strip_prefix(err)) end
+end
+
 --- :StrapsAuto — grant permission categories to THIS session (auto mode). A
 --- grant writes a "cap:<category>" key into the registry's per-session grant
 --- set, which the default hook.confirm honors to auto-allow every call

@@ -64,6 +64,8 @@ provider, tools, editor tools and UI. It is idempotent: registration uses
 
 The API key is read by |fn.api_key|: `$ANTHROPIC_API_KEY` first, then the
 first line of `$XDG_CONFIG_HOME/straps/api_key` (which must be chmod 600).
+The OpenAI provider reads |fn.openai_api_key|, which also accepts a ChatGPT
+login made with |:StrapsLogin|.
 
 The commands work without `setup()` (they `require` lazily), but folding, the
 `gf` mapping and rendering are only fully wired once `setup()` has run.
@@ -169,6 +171,22 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			|:StrapsSteer| it instead. Distinct from
 			|:StrapsResume|, which reopens a saved transcript from
 			disk.
+
+							*:StrapsLogin*
+:StrapsLogin openai [{url}]
+			Sign in with ChatGPT for the OpenAI provider. Without
+			{url} it opens the ChatGPT sign-in page and prints its
+			URL. After sign-in the browser fails to load a
+			http://127.0.0.1:1455/auth/callback?... page; copy that
+			full URL from the address bar and run
+			`:StrapsLogin openai {url}`. The login is stored in
+			$XDG_CONFIG_HOME/straps/openai_oauth.json (mode 600),
+			refreshed automatically, and wins over $OPENAI_API_KEY
+			and the key file. See |fn.openai_api_key|.
+
+							*:StrapsLogout*
+:StrapsLogout openai	Cancel a pending ChatGPT login and delete the stored
+			one.
 
 							*:StrapsAuto*
 :StrapsAuto [off|{cats}]
@@ -409,7 +427,9 @@ layers			(table) { editor = true, openai = true }. Which
 			default registration groups |straps.setup()| performs.
 			`editor` gates the LSP/tree-sitter tool set
 			(lua/straps/editor.lua); `openai` gates the OpenAI
-			backend fns (`fn.openai_api_key`, `fn.provider_openai`).
+			backend fns (`fn.openai_api_key`, `fn.provider_openai`,
+			and the ChatGPT login fns `fn.openai_oauth_*`,
+			`fn.openai_device_id`).
 			A registration gate, not a kill switch: false skips
 			registering that group; it does not unregister entries
 			an earlier `setup()` call already registered (restart
@@ -797,8 +817,41 @@ fn.provider_pref(value?)	Read (no arg) or write (a string) the persisted
 						*fn.api_key*
 fn.api_key() -> string		Resolve the Anthropic API key (see |straps-setup|).
 						*fn.openai_api_key*
-fn.openai_api_key() -> string	Resolve the OpenAI API key ($OPENAI_API_KEY,
-		then $XDG_CONFIG_HOME/straps/openai_api_key, chmod 600).
+fn.openai_api_key(opts?) -> key, source
+		Resolve the OpenAI key. A stored ChatGPT login (|:StrapsLogin|)
+		wins, refreshed when it expires within 5 minutes; else
+		$OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key
+		(chmod 600). `source` is "oauth", "env" or "file". opts:
+		`ctx` (wait for a refresh through ctx.await), `refresh = false`
+		(never refresh; used by health), `base_url` (the login token is
+		refused for anything but https://api.openai.com), `wait_ms`
+		(synchronous refresh wait cap). A failed refresh raises; it does
+		not fall back to the env key or key file.
+						*fn.openai_oauth_login*
+fn.openai_oauth_login(opts)	Sign in with ChatGPT. `{}` starts a login
+		(PKCE, state) and opens/returns the authorize URL; `{ callback_url
+		= url }` completes it from the pasted redirect URL; `{ cancel =
+		true }` cancels. The pending login lives in `straps.oauth`.
+						*fn.openai_oauth_refresh*
+fn.openai_oauth_refresh(opts, done)	Refresh the stored login under
+		|fn.openai_oauth_lock|; `opts.rejected_access` forces a refresh
+		after an HTTP 401. done(cred) or done(nil, err).
+						*fn.openai_oauth_credential*
+fn.openai_oauth_credential(value?)	Read (no arg), write (table) or
+		delete (false) $XDG_CONFIG_HOME/straps/openai_oauth.json.
+						*fn.openai_oauth_lock*
+fn.openai_oauth_lock(cb)	Take the lock directory
+		$XDG_CONFIG_HOME/straps/openai_oauth.lock; cb(release) or
+		cb(nil, err). Stale after 20 s; waiters give up after 30 s.
+						*fn.openai_oauth_post*
+fn.openai_oauth_post(form, cb)	POST a form to the OpenAI token endpoint
+		(body on stdin, never argv).
+						*fn.openai_oauth_logout*
+fn.openai_oauth_logout(cb?)	Cancel a pending login and delete the stored
+		one.
+						*fn.openai_device_id*
+fn.openai_device_id()		This installation's UUIDv4, sent as
+		`ext_agent_host_id`.
 						*fn.list_models*
 fn.list_models(provider?) -> entries
 			Live GET /v1/models for |:StrapsModel|. Optional provider is
@@ -1160,7 +1213,8 @@ category, add `vcs` to the grantable list, then `:StrapsAuto vcs` grants it. >lu
 <
 Diagnoses everything that can be wrong before a session runs: the Neovim
 version, `curl` (and optional ripgrep), the API key (including a group/other
-readable key file), a writable `session_dir`, the tree-sitter `straps` parser
+readable key file, the ChatGPT login file for OpenAI, and which source the key
+comes from), a writable `session_dir`, the tree-sitter `straps` parser
 and its queries, the `.straps.lua` trust state, the loaded registry (entry
 counts, redefinitions, missing core entries), the model/effort pairing, and
 any runs still in flight. Every probe is isolated, so the report runs even

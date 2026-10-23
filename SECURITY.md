@@ -20,4 +20,6 @@ A guard enforces policy at the call site; it does not limit what already-approve
 
 Provider endpoints receive API credentials and complete conversation payloads. Configure custom endpoints only when you trust their operator.
 
+`:StrapsLogin openai` stores a ChatGPT access token and refresh token in `$XDG_CONFIG_HOME/straps/openai_oauth.json` (mode 600, directory 0700) and uses `openai_oauth.lock` beside it to serialise refreshes across Neovim processes. The refresh token grants ongoing access to the ChatGPT account's API quota; treat the file like a private key. Straps sends the login token only to `https://api.openai.com` and refuses it for a custom `openai_base_url`. OAuth codes, verifiers and refresh tokens go to curl on stdin, not argv. The bearer token for API requests is still passed in curl's argv, which other local users can read through `/proc`.
+
 Session transcripts persist under Neovim's data directory by default. They can contain prompts, source code, and tool output.

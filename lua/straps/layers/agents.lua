@@ -282,9 +282,6 @@ return function(input, ctx)
   -- lifetime, not just the time spent inside spawn_wait.
   vim.b[child].straps_spawn_timeout_ms = tonumber(input.timeout_ms) or 600000
   vim.b[child].straps_spawn_started_ms = vim.uv.now()
-  -- Provider / model / effort: explicit spawn args win; else inherit the
-  -- PARENT's per-buffer overrides if it has them (so a subagent matches its
-  -- session by default), else leave unset so fn.provider falls back globally.
   do
     local pp, pm, pom, pe
     pcall(function()
@@ -293,11 +290,22 @@ return function(input, ctx)
       pom = vim.b[ctx.bufnr].straps_openai_model
       pe = vim.b[ctx.bufnr].straps_effort
     end)
-    local provider = input.provider or pp
-    local model = input.model or ((provider == "openai") and pom or pm)
+    local function present(v) return type(v) == "string" and v ~= "" end
+    local ok_straps, straps = pcall(require, "straps")
+    local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+    local provider = (present(input.provider) and input.provider) or (present(pp) and pp)
+      or (present(config.provider) and config.provider)
+    if not provider then
+      local pref = registry.try_call("fn.provider_pref")
+      provider = present(pref) and pref or "anthropic"
+    end
+    local model = input.model
+    if not present(model) then
+      if provider == "openai" then model = pom else model = pm end
+    end
     local effort = input.effort or pe
-    if type(provider) == "string" and provider ~= "" then vim.b[child].straps_provider = provider end
-    if type(model) == "string" and model ~= "" then
+    vim.b[child].straps_provider = provider
+    if present(model) then
       if provider == "openai" then vim.b[child].straps_openai_model = model else vim.b[child].straps_model = model end
     end
     if type(effort) == "string" and effort ~= "" then vim.b[child].straps_effort = effort end

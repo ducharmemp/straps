@@ -1023,7 +1023,9 @@ silent, and `spawn_notify = false` turns the whole thing off.
 A child is a full session: its transcript is a real buffer the user can open
 (`show = true`), watch and steer. It inherits the parent's registry view but
 anything it defines lands in its own scope. Use it to isolate a broad
-investigation so the parent transcript keeps only the conclusion.
+investigation so the parent transcript keeps only the conclusion. Without a
+`provider` argument, a child uses its parent's resolved provider. Without a
+`model` argument, it inherits the parent's model for that provider.
 
 `spawn` takes `allow` (an array of strings) to grant the child permission
 categories. Each entry is a grantable category (see |fn.capability|) or a

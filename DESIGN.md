@@ -1204,7 +1204,7 @@ API names (registry names prefixed `tool.`):
   redefinitions of any tool/hook/fn, including the provider and confirm hook.
 - `eval_lua {code}` — `load` + pcall, returns `vim.inspect` of results.
   Dangerous by design; gated by `hook.confirm`.
-- `spawn {task, system?, tools?, readonly?, allow?, show?, max_turns?, model?, effort?, timeout_ms?}`
+- `spawn {task, system?, provider?, tools?, readonly?, allow?, show?, max_turns?, model?, effort?, timeout_ms?}`
   — creates a child session buffer (`state.new_session`), chains its registry
   scope under the parent (`registry.ensure_scope`), stamps parentage/task/model/
   effort/timeout vim.b vars, seeds the task, `loop.start`s it, and **returns
@@ -1952,8 +1952,13 @@ Existing suites must all still pass.
   `vim.b[bufnr].straps_effort` in preference to `config.model` /
   `config.openai_model` / `config.effort`, so two sessions can run different
   providers/models at once (and a subagent can differ from its parent —
-  `tool.spawn` accepts `provider`/`model`/`effort` args and otherwise inherits
-  the parent's provider-specific override). `ui.pick_model` /
+  `tool.spawn` accepts `provider`/`model`/`effort` args). Without a `provider`
+  arg, `tool.spawn` resolves the parent's provider with the same chain as
+  `fn.provider` (parent `straps_provider`, `config.provider`,
+  `fn.provider_pref`, `"anthropic"`) and stores the result in the child's
+  `straps_provider`. A `model` arg goes to that provider's slot; without one
+  the child inherits only the parent's slot for that provider, so an OpenAI
+  child never receives an Anthropic id. `ui.pick_model` /
   `ui.pick_effort` write `vim.b` when invoked ON a session buffer, else the
   global config default. `ui.session_info(bufnr)` is the single accessor that
   RESOLVES that whole override -> config chain (returning `nil` off a session

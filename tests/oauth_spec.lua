@@ -422,6 +422,43 @@ it("provider: a 401 with a login token refreshes once and retries with the new t
   assert(last_bearer:find("Bearer acc%-") and not last_bearer:find("acc-old", 1, true), last_bearer)
 end)
 
+it("provider: a spawned child under a ChatGPT login sends its explicit model with the login token", function()
+  store(cred_fixture({ access = "acc-spawn" }))
+  local loop = require("straps.loop")
+  local parent = vim.api.nvim_create_buf(true, false)
+  vim.b[parent].straps_model = "claude-parent"
+  local child
+  local real_start = loop.start
+  loop.start = function(b) child = b end
+  local ok, serr = pcall(registry.call, "tool.spawn", { task = "probe", model = "gpt-spawned" }, { bufnr = parent })
+  loop.start = real_start
+  assert(ok and child, tostring(serr))
+  local ctx = {
+    bufnr = child,
+    emit = function() end,
+    cancelled = function() return false end,
+    on_cancel = function() end,
+    await = function(start)
+      local r, fin = nil, false
+      start(function(...) if not fin then fin, r = true, { n = select("#", ...), ... } end end)
+      vim.wait(20000, function() return fin end, 10)
+      return unpack(r, 1, r.n)
+    end,
+  }
+  local co = coroutine.create(function()
+    return registry.call("fn.provider", { system = "s", messages = { { role = "user", content = "hi" } } }, ctx)
+  end)
+  local done, res = coroutine.resume(co)
+  assert(done and res.content[1].text == "oauth-ok", vim.inspect(res))
+  local body = vim.json.decode(last_stdin())
+  assert(body.model == "gpt-spawned", "child sent model " .. tostring(body.model))
+  local last_bearer
+  for _, l in ipairs(vim.fn.readfile(tmp .. "/argv")) do
+    if l:find("Bearer", 1, true) then last_bearer = l end
+  end
+  assert(last_bearer:find("Bearer acc-spawn", 1, true), last_bearer)
+end)
+
 it("provider: a refresh that keeps failing surfaces the 401 instead of looping", function()
   store(cred_fixture({ access = "acc-old" }))
   set_mode("fail")

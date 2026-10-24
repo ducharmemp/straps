@@ -1266,7 +1266,7 @@ end
 -- setup{}) -> the persisted preference file (fn.provider_pref, written by
 -- :StrapsProvider) -> "anthropic". Keeping config.provider nil by default lets
 -- the file be the durable default; setting it in setup{} pins it and wins over
--- the file. Unknown values fall back to Anthropic rather than erroring mid-run.
+-- the file. An unknown nonempty value raises an error.
 -- Keeping fn.provider as the single loop-facing entry means the loop, tests and
 -- DESIGN contract are unchanged; each backend is its own redefinable entry.
 local PROVIDER_SRC = [==[

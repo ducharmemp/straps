@@ -374,7 +374,10 @@ function M.key(buf, key)
     if entry.bufnr then ui().rename_session(entry.bufnr)
     else
       vim.ui.input({ prompt = "session title: ", default = require("straps.state").session_title(entry.path) or "" }, function(text)
-        if text ~= nil then require("straps.state").set_session_title(entry.path, text); M.refresh() end
+        if text == nil then return end
+        local ok, err = require("straps.state").set_session_title(entry.path, text)
+        if not ok then vim.notify("straps: could not write session title: " .. tostring(err), vim.log.levels.WARN) end
+        M.refresh()
       end)
     end
   elseif key == "x" then

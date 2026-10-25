@@ -53,7 +53,6 @@ Run |:checkhealth| straps to verify your install — see |straps-health|.
 						*straps.setup()*
 >lua
 	require("straps").setup({
-	  model = "claude-sonnet-5",
 	  default_max_tokens = 32000,
 	})
 <
@@ -65,7 +64,10 @@ provider, tools, editor tools and UI. It is idempotent: registration uses
 The API key is read by |fn.api_key|: `$ANTHROPIC_API_KEY` first, then the
 first line of `$XDG_CONFIG_HOME/straps/api_key` (which must be chmod 600).
 The OpenAI provider reads |fn.openai_api_key|, which also accepts a ChatGPT
-login made with |:StrapsLogin|.
+login made with |:StrapsLogin|. The llama.cpp provider needs a key only when
+`llama-server` runs with `--api-key`; |fn.llamacpp_api_key| reads
+`$LLAMACPP_API_KEY`, else `$LLAMA_API_KEY` (the variable `llama-server` reads),
+and the key is sent as `Authorization: Bearer`.
 
 The commands work without `setup()` (they `require` lazily), but folding, the
 `gf` mapping and rendering are only fully wired once `setup()` has run.
@@ -233,11 +235,27 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			|:Straps| (:vertical StrapsAgents for a vsplit).
 			See the dashboard keys below and |straps-subagents|.
 
+							*:StrapsProvider*
+:StrapsProvider		Pick the backend: anthropic, openai or llamacpp. On a
+			session buffer it sets b:straps_provider for that
+			session only; elsewhere it sets config `provider` and
+			persists the choice to ~/.config/straps/provider
+			(|fn.provider_pref|). Run |:StrapsModel| after it to
+			pick that provider's model. A session keeps the
+			provider and model of its first successful request,
+			saved in the transcript's .meta file, so a global pick
+			affects only sessions that have not made a request.
+
 							*:StrapsModel*
 :StrapsModel		Pick the provider-specific model for the current session
 			(or global default off a non-session buffer). Does live
-			discovery via |fn.list_models| and merges your account
-			catalog over `models` or `openai_models`.
+			discovery via |fn.list_models| and merges the
+			provider's catalog over `models`, `openai_models` or
+			`llamacpp_models`. A session pick is saved in the
+			transcript's .meta file and restored on resume. A
+			global pick persists per provider to
+			~/.config/straps/model_<provider> (|fn.model_pref|);
+			a model key set in setup{} wins over it.
 
 							*:StrapsEffort*
 :StrapsEffort		Pick the extended-thinking effort (off/low/medium/high
@@ -313,7 +331,10 @@ from a Lua component framework, or use `ui.agents_status()`.
 Pass these to |straps.setup()|. Defaults shown.
 
 						*straps-config-model*
-model			(string) "claude-sonnet-5". The request model.
+model			(string|nil) nil. The Anthropic request model. nil uses
+			the persisted global |:StrapsModel| pick
+			(|fn.model_pref|), else "claude-sonnet-5". A value here
+			wins over the persisted pick.
 max_tokens		(number|nil) nil. Response token cap per call. nil uses
 			the active model's own max output (the matching
 			|models| entry's `max_output`, else
@@ -322,6 +343,9 @@ max_tokens		(number|nil) nil. Response token cap per call. nil uses
 			bumps above it when it would be <= budget_tokens (the
 			API rejects that). OpenAI: max_tokens else
 			default_max_tokens (no per-model discovery).
+			llama.cpp: max_tokens, else the `llamacpp_models`
+			entry's `max_output` (discovery sets none), else
+			default_max_tokens.
 default_max_tokens	(number) 32000. Fallback cap when max_tokens is nil and
 			the model has no known max_output; also the OpenAI
 			default.
@@ -352,7 +376,8 @@ gzip			(boolean) true. gzip the Anthropic request body
 			(Content-Encoding: gzip), 3-4x fewer upload bytes per
 			turn. Falls back to the plain body when gzip is not on
 			PATH. Set false for a proxy that rejects compressed
-			requests.
+			requests. The llama.cpp provider never compresses:
+			`llama-server` answers a gzip body with HTTP 415.
 compact_keep_turns	(number) 2. Assistant turns |fn.compact| keeps intact.
 after_write_diagnostics	(boolean) true. Default |hook.after_write|: feed the
 			attached LSP's ERROR/WARN diagnostics for a written file
@@ -399,24 +424,37 @@ models			(list) 4 curated Anthropic entries { id, label?,
 openai_models		(list) curated OpenAI entries { id, label? }. The
 			|:StrapsModel| OpenAI seed/cache, separate from
 			`models` so provider switches do not show stale ids.
+llamacpp_models		(list) {}. The |:StrapsModel| llama.cpp cache, filled
+			from the server's /v1/models; a loaded model's
+			`n_ctx` becomes its `context`.
 context_window		(number|nil) 200000. Fallback token window for a model
 			with no `context` in the active provider's model list,
 			used only to render the winbar's context-fill percentage.
-			nil hides the %.
+			nil hides the %. Not applied to llama.cpp models, whose
+			window depends on the server's -c.
 effort			(string) "off". Name of the active |:StrapsEffort|
 			entry.
 efforts			(list) off/low/medium/high, each { name, level?,
 			budget_tokens? }.
 base_url		(string|nil) nil -> https://api.anthropic.com. Prefixes
 			/v1/messages, so a compatible proxy is a config knob.
-provider		(string|nil) nil. Backend for |fn.provider|: "anthropic"
-			or "openai". nil -> the |:StrapsProvider| persisted
-			choice (~/.config/straps/provider) else "anthropic".
+provider		(string|nil) nil. Backend for |fn.provider|:
+			"anthropic", "openai" or "llamacpp". nil -> the
+			|:StrapsProvider| persisted choice
+			(~/.config/straps/provider) else "anthropic".
 			Per session via b:straps_provider.
 openai_base_url		(string|nil) nil -> https://api.openai.com. Prefixes
 			/v1/responses for the OpenAI backend.
-openai_model		(string|nil) "gpt-5". Model id when provider ==
-			"openai"; kept separate from Anthropic `model`.
+openai_model		(string|nil) nil. Model id when provider == "openai";
+			kept separate from Anthropic `model`. nil uses the
+			persisted global pick, else "gpt-5".
+llamacpp_base_url	(string|nil) "http://127.0.0.1:8080". Prefixes
+			/v1/messages and /v1/models for the llama.cpp backend.
+llamacpp_model		(string|nil) nil. Model id when provider ==
+			"llamacpp": the server's --alias or a router-mode
+			model name. Required: |fn.provider_llamacpp| raises
+			without one, because router mode rejects a request
+			with no model.
 request_timeout_ms	(number) 300000. Idle watchdog: kill a request whose
 			stream is silent this long.
 log_file		(string|nil) nil (off). Structured JSONL event log; see
@@ -440,9 +478,11 @@ layers			(table) { editor = true, openai = true }. Which
 			to dispatch to "openai", and |fn.list_models| returns
 			`(nil, err)` instead of raising.
 
-Per-session overrides live in buffer variables (b:straps_model,
-b:straps_effort, ...) set by |:StrapsModel| / |:StrapsEffort| on a session
-buffer, so two sessions can run different models at once. The effective
+Per-session overrides live in buffer variables (b:straps_provider, the
+provider's model variable b:straps_model, b:straps_openai_model or
+b:straps_llamacpp_model, and b:straps_effort) set by |:StrapsProvider| /
+|:StrapsModel| / |:StrapsEffort| on a session buffer, so two sessions can run
+different models at once. The effective
 provider/model/effort is also told to the agent by |fn.model_note|, a
 "# Model" section appended to each request's system text (never to the
 transcript), so a mid-run change is reflected on the next turn.
@@ -799,12 +839,42 @@ The machinery itself, exposed as redefinable entries.
 fn.provider(req, ctx) -> { content, stop_reason, usage }
 		A DISPATCHER: selects a backend (b:straps_provider ->
 		config `provider` -> |fn.provider_pref| file -> "anthropic")
-		and delegates to |fn.provider_anthropic| or
-		|fn.provider_openai|. See |:StrapsProvider|.
+		and delegates to |fn.provider_anthropic|,
+		|fn.provider_openai| or |fn.provider_llamacpp|. See
+		|:StrapsProvider|. The provider names live in the
+		`PROVIDERS` table of lua/straps/provider.lua, which the
+		pickers, `spawn` and health read, so a fourth backend needs
+		an entry there as well as a redefined |fn.provider|.
 						*fn.provider_anthropic*
-fn.provider_anthropic(req, ctx)	The Anthropic Messages API over streaming SSE
-		via curl. Prompt caching, extended thinking, idle watchdog,
-		429/529 retry with backoff.
+fn.provider_anthropic(req, ctx)	The Anthropic backend: calls
+		|fn.anthropic_messages| with no `opts`, so endpoint, key and
+		model come from config `base_url`, |fn.api_key| and
+		b:straps_model / config `model`. Redefining it changes only
+		Anthropic sessions.
+						*fn.anthropic_messages*
+fn.anthropic_messages(req, ctx, opts?)
+		The Anthropic Messages wire format over streaming SSE via
+		curl. Prompt caching, extended thinking, idle watchdog,
+		429/529 retry with backoff. `opts` points it at another
+		server: `base_url`, `model` (replaces b:straps_model /
+		config `model`), `models` (replaces config `models`),
+		`auth_headers` (argv list replacing the x-api-key header;
+		|fn.api_key| is not called; with `base_url` set and
+		`auth_headers` omitted, no auth header is sent), `gzip`
+		(false disables compression) and `label` (names the backend
+		in errors). |fn.provider_llamacpp| routes through it, so a
+		redefinition must accept and honor `opts`.
+						*fn.provider_llamacpp*
+fn.provider_llamacpp(req, ctx)	A llama.cpp `llama-server` through
+		|fn.anthropic_messages| with `opts`: endpoint config
+		`llamacpp_base_url`, model b:straps_llamacpp_model else
+		config `llamacpp_model` (an error when both are unset), no
+		gzip, and an optional Bearer key from |fn.llamacpp_api_key|.
+						*fn.llamacpp_api_key*
+fn.llamacpp_api_key(opts?) -> key?	`$LLAMACPP_API_KEY`, else
+		`$LLAMA_API_KEY`, or nil when both are unset or empty.
+		`opts.base_url` is the server the key is for; every caller
+		passes it, so a redefinition can pick a key per server.
 						*fn.provider_openai*
 fn.provider_openai(req, ctx)	The OpenAI Responses API over streaming
 		SSE via curl. Translates the request/response to and from the
@@ -814,6 +884,14 @@ fn.provider_openai(req, ctx)	The OpenAI Responses API over streaming
 fn.provider_pref(value?)	Read (no arg) or write (a string) the persisted
 		provider choice at $XDG_CONFIG_HOME/straps/provider. Written by
 		|:StrapsProvider|; read by |fn.provider| as the default.
+						*fn.model_pref*
+fn.model_pref(provider, value?, entry?) -> value, entry?
+		Read (no value) or write (a string, plus the model's list entry)
+		the persisted global model for a provider at
+		$XDG_CONFIG_HOME/straps/model_<provider>. Written by a global
+		|:StrapsModel| pick. Read on each request, so it applies to every
+		model key that setup{} did not set, and to other running Neovim
+		instances at once.
 						*fn.api_key*
 fn.api_key() -> string		Resolve the Anthropic API key (see |straps-setup|).
 						*fn.openai_api_key*
@@ -855,7 +933,9 @@ fn.openai_device_id()		This installation's UUIDv4, sent as
 						*fn.list_models*
 fn.list_models(provider?) -> entries
 			Live GET /v1/models for |:StrapsModel|. Optional provider is
-			"anthropic" or "openai"; omitted means effective provider.
+			"anthropic", "openai" or "llamacpp"; omitted means
+			effective provider. llama.cpp needs no key, and a
+			loaded model's `meta.n_ctx` becomes `context`.
 						*fn.build_tools*
 fn.build_tools() -> tools	Map every tool.* entry to an API tool def.
 						*fn.capability*
@@ -1215,10 +1295,12 @@ category, add `vcs` to the grantable list, then `:StrapsAuto vcs` grants it. >lu
 <
 Diagnoses everything that can be wrong before a session runs: the Neovim
 version, `curl` (and optional ripgrep), the API key (including a group/other
-readable key file, the ChatGPT login file for OpenAI, and which source the key
-comes from), a writable `session_dir`, the tree-sitter `straps` parser
+readable key file, the ChatGPT login file for OpenAI, which source the key
+comes from, and for llama.cpp the `llamacpp_base_url` and whether
+|fn.llamacpp_api_key| returns a key), a writable `session_dir`, the tree-sitter `straps` parser
 and its queries, the `.straps.lua` trust state, the loaded registry (entry
-counts, redefinitions, missing core entries), the model/effort pairing, and
+counts, redefinitions, missing core entries), the active provider's
+model/effort pairing, and
 any runs still in flight. Every probe is isolated, so the report runs even
 when `setup()` never ran or the data dir is unwritable.
 

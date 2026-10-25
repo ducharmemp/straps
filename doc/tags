@@ -10,6 +10,7 @@
 :StrapsLogin	straps.txt	/*:StrapsLogin*
 :StrapsLogout	straps.txt	/*:StrapsLogout*
 :StrapsModel	straps.txt	/*:StrapsModel*
+:StrapsProvider	straps.txt	/*:StrapsProvider*
 :StrapsRegistry	straps.txt	/*:StrapsRegistry*
 :StrapsRename	straps.txt	/*:StrapsRename*
 :StrapsResume	straps.txt	/*:StrapsResume*
@@ -22,14 +23,17 @@ StrapsRunStart	straps.txt	/*StrapsRunStart*
 StrapsStatusChanged	straps.txt	/*StrapsStatusChanged*
 b:straps_run_reason	straps.txt	/*b:straps_run_reason*
 b:straps_status	straps.txt	/*b:straps_status*
+fn.anthropic_messages	straps.txt	/*fn.anthropic_messages*
 fn.api_key	straps.txt	/*fn.api_key*
 fn.autocmd_bridge	straps.txt	/*fn.autocmd_bridge*
 fn.build_tools	straps.txt	/*fn.build_tools*
 fn.capability	straps.txt	/*fn.capability*
 fn.compact	straps.txt	/*fn.compact*
 fn.list_models	straps.txt	/*fn.list_models*
+fn.llamacpp_api_key	straps.txt	/*fn.llamacpp_api_key*
 fn.log	straps.txt	/*fn.log*
 fn.model_note	straps.txt	/*fn.model_note*
+fn.model_pref	straps.txt	/*fn.model_pref*
 fn.openai_api_key	straps.txt	/*fn.openai_api_key*
 fn.openai_device_id	straps.txt	/*fn.openai_device_id*
 fn.openai_oauth_credential	straps.txt	/*fn.openai_oauth_credential*
@@ -40,6 +44,7 @@ fn.openai_oauth_post	straps.txt	/*fn.openai_oauth_post*
 fn.openai_oauth_refresh	straps.txt	/*fn.openai_oauth_refresh*
 fn.provider	straps.txt	/*fn.provider*
 fn.provider_anthropic	straps.txt	/*fn.provider_anthropic*
+fn.provider_llamacpp	straps.txt	/*fn.provider_llamacpp*
 fn.provider_openai	straps.txt	/*fn.provider_openai*
 fn.provider_pref	straps.txt	/*fn.provider_pref*
 fn.readonly_policy	straps.txt	/*fn.readonly_policy*

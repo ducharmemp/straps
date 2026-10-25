@@ -22,6 +22,10 @@ local function step(fn)
 end
 
 
+-- Hermetic: global pickers persist to $XDG_CONFIG_HOME/straps (provider and
+-- model_<provider> files), so they write under a throwaway dir.
+vim.env.XDG_CONFIG_HOME = vim.fn.tempname()
+vim.fn.mkdir(vim.env.XDG_CONFIG_HOME, "p")
 local straps = require("straps").setup({ max_turns = 8 })
 -- Hermetic: durable sessions write under a throwaway dir, never the real data dir.
 straps.config.session_dir = vim.fn.tempname()
@@ -180,7 +184,9 @@ end)
 
 it("config merge applied", function()
   assert(straps.config.max_turns == 8)
-  assert(straps.config.model == "claude-sonnet-5")
+  assert(straps.config.model == nil, "config.model should default to nil: " .. tostring(straps.config.model))
+  assert(require("straps.provider").resolve_model("anthropic", nil, straps.config) == "claude-sonnet-5",
+    "the anthropic slot default should apply")
 end)
 
 -- Picker tests: stub ui.pick (the snacks/vim.ui.select seam) so these run
@@ -219,15 +225,17 @@ do
     end
   end
 
-  it("pick_model sets config.model from a picked entry", function()
+  it("a global pick_model persists the picked entry and the anthropic model resolves to it", function()
     straps.config.provider = "anthropic"
+    straps.config.model = nil
     with_list_models("return function() return nil, 'stubbed offline' end", function()
       with_stub({ id = "claude-opus-4-8", label = "Opus 4.8" }, function()
         ui.pick_model()
       end)
     end)
-    assert(straps.config.model == "claude-opus-4-8",
-      "config.model is " .. tostring(straps.config.model))
+    local resolved = require("straps.provider").resolve_model("anthropic", nil, straps.config)
+    assert(registry.call("fn.model_pref", "anthropic") == "claude-opus-4-8", "the pick was not persisted")
+    assert(resolved == "claude-opus-4-8", "resolved " .. tostring(resolved))
   end)
 
   it("pick_model writes config.openai_model and uses only OpenAI models when OpenAI is active", function()
@@ -244,7 +252,9 @@ do
       ui.pick_model()
       ui.pick = real_pick
     end)
-    assert(_G.__last_model_provider == "openai", "pick_model did not request the OpenAI catalog")
+    local asked = _G.__last_model_provider
+    _G.__last_model_provider = nil
+    assert(asked == "openai", "pick_model did not request the OpenAI catalog")
     assert(straps.config.openai_model == "gpt-5-mini",
       "openai_model is " .. tostring(straps.config.openai_model))
     assert(straps.config.model == "claude-sonnet-5", "OpenAI pick should not overwrite Anthropic config.model")
@@ -252,6 +262,106 @@ do
       assert(not tostring(m.id):find("claude", 1, true), "OpenAI picker leaked Claude model: " .. vim.inspect(m))
     end
     straps.config.provider = "anthropic"
+  end)
+
+  -- Runs a test body and restores the provider and model config afterwards,
+  -- even when an assertion fails, so one failure does not leak
+  -- provider = "llamacpp" into the tests after it.
+  local function with_restored_config(fn)
+    return function()
+      local keys = { "provider", "model", "llamacpp_model", "models", "llamacpp_models" }
+      local saved = {}
+      for _, k in ipairs(keys) do saved[k] = straps.config[k] end
+      local ok, err = pcall(fn)
+      for _, k in ipairs(keys) do straps.config[k] = saved[k] end
+      if not ok then error(err, 0) end
+    end
+  end
+
+  it("pick_model under llamacpp persists the llamacpp model globally and stores llamacpp_models", with_restored_config(function()
+    straps.config.provider = "llamacpp"
+    straps.config.model = "claude-sonnet-5"
+    straps.config.llamacpp_model = nil
+    straps.config.llamacpp_models = {}
+    local seen
+    with_list_models("return function(provider) _G.__last_model_provider = provider; return { { id = 'qwen-dense', label = 'qwen-dense', context = 131072 } } end", function()
+      ui.pick = function(items, opts, on_choice)
+        seen = items
+        on_choice(items[1])
+      end
+      local ok, err = pcall(ui.pick_model)
+      ui.pick = real_pick
+      assert(ok, tostring(err))
+    end)
+    local asked = _G.__last_model_provider
+    _G.__last_model_provider = nil
+    assert(asked == "llamacpp", "pick_model did not request the llamacpp catalog")
+    local resolved = require("straps.provider").resolve_model("llamacpp", nil, straps.config)
+    assert(resolved == "qwen-dense", "the llamacpp model resolves to " .. tostring(resolved))
+    assert(straps.config.llamacpp_model == nil, "a persisted global pick should leave config.llamacpp_model unset")
+    local stored, stored_entry = registry.call("fn.model_pref", "llamacpp")
+    assert(stored == "qwen-dense", "the global pick was not persisted: " .. tostring(stored))
+    assert(stored_entry and stored_entry.context == 131072, "the pick's entry was not persisted: " .. vim.inspect(stored_entry))
+    assert(registry.call("fn.model_pref", "anthropic") ~= "qwen-dense", "a llamacpp pick persisted as the anthropic model")
+    assert(straps.config.model == "claude-sonnet-5", "llamacpp pick should not overwrite config.model")
+    assert(#straps.config.llamacpp_models == 1 and straps.config.llamacpp_models[1].context == 131072,
+      "llamacpp_models not stored: " .. vim.inspect(straps.config.llamacpp_models))
+    for _, m in ipairs(seen or {}) do
+      assert(not tostring(m.id):find("claude", 1, true), "llamacpp picker leaked Claude model: " .. vim.inspect(m))
+    end
+    straps.config.provider = "anthropic"
+    straps.config.llamacpp_model = nil
+    straps.config.llamacpp_models = {}
+  end))
+
+  it("pick_model: a live n_ctx replaces a stored llamacpp context; an Anthropic stored context is kept", with_restored_config(function()
+    straps.config.provider = "llamacpp"
+    local saved_models = straps.config.models
+    straps.config.llamacpp_models = { { id = "qwen-dense", label = "qwen-dense", context = 8192 } }
+    straps.config.models = { { id = "claude-x", label = "X", context = 1000 } }
+    with_list_models("return function() return { { id = 'qwen-dense', label = 'qwen-dense', context = 32768 } } end", function()
+      with_stub(nil, function()
+        ui.pick_model()
+      end)
+    end)
+    assert(straps.config.llamacpp_models[1].context == 32768,
+      "stale llama context kept: " .. tostring(straps.config.llamacpp_models[1].context))
+    straps.config.provider = "anthropic"
+    with_list_models("return function() return { { id = 'claude-x', label = 'X', context = 5 } } end", function()
+      with_stub(nil, function()
+        ui.pick_model()
+      end)
+    end)
+    assert(straps.config.models[1].context == 1000, "an Anthropic stored context should not be replaced")
+    straps.config.llamacpp_models = {}
+    straps.config.models = saved_models
+  end))
+
+  it("pick_model under llamacpp on a session buffer writes straps_llamacpp_model only", with_restored_config(function()
+    straps.config.provider = "anthropic"
+    local sess = state.new_session()
+    vim.b[sess].straps_provider = "llamacpp"
+    local prev = vim.api.nvim_get_current_buf()
+    vim.api.nvim_set_current_buf(sess)
+    with_list_models("return function() return { { id = 'gpt-oss', label = 'gpt-oss' } } end", function()
+      with_stub({ id = "gpt-oss", label = "gpt-oss", thinking = "adaptive" }, function()
+        ui.pick_model()
+      end)
+    end)
+    vim.api.nvim_set_current_buf(prev)
+    assert(vim.b[sess].straps_llamacpp_model == "gpt-oss", tostring(vim.b[sess].straps_llamacpp_model))
+    assert(vim.b[sess].straps_model == nil, "Anthropic slot written: " .. tostring(vim.b[sess].straps_model))
+    assert(straps.config.llamacpp_model == nil, "global llamacpp_model mutated on a session buffer")
+    local saved_provider, saved_model, _, saved_entry = state.session_pin(vim.api.nvim_buf_get_name(sess))
+    assert(saved_provider == "llamacpp" and saved_model == "gpt-oss",
+      "the session pick was not saved to .meta: " .. tostring(saved_provider) .. "/" .. tostring(saved_model))
+    assert(saved_entry and saved_entry.thinking == "adaptive", "the pick's entry was not saved: " .. vim.inspect(saved_entry))
+    straps.config.llamacpp_models = {}
+  end))
+
+  it("merge_models: a live llamacpp entry without n_ctx keeps the stored context", function()
+    local merged = ui._merge_models({ { id = "gpt-oss", label = "gpt-oss", context = 8192 } }, { { id = "gpt-oss" } }, true)
+    assert(merged[1].context == 8192, "a live entry with no context erased the stored one: " .. tostring(merged[1].context))
   end)
 
   it("pick_model cancel (nil choice) leaves config.model untouched", function()
@@ -350,6 +460,14 @@ end
     assert(straps.config.openai_model == "gpt-5", "global openai_model was mutated on a session buffer")
   end)
 
+  -- The global pick_model tests above persist their picks (fn.model_pref);
+  -- remove them so the persisted models do not override config in later tests.
+  step(function()
+    for _, name in ipairs(require("straps.provider").provider_names()) do
+      vim.fn.delete(vim.env.XDG_CONFIG_HOME .. "/straps/model_" .. name)
+    end
+  end)
+
   it("pick_effort on a session buffer sets it PER-BUFFER, not global", function()
     local sess = state.new_session()
     local prev = vim.api.nvim_get_current_buf()
@@ -378,17 +496,84 @@ end
       vim.env.XDG_CONFIG_HOME = pdir
     end)
 
-    it("pick_provider global sets config.provider AND persists to the file", function()
+    it("pick_provider global persists to the file and leaves an unset config.provider unset", function()
       straps.config.provider = nil
       with_stub("openai", function()
         ui.pick_provider()
       end)
-      assert(straps.config.provider == "openai",
+      assert(straps.config.provider == nil,
         "config.provider is " .. tostring(straps.config.provider))
+      assert((require("straps.provider").resolve_provider(nil, straps.config)) == "openai",
+        "the persisted pick does not resolve")
       local line = vim.trim(table.concat(vim.fn.readfile(pdir .. "/straps/provider"), "\n"))
       assert(line == "openai", "persisted file wrong: " .. line)
       -- fn.provider_pref reads it back.
       assert(registry.call("fn.provider_pref") == "openai", "provider_pref read-back wrong")
+    end)
+
+    it("pick_provider offers llamacpp and persists it", function()
+      straps.config.provider = nil
+      local offered
+      ui.pick = function(items, opts, on_choice)
+        offered = items
+        on_choice("llamacpp")
+      end
+      local ok, err = pcall(ui.pick_provider)
+      ui.pick = real_pick
+      assert(ok, tostring(err))
+      assert(vim.tbl_contains(offered or {}, "llamacpp"), "llamacpp not offered: " .. vim.inspect(offered))
+      assert((require("straps.provider").resolve_provider(nil, straps.config)) == "llamacpp",
+        "the persisted pick does not resolve")
+      assert(registry.call("fn.provider_pref") == "llamacpp", "provider_pref read-back wrong")
+      straps.config.provider = nil
+    end)
+
+    it("pick_model refuses an unknown provider instead of listing anthropic models", function()
+      straps.config.provider = "llama.cpp"
+      local picked = false
+      ui.pick = function() picked = true end
+      local ok, err = pcall(function()
+        with_list_models("return function() _G.__unknown_listed = true; return {} end", function()
+          ui.pick_model()
+        end)
+      end)
+      ui.pick = real_pick
+      local listed = _G.__unknown_listed == true
+      _G.__unknown_listed = nil
+      straps.config.provider = nil
+      assert(ok, tostring(err))
+      assert(not listed, "pick_model queried a catalog for an unknown provider")
+      assert(not picked, "pick_model opened a picker for an unknown provider")
+    end)
+
+    it("pick_model refuses an unknown provider read from the pref file", function()
+      straps.config.provider = nil
+      vim.fn.writefile({ "llama.cpp" }, pdir .. "/straps/provider")
+      local picked = false
+      ui.pick = function() picked = true end
+      local ok, err = pcall(function()
+        with_list_models("return function() _G.__unknown_listed = true; return {} end", function()
+          ui.pick_model()
+        end)
+      end)
+      ui.pick = real_pick
+      vim.fn.delete(pdir .. "/straps/provider")
+      local listed = _G.__unknown_listed == true
+      _G.__unknown_listed = nil
+      assert(ok, tostring(err))
+      assert(not listed, "pick_model queried a catalog for an unknown pref-file provider")
+      assert(not picked, "pick_model opened a picker for an unknown pref-file provider")
+    end)
+
+    it("a persisted llamacpp preference drives session_info when config.provider is nil", function()
+      straps.config.provider = nil
+      registry.call("fn.provider_pref", "llamacpp")
+      local sess = state.new_session()
+      vim.b[sess].straps_llamacpp_model = "pref-model"
+      local i = ui.session_info(sess)
+      vim.fn.delete(pdir .. "/straps/provider")
+      assert(i.provider == "llamacpp", "provider: " .. tostring(i.provider))
+      assert(i.model == "pref-model", "model: " .. tostring(i.model))
     end)
 
     it("pick_provider cancel (nil) leaves config.provider untouched", function()
@@ -400,8 +585,9 @@ end
         "cancel should not change config.provider, got " .. tostring(straps.config.provider))
     end)
 
-    it("pick_provider on a session buffer sets it PER-BUFFER, no file write", function()
+    it("pick_provider on a pinned session buffer switches it PER-BUFFER and saves it to .meta, not the global file", function()
       local sess = state.new_session()
+      state.set_session_pin(sess, "llamacpp")
       local prev = vim.api.nvim_get_current_buf()
       vim.api.nvim_set_current_buf(sess)
       straps.config.provider = nil
@@ -412,6 +598,11 @@ end
       vim.api.nvim_set_current_buf(prev)
       assert(vim.b[sess].straps_provider == "openai",
         "per-buffer provider not set: " .. tostring(vim.b[sess].straps_provider))
+      local saved, saved_model = state.session_pin(vim.api.nvim_buf_get_name(sess))
+      local expected_model = require("straps.provider").resolve_model("openai", nil, straps.config)
+      assert(saved == "openai", ".meta holds " .. tostring(saved))
+      assert(saved_model == expected_model and vim.b[sess].straps_openai_model == expected_model,
+        "the switch did not pin the openai model: " .. tostring(saved_model) .. "/" .. tostring(vim.b[sess].straps_openai_model))
       assert(straps.config.provider == nil,
         "global config.provider was mutated on a session buffer")
       assert(vim.fn.filereadable(pdir .. "/straps/provider") == 0,
@@ -572,6 +763,125 @@ it("session_info resolves model/effort/status for a NON-current buffer", functio
   assert(ui.session_winbar() == "", "zero-arg winbar on a scratch buffer must stay empty")
 
   vim.api.nvim_set_current_buf(prev)
+end)
+
+it("session_info resolves a llamacpp session's model, label and context", function()
+  local ui = require("straps.ui")
+  straps.config.provider = "anthropic"
+  straps.config.llamacpp_models = { { id = "qwen-dense", label = "Qwen dense", context = 131072 } }
+  local sess = state.new_session()
+  vim.b[sess].straps_provider = "llamacpp"
+  vim.b[sess].straps_llamacpp_model = "qwen-dense"
+  vim.b[sess].straps_usage = { input_billed = 13107 }
+  local i = ui.session_info(sess)
+  straps.config.llamacpp_models = {}
+  assert(i.provider == "llamacpp", "provider: " .. tostring(i.provider))
+  assert(i.model == "qwen-dense", "model: " .. tostring(i.model))
+  assert(i.model_label == "Qwen dense", "label: " .. tostring(i.model_label))
+  assert(i.context == 131072, "context: " .. tostring(i.context))
+  assert(i.context_pct == 10, "context_pct: " .. tostring(i.context_pct))
+end)
+
+it("session_info falls back to gpt-5 for openai with no openai_model set", function()
+  local ui = require("straps.ui")
+  local saved_provider, saved_model = straps.config.provider, straps.config.openai_model
+  straps.config.provider = "openai"
+  straps.config.openai_model = nil
+  local sess = state.new_session()
+  local ok, i = pcall(ui.session_info, sess)
+  straps.config.provider, straps.config.openai_model = saved_provider, saved_model
+  assert(ok, tostring(i))
+  assert(i.model == "gpt-5", "model: " .. tostring(i.model))
+end)
+
+it("session_info hides the context fill for a llamacpp model with no known n_ctx", function()
+  local ui = require("straps.ui")
+  straps.config.llamacpp_models = {}
+  local sess = state.new_session()
+  vim.b[sess].straps_provider = "llamacpp"
+  vim.b[sess].straps_llamacpp_model = "gpt-oss"
+  vim.b[sess].straps_usage = { input_billed = 1000 }
+  local i = ui.session_info(sess)
+  assert(i.context == nil, "config.context_window leaked into a llamacpp session: " .. tostring(i.context))
+  assert(i.context_pct == nil, "context_pct: " .. tostring(i.context_pct))
+end)
+
+it("session_info does not raise for an unknown provider and labels it instead of showing an anthropic model", function()
+  local ui = require("straps.ui")
+  straps.config.model = "claude-sonnet-5"
+  local sess = state.new_session()
+  vim.b[sess].straps_provider = "bogus"
+  local ok, i = pcall(ui.session_info, sess)
+  assert(ok, "session_info raised: " .. tostring(i))
+  assert(i.model == "?", "model: " .. tostring(i.model))
+  assert(i.model_label == "unknown provider bogus", "model_label: " .. tostring(i.model_label))
+  assert(i.context == nil, "an unknown provider got a context window: " .. tostring(i.context))
+  local ok_s, s = pcall(ui.session_status, sess)
+  assert(ok_s and type(s) == "string", "session_status raised: " .. tostring(s))
+end)
+
+it("session_info shows an unreadable provider pref as the label and as `error`", function()
+  local ui = require("straps.ui")
+  local saved_provider = straps.config.provider
+  straps.config.provider = nil
+  local pref = vim.env.XDG_CONFIG_HOME .. "/straps/provider"
+  vim.fn.mkdir(vim.env.XDG_CONFIG_HOME .. "/straps", "p")
+  vim.fn.writefile({ "llamacpp" }, pref)
+  vim.uv.fs_chmod(pref, 0)
+  local sess = state.new_session()
+  local ok, i = pcall(ui.session_info, sess)
+  vim.uv.fs_chmod(pref, 420)
+  vim.fn.delete(pref)
+  straps.config.provider = saved_provider
+  assert(ok, "session_info raised: " .. tostring(i))
+  assert(i.error and i.error:find("exists but could not be read", 1, true), "error: " .. tostring(i.error))
+  assert(i.model_label == i.error, "label: " .. tostring(i.model_label))
+  assert(i.provider == "?", "provider: " .. tostring(i.provider))
+end)
+
+it("rename_session names the error when the title cannot be written", function()
+  local ui = require("straps.ui")
+  local sess = state.new_session()
+  local path = vim.api.nvim_buf_get_name(sess)
+  state.append(sess, "user", nil, "hello")
+  vim.api.nvim_buf_call(sess, function() vim.cmd("silent write") end)
+  vim.fn.mkdir(path .. ".meta", "p")
+  vim.fn.writefile({ "x" }, path .. ".meta/occupied")
+  local said
+  local real_notify = vim.notify
+  vim.notify = function(msg, level) if level == vim.log.levels.WARN then said = msg end end
+  ui.rename_session(sess, "new title")
+  vim.notify = real_notify
+  vim.fn.delete(path .. ".meta", "rf")
+  assert(said and said:find("could not write session title: ", 1, true) and #said > #"straps: could not write session title: ",
+    "the notice does not name the error: " .. tostring(said))
+end)
+
+it("session_winbar escapes the % in the usage segment, so the bar evaluates and shows the percentage", function()
+  local ui = require("straps.ui")
+  local saved = straps.config.context_window
+  straps.config.context_window = 1000
+  local sess = state.new_session()
+  vim.b[sess].straps_provider = "anthropic"
+  vim.b[sess].straps_model = "claude-unlisted"
+  vim.b[sess].straps_usage = { input_billed = 100, cache_read = 50 }
+  local ok, res = pcall(vim.api.nvim_eval_statusline, ui.session_winbar(sess), {})
+  straps.config.context_window = saved
+  assert(ok, "the winbar did not evaluate: " .. tostring(res))
+  assert(res.str:find("(10%)", 1, true) and res.str:find("50%", 1, true), "usage percentages missing: " .. res.str)
+end)
+
+it("session_winbar escapes % so a model id cannot run a statusline expression", function()
+  local ui = require("straps.ui")
+  local sess = state.new_session()
+  vim.b[sess].straps_provider = "anthropic"
+  vim.b[sess].straps_model = [[%{execute('let g:straps_winbar_ran = 1')}]]
+  vim.g.straps_winbar_ran = nil
+  local out = vim.api.nvim_eval_statusline(ui.session_winbar(sess), {}).str
+  local ran = vim.g.straps_winbar_ran
+  vim.g.straps_winbar_ran = nil
+  assert(ran == nil, "the model id ran as a statusline expression")
+  assert(out:find("%{execute(", 1, true), "the model id is not shown literally: " .. out)
 end)
 
 it("session_info.overridden means DIVERGENCE, not merely a var being set", function()

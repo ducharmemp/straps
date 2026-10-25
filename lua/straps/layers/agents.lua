@@ -152,7 +152,7 @@ function M.register_spawn()
       properties = {
         task = { type = "string", description = "Complete, self-contained instructions for the subagent." },
         system = { type = "string", description = "Extra standing instructions for the child." },
-        provider = { type = "string", enum = { "anthropic", "openai" }, description = "Provider for the child (default: this session's provider/global default)." },
+        provider = { type = "string", enum = require("straps.provider").provider_names(), description = "Provider for the child (default: this session's provider/global default)." },
         tools = {
           type = "array",
           items = { type = "string" },
@@ -192,6 +192,10 @@ return function(input, ctx)
   end
   if input.allow ~= nil and type(input.allow) ~= "table" then
     error("spawn: allow must be an array of categories or tool names")
+  end
+  local providers = require("straps.provider")
+  if type(input.provider) == "string" and input.provider ~= "" and not providers.is_provider(input.provider) then
+    error("spawn: " .. providers.unknown_provider_error(input.provider))
   end
   -- A gated spawner (itself a readonly/allow child, marked by the spawn:gated
   -- grant) is a permission ceiling for its own children: it may delegate only
@@ -283,30 +287,24 @@ return function(input, ctx)
   vim.b[child].straps_spawn_timeout_ms = tonumber(input.timeout_ms) or 600000
   vim.b[child].straps_spawn_started_ms = vim.uv.now()
   do
-    local pp, pm, pom, pe
+    local pe
     pcall(function()
-      pp = vim.b[ctx.bufnr].straps_provider
-      pm = vim.b[ctx.bufnr].straps_model
-      pom = vim.b[ctx.bufnr].straps_openai_model
       pe = vim.b[ctx.bufnr].straps_effort
     end)
     local function present(v) return type(v) == "string" and v ~= "" end
     local ok_straps, straps = pcall(require, "straps")
     local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
-    local provider = (present(input.provider) and input.provider) or (present(pp) and pp)
-      or (present(config.provider) and config.provider)
-    if not provider then
-      local pref = registry.try_call("fn.provider_pref")
-      provider = present(pref) and pref or "anthropic"
-    end
+    local provider = (present(input.provider) and input.provider)
+      or providers.resolve_provider(ctx.bufnr, config)
+    local slot = providers.provider_slot(provider)
     local model = input.model
     if not present(model) then
-      if provider == "openai" then model = pom else model = pm end
+      pcall(function() model = vim.b[ctx.bufnr][slot.buf_model_var] end)
     end
     local effort = input.effort or pe
     vim.b[child].straps_provider = provider
     if present(model) then
-      if provider == "openai" then vim.b[child].straps_openai_model = model else vim.b[child].straps_model = model end
+      vim.b[child][slot.buf_model_var] = model
     end
     if type(effort) == "string" and effort ~= "" then vim.b[child].straps_effort = effort end
   end
@@ -737,16 +735,18 @@ return function(input, ctx)
   -- the marked entry is the one this session would actually send.
   local info
   pcall(function() info = require("straps.ui").session_info(ctx and ctx.bufnr) end)
-  local provider = (info and info.provider)
-    or (cfg.provider ~= "" and cfg.provider)
-    or require("straps.registry").try_call("fn.provider_pref")
-    or "anthropic"
+  local provider = (info and info.provider) or require("straps.provider").resolve_provider(nil, cfg)
   local current = info and info.model
 
-  local list = cfg[provider == "openai" and "openai_models" or "models"]
+  local providers = require("straps.provider")
+  if info and info.error then return "straps: " .. info.error end
+  if not providers.is_provider(provider) then
+    return providers.unknown_provider_error(provider) .. "; run :StrapsProvider"
+  end
+  local list = cfg[providers.provider_slot(provider).models_key]
   if type(list) ~= "table" or #list == 0 then
     return "no models configured for provider " .. tostring(provider)
-      .. " (run :StrapsModel to discover the account's catalog)"
+      .. " (run :StrapsModel to discover the provider's catalog)"
   end
 
   local lines = { ("models available to this session (provider: %s)"):format(provider) }
@@ -995,21 +995,32 @@ end
     doc = "Called as (ctx) each turn by the loop; returns a '# Model' section"
       .. " appended to that request's system text, naming the session's"
       .. " effective provider/model/effort (resolved through ui.session_info,"
-      .. " the same vim.b-override -> config chain fn.provider uses) plus the"
-      .. " standing note that subagents inherit them unless spawn is passed"
-      .. " explicit arguments. nil for a non-session buffer. Redefine to"
+      .. " with the rules fn.provider uses), an '(inert: <reason>)' marker"
+      .. " when the effort changes nothing for the model (provider.effort_applies),"
+      .. " plus the standing note that subagents inherit them unless spawn is"
+      .. " passed explicit arguments. nil for a non-session buffer. Redefine to"
       .. " reshape or silence it.",
     source = [==[
 return function(ctx)
   local bufnr = ctx and ctx.bufnr
   if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then return end
-  -- ui.session_info resolves the vim.b-override -> global-config chain for
-  -- provider/model/effort (the same chain fn.provider uses to build the
-  -- request), and returns nil for a non-session buffer.
+  -- ui.session_info resolves provider/model/effort with the rules the request
+  -- uses (fn.provider's provider order, provider.resolve_model), and returns nil for a
+  -- non-session buffer.
   local ok, info = pcall(function() return require("straps.ui").session_info(bufnr) end)
   if not ok or type(info) ~= "table" then return end
   local shown = info.model_label ~= info.model
     and ("%s (%s)"):format(info.model_label, info.model) or info.model
+  -- An effort is inert when provider.effort_applies says the backend sends no
+  -- thinking or reasoning field for it, the same rule :checkhealth reports.
+  local effort = info.effort
+  if effort ~= "off" then
+    local cfg = require("straps").config or {}
+    local providers = require("straps.provider")
+    local entry = providers.is_provider(info.provider) and providers.model_entry(info.provider, info.model, cfg) or nil
+    local applies, why = providers.effort_applies(info.provider, entry, effort, cfg.efforts)
+    if not applies then effort = effort .. " (inert: " .. why .. "; no thinking or reasoning is sent)" end
+  end
   -- Carried here, not only in the prompt's # Subagents section: that section
   -- is dropped for a subagent at the depth limit, so a nested spawner whose
   -- limit was raised mid-session would never read it.
@@ -1017,7 +1028,7 @@ return function(ctx)
     .. " Subagents inherit this model and effort unless you pass spawn an"
     .. " explicit model / effort — call the models tool for the ids you can"
     .. " pass, and match the child's capability to its task rather than"
-    .. " defaulting to your own."):format(shown, info.provider, info.effort)
+    .. " defaulting to your own."):format(shown, info.provider, effort)
 end
 ]==],
   })

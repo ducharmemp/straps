@@ -41,7 +41,7 @@ except `curl` on PATH. No plenary.
 lua/straps/init.lua        -- setup(), config, wires everything together
 lua/straps/registry.lua    -- the late-bound registry (heart of the plugin)
 lua/straps/state.lua       -- transcript buffer format: create/append/parse
-lua/straps/provider.lua    -- registers fn.provider plus Anthropic/OpenAI curl backends
+lua/straps/provider.lua    -- registers fn.provider plus Anthropic/OpenAI/llama.cpp curl backends
 lua/straps/oauth.lua       -- Sign in with ChatGPT: constants, PKCE/URL helpers, pending-login state
 lua/straps/loop.lua        -- coroutine agent loop
 lua/straps/tools.lua       -- registration dispatcher; composes builtin-tool layer manifests
@@ -66,6 +66,12 @@ README.md
 
 All modules return a table `M`. `provider.lua`, `tools.lua` expose
 `M.register()` which defines their registry entries; `init.setup()` calls these.
+`provider.lua` also exposes `M.PROVIDERS`, `M.provider_names()`,
+`M.is_provider(name)`, `M.provider_slot(name)`, `M.effort_applies`,
+`M.resolve_provider`, `M.resolve_model`, `M.model_entry`, `M.merge_model_entry` and
+`M.llamacpp_base_url`: the provider name set, each provider's config keys and
+model buffer variable, the effort rule and the helpers (see the provider.lua
+section).
 Nothing registers at `require` time except `registry.lua`'s own module table.
 
 ---
@@ -681,32 +687,150 @@ edit.
 - Context is the transcript, so pruning old tool results is deleting buffer
   lines. `config.log_file` enables structured event logs for long runs.
 
-## provider.lua — registers `fn.provider` (+ `fn.provider_anthropic`, `fn.provider_openai`, `fn.provider_pref`, `fn.api_key`, `fn.openai_api_key`, `fn.openai_oauth_*`, `fn.openai_device_id`, `fn.list_models`, `fn.build_tools`, `fn.system_prompt`)
+## provider.lua — registers `fn.provider` (+ `fn.anthropic_messages`, `fn.provider_anthropic`, `fn.provider_openai`, `fn.provider_llamacpp`, `fn.provider_pref`, `fn.model_pref`, `fn.api_key`, `fn.openai_api_key`, `fn.llamacpp_api_key`, `fn.openai_oauth_*`, `fn.openai_device_id`, `fn.list_models`, `fn.build_tools`, `fn.system_prompt`)
 
 `fn.provider` is a thin **dispatcher**: `function(req, ctx) -> { content =
 blocks, stop_reason = s }` that selects a backend and delegates. Resolution
-order: `vim.b[bufnr].straps_provider` (per session) → `config.provider` (when
-pinned in `setup{}`) → the persisted preference file (`fn.provider_pref`,
-`$XDG_CONFIG_HOME/straps/provider`, written by `:StrapsProvider`) → `"anthropic"`.
+order (`M.resolve_provider(bufnr, config)`, which `fn.list_models`,
+`ui.effective_provider`, health, `tool.spawn` and `tool.models` also call):
+`vim.b[bufnr].straps_provider` (per session) → `config.provider` (when set in
+`setup{}`) → the persisted preference file (`fn.provider_pref`,
+`$XDG_CONFIG_HOME/straps/provider`, written by `:StrapsProvider`) →
+`"anthropic"`.
 `config.provider` defaults to `nil` precisely so the file is the durable
-default; a value in `setup{}` pins it and wins over the file. It calls
-`fn.provider_openai` only when the resolved value is exactly `"openai"`, calls
-`fn.provider_anthropic` for `nil`/`"anthropic"`, and errors on any other value
-instead of silently routing an invalid preference to the wrong backend. The loop,
-tests and the return contract only ever see `fn.provider`; each backend is its
-own redefinable registry entry with the identical `(req, ctx) -> { content,
-stop_reason, usage }` signature and the same `ctx.emit` text-streaming /
-`ctx.on_cancel` behaviour.
+default; a value in `setup{}` wins over the file. It calls
+`fn.provider_openai` only when the resolved value is exactly `"openai"`,
+`fn.provider_llamacpp` only for `"llamacpp"`, `fn.provider_anthropic` for
+`nil`/`"anthropic"`, and errors on any other value, whether it came from
+`vim.b`, `config.provider` or the pref file, instead of silently routing an
+invalid preference to the wrong backend.
+
+The dispatcher resolves the model once per request: `M.resolve_model` (the
+buffer's model variable for the provider; else the provider's config key,
+which is nil unless `setup{}` or runtime code set it; else the persisted
+`fn.model_pref`; else the slot's `default_model`; nil for llamacpp with no
+model set) and the model's list entry (`M.model_entry`). It calls the backend
+with a ctx that adds `ctx.provider`, `ctx.model` and `ctx.model_entry` over the
+loop's ctx. The stock backends send `ctx.model`, read thinking and
+`max_output` from `ctx.model_entry`, and judge effort for `ctx.provider`. A
+backend that sends a different model returns it as `result.model`. A
+redefined backend that ignores `ctx.model` and does not return `result.model`
+gets the dispatched model pinned.
+
+Each successful request of a session buffer then pins one record: the
+provider, the model sent and its list entry. A request that raises or is
+cancelled pins nothing. The dispatcher also records the buffer's provider and
+model variable at dispatch; when either changed during the request (a
+per-session `:StrapsProvider` or `:StrapsModel` pick made mid-request), it
+pins nothing, so the pick wins. `state.set_session_pin(bufnr, provider, model,
+entry)` sets `vim.b straps_provider` and the provider's model variable (`vim.b
+straps_llamacpp_model` and the like), and for a file-backed session writes
+`provider`, `model` and `model_entry` into the transcript's companion
+`<path>.meta` JSON file, beside the durable title. A per-session
+`:StrapsProvider` or `:StrapsModel` pick calls it too. Every `.meta` write
+keeps the other fields and goes through a `<path>.meta.tmp` file renamed over
+the old one, so a crash mid-write leaves the previous file. `vim.b
+straps_pin_saved` records the pin and path last written: an unchanged pin
+does not rewrite the file while it exists, and a rename (`:saveas`, `:file`)
+or a deleted file gets a new write on the next request. A failed write warns
+once, until a write succeeds.
+
+`state.open_session_file` restores `vim.b straps_provider` when it is unset,
+the model variable when that is unset too, and merges the saved entry into
+the provider's model list (`M.merge_model_entry`), so a discovered model keeps
+its `thinking` tag, `max_output` and `context` after a restart. A blank
+`.meta` reads as empty. A `.meta` that does not parse as a JSON object reads
+as empty too: resume warns (naming the provider the buffer keeps, when it
+already has one) and the next successful request replaces the file (the title
+it held is lost). A transcript with assistant turns and no saved provider (one
+copied without its `.meta`, or one whose `.meta` has no provider) warns on resume that it
+will use the global provider. A session therefore keeps its backend and model
+through a later global `:StrapsProvider` or `:StrapsModel` change, a missing or
+rewritten pref file, or a Neovim restart; a global pick affects only sessions
+that have not made a request yet.
+
+A global `:StrapsModel` pick persists per provider through `fn.model_pref`
+(`$XDG_CONFIG_HOME/straps/model_<provider>`, one JSON object `{ id, entry }`),
+the model twin of `fn.provider_pref`. Like `fn.provider_pref`, it is read on
+each call. The model keys (`model`, `openai_model`, `llamacpp_model`) default
+to nil, so any value in config was set by `setup{}` or at runtime, and it wins;
+`M.resolve_model` uses the stored id only for a key that is unset, then falls
+back to the slot's `default_model`. `M.model_entry` returns the stored entry
+when the list has none for that id. A successful global pick writes only the
+pref file, so it applies to every Neovim on its next request, including a pick
+equal to the slot default. When the key is set in config, the pick goes into
+config for this Neovim only, and the picker says so; when the pref write
+fails, the pick goes into config too, with a warning. A session pin cannot
+be cleared back to the global default; a per-session pick replaces it. Effort
+is not pinned: a global `:StrapsEffort` change reaches every session without a
+per-session effort. The loop, tests and the return contract only ever see
+`fn.provider`; each backend is its own redefinable registry entry that the
+dispatcher calls as `(req, ctx) -> { content, stop_reason, usage?, model? }`
+(`model`: the id sent, which `fn.provider` pins), with the same `ctx.emit` text-streaming /
+`ctx.on_cancel` behaviour. The Anthropic Messages wire format lives in its own
+entry, `fn.anthropic_messages(req, ctx, opts?)`: `fn.provider_anthropic` calls
+it with no `opts`, and `fn.provider_llamacpp` calls it with `opts` (see below).
+Neither backend calls the other, so redefining `fn.provider_anthropic` changes
+only Anthropic sessions and can never send a llama.cpp session to Anthropic.
+
+The provider NAME SET is the first of the module-table pieces that are not
+registry entries (the helpers below are the others).
+`provider.lua`'s module table holds `M.PROVIDERS`, an ordered list of
+`{ name, model_key, models_key, buf_model_var, base_url_key, default_model?,
+server_context? }`: each provider's config key for its model, its model list
+and its base URL, its `vim.b` model variable, and for llama.cpp
+`server_context = true` (the context window belongs to the running server). `fn.provider_pref`,
+`fn.list_models`, `ui.lua` (`effective_provider`, `effective_model`,
+`session_info`, `pick_model`, `pick_provider`), `tool.spawn` (its `provider`
+enum and validation), `tool.models` and `health.lua` read it through
+`M.provider_slot(name)`, `M.is_provider(name)` or `M.provider_names()`.
+`M.provider_slot` returns the `anthropic` slot for an unknown
+name so `session_info` on the statusline never raises. This is a stated limit
+on invariant 2: a redefined `fn.provider` alone cannot add a fourth backend,
+because the pickers, the persisted preference and `spawn` would still reject
+its name. Adding a provider means editing `provider.lua`: a `M.PROVIDERS`
+entry, a branch in the `fn.provider` dispatcher, a branch in `fn.list_models`,
+the key probe in `health.lua`'s `check_api_key`, the provider-specific lines
+in `health.lua`'s `check_model`, and a branch in `M.effort_applies`. Inserting into
+`M.PROVIDERS` at runtime is unsupported: the pickers and validation would
+accept the name while the dispatcher rejects it and the `tool.spawn` schema
+enum, built at registration, still omits it. A registry entry for the table
+was rejected because the statusline path and the specs that call
+`tools.register()` without `provider.register()` would each need a fallback
+for an absent or broken entry.
+
+`M.effort_applies(provider, entry, effort_name, efforts)` is the second
+module-table exception: the rule for whether an effort changes a request.
+`fn.anthropic_messages` (for `ctx.provider`, "anthropic" when unset) and
+`fn.provider_openai` call it to decide whether to
+send `thinking` / `output_config` or `reasoning`, and `fn.model_note` and
+`health.lua`'s `check_model` call it to report an inert effort, each with the
+session's provider name. It returns `true` plus the matching `config.efforts`
+entry, or `false` plus a reason. A redefined backend that skips it can send
+something the note and health do not report. The plain helpers on the same
+table are `M.resolve_provider(bufnr, config)` (the provider and where its name
+came from), `M.resolve_model(provider, bufnr, config)` (the model a request
+sends), `M.model_entry(provider, id, config)` (the first list entry with that
+id, else the entry stored with the model pref; the one lookup every caller
+uses), `M.merge_model_entry(provider, entry, config)`,
+`M.unknown_provider_error(name)` and `M.llamacpp_base_url(config)`
+(`config.llamacpp_base_url` with its default and with a trailing `/` or `/v1`
+removed). Each takes `config` last; `resolve_model` and `model_entry` return
+nil for an unknown provider.
 
 `fn.provider_pref(value?)` is the persistence seam: called with no argument it
 reads the first line of `$XDG_CONFIG_HOME/straps/provider`
 (`~/.config/straps/provider`, the same directory as the key files) and returns
-`"anthropic"`/`"openai"` or `nil`; called with a string it writes that value
-there (creating the dir) and returns it. A read miss never throws; a write
-failure returns `(nil, err)` so `:StrapsProvider` can report it. It is not a
-secret, so no mode-600 guard.
+its trimmed value or `nil` when it is absent or blank (an unknown value is
+returned as-is so the dispatcher raises on it), or `(nil, err)` when the file
+exists but cannot be read, which `M.resolve_provider` passes on so
+`fn.provider` raises instead of falling back to Anthropic. Called with a string
+it validates the name against `M.PROVIDERS`, writes it through a temp file and
+a rename (creating the dir) and returns it; a failed write returns
+`(nil, err)` so `:StrapsProvider` can report it. Reads are cached on the
+file's mtime, size and inode. It is not a secret, so no mode-600 guard.
 
-### `fn.provider_anthropic` — the Anthropic Messages API backend
+### `fn.provider_anthropic` and `fn.anthropic_messages` — the Anthropic Messages API backend
 
 - POST `https://api.anthropic.com/v1/messages` with headers `x-api-key`
   (from `registry.call("fn.api_key")`, default entry reads
@@ -716,7 +840,7 @@ secret, so no mode-600 guard.
   distinct error for a present-but-unreadable file, error with clear message
   if neither source yields a key),
   `anthropic-version: 2023-06-01`, `content-type: application/json`.
-- Body: `{ model=config.model, max_tokens=(config.max_tokens or the model's
+- Body: `{ model=(opts.model or ctx.model or M.resolve_model), max_tokens=(config.max_tokens or the model's
   max_output or config.default_max_tokens), stream=true,
   system=req.system (omit if nil), messages=req.messages, tools=req.tools (omit if empty) }`,
   plus optional `tool_choice=req.tool_choice` and
@@ -744,7 +868,8 @@ secret, so no mode-600 guard.
   cancel during curl. The `fn.log` request event carries `bytes` (JSON) and
   `wire_bytes` (what curl sent). The OpenAI backend sends plain JSON and
   logs `wire_bytes == bytes`, so a log consumer reads one field shape from
-  both backends.
+  both backends. `opts.gzip = false` (passed by `fn.provider_llamacpp`)
+  skips compression: `llama-server` answers a gzip body with HTTP 415.
 - Streaming: spawn `curl -sS --no-buffer -X POST ... --data-binary @-` (pass
   body on stdin to avoid argv length limits) via `vim.system` with a stdout
   callback.
@@ -767,15 +892,67 @@ secret, so no mode-600 guard.
   with no HTTP status (connection refused, DNS, TLS, timeout). A `vim.system`
   spawn that raises (EAGAIN with the process table full, ENOMEM) is pcall'd
   in both backends and resolved as the same curl-level failure, so it
-  retries with backoff instead of escaping as `straps: run error`. The OpenAI
+  retries with backoff instead of escaping as `straps: run error`. Once a
+  non-empty text delta has reached the transcript, the request is not
+  retried: a retry would stream the same text a second time. The OpenAI
   backend retries the same status set (429/500/502/503/408 + curl failures).
 - `config.base_url` (default `https://api.anthropic.com`) prefixes
   `/v1/messages` so Anthropic-compatible servers/proxies are a config knob.
+- The request code is `fn.anthropic_messages`; `fn.provider_anthropic` is a
+  one-line entry that calls it with no `opts`. An optional third argument
+  `opts` points the same wire format at another server without copying it:
+  `opts.base_url` replaces `config.base_url`; `opts.model` replaces
+  `ctx.model` and the `M.resolve_model` fallback (effort still comes from
+  `vim.b straps_effort` / `config.effort`); `opts.model_entry` supplies the
+  model's list entry for `max_output` and thinking (else `ctx.model_entry`
+  when the model is `ctx.model`, else, without `opts.base_url`, the Anthropic
+  list entry); the success result carries `model`, the id sent, which
+  `fn.provider` pins; `opts.auth_headers` (an argv list, `{}`
+  allowed) replaces the `x-api-key` header, and `fn.api_key` is then not
+  called (`anthropic-version` and `content-type` stay); with `opts.base_url`
+  set and `opts.auth_headers` omitted no auth header is sent, so the Anthropic
+  key never goes to another host; `opts.gzip = false`
+  skips compression; `opts.label` names the backend in the "request failed"
+  and "retries exhausted" errors (`straps provider (llamacpp): ...`). With no
+  `opts` the request and messages are unchanged. A redefinition of
+  `fn.anthropic_messages` must accept and honor `opts`, because
+  `fn.provider_llamacpp` routes through it.
 - Idle watchdog: `config.request_timeout_ms` (default 300000) — a uv timer
   armed at spawn and reset on every stdout chunk. On expiry it kills curl AND
   resolves the await immediately with a descriptive error (never wait for the
   exit callback: children inheriting stdio can delay it indefinitely). This is
   what prevents an open-but-silent stream from hanging a run forever.
+
+### `fn.provider_llamacpp` — the llama.cpp backend
+
+`llama-server` serves the Anthropic Messages format at `/v1/messages`
+(streaming, tool use, `cache_control` accepted), so this backend resolves the
+llama.cpp settings and calls `fn.anthropic_messages(req, ctx, opts)`:
+
+- `base_url = M.llamacpp_base_url(config)` (`config.llamacpp_base_url`,
+  default `http://127.0.0.1:8080`, with a trailing `/` or `/v1` removed).
+- Model: `ctx.model`, which `fn.provider` resolves with `M.resolve_model`
+  (`vim.b[bufnr].straps_llamacpp_model`, then `config.llamacpp_model`, then
+  the model pref); a direct call without `ctx.model` resolves it the same way.
+  None set raises
+  "straps provider (llamacpp): no model; set llamacpp_model in setup{} or run
+  :StrapsModel": a router-mode server rejects a request without a model
+  (HTTP 400 "model name is missing from the request").
+- `model_entry`: `ctx.model_entry` when it describes the model, else the
+  `config.llamacpp_models` entry (filled by discovery, which sets no
+  `max_output`): `max_tokens` is `config.max_tokens`, else the entry's
+  `max_output` when you configure one, else `default_max_tokens`; the server
+  accepts a value above the model's `n_ctx`.
+- `auth_headers`: `Authorization: Bearer <key>` when `fn.llamacpp_api_key`
+  returns one (`$LLAMACPP_API_KEY`, else `$LLAMA_API_KEY`, the variable
+  llama-server binds to `--api-key`), else `{}`. llama-server's `--api-key`
+  check accepts `Authorization: Bearer` and `X-Api-Key`.
+- `gzip = false`, `label = "llamacpp"`.
+
+Thinking blocks the server streams are handled the same as Anthropic ones and
+stay out of the transcript. A router-mode server holds the connection open
+while it loads a model that is not loaded, so a model switch shows up as a
+slow first byte, which the idle watchdog (`request_timeout_ms`) allows for.
 
 ### `fn.provider_openai` — the OpenAI Responses backend
 
@@ -806,8 +983,9 @@ function tools together with any reasoning effort.
   name, description, parameters=input_schema, strict=false }]`, omitted when
   empty. `max_output_tokens=(config.max_tokens or config.default_max_tokens or 8192)`
   (no per-model discovery for OpenAI), `stream=true`, `store=false`. Model id
-  is `vim.b[bufnr].straps_openai_model`, then `config.openai_model`, then
-  `"gpt-5"`; it never falls back to the Anthropic `config.model`.
+  is `ctx.model`, which `fn.provider` resolves with `M.resolve_model`
+  (`vim.b[bufnr].straps_openai_model`, then `config.openai_model`, then the
+  model pref, then `"gpt-5"`); it never falls back to the Anthropic model.
 - **Response translation** (typed SSE events → blocks):
   `response.output_text.delta` and `response.refusal.delta` →
   `ctx.emit{type="text_delta"}` accumulated into one text block (separate output
@@ -901,7 +1079,7 @@ second backend.
 ### Live model discovery (`fn.list_models`)
 
 `fn.list_models(provider?) -> models | (nil, err)` — a synchronous `curl GET
-/v1/models` against an explicit provider (`"anthropic"`/`"openai"`) or **the
+/v1/models` against an explicit provider (`"anthropic"`/`"openai"`/`"llamacpp"`) or **the
 same backend `fn.provider` would use**. It resolves the effective provider exactly as `fn.provider` does (per-session `vim.b straps_provider` on the
 current buffer → `config.provider` → the persisted `fn.provider_pref` file), so discovery never disagrees with the loop: under the OpenAI
 provider it lists GPT models, not Claude ones.
@@ -928,18 +1106,27 @@ provider it lists GPT models, not Claude ones.
   with `visibility = "hide"` are dropped. `thinking` stays `nil` for both
   shapes; static `config.openai_models` entries must opt in to
   `reasoning.effort` with `reasoning = true` (or `reasoning_effort = true`).
+- **llama.cpp**: `GET {llamacpp_base_url}/v1/models` with no `?limit` and
+  `Authorization: Bearer` only when `fn.llamacpp_api_key` returns a key (no
+  key is not an error). The catalog is `{data:[{id, status, meta?}]}`: the id
+  doubles as the label, `thinking` is `nil`, and `meta.n_ctx`, present only
+  for a loaded model, becomes `context`.
 
 It never throws — any failure (no key, curl error, non-2xx, unparseable body)
 returns `(nil, errmsg)` so the picker can fall back to the provider-specific static list.
 
 `ui.pick_model` calls it and MERGES the result over `config.models` for
-Anthropic or `config.openai_models` for OpenAI: configured entries keep their
+Anthropic, `config.openai_models` for OpenAI or `config.llamacpp_models` for
+llama.cpp: configured entries keep their
 curated `label` and lead the list in configured order; any live-only model
 (e.g. a newly released one) is appended with its API display name/id. The
 merged list is written back to that provider's cache so `fn.provider`'s
 Anthropic per-model lookup (thinking tag and `max_output`) finds discovered
 models and repeat pickers are instant. A merged entry keeps a hand-set
-`label`/`thinking`/`context`/`max_output` and fills any gap from the live entry. Fetch failure → notify + the matching static list; the picker never breaks.
+`label`/`thinking`/`context`/`max_output` and fills any gap from the live entry,
+except that a llama.cpp slot (`server_context = true`) lets a live `context`
+replace the stored one, because `n_ctx` is the server's current `-c` and
+changes when the server restarts with another value. Fetch failure → notify + the matching static list; the picker never breaks.
 
 ### Prompt caching (cache_control breakpoints)
 
@@ -1007,7 +1194,8 @@ breakpoints so the replayed prefix becomes a server-side cache hit:
     alternating roles (tool_use/tool_result pairing intact — only contents
     shrink, blocks are never removed).
   - Users or the agent can redefine this with LLM-summarizing compaction by
-    calling `fn.provider` with a summary prompt.
+    calling `fn.provider` with a summary prompt; pass `{ bufnr = bufnr }` as
+    `ctx` so the request uses the session's pinned provider.
 - `state.list_blocks(bufnr) -> { {kind, attrs, marker_lnum, first_lnum,
   last_lnum}, ... }` (1-based, content range excludes the marker line;
   empty content → first_lnum > last_lnum). Public helper so compact
@@ -1948,9 +2136,10 @@ Existing suites must all still pass.
   Each stamp is followed by `User` autocmds (see "Run lifecycle events" under
   loop.lua) so user UI can react without polling.
 - Per-buffer model / effort: `fn.provider` reads `vim.b[bufnr].straps_model`
-  for Anthropic, `vim.b[bufnr].straps_openai_model` for OpenAI, and
+  for Anthropic, `vim.b[bufnr].straps_openai_model` for OpenAI,
+  `vim.b[bufnr].straps_llamacpp_model` for llama.cpp, and
   `vim.b[bufnr].straps_effort` in preference to `config.model` /
-  `config.openai_model` / `config.effort`, so two sessions can run different
+  `config.openai_model` / `config.llamacpp_model` / `config.effort`, so two sessions can run different
   providers/models at once (and a subagent can differ from its parent —
   `tool.spawn` accepts `provider`/`model`/`effort` args). Without a `provider`
   arg, `tool.spawn` resolves the parent's provider with the same chain as
@@ -1958,12 +2147,21 @@ Existing suites must all still pass.
   `fn.provider_pref`, `"anthropic"`) and stores the result in the child's
   `straps_provider`. A `model` arg goes to that provider's slot; without one
   the child inherits only the parent's slot for that provider, so an OpenAI
-  child never receives an Anthropic id. `ui.pick_model` /
+  child never receives an Anthropic id. A nonempty `provider` arg outside
+  `M.PROVIDERS` raises before the child buffer exists; a blank one counts as
+  unset. Spawn does not check that a model resolves for the child's provider;
+  a `llamacpp` child with no model fails on its first request with
+  `fn.provider_llamacpp`'s error, before any network call. An unknown provider
+  inherited from the parent's `straps_provider` is
+  copied as-is and the dispatcher rejects it on the child's first request. `ui.pick_model` /
   `ui.pick_effort` write `vim.b` when invoked ON a session buffer, else the
   global config default. `ui.session_info(bufnr)` is the single accessor that
   RESOLVES that whole override -> config chain (returning `nil` off a session
   buffer, else provider/model/model_label/effort/overridden/status/parent/
-  usage/context_used/context/context_pct/cache_pct, percentages pre-rounded);
+  usage/context_used/context/context_pct/cache_pct, percentages pre-rounded;
+  `context` falls back to `config.context_window` except for llama.cpp, whose
+  slot sets `server_context = true` because its window is the server's
+  `-c`, so an unknown llama.cpp context hides the percentage);
   `ui.session_status()`, `ui.usage_status()` and `ui.session_winbar()` are thin
   formatters over it, each taking the same optional `bufnr` so a component can
   render a session from outside its window. `overridden` means the effective
@@ -1987,11 +2185,14 @@ Existing suites must all still pass.
   `:redrawtabline` — the former does not cover the tabline — and every status
   redraw in `loop.lua`/`ui.lua` goes through it.
 - `:StrapsProvider` (`ui.pick_provider`) — picks the API backend
-  (anthropic/openai). ON a session buffer it sets `vim.b straps_provider`
-  (session-only, like `:StrapsModel`); otherwise it sets `config.provider` AND
-  persists the choice to `$XDG_CONFIG_HOME/straps/provider` via
-  `fn.provider_pref`, so it survives restarts — the durable twin of the key
-  files in the same directory. `effective_provider` mirrors
+  (anthropic/openai/llamacpp). ON a session buffer it sets `vim.b straps_provider`
+  and saves it to the transcript's `.meta` file (`state.set_session_pin`);
+  otherwise it writes the choice to `$XDG_CONFIG_HOME/straps/provider` via
+  `fn.provider_pref`, which every Neovim reads on its next request, so it
+  survives restarts. It sets `config.provider` only when that key is already
+  set (by `setup{}` or at runtime; the pick then lasts for this Neovim only)
+  or when the write fails; the next global pick after a failed write retries
+  it. A global `:StrapsModel` pick follows the same rule. `effective_provider` mirrors
   `effective_model`/`effective_effort` for the picker's current-* marker.
 - `:StrapsLogin openai [url]` / `:StrapsLogout openai` (`ui.login`,
   `ui.logout`) call `fn.openai_oauth_login` / `fn.openai_oauth_logout` and
@@ -2028,14 +2229,19 @@ that as the error) and when the data dir is unwritable.
 Sections: nvim version (>= 0.11), dependencies (curl required, ripgrep
 optional), API key (env, key-file mode 600, for OpenAI the ChatGPT login file's
 mode, expiry and client id, and whether `fn.api_key` / `fn.openai_api_key`
-resolves a key and from which source, without refreshing), sessions (dir writable + transcript count), transcript rendering
+resolves a key and from which source, without refreshing; for llama.cpp only
+`llamacpp_base_url` as info, a key from `fn.llamacpp_api_key` as OK and no key as info,
+with no Anthropic key-file or `fn.api_key` probe), sessions (dir writable + transcript count), transcript rendering
 (tree-sitter `straps` parser + queries, `config.render`), project registry
 (`.straps.lua` trust state against the sha256 store), registry (entry counts,
 redefinitions, missing core entries, `fn.log`), layers (each `config.layers`
 flag's on/off state; on but sentinel entry missing is an error, off is info),
-model (model/effort pairing —
-the mismatch that 400s a request), and active runs (a warning that quitting
-cancels in-flight sessions). It is read-only and touches no windows.
+model (the ACTIVE provider's model, model list and base URL from its
+`M.PROVIDERS` slot, and the model/effort pairing, the mismatch that 400s a
+request; an effort other than "off" on a model whose list entry marks no
+thinking style, or for OpenAI no `reasoning` flag, is reported as inert, and
+an unset `llamacpp_model` warns with the `:StrapsModel` remedy), and active
+runs (a warning that quitting cancels in-flight sessions). It is read-only and touches no windows.
 `tests/health_spec.lua` stubs `vim.health.*` to collect the report and asserts
 the healthy and broken-state paths (no setup, unwritable dir) both classify
 without throwing.
@@ -2053,7 +2259,8 @@ now doc/straps.txt — in the same change).
 
 ```lua
 require("straps").setup{
-  model = "claude-sonnet-5",
+  -- model defaults to nil = the persisted :StrapsModel pick, else claude-sonnet-5;
+  -- setting it here makes global picks last for one Neovim only
   -- max_tokens defaults to nil = model's max_output else default_max_tokens
   default_max_tokens = 32000,
   max_turns = 64,
@@ -2387,7 +2594,8 @@ parent's (tools.lua) — a real decision the agent had no inputs for.
   default, for budget checks and telemetry.
 - `tool.models` is the note's other half: the note says what you ARE, this
   says what you could pass. It formats the ACTIVE provider's `config.models` /
-  `config.openai_models` (id, label, context) with the session's model marked,
+  `config.openai_models` / `config.llamacpp_models` (id, label, context) with
+  the session's model marked,
   plus `config.efforts` names — no network call, so it reflects the seeded and
   previously discovered catalog and `:StrapsModel` remains what refreshes it.
   The capability labels ("most capable, slowest", "fastest, cheapest") existed

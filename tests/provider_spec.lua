@@ -19,6 +19,10 @@ end
 
 
 vim.env.ANTHROPIC_API_KEY = "test-key-not-real"
+-- Hermetic config dir: a real ~/.config/straps provider or model_<provider>
+-- pref file would change which provider and model the requests use.
+vim.env.XDG_CONFIG_HOME = vim.fn.tempname()
+vim.fn.mkdir(vim.env.XDG_CONFIG_HOME, "p")
 local straps = require("straps").setup({})
 -- Hermetic: durable sessions write under a throwaway dir, never the real data dir.
 straps.config.session_dir = vim.fn.tempname()
@@ -751,8 +755,10 @@ step(function()
   -- ---------------------------------------------------------------- watchdog
   vim.env.PATH = tmp .. "/stalling:" .. real_path
   straps.config.request_timeout_ms = 400
+  straps.config.base_url = "http://user:hunter2@straps-stall.invalid"
   t0 = vim.uv.hrtime()
   bufnr2, text2 = run_session("this endpoint hangs")
+  straps.config.base_url = nil
   elapsed_ms = (vim.uv.hrtime() - t0) / 1e6
 end)
 
@@ -760,7 +766,74 @@ it("idle watchdog kills a silent stream instead of hanging forever", function()
   assert(not loop.running(bufnr2), "run never finished — watchdog did not fire")
   assert(text2:find("stream stalled", 1, true), "missing stall explanation:\n" .. text2)
   assert(text2:find("request_timeout_ms", 1, true), "error should mention the config knob")
+  assert(not text2:find("hunter2", 1, true), "the stall error wrote the URL password into the transcript")
+  assert(text2:find("http://***@straps-stall.invalid", 1, true), "the stall error should name the redacted URL")
   assert(elapsed_ms < 10000, "took too long: " .. elapsed_ms .. "ms")
+end)
+
+local half_text, half_requests
+step(function()
+  vim.fn.mkdir(tmp .. "/halfstall", "p")
+  write_exec(tmp .. "/halfstall/curl", ([[#!/usr/bin/env bash
+D=%q
+cat > /dev/null
+echo x >> "$D/halfstall_n"
+echo "STRAPS_HTTP_STATUS:200" >&2
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start","message":{"usage":{}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"HALFWAY-TEXT "}}
+
+EOF
+sleep 60
+]]):format(tmp))
+  vim.env.PATH = tmp .. "/halfstall:" .. real_path
+  straps.config.request_timeout_ms = 400
+  local _
+  _, half_text = run_session("this stream stalls after some text")
+  half_requests = #vim.fn.readfile(tmp .. "/halfstall_n")
+end)
+
+it("a stream that stalls after text has streamed is not retried, so the text appears once", function()
+  local _, count = half_text:gsub("HALFWAY%-TEXT", "")
+  assert(count == 1, ("streamed text repeated %d times:\n%s"):format(count, half_text))
+  assert(half_requests == 1, "request was retried after text streamed: " .. half_requests .. " requests")
+  assert(half_text:find("stream stalled", 1, true), "stall explanation missing:\n" .. half_text)
+end)
+
+local empty_requests
+step(function()
+  vim.fn.mkdir(tmp .. "/emptystall", "p")
+  write_exec(tmp .. "/emptystall/curl", ([[#!/usr/bin/env bash
+D=%q
+cat > /dev/null
+echo x >> "$D/emptystall_n"
+echo "STRAPS_HTTP_STATUS:200" >&2
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start","message":{"usage":{}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}
+
+EOF
+sleep 60
+]]):format(tmp))
+  vim.env.PATH = tmp .. "/emptystall:" .. real_path
+  run_session("this stream stalls after an empty text delta")
+  empty_requests = #vim.fn.readfile(tmp .. "/emptystall_n")
+end)
+
+it("a stream that stalls after only an empty text delta is still retried", function()
+  assert(empty_requests > 1, "an empty text delta blocked the retry: " .. empty_requests .. " request(s)")
 end)
 
 local buf400, text400
@@ -787,7 +860,7 @@ end)
 
 it("HTTP 400 surfaces the API's error message and ends the run cleanly", function()
   assert(not loop.running(buf400), "run still active after a 400")
-  assert(text400:find("request failed (HTTP 400)", 1, true),
+  assert(text400:find("straps provider: request failed (HTTP 400)", 1, true),
     "status missing from error:\n" .. text400:sub(-400))
   assert(text400:find("Input should be an object", 1, true),
     "API error message not surfaced:\n" .. text400:sub(-400))
@@ -1324,6 +1397,12 @@ if grep -q trigger-stream-error "$D/oai_body.$N"; then
 elif grep -q trigger-retry-error "$D/oai_body.$N" && [ ! -e "$D/oai_retry_done" ]; then
   touch "$D/oai_retry_done"
   printf 'event: error\ndata: {"type":"error","code":"rate_limit_exceeded","message":"fake rate limit","param":null,"sequence_number":1}\n\n'
+elif grep -q trigger-stall-after-empty "$D/oai_body.$N"; then
+  printf 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"delta":""}\n\n'
+  sleep 60
+elif grep -q trigger-stall-after-text "$D/oai_body.$N"; then
+  printf 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"delta":"OAI-STALL-TEXT "}\n\n'
+  sleep 60
 elif grep -q trigger-late-retry "$D/oai_body.$N"; then
   printf 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","output_index":0,"delta":"partial-before-error "}\n\n'
   printf 'event: error\ndata: {"type":"error","code":"server_error","message":"fake late server error","param":null,"sequence_number":2}\n\n'
@@ -1541,6 +1620,28 @@ do
     assert(tonumber(vim.fn.readfile(tmp .. "/oai_n")[1]) == n_before + 1, "stream error after streamed text was retried")
   end)
 
+  it("openai backend: a stream that stalls after text has streamed is not retried, so the text appears once", function()
+    local n_before = tonumber(vim.fn.readfile(tmp .. "/oai_n")[1])
+    local saved_timeout = straps.config.request_timeout_ms
+    straps.config.request_timeout_ms = 400
+    local _, text = run_session("trigger-stall-after-text please")
+    straps.config.request_timeout_ms = saved_timeout
+    local _, count = text:gsub("OAI%-STALL%-TEXT", "")
+    local requests = tonumber(vim.fn.readfile(tmp .. "/oai_n")[1]) - n_before
+    assert(count == 1, ("streamed text repeated %d times:\n%s"):format(count, text:sub(-600)))
+    assert(requests == 1, "request was retried after text streamed: " .. requests .. " requests")
+  end)
+
+  it("openai backend: a stream that stalls after only an empty text delta is still retried", function()
+    local n_before = tonumber(vim.fn.readfile(tmp .. "/oai_n")[1])
+    local saved_timeout = straps.config.request_timeout_ms
+    straps.config.request_timeout_ms = 400
+    run_session("trigger-stall-after-empty please")
+    straps.config.request_timeout_ms = saved_timeout
+    local requests = tonumber(vim.fn.readfile(tmp .. "/oai_n")[1]) - n_before
+    assert(requests > 1, "an empty text delta blocked the retry: " .. requests .. " request(s)")
+  end)
+
   it("openai backend: response.failed fails the run with the response error", function()
     local _, text = run_session("trigger-failed please")
     assert(text:find("fake response failed", 1, true), "response.failed error not surfaced:\n" .. text:sub(-600))
@@ -1659,12 +1760,33 @@ do
     assert(vim.trim(vim.fn.readfile(pd .. "/straps/provider")[1]) == "openai", "file content wrong")
   end)
 
+  it("fn.provider_pref: llamacpp writes, and a file holding llamacpp reads back", function()
+    assert(registry.call("fn.provider_pref", "llamacpp") == "llamacpp", "llamacpp write rejected")
+    vim.fn.writefile({ "llamacpp" }, pd .. "/straps/provider")
+    assert(registry.call("fn.provider_pref") == "llamacpp", "llamacpp read-back wrong")
+    local w, err = registry.call("fn.provider_pref", "bogus")
+    assert(w == nil and tostring(err):find("unknown provider bogus", 1, true), tostring(err))
+  end)
+
   -- Snapshot the real backend sources so we can restore them after spying.
   local real_anthropic
   local real_openai
+  local real_llamacpp
   step(function()
     real_anthropic = registry.get("fn.provider_anthropic").source
     real_openai = registry.get("fn.provider_openai").source
+    real_llamacpp = registry.get("fn.provider_llamacpp").source
+  end)
+
+  -- Backend spies for the dispatcher tests below; the step after them
+  -- restores the real sources.
+  step(function()
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy",
+      source = [[return function() return { content = {}, stop_reason = "end_turn", _who = "a" } end]] })
+    registry.define({ name = "fn.provider_openai", kind = "fn", doc = "spy",
+      source = [[return function() return { content = {}, stop_reason = "end_turn", _who = "o" } end]] })
+    registry.define({ name = "fn.provider_llamacpp", kind = "fn", doc = "spy",
+      source = [[return function() return { content = {}, stop_reason = "end_turn", _who = "l" } end]] })
   end)
 
   it("dispatcher: config.provider overrides the persisted file", function()
@@ -1672,10 +1794,6 @@ do
     registry.call("fn.provider_pref", "openai")
     straps.config.provider = "anthropic"
     local picked
-    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy",
-      source = [[return function() return { content = {}, stop_reason = "end_turn", _who = "a" } end]] })
-    registry.define({ name = "fn.provider_openai", kind = "fn", doc = "spy",
-      source = [[return function() return { content = {}, stop_reason = "end_turn", _who = "o" } end]] })
     local resp = registry.call("fn.provider", { messages = {} }, { bufnr = nil })
     picked = resp._who
     assert(picked == "a", "config anthropic should win over file openai, got " .. tostring(picked))
@@ -1695,12 +1813,764 @@ do
     assert(resp._who == "a", "default should be anthropic, got " .. tostring(resp._who))
   end)
 
+  it("dispatcher: llamacpp routes to fn.provider_llamacpp", function()
+    registry.define({ name = "fn.provider_llamacpp", kind = "fn", doc = "spy",
+      source = [[return function() return { content = {}, stop_reason = "end_turn", _who = "l" } end]] })
+    straps.config.provider = "llamacpp"
+    local resp = registry.call("fn.provider", { messages = {} }, { bufnr = nil })
+    assert(resp._who == "l", "llamacpp should reach fn.provider_llamacpp, got " .. tostring(resp._who))
+    straps.config.provider = "bogus"
+    local ok, err = pcall(registry.call, "fn.provider", { messages = {} }, { bufnr = nil })
+    straps.config.provider = nil
+    assert(not ok and tostring(err):find("llamacpp", 1, true), "unknown-provider error should list llamacpp: " .. tostring(err))
+  end)
+
+  it("dispatcher and fn.list_models: an unknown value in the pref file raises or returns (nil, err), never anthropic", function()
+    straps.config.provider = nil
+    vim.fn.mkdir(pd .. "/straps", "p")
+    vim.fn.writefile({ "llama.cpp" }, pd .. "/straps/provider")
+    local ok, err = pcall(registry.call, "fn.provider", { messages = {} }, { bufnr = nil })
+    local saved_path = vim.env.PATH
+    vim.env.PATH = tmp .. "/models_500:" .. real_path
+    local models, why = registry.call("fn.list_models")
+    vim.env.PATH = saved_path
+    vim.fn.delete(pd .. "/straps/provider")
+    assert(not ok and tostring(err):find("unknown provider llama.cpp (expected one of:", 1, true)
+      and tostring(err):find("), from the provider pref file", 1, true),
+      "unknown pref value should raise and name the pref file, got: " .. tostring(err))
+    assert(models == nil and tostring(why):find("unknown provider", 1, true), "list_models should refuse: " .. tostring(why))
+  end)
+
+  it("dispatcher: a session's first request pins its provider in vim.b and the .meta file", function()
+    straps.config.provider = "llamacpp"
+    local sess = state.new_session()
+    local first = registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    straps.config.provider = "anthropic"
+    local second = registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    local fresh = state.new_session()
+    local other = registry.call("fn.provider", { messages = {} }, { bufnr = fresh })
+    local path = vim.api.nvim_buf_get_name(sess)
+    straps.config.provider = nil
+    assert(first._who == "l" and second._who == "l",
+      "pinned session moved to another backend: " .. tostring(first._who) .. "/" .. tostring(second._who))
+    assert(other._who == "a", "a new session should follow the new global provider, got " .. tostring(other._who))
+    assert(vim.b[sess].straps_provider == "llamacpp", "vim.b not pinned: " .. tostring(vim.b[sess].straps_provider))
+    assert((state.session_pin(path)) == "llamacpp", "provider not saved in .meta: " .. tostring((state.session_pin(path))))
+  end)
+
+  it("state: a resumed session restores its pinned provider; the title and provider share the .meta file", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    state.set_session_pin(sess, "llamacpp")
+    assert(state.set_session_title(path, "my title"), "title write failed")
+    assert((state.session_pin(path)) == "llamacpp", "setting the title dropped the provider")
+    assert(state.set_session_title(path, nil), "title clear failed")
+    assert((state.session_pin(path)) == "llamacpp", "clearing the title dropped the provider")
+    vim.api.nvim_buf_delete(sess, { force = true })
+    local resumed = state.open_session_file(path)
+    assert(vim.b[resumed].straps_provider == "llamacpp",
+      "resume did not restore the provider: " .. tostring(vim.b[resumed].straps_provider))
+  end)
+
+  it("state: pinning a provider keeps the title already in the .meta file", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    assert(state.set_session_title(path, "kept title"), "title write failed")
+    state.set_session_pin(sess, "llamacpp")
+    assert((state.session_pin(path)) == "llamacpp", "provider not saved: " .. tostring((state.session_pin(path))))
+    assert(state.session_title(path) == "kept title", "pinning dropped the title: " .. tostring(state.session_title(path)))
+  end)
+
+  it("dispatcher: a failed or cancelled first request pins nothing; the next successful one pins", function()
+    local spy_l = registry.get("fn.provider_llamacpp").source
+    straps.config.provider = "llamacpp"
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    registry.define({ name = "fn.provider_llamacpp", kind = "fn", doc = "spy",
+      source = [[return function() error("fake backend failure") end]] })
+    local ok = pcall(registry.call, "fn.provider", { messages = {} }, { bufnr = sess })
+    local after_fail_b, after_fail_meta = vim.b[sess].straps_provider, (state.session_pin(path))
+    registry.define({ name = "fn.provider_llamacpp", kind = "fn", doc = "spy",
+      source = [[return function() return { content = {}, stop_reason = "cancelled" } end]] })
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    local after_cancel_b, after_cancel_meta = vim.b[sess].straps_provider, (state.session_pin(path))
+    registry.define({ name = "fn.provider_llamacpp", kind = "fn", doc = "spy", source = spy_l })
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    straps.config.provider = nil
+    assert(not ok, "the failing backend did not raise")
+    assert(after_fail_b == nil and after_fail_meta == nil,
+      "a failed request pinned: " .. tostring(after_fail_b) .. "/" .. tostring(after_fail_meta))
+    assert(after_cancel_b == nil and after_cancel_meta == nil,
+      "a cancelled request pinned: " .. tostring(after_cancel_b) .. "/" .. tostring(after_cancel_meta))
+    assert(vim.b[sess].straps_provider == "llamacpp" and (state.session_pin(path)) == "llamacpp",
+      "a successful request did not pin")
+  end)
+
+  it("dispatcher: an unknown provider pins nothing and the error names its source", function()
+    straps.config.provider = "bogus"
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    local ok, err = pcall(registry.call, "fn.provider", { messages = {} }, { bufnr = sess })
+    straps.config.provider = nil
+    vim.b[sess].straps_provider = "bogus2"
+    local ok_b, err_b = pcall(registry.call, "fn.provider", { messages = {} }, { bufnr = sess })
+    vim.b[sess].straps_provider = nil
+    assert(not ok and tostring(err):find("unknown provider bogus (expected one of:", 1, true)
+      and tostring(err):find("), from setup{ provider }", 1, true), tostring(err))
+    assert(not tostring(err):find('[string "', 1, true), "the error carries a chunk position: " .. tostring(err))
+    assert(not ok_b and tostring(err_b):find("unknown provider bogus2 (expected one of:", 1, true)
+      and tostring(err_b):find("), from the session's vim.b straps_provider", 1, true),
+      tostring(err_b))
+    assert((state.session_pin(path)) == nil, ".meta pinned an unknown provider: " .. tostring((state.session_pin(path))))
+  end)
+
+  it("dispatcher: a pinned session switched per buffer saves the new provider and uses it", function()
+    straps.config.provider = "llamacpp"
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    vim.b[sess].straps_provider = "openai"
+    local resp = registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    straps.config.provider = nil
+    assert(resp._who == "o", "switched session still went to " .. tostring(resp._who))
+    assert((state.session_pin(path)) == "openai", ".meta kept " .. tostring((state.session_pin(path))))
+  end)
+
+  it("dispatcher: after a rename the next request saves the pin beside the new path", function()
+    straps.config.provider = "llamacpp"
+    local sess = state.new_session()
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    local renamed = vim.fn.tempname() .. ".straps"
+    vim.api.nvim_buf_set_name(sess, renamed)
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    straps.config.provider = nil
+    assert((state.session_pin(renamed)) == "llamacpp",
+      "the renamed transcript has no pin: " .. tostring((state.session_pin(renamed))))
+  end)
+
+  it("state: a .meta file that does not parse warns on resume, restores nothing, and the next request heals it", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    vim.api.nvim_buf_delete(sess, { force = true })
+    vim.fn.writefile({ "{not json" }, path .. ".meta")
+    local warned
+    local real_notify = vim.notify
+    vim.notify = function(msg, level) if level == vim.log.levels.WARN then warned = msg end end
+    local resumed = state.open_session_file(path)
+    vim.notify = real_notify
+    local restored = vim.b[resumed].straps_provider
+    straps.config.provider = "llamacpp"
+    registry.call("fn.provider", { messages = {} }, { bufnr = resumed })
+    straps.config.provider = nil
+    assert(warned and warned:find("not a JSON object", 1, true), "no warning: " .. tostring(warned))
+    assert(restored == nil, "an unparsable .meta restored " .. tostring(restored))
+    assert((state.session_pin(path)) == "llamacpp",
+      "the request did not replace the unparsable .meta: " .. table.concat(vim.fn.readfile(path .. ".meta"), "\n"))
+  end)
+
+  it("dispatcher: the first request pins the resolved model, so a later global model change does not move the session", function()
+    straps.config.provider = "anthropic"
+    local saved_model = straps.config.model
+    straps.config.model = "claude-first"
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    straps.config.model = "claude-later"
+    local resolved = require("straps.provider").resolve_model("anthropic", sess, straps.config)
+    local _, saved = state.session_pin(path)
+    straps.config.model = saved_model
+    straps.config.provider = nil
+    assert(vim.b[sess].straps_model == "claude-first", "model not pinned in the buffer: " .. tostring(vim.b[sess].straps_model))
+    assert(resolved == "claude-first", "a global model change moved the pinned session to " .. tostring(resolved))
+    assert(saved == "claude-first", "model not saved in .meta: " .. tostring(saved))
+  end)
+
+  it("state: set_session_pin writes the provider it is given, even over a different buffer provider", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    vim.b[sess].straps_provider = "anthropic"
+    state.set_session_pin(sess, "openai", "gpt-x")
+    local provider, model = state.session_pin(path)
+    assert(vim.b[sess].straps_provider == "openai", "vim.b kept " .. tostring(vim.b[sess].straps_provider))
+    assert(vim.b[sess].straps_openai_model == "gpt-x", "model variable not set: " .. tostring(vim.b[sess].straps_openai_model))
+    assert(provider == "openai" and model == "gpt-x", ".meta holds " .. tostring(provider) .. "/" .. tostring(model))
+  end)
+
+  it("state: a failed pin write warns once per buffer and keeps the pin in memory", function()
+    local sess = state.new_session()
+    vim.api.nvim_buf_set_name(sess, vim.fn.tempname() .. "/missing-dir/s.straps")
+    local warnings = {}
+    local real_notify = vim.notify
+    vim.notify = function(msg, level) if level == vim.log.levels.WARN then warnings[#warnings + 1] = msg end end
+    state.set_session_pin(sess, "llamacpp", "m1")
+    state.set_session_pin(sess, "llamacpp", "m1")
+    vim.notify = real_notify
+    assert(#warnings == 1, "expected one warning, got " .. #warnings .. ": " .. vim.inspect(warnings))
+    assert(warnings[1]:find("could not save this session's provider", 1, true), warnings[1])
+    assert(vim.b[sess].straps_provider == "llamacpp", "the pin was lost in memory")
+  end)
+
+  it("state: a .meta deleted while the buffer is open is written again on the next pin", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    state.set_session_pin(sess, "llamacpp", "m1")
+    vim.fn.delete(path .. ".meta")
+    state.set_session_pin(sess, "llamacpp", "m1")
+    local provider, model = state.session_pin(path)
+    assert(provider == "llamacpp" and model == "m1", "the deleted .meta was not rewritten: " .. tostring(provider))
+  end)
+
+  it("state: a resume keeps a model variable the loaded buffer already has", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    state.set_session_pin(sess, "llamacpp", "saved-model")
+    vim.b[sess].straps_provider = nil
+    vim.b[sess].straps_llamacpp_model = "live-model"
+    state.open_session_file(path)
+    assert(vim.b[sess].straps_llamacpp_model == "live-model",
+      "resume overwrote the buffer's model with " .. tostring(vim.b[sess].straps_llamacpp_model))
+  end)
+
+  it("state: a .meta holding valid JSON that is not an object warns on resume and restores nothing", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    vim.api.nvim_buf_delete(sess, { force = true })
+    vim.fn.writefile({ "[1,2]" }, path .. ".meta")
+    local warned
+    local real_notify = vim.notify
+    vim.notify = function(msg, level) if level == vim.log.levels.WARN then warned = msg end end
+    local resumed = state.open_session_file(path)
+    vim.notify = real_notify
+    assert(warned and warned:find("not a JSON object", 1, true), "no warning for a JSON array: " .. tostring(warned))
+    assert(vim.b[resumed].straps_provider == nil, "a JSON array restored " .. tostring(vim.b[resumed].straps_provider))
+  end)
+
+  it("state: a failed title write returns false and the error", function()
+    local path = vim.fn.tempname() .. "/missing-dir/t.straps"
+    local ok, err = state.set_session_title(path, "x")
+    assert(ok == false, "a title write into a missing directory succeeded")
+    assert(type(err) == "string" and err:find("t.straps.meta.tmp", 1, true), "error missing: " .. tostring(err))
+  end)
+
+  it("dispatcher: a per-session provider switch made during a request survives the request", function()
+    local spy_a = registry.get("fn.provider_anthropic").source
+    straps.config.provider = "anthropic"
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    _G.__switch_buf = sess
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy: switches mid-request",
+      source = [[return function()
+  require("straps.state").set_session_pin(_G.__switch_buf, "llamacpp", "local-model")
+  return { content = {}, stop_reason = "end_turn" }
+end]] })
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy", source = spy_a })
+    _G.__switch_buf = nil
+    straps.config.provider = nil
+    local provider, model = state.session_pin(path)
+    assert(vim.b[sess].straps_provider == "llamacpp", "the request reverted the switch to " .. tostring(vim.b[sess].straps_provider))
+    assert(provider == "llamacpp" and model == "local-model", ".meta holds " .. tostring(provider) .. "/" .. tostring(model))
+  end)
+
+  it("dispatcher: the backend gets ctx.model, and a global model change during the request does not change the pin", function()
+    local spy_a = registry.get("fn.provider_anthropic").source
+    straps.config.provider = "anthropic"
+    local saved_model = straps.config.model
+    straps.config.model = "claude-dispatched"
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy: global pick mid-request",
+      source = [[return function(req, ctx)
+  _G.__ctx_model = ctx.model
+  require("straps").config.model = "claude-picked-later"
+  return { content = {}, stop_reason = "end_turn" }
+end]] })
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy", source = spy_a })
+    local seen = _G.__ctx_model
+    _G.__ctx_model = nil
+    straps.config.model = saved_model
+    straps.config.provider = nil
+    local _, model = state.session_pin(path)
+    assert(seen == "claude-dispatched", "ctx.model was " .. tostring(seen))
+    assert(model == "claude-dispatched", "the pin recorded " .. tostring(model) .. " instead of the model sent")
+  end)
+
+  it("dispatcher: a per-session model pick during a request survives the request", function()
+    local spy_a = registry.get("fn.provider_anthropic").source
+    straps.config.provider = "anthropic"
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    _G.__pick_buf = sess
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy: model pick mid-request",
+      source = [[return function()
+  require("straps.state").set_session_pin(_G.__pick_buf, "anthropic", "claude-picked-mid-request")
+  return { content = {}, stop_reason = "end_turn" }
+end]] })
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy", source = spy_a })
+    _G.__pick_buf = nil
+    straps.config.provider = nil
+    local _, model = state.session_pin(path)
+    assert(vim.b[sess].straps_model == "claude-picked-mid-request", "the request reverted the pick to " .. tostring(vim.b[sess].straps_model))
+    assert(model == "claude-picked-mid-request", ".meta holds " .. tostring(model))
+  end)
+
+  it("dispatcher: the backend gets ctx.provider and ctx.model_entry", function()
+    local spy_l = registry.get("fn.provider_llamacpp").source
+    straps.config.provider = "llamacpp"
+    local saved_list, saved_model = straps.config.llamacpp_models, straps.config.llamacpp_model
+    straps.config.llamacpp_models = { { id = "ctx-model", thinking = "adaptive" } }
+    straps.config.llamacpp_model = "ctx-model"
+    registry.define({ name = "fn.provider_llamacpp", kind = "fn", doc = "spy: ctx fields",
+      source = [[return function(req, ctx)
+  _G.__ctx_seen = { provider = ctx.provider, entry = ctx.model_entry }
+  return { content = {}, stop_reason = "end_turn" }
+end]] })
+    registry.call("fn.provider", { messages = {} }, { bufnr = nil })
+    registry.define({ name = "fn.provider_llamacpp", kind = "fn", doc = "spy", source = spy_l })
+    local seen = _G.__ctx_seen
+    _G.__ctx_seen = nil
+    straps.config.llamacpp_models, straps.config.llamacpp_model = saved_list, saved_model
+    straps.config.provider = nil
+    assert(seen and seen.provider == "llamacpp", "ctx.provider: " .. vim.inspect(seen))
+    assert(seen.entry and seen.entry.id == "ctx-model" and seen.entry.thinking == "adaptive",
+      "ctx.model_entry: " .. vim.inspect(seen.entry))
+  end)
+
+  it("provider.resolve_provider: vim.b first, then setup{}, then the pref file, then anthropic, with the source", function()
+    local providers = require("straps.provider")
+    local sess = state.new_session()
+    vim.b[sess].straps_provider = "openai"
+    local b, b_src = providers.resolve_provider(sess, { provider = "llamacpp" })
+    local c, c_src = providers.resolve_provider(nil, { provider = "llamacpp" })
+    registry.call("fn.provider_pref", "openai")
+    local p, p_src = providers.resolve_provider(nil, {})
+    vim.fn.delete(pd .. "/straps/provider")
+    local d, d_src = providers.resolve_provider(nil, {})
+    assert(b == "openai" and b_src:find("vim.b", 1, true), b .. " / " .. b_src)
+    assert(c == "llamacpp" and c_src == "setup{ provider }", c .. " / " .. c_src)
+    assert(p == "openai" and p_src:find("pref file", 1, true), p .. " / " .. p_src)
+    assert(d == "anthropic", d)
+  end)
+
+  it("state: set_session_pin refuses an unknown provider and pins nothing", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    local ok, err = state.set_session_pin(sess, "bogus", "m1")
+    assert(ok == nil and tostring(err):find("unknown provider bogus", 1, true), tostring(err))
+    assert(vim.b[sess].straps_provider == nil, "an unknown provider was pinned in memory")
+    assert((state.session_pin(path)) == nil, "an unknown provider was written to .meta")
+  end)
+
+  it("dispatcher: a pinned model keeps its entry after a global pick elsewhere changes the model pref", function()
+    local spy_a = registry.get("fn.provider_anthropic").source
+    straps.config.provider = "anthropic"
+    local saved_models, saved_model = straps.config.models, straps.config.model
+    straps.config.models = {}
+    straps.config.model = nil
+    registry.call("fn.model_pref", "anthropic", "claude-from-pref", { id = "claude-from-pref", thinking = "adaptive" })
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy: records ctx.model_entry",
+      source = [[return function(req, ctx)
+  _G.__entries = _G.__entries or {}
+  table.insert(_G.__entries, ctx.model_entry and ctx.model_entry.thinking or "none")
+  return { content = {}, stop_reason = "end_turn" }
+end]] })
+    _G.__entries = {}
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    registry.call("fn.model_pref", "anthropic", "claude-other")
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy", source = spy_a })
+    local seen = _G.__entries
+    _G.__entries = nil
+    local _, model, _, entry = state.session_pin(path)
+    vim.fn.delete(pd .. "/straps/model_anthropic")
+    straps.config.models, straps.config.model = saved_models, saved_model
+    straps.config.provider = nil
+    assert(seen[1] == "adaptive" and seen[2] == "adaptive", "the entry was lost: " .. vim.inspect(seen))
+    assert(model == "claude-from-pref" and entry and entry.thinking == "adaptive", ".meta lost the entry: " .. vim.inspect(entry))
+  end)
+
+  it("state: pinning the same model without an entry keeps the entry already saved", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    state.set_session_pin(sess, "llamacpp", "m1", { id = "m1", thinking = "budget" })
+    state.set_session_pin(sess, "llamacpp", "m1", nil)
+    local _, _, _, entry = state.session_pin(path)
+    assert(entry and entry.thinking == "budget", "the saved entry was erased: " .. vim.inspect(entry))
+  end)
+
+  it("dispatcher: an unreadable provider pref file raises instead of falling back to anthropic", function()
+    straps.config.provider = nil
+    vim.fn.mkdir(pd .. "/straps", "p")
+    vim.fn.writefile({ "llamacpp" }, pd .. "/straps/provider")
+    vim.uv.fs_chmod(pd .. "/straps/provider", 0)
+    local sess = state.new_session()
+    local ok, err = pcall(registry.call, "fn.provider", { messages = {} }, { bufnr = sess })
+    vim.uv.fs_chmod(pd .. "/straps/provider", 420)
+    vim.fn.delete(pd .. "/straps/provider")
+    assert(not ok and tostring(err):find("exists but could not be read", 1, true), tostring(err))
+    assert(vim.b[sess].straps_provider == nil, "a session was pinned despite the unreadable pref")
+  end)
+
+  it("dispatcher: a model pref file that is not a JSON object raises instead of using the default model", function()
+    straps.config.provider = "anthropic"
+    local saved_model = straps.config.model
+    straps.config.model = nil
+    vim.fn.mkdir(pd .. "/straps", "p")
+    vim.fn.writefile({ "claude-opus-4-8" }, pd .. "/straps/model_anthropic")
+    local ok, err = pcall(registry.call, "fn.provider", { messages = {} }, { bufnr = nil })
+    vim.fn.delete(pd .. "/straps/model_anthropic")
+    straps.config.model = saved_model
+    straps.config.provider = nil
+    assert(not ok and tostring(err):find("is not a JSON object", 1, true), tostring(err))
+  end)
+
+  it("fn.provider_pref and fn.model_pref write through a temporary file and leave none behind", function()
+    registry.call("fn.provider_pref", "openai")
+    registry.call("fn.model_pref", "openai", "gpt-x")
+    local leftovers = vim.fn.glob(pd .. "/straps/*.tmp", false, true)
+    vim.fn.delete(pd .. "/straps/provider")
+    vim.fn.delete(pd .. "/straps/model_openai")
+    assert(#leftovers == 0, "temporary files left: " .. vim.inspect(leftovers))
+  end)
+
+  it("provider.redact_url hides credentials with or without a scheme, and the query and fragment", function()
+    local redact = require("straps.provider").redact_url
+    assert(redact("http://u:p@ss@h:8080/x?k=1") == "http://***@h:8080/x?***", redact("http://u:p@ss@h:8080/x?k=1"))
+    assert(redact("admin:secret@10.0.0.5:8080") == "***@10.0.0.5:8080", redact("admin:secret@10.0.0.5:8080"))
+    assert(redact("http://h/#tok=abc") == "http://h/?***", redact("http://h/#tok=abc"))
+    assert(redact("http://127.0.0.1:8080") == "http://127.0.0.1:8080", redact("http://127.0.0.1:8080"))
+  end)
+
+  it("state: a changed entry for the same model rewrites .meta", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    state.set_session_pin(sess, "llamacpp", "m1", { id = "m1" })
+    state.set_session_pin(sess, "llamacpp", "m1", { id = "m1", thinking = "adaptive" })
+    local _, _, _, entry = state.session_pin(path)
+    assert(entry and entry.thinking == "adaptive", "the changed entry was not written: " .. vim.inspect(entry))
+  end)
+
+  it("state: an entry whose id differs from the pinned model is not saved", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    state.set_session_pin(sess, "llamacpp", "m1", { id = "other" })
+    local _, _, _, entry = state.session_pin(path)
+    assert(entry == nil, "a mismatched entry was saved: " .. vim.inspect(entry))
+  end)
+
+  it("provider.merge_model_entry adds an entry once and never duplicates an id", function()
+    local providers = require("straps.provider")
+    local cfg = { llamacpp_models = { { id = "a" } } }
+    providers.merge_model_entry("llamacpp", { id = "a", thinking = "adaptive" }, cfg)
+    providers.merge_model_entry("llamacpp", { id = "b" }, cfg)
+    providers.merge_model_entry("llamacpp", { id = "b" }, cfg)
+    assert(#cfg.llamacpp_models == 2, "list length " .. #cfg.llamacpp_models)
+    assert(cfg.llamacpp_models[1].thinking == nil, "merge replaced the existing entry")
+  end)
+
+  it("state: a pin write that fails, then succeeds, then fails warns twice and returns false, err", function()
+    local sess = state.new_session()
+    local good = vim.api.nvim_buf_get_name(sess)
+    local bad = vim.fn.tempname() .. "/missing/s.straps"
+    local warnings = {}
+    local real_notify = vim.notify
+    vim.notify = function(msg, level) if level == vim.log.levels.WARN then warnings[#warnings + 1] = msg end end
+    vim.api.nvim_buf_set_name(sess, bad)
+    local ok1, err1 = state.set_session_pin(sess, "llamacpp", "m1")
+    vim.api.nvim_buf_set_name(sess, good)
+    local ok2 = state.set_session_pin(sess, "llamacpp", "m2")
+    vim.api.nvim_buf_set_name(sess, bad)
+    state.set_session_pin(sess, "llamacpp", "m3")
+    vim.notify = real_notify
+    assert(ok1 == false and type(err1) == "string", "failed write returned " .. tostring(ok1))
+    assert(ok2 == true, "successful write returned " .. tostring(ok2))
+    assert(#warnings == 2, "expected two warnings, got " .. #warnings)
+  end)
+
+  it("state: resuming a session whose first request is still running does not warn about a missing pin", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    state.append(sess, "user", nil, "hello")
+    state.append(sess, "assistant", nil, "")
+    local loop_mod = require("straps.loop")
+    local real_running = loop_mod.running
+    loop_mod.running = function(b) return b == sess end
+    local warned
+    local real_notify = vim.notify
+    vim.notify = function(msg, level) if level == vim.log.levels.WARN then warned = msg end end
+    state.open_session_file(path)
+    vim.notify = real_notify
+    loop_mod.running = real_running
+    assert(warned == nil, "a running session warned: " .. tostring(warned))
+  end)
+
+  it("dispatcher: a backend that returns result.model gets that model pinned", function()
+    local spy_a = registry.get("fn.provider_anthropic").source
+    straps.config.provider = "anthropic"
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy: own model",
+      source = [[return function() return { content = {}, stop_reason = "end_turn", model = "claude-own-choice" } end]] })
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "spy", source = spy_a })
+    straps.config.provider = nil
+    local _, model = state.session_pin(path)
+    assert(model == "claude-own-choice", "pinned " .. tostring(model))
+  end)
+
+  it("dispatcher: the pin saves the model's list entry, and a resume merges it back into the model list", function()
+    straps.config.provider = "anthropic"
+    local saved_models, saved_model = straps.config.models, straps.config.model
+    straps.config.models = { { id = "claude-discovered", thinking = "adaptive", max_output = 4321 } }
+    straps.config.model = "claude-discovered"
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    local _, _, _, entry = state.session_pin(path)
+    vim.api.nvim_buf_delete(sess, { force = true })
+    straps.config.models = {}
+    straps.config.model = saved_model
+    state.open_session_file(path)
+    local restored = require("straps.provider").model_entry("anthropic", "claude-discovered", straps.config)
+    straps.config.models = saved_models
+    straps.config.provider = nil
+    assert(entry and entry.thinking == "adaptive", ".meta has no entry: " .. vim.inspect(entry))
+    assert(restored and restored.thinking == "adaptive" and restored.max_output == 4321,
+      "the entry was not merged back: " .. vim.inspect(restored))
+  end)
+
+  it("state: renaming onto a transcript whose .meta already exists rewrites that .meta on the next request", function()
+    straps.config.provider = "llamacpp"
+    local sess = state.new_session()
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    local renamed = vim.fn.tempname() .. ".straps"
+    vim.fn.writefile({ vim.json.encode({ provider = "openai" }) }, renamed .. ".meta")
+    vim.api.nvim_buf_set_name(sess, renamed)
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    straps.config.provider = nil
+    assert((state.session_pin(renamed)) == "llamacpp", "the existing .meta kept " .. tostring((state.session_pin(renamed))))
+  end)
+
+  it("state: an unchanged pin does not rewrite .meta, including right after a resume", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    state.set_session_pin(sess, "llamacpp", "m1")
+    local sentinel = vim.json.encode({ provider = "llamacpp", model = "m1", title = "sentinel" })
+    vim.fn.writefile({ sentinel }, path .. ".meta")
+    state.set_session_pin(sess, "llamacpp", "m1")
+    local after_pin = table.concat(vim.fn.readfile(path .. ".meta"), "\n")
+    vim.api.nvim_buf_delete(sess, { force = true })
+    local resumed = state.open_session_file(path)
+    state.set_session_pin(resumed, "llamacpp", "m1")
+    local after_resume = table.concat(vim.fn.readfile(path .. ".meta"), "\n")
+    assert(after_pin == sentinel, "an unchanged pin rewrote .meta: " .. after_pin)
+    assert(after_resume == sentinel, "an unchanged pin after resume rewrote .meta: " .. after_resume)
+  end)
+
+  it("state: a corrupt .meta on a reused buffer warns that the buffer keeps its provider, and the next pin rewrites it", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    state.set_session_pin(sess, "llamacpp", "m1")
+    vim.fn.writefile({ "not json" }, path .. ".meta")
+    local warned
+    local real_notify = vim.notify
+    vim.notify = function(msg, level) if level == vim.log.levels.WARN then warned = msg end end
+    state.open_session_file(path)
+    vim.notify = real_notify
+    state.set_session_pin(sess, "llamacpp", "m1")
+    assert(warned and warned:find("keeps provider llamacpp", 1, true), "warning wrong: " .. tostring(warned))
+    assert((state.session_pin(path)) == "llamacpp", "the corrupt .meta was not rewritten")
+  end)
+
+  it("state: resuming a transcript with assistant turns and no saved provider warns; one without assistant turns does not", function()
+    local function resume_warning(with_assistant)
+      local sess = state.new_session()
+      local path = vim.api.nvim_buf_get_name(sess)
+      state.append(sess, "user", nil, "hello")
+      if with_assistant then state.append(sess, "assistant", nil, "hi") end
+      vim.api.nvim_buf_call(sess, function() vim.cmd("silent write") end)
+      vim.api.nvim_buf_delete(sess, { force = true })
+      vim.fn.delete(path .. ".meta")
+      local warned
+      local real_notify = vim.notify
+      vim.notify = function(msg, level) if level == vim.log.levels.WARN then warned = msg end end
+      state.open_session_file(path)
+      vim.notify = real_notify
+      return warned
+    end
+    local with = resume_warning(true)
+    local without = resume_warning(false)
+    assert(with and with:find("has no saved provider", 1, true), "no warning: " .. tostring(with))
+    assert(without == nil, "a transcript with no assistant turns warned: " .. tostring(without))
+  end)
+
+  it("state: a .meta naming an unknown provider restores it, and the next request raises naming the source", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    vim.api.nvim_buf_delete(sess, { force = true })
+    vim.fn.writefile({ vim.json.encode({ provider = "retired", model = "x" }) }, path .. ".meta")
+    local resumed = state.open_session_file(path)
+    local ok, err = pcall(registry.call, "fn.provider", { messages = {} }, { bufnr = resumed })
+    assert(vim.b[resumed].straps_model == nil, "a model was restored into the anthropic slot for an unknown provider")
+    assert(not ok and tostring(err):find("unknown provider retired (expected one of:", 1, true)
+      and tostring(err):find("), from the session's vim.b straps_provider", 1, true),
+      tostring(err))
+  end)
+
+  it("state: a failed rename in a .meta write removes the temporary file and raises", function()
+    local mp = vim.fn.tempname() .. ".straps.meta"
+    vim.fn.mkdir(mp, "p")
+    vim.fn.writefile({ "x" }, mp .. "/occupied")
+    local ok = pcall(state._write_meta_fields, mp, { title = "t" })
+    assert(not ok, "a rename onto a directory succeeded")
+    assert(vim.fn.filereadable(mp .. ".tmp") == 0, "the temporary file was left behind")
+  end)
+
+  it("dispatcher: every provider name reaches its own backend", function()
+    local seen = {}
+    for _, name in ipairs(require("straps.provider").provider_names()) do
+      local entry = "fn.provider_" .. name
+      local real = registry.get(entry)
+      registry.define({ name = entry, kind = "fn", doc = "spy",
+        source = ([[return function() return { content = {}, stop_reason = "end_turn", _who = %q } end]]):format(name) })
+      straps.config.provider = name
+      local resp = registry.call("fn.provider", { messages = {} }, { bufnr = nil })
+      registry.define({ name = real.name, kind = real.kind, doc = real.doc, source = real.source })
+      seen[name] = resp._who
+    end
+    straps.config.provider = nil
+    for name, who in pairs(seen) do
+      assert(who == name, name .. " reached " .. tostring(who))
+    end
+  end)
+
+  it("state: a blank .meta reads as empty, warns nothing, and takes a title", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    vim.api.nvim_buf_delete(sess, { force = true })
+    vim.fn.writefile({}, path .. ".meta")
+    local warned
+    local real_notify = vim.notify
+    vim.notify = function(msg, level) if level == vim.log.levels.WARN then warned = msg end end
+    state.open_session_file(path)
+    vim.notify = real_notify
+    local ok, err = state.set_session_title(path, "after crash")
+    assert(warned == nil, "a blank .meta warned: " .. tostring(warned))
+    assert(ok, "title write failed on a blank .meta: " .. tostring(err))
+    assert(state.session_title(path) == "after crash", "title not saved: " .. tostring(state.session_title(path)))
+  end)
+
+  it("state: the pin saves the session's model with the provider and a resume restores both", function()
+    straps.config.provider = "llamacpp"
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    vim.b[sess].straps_llamacpp_model = "qwen-session"
+    registry.call("fn.provider", { messages = {} }, { bufnr = sess })
+    straps.config.provider = nil
+    local provider, model = state.session_pin(path)
+    vim.api.nvim_buf_delete(sess, { force = true })
+    local resumed = state.open_session_file(path)
+    assert(provider == "llamacpp" and model == "qwen-session",
+      "pin saved " .. tostring(provider) .. "/" .. tostring(model))
+    assert(vim.b[resumed].straps_provider == "llamacpp", "provider not restored")
+    assert(vim.b[resumed].straps_llamacpp_model == "qwen-session",
+      "model not restored: " .. tostring(vim.b[resumed].straps_llamacpp_model))
+    vim.b[resumed].straps_llamacpp_model = nil
+    state.set_session_pin(resumed, "llamacpp")
+    local _, cleared = state.session_pin(path)
+    assert(cleared == nil, "an unset session model stayed in .meta: " .. tostring(cleared))
+  end)
+
+  it("state: a resume keeps a provider the loaded buffer already has", function()
+    local sess = state.new_session()
+    local path = vim.api.nvim_buf_get_name(sess)
+    state.set_session_pin(sess, "llamacpp")
+    vim.b[sess].straps_provider = "openai"
+    local same = state.open_session_file(path)
+    assert(same == sess, "open_session_file did not reuse the loaded buffer")
+    assert(vim.b[sess].straps_provider == "openai",
+      "resume overwrote the buffer's provider with " .. tostring(vim.b[sess].straps_provider))
+  end)
+
+  it("state: a file buffer that is not a session is never pinned", function()
+    local name = vim.fn.tempname() .. ".lua"
+    local buf = vim.fn.bufadd(name)
+    vim.fn.bufload(buf)
+    state.set_session_pin(buf, "llamacpp")
+    assert(vim.b[buf].straps_provider == nil, "a non-session buffer was pinned")
+    assert(vim.fn.filereadable(name .. ".meta") == 0, "a non-session buffer wrote a .meta file")
+  end)
+
+  it("state: .meta holds exactly the fields set, over every set/clear sequence up to length 4", function()
+    local ops = {
+      { title = "t1" }, { title = false }, { provider = "llamacpp" }, { provider = false }, { model = "m1" }, { model = false },
+    }
+    local mp = vim.fn.tempname() .. ".straps.meta"
+    local checked = 0
+    local function run(seq)
+      for start_name, content in pairs({ absent = false, blank = "", corrupt = "{not json", array = "[1,2]" }) do
+        vim.fn.delete(mp)
+        if content then vim.fn.writefile({ content }, mp) end
+        local expect = {}
+        for _, op in ipairs(seq) do
+          state._write_meta_fields(mp, op)
+          for k, v in pairs(op) do
+            if v == false then expect[k] = nil else expect[k] = v end
+          end
+          local exists = vim.fn.filereadable(mp) == 1
+          local label = start_name .. " " .. vim.inspect(seq)
+          assert(exists == (next(expect) ~= nil), "file presence wrong after " .. label)
+          if exists then
+            local got = vim.json.decode(table.concat(vim.fn.readfile(mp), "\n"))
+            assert(vim.deep_equal(got, expect), label .. ": " .. vim.inspect(got) .. " ~= " .. vim.inspect(expect))
+          end
+          assert(vim.fn.filereadable(mp .. ".tmp") == 0, "temporary file left behind after " .. label)
+          checked = checked + 1
+        end
+      end
+    end
+    local function walk(seq, depth)
+      if #seq > 0 then run(seq) end
+      if depth == 0 then return end
+      for _, op in ipairs(ops) do
+        local next_seq = vim.list_extend(vim.deepcopy(seq), { op })
+        walk(next_seq, depth - 1)
+      end
+    end
+    walk({}, 4)
+    assert(checked > 10000, "the sequence walk covered only " .. checked .. " writes")
+  end)
+
+  it("state: a scratch session buffer is pinned in memory and writes no .meta file", function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    local name = vim.fn.tempname() .. ".straps"
+    vim.api.nvim_buf_set_name(buf, name)
+    vim.b[buf].straps_session = true
+    state.set_session_pin(buf, "llamacpp")
+    assert(vim.b[buf].straps_provider == "llamacpp", "scratch buffer not pinned in memory")
+    assert(vim.fn.filereadable(name .. ".meta") == 0, "a scratch buffer wrote a .meta file")
+  end)
+
+  it("fn.list_models: an explicit unknown provider returns (nil, err) instead of resolving another", function()
+    local saved_path = vim.env.PATH
+    vim.env.PATH = tmp .. "/models_500:" .. real_path
+    local models, why = registry.call("fn.list_models", "llama.cpp")
+    vim.env.PATH = saved_path
+    assert(models == nil and tostring(why):find("unknown provider llama.cpp", 1, true), tostring(why))
+  end)
+
   -- Restore the real backends the rest of the suite (and any later run) needs.
   step(function()
     registry.define({ name = "fn.provider_anthropic", kind = "fn",
       doc = "restored", source = real_anthropic })
     registry.define({ name = "fn.provider_openai", kind = "fn",
       doc = "restored", source = real_openai })
+    registry.define({ name = "fn.provider_llamacpp", kind = "fn",
+      doc = "restored", source = real_llamacpp })
     vim.env.XDG_CONFIG_HOME = saved_xdg
     straps.config.provider = saved_provider
   end)
@@ -1753,5 +2623,498 @@ do
   step(function()
     vim.env.OPENAI_API_KEY = saved_oai
     vim.env.XDG_CONFIG_HOME = saved_xdg2
+  end)
+end
+
+-- ---------------------------------------------------------- llamacpp backend
+-- fn.provider_llamacpp drives fn.anthropic_messages at llamacpp_base_url with
+-- no x-api-key, an optional Bearer key, the llama.cpp model slot and no gzip.
+-- Its own fake directory keeps the scripted fixture's argv/body files intact.
+do
+  local ld = tmp .. "/llama"
+  local saved = {}
+  local function read(name) return table.concat(vim.fn.readfile(ld .. "/" .. name), "\n") end
+  local function reset()
+    for _, name in ipairs(vim.fn.readdir(ld)) do
+      if name ~= "curl" and name ~= "gzip" then vim.fn.delete(ld .. "/" .. name) end
+    end
+  end
+  local function session(text, model)
+    local b = state.new_session()
+    if model then vim.b[b].straps_llamacpp_model = model end
+    state.append(b, "user", nil, text)
+    loop.start(b)
+    vim.wait(15000, function() return not loop.running(b) end, 50)
+    return b, table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
+  end
+  local text1, argv1, body1, body2
+  local lines_keyed, argv_keyed
+  local gz_argv, gz_body
+  local nomodel_text, nomodel_ok, nomodel_err
+  local fail_text
+  local switched_body, leak_argv, redefined_argv, llama_fallback_argv, per_server_argv
+  local v1_argv, blank_body, guard_body, adaptive_body, budget_body, pref_entry_body, own_model_pin
+
+  step(function()
+    vim.fn.mkdir(ld, "p")
+    write_exec(ld .. "/curl", ([[#!/usr/bin/env bash
+D=%q
+N=$(cat "$D/n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/n"
+printf '%%s\n' "$*" >> "$D/argv"
+cat > "$D/body.$N"
+if [ -f "$D/fail" ]; then
+  echo "STRAPS_HTTP_STATUS:400" >&2
+  echo '{"error":{"code":400,"message":"model name is missing from the request","type":"invalid_request_error"}}'
+  exit 0
+fi
+echo "STRAPS_HTTP_STATUS:200" >&2
+if [ "$N" = 1 ] && [ -f "$D/tool" ]; then
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":50}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"use bash"}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"Lt1","name":"bash"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"echo llama-e2e-output\"}"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":""}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+EOF
+else
+cat <<'EOF'
+event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":60}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"llama done"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+EOF
+fi
+]]):format(ld))
+    write_exec(ld .. "/gzip", [[#!/usr/bin/env bash
+cat > /dev/null
+printf 'GZIPPED'
+]])
+    saved.path = vim.env.PATH
+    saved.provider = straps.config.provider
+    saved.anthropic_key = vim.env.ANTHROPIC_API_KEY
+    saved.llama_key = vim.env.LLAMACPP_API_KEY
+    saved.llama_server_key = vim.env.LLAMA_API_KEY
+    vim.env.LLAMA_API_KEY = nil
+    saved.xdg = vim.env.XDG_CONFIG_HOME
+    saved.base_url = straps.config.base_url
+    saved.llamacpp_base_url = straps.config.llamacpp_base_url
+    saved.llamacpp_model = straps.config.llamacpp_model
+    vim.env.PATH = ld .. ":" .. real_path
+    vim.env.ANTHROPIC_API_KEY = nil
+    vim.env.LLAMACPP_API_KEY = nil
+    vim.env.XDG_CONFIG_HOME = vim.fn.tempname()
+    vim.fn.mkdir(vim.env.XDG_CONFIG_HOME, "p")
+    straps.config.provider = "llamacpp"
+    straps.config.base_url = "http://anthropic-must-not-be-used.invalid"
+    straps.config.llamacpp_base_url = "http://straps-llama.invalid:8080"
+    straps.config.llamacpp_model = "config-model"
+    saved.llamacpp_models = straps.config.llamacpp_models
+    straps.config.llamacpp_models = { { id = "buffer-model", max_output = 1234 } }
+
+    reset()
+    vim.fn.writefile({}, ld .. "/tool")
+    local _
+    _, text1 = session("run echo via bash", "buffer-model")
+    argv1 = read("argv")
+    body1 = vim.json.decode(read("body.1"))
+    body2 = vim.json.decode(read("body.2"))
+    straps.config.llamacpp_models = saved.llamacpp_models
+
+    reset()
+    vim.env.LLAMACPP_API_KEY = "llama-secret"
+    session("keyed", nil)
+    argv_keyed = read("argv")
+    lines_keyed = vim.json.decode(read("body.1"))
+    vim.env.LLAMACPP_API_KEY = nil
+
+    reset()
+    straps.config.gzip = true
+    session("compress me not", nil)
+    straps.config.gzip = false
+    gz_argv = read("argv")
+    gz_body = read("body.1")
+
+    reset()
+    straps.config.llamacpp_model = nil
+    _, nomodel_text = session("no model anywhere", nil)
+    nomodel_ok, nomodel_err = pcall(registry.call, "fn.provider_llamacpp", { messages = {} }, {})
+    straps.config.llamacpp_model = "config-model"
+
+    reset()
+    vim.fn.writefile({}, ld .. "/fail")
+    _, fail_text = session("this one fails", nil)
+    vim.fn.delete(ld .. "/fail")
+
+    reset()
+    local sb = state.new_session()
+    vim.b[sb].straps_model = "claude-left-over"
+    vim.b[sb].straps_llamacpp_model = "switched-model"
+    state.append(sb, "user", nil, "switched from anthropic")
+    loop.start(sb)
+    vim.wait(15000, function() return not loop.running(sb) end, 50)
+    switched_body = vim.json.decode(read("body.1"))
+
+    reset()
+    local real_llama = registry.get("fn.provider_llamacpp")
+    vim.env.ANTHROPIC_API_KEY = "sk-ant-MUST-NOT-LEAVE"
+    registry.define({ name = "fn.provider_llamacpp", kind = "fn", doc = "test: base_url without headers",
+      source = [[return function(req, ctx)
+  return require("straps.registry").call("fn.anthropic_messages", req, ctx,
+    { base_url = "http://other-host.invalid:9000", model = "m", gzip = false })
+end]] })
+    session("opts without headers", nil)
+    registry.define({ name = real_llama.name, kind = real_llama.kind, doc = real_llama.doc, source = real_llama.source })
+    vim.env.ANTHROPIC_API_KEY = nil
+    leak_argv = read("argv")
+
+    reset()
+    local real_anthropic = registry.get("fn.provider_anthropic")
+    vim.env.ANTHROPIC_API_KEY = "sk-ant-MUST-NOT-LEAVE"
+    registry.define({ name = "fn.provider_anthropic", kind = "fn", doc = "test: two-argument fn.provider_anthropic redefinition",
+      source = [[return function(req, ctx)
+  return require("straps.registry").call("fn.anthropic_messages", req, ctx)
+end]] })
+    session("redefined anthropic backend", nil)
+    registry.define({ name = real_anthropic.name, kind = real_anthropic.kind, doc = real_anthropic.doc,
+      source = real_anthropic.source })
+    vim.env.ANTHROPIC_API_KEY = nil
+    redefined_argv = read("argv")
+
+    reset()
+    vim.env.LLAMA_API_KEY = "llama-server-var"
+    session("server variable", nil)
+    vim.env.LLAMA_API_KEY = nil
+    llama_fallback_argv = read("argv")
+
+    reset()
+    local real_key = registry.get("fn.llamacpp_api_key")
+    registry.define({ name = "fn.llamacpp_api_key", kind = "fn", doc = "test: key per server",
+      source = [[return function(opts) return "k-" .. tostring(opts and opts.base_url) end]] })
+    session("key per server", nil)
+    registry.define({ name = real_key.name, kind = real_key.kind, doc = real_key.doc, source = real_key.source })
+    per_server_argv = read("argv")
+
+    reset()
+    straps.config.llamacpp_base_url = "http://straps-llama.invalid:8080/v1/"
+    session("v1 suffix", nil)
+    straps.config.llamacpp_base_url = "http://straps-llama.invalid:8080"
+    v1_argv = read("argv")
+
+    reset()
+    session("blank buffer model", "")
+    blank_body = vim.json.decode(read("body.1"))
+
+    reset()
+    local models_before, effort_before, llama_models_before = straps.config.models, straps.config.effort,
+      straps.config.llamacpp_models
+    straps.config.models = { { id = "config-model", thinking = "adaptive", max_output = 777 } }
+    straps.config.llamacpp_models = nil
+    straps.config.effort = "high"
+    session("anthropic list must not apply", nil)
+    straps.config.models, straps.config.effort, straps.config.llamacpp_models = models_before, effort_before,
+      llama_models_before
+    guard_body = vim.json.decode(read("body.1"))
+
+    local efforts_before, effort_before2, list_before = straps.config.efforts, straps.config.effort,
+      straps.config.llamacpp_models
+    straps.config.efforts = { { name = "high", level = "high", budget_tokens = 4000 } }
+    straps.config.effort = "high"
+    reset()
+    straps.config.llamacpp_models = { { id = "config-model", thinking = "adaptive" } }
+    session("thinking-tagged adaptive", nil)
+    adaptive_body = vim.json.decode(read("body.1"))
+    reset()
+    straps.config.llamacpp_models = { { id = "config-model", thinking = "budget" } }
+    session("thinking-tagged budget", nil)
+    budget_body = vim.json.decode(read("body.1"))
+    straps.config.efforts, straps.config.effort, straps.config.llamacpp_models = efforts_before, effort_before2,
+      list_before
+
+    reset()
+    local list_before2 = straps.config.llamacpp_models
+    straps.config.llamacpp_models = {}
+    registry.call("fn.model_pref", "llamacpp", "config-model", { id = "config-model", max_output = 4321 })
+    session("entry from the model pref", nil)
+    vim.fn.delete(vim.env.XDG_CONFIG_HOME .. "/straps/model_llamacpp")
+    straps.config.llamacpp_models = list_before2
+    pref_entry_body = vim.json.decode(read("body.1"))
+
+    reset()
+    local real_llama2 = registry.get("fn.provider_llamacpp")
+    registry.define({ name = "fn.provider_llamacpp", kind = "fn", doc = "test: own model",
+      source = [[return function(req, ctx)
+  return require("straps.registry").call("fn.anthropic_messages", req, ctx,
+    { base_url = "http://straps-llama.invalid:8080", model = "own-model", auth_headers = {}, gzip = false })
+end]] })
+    local own_buf = session("own model", nil)
+    registry.define({ name = real_llama2.name, kind = real_llama2.kind, doc = real_llama2.doc, source = real_llama2.source })
+    own_model_pin = select(2, state.session_pin(vim.api.nvim_buf_get_name(own_buf)))
+  end)
+
+  it("llamacpp: a backend that sends its own opts.model gets that model pinned (result.model)", function()
+    assert(own_model_pin == "own-model", "pinned " .. tostring(own_model_pin))
+  end)
+
+  it("llamacpp: an entry stored with the model pref reaches the request (opts.model_entry)", function()
+    assert(pref_entry_body.max_tokens == 4321, "the pref entry's max_output was not used: " .. tostring(pref_entry_body.max_tokens))
+  end)
+
+  it("llamacpp: a thinking-tagged llamacpp_models entry gets thinking in the request", function()
+    assert(adaptive_body.thinking and adaptive_body.thinking.type == "adaptive",
+      "adaptive thinking missing: " .. vim.inspect(adaptive_body.thinking))
+    assert(adaptive_body.output_config and adaptive_body.output_config.effort == "high",
+      "output_config.effort missing: " .. vim.inspect(adaptive_body.output_config))
+    assert(budget_body.thinking and budget_body.thinking.type == "enabled" and budget_body.thinking.budget_tokens == 4000,
+      "budget thinking missing: " .. vim.inspect(budget_body.thinking))
+    assert(budget_body.max_tokens > 4000, "max_tokens not raised above the budget: " .. tostring(budget_body.max_tokens))
+  end)
+
+  it("llamacpp: a base URL ending in /v1/ is not doubled", function()
+    assert(v1_argv:find("http://straps-llama.invalid:8080/v1/messages", 1, true), "url wrong:\n" .. v1_argv)
+    assert(not v1_argv:find("/v1/v1/", 1, true), "/v1 doubled:\n" .. v1_argv)
+  end)
+
+  it("llamacpp: a blank per-session model falls back to config.llamacpp_model", function()
+    assert(blank_body.model == "config-model", "model: " .. tostring(blank_body.model))
+  end)
+
+  it("llamacpp: with llamacpp_models unset, the Anthropic model list never supplies thinking or max_tokens", function()
+    assert(guard_body.thinking == nil, "Anthropic thinking entry applied: " .. vim.inspect(guard_body.thinking))
+    assert(guard_body.max_tokens ~= 777, "Anthropic max_output applied to a llamacpp request")
+  end)
+
+  it("fn.anthropic_messages raises when opts.base_url is set without opts.model", function()
+    local ok, err = pcall(registry.call, "fn.anthropic_messages", { messages = {} }, {},
+      { base_url = "http://elsewhere.invalid", label = "test" })
+    assert(not ok and tostring(err):find("opts.base_url is set without opts.model", 1, true), tostring(err))
+  end)
+
+  it("llamacpp: the backend passes llamacpp_base_url to fn.llamacpp_api_key", function()
+    assert(per_server_argv:find("Authorization: Bearer k-http://straps-llama.invalid:8080", 1, true),
+      "the key fn did not receive opts.base_url:\n" .. per_server_argv)
+  end)
+
+  it("llamacpp: posts to llamacpp_base_url/v1/messages with no x-api-key and no Anthropic key", function()
+    assert(argv1:find("http://straps-llama.invalid:8080/v1/messages", 1, true), "llamacpp url not in argv:\n" .. argv1)
+    assert(not argv1:find("anthropic-must-not-be-used", 1, true), "config.base_url leaked:\n" .. argv1)
+    assert(not argv1:find("x-api-key", 1, true), "x-api-key sent to llama-server:\n" .. argv1)
+    assert(not argv1:find("Authorization", 1, true), "Authorization sent without LLAMACPP_API_KEY:\n" .. argv1)
+  end)
+
+  it("llamacpp: full tool round-trip completes, thinking stays out of the transcript", function()
+    assert(text1:find("llama-e2e-output", 1, true), "bash tool_result missing:\n" .. text1)
+    assert(text1:find("llama done", 1, true), "final text missing:\n" .. text1)
+    assert(not text1:find("use bash", 1, true), "thinking text leaked into the transcript")
+    local last = body2.messages[#body2.messages]
+    assert(last.content[1].type == "tool_result" and last.content[1].content:find("llama-e2e-output", 1, true),
+      "second request lacks the tool_result: " .. vim.inspect(last))
+  end)
+
+  it("llamacpp: vim.b straps_llamacpp_model wins over config.llamacpp_model", function()
+    assert(body1.model == "buffer-model", "model wrong: " .. tostring(body1.model))
+    assert(body1.max_tokens == 1234, "llamacpp_models max_output not used: " .. tostring(body1.max_tokens))
+    assert(lines_keyed.model == "config-model", "config model not used without a buffer model: "
+      .. tostring(lines_keyed.model))
+  end)
+
+  it("llamacpp: LLAMACPP_API_KEY is sent as a Bearer token, never as x-api-key", function()
+    assert(argv_keyed:find("Authorization: Bearer llama-secret", 1, true), "Bearer header missing:\n" .. argv_keyed)
+    assert(not argv_keyed:find("x-api-key", 1, true), "x-api-key sent:\n" .. argv_keyed)
+  end)
+
+  it("llamacpp: no gzip even with config.gzip on and gzip available", function()
+    assert(not gz_argv:find("Content-Encoding", 1, true), "Content-Encoding sent to llama-server:\n" .. gz_argv)
+    assert(vim.json.decode(gz_body).messages, "body is not plain JSON: " .. gz_body:sub(1, 80))
+  end)
+
+  it("llamacpp: no model set errors with the remedy, also for ctx = {}", function()
+    assert(nomodel_text:find("set llamacpp_model in setup{} or run :StrapsModel", 1, true),
+      "no-model error missing from the transcript:\n" .. nomodel_text)
+    assert(not nomodel_ok and tostring(nomodel_err):find("set llamacpp_model in setup{} or run :StrapsModel", 1, true),
+      "ctx = {} call should raise the no-model error with the remedy: " .. tostring(nomodel_err))
+  end)
+
+  it("llamacpp: a session switched from anthropic sends the llama model, not the left-over Claude id", function()
+    assert(switched_body.model == "switched-model", "model wrong: " .. tostring(switched_body.model))
+  end)
+
+  it("fn.anthropic_messages: opts.base_url without opts.auth_headers sends no Anthropic key", function()
+    assert(leak_argv:find("http://other-host.invalid:9000/v1/messages", 1, true), "request not sent:\n" .. leak_argv)
+    assert(not leak_argv:find("x-api-key", 1, true), "Anthropic key sent to another host:\n" .. leak_argv)
+    assert(not leak_argv:find("MUST-NOT-LEAVE", 1, true), "Anthropic key value in argv:\n" .. leak_argv)
+  end)
+
+  it("llamacpp: a redefined fn.provider_anthropic does not reroute llama.cpp sessions", function()
+    assert(redefined_argv:find("http://straps-llama.invalid:8080/v1/messages", 1, true),
+      "llamacpp request left the llama server:\n" .. redefined_argv)
+    assert(not redefined_argv:find("x-api-key", 1, true), "Anthropic key sent:\n" .. redefined_argv)
+  end)
+
+  it("llamacpp: $LLAMA_API_KEY is the fallback key source", function()
+    assert(llama_fallback_argv:find("Authorization: Bearer llama-server-var", 1, true),
+      "LLAMA_API_KEY not used:\n" .. llama_fallback_argv)
+  end)
+
+  it("llamacpp: a failed request names the llamacpp backend", function()
+    assert(fail_text:find("straps provider (llamacpp): request failed (HTTP 400)", 1, true),
+      "labelled failure missing:\n" .. fail_text)
+    assert(fail_text:find("model name is missing", 1, true), "server error message missing")
+  end)
+
+  step(function()
+    vim.env.PATH = saved.path
+    vim.env.ANTHROPIC_API_KEY = saved.anthropic_key
+    vim.env.LLAMACPP_API_KEY = saved.llama_key
+    vim.env.LLAMA_API_KEY = saved.llama_server_key
+    vim.env.XDG_CONFIG_HOME = saved.xdg
+    straps.config.provider = saved.provider
+    straps.config.base_url = saved.base_url
+    straps.config.llamacpp_base_url = saved.llamacpp_base_url
+    straps.config.llamacpp_model = saved.llamacpp_model
+  end)
+end
+
+-- ------------------------------------------------- llamacpp model discovery
+do
+  local md = tmp .. "/llama_models"
+  local saved = {}
+  local models, err, argv_nokey, argv_key
+  step(function()
+    vim.fn.mkdir(md, "p")
+    write_exec(md .. "/curl", ([[#!/usr/bin/env bash
+D=%q
+printf '%%s\n' "$*" >> "$D/argv"
+cat <<'EOF'
+{"object":"list","data":[
+  {"id":"qwen-dense","object":"model","owned_by":"llamacpp","status":{"value":"loaded"},"meta":{"n_ctx":131072}},
+  {"id":"gpt-oss","object":"model","owned_by":"llamacpp","status":{"value":"unloaded"}}
+]}
+EOF
+printf '\nSTRAPS_HTTP_STATUS:200\n'
+]]):format(md))
+    saved.path = vim.env.PATH
+    saved.provider = straps.config.provider
+    saved.anthropic_key = vim.env.ANTHROPIC_API_KEY
+    saved.llama_key = vim.env.LLAMACPP_API_KEY
+    saved.llama_server_key = vim.env.LLAMA_API_KEY
+    saved.xdg = vim.env.XDG_CONFIG_HOME
+    saved.llamacpp_base_url = straps.config.llamacpp_base_url
+    vim.env.PATH = md .. ":" .. real_path
+    vim.env.ANTHROPIC_API_KEY = nil
+    vim.env.LLAMACPP_API_KEY = nil
+    vim.env.LLAMA_API_KEY = nil
+    vim.env.XDG_CONFIG_HOME = vim.fn.tempname()
+    vim.fn.mkdir(vim.env.XDG_CONFIG_HOME, "p")
+    straps.config.provider = "anthropic"
+    straps.config.llamacpp_base_url = "http://straps-llama-models.invalid:8080"
+    models, err = registry.call("fn.list_models", "llamacpp")
+    argv_nokey = table.concat(vim.fn.readfile(md .. "/argv"), "\n")
+    vim.fn.delete(md .. "/argv")
+    vim.env.LLAMACPP_API_KEY = "llama-secret"
+    registry.call("fn.list_models", "llamacpp")
+    argv_key = table.concat(vim.fn.readfile(md .. "/argv"), "\n")
+  end)
+
+  it("fn.list_models (llamacpp) needs no key and hits llamacpp_base_url/v1/models without ?limit", function()
+    assert(type(models) == "table", "expected a model list, got err: " .. tostring(err))
+    assert(argv_nokey:find("http://straps-llama-models.invalid:8080/v1/models", 1, true), "url wrong:\n" .. argv_nokey)
+    assert(not argv_nokey:find("limit=", 1, true), "?limit sent to llama-server:\n" .. argv_nokey)
+    assert(not argv_nokey:find("x-api-key", 1, true), "x-api-key sent:\n" .. argv_nokey)
+    assert(not argv_nokey:find("Authorization", 1, true), "Authorization sent without a key:\n" .. argv_nokey)
+  end)
+
+  it("fn.list_models (llamacpp) maps meta.n_ctx to context, id doubles as label", function()
+    assert(#models == 2, "expected 2 models, got " .. #models)
+    assert(models[1].id == "qwen-dense" and models[1].label == "qwen-dense", vim.inspect(models[1]))
+    assert(models[1].context == 131072, "n_ctx not mapped: " .. tostring(models[1].context))
+    assert(models[2].context == nil, "an unloaded model has no n_ctx: " .. tostring(models[2].context))
+    assert(models[1].thinking == nil, "llama.cpp entries carry no thinking tag")
+  end)
+
+  it("fn.list_models (llamacpp) returns (nil, err) when fn.llamacpp_api_key raises", function()
+    local real = registry.get("fn.llamacpp_api_key")
+    registry.define({ name = "fn.llamacpp_api_key", kind = "fn", doc = "test",
+      source = [[return function() error("vault locked") end]] })
+    local ok, got, why = pcall(registry.call, "fn.list_models", "llamacpp")
+    registry.define({ name = real.name, kind = real.kind, doc = real.doc, source = real.source })
+    assert(ok, "fn.list_models raised: " .. tostring(got))
+    assert(got == nil and tostring(why):find("fn.llamacpp_api_key failed", 1, true)
+      and tostring(why):find("vault locked", 1, true), "wrong result: " .. tostring(why))
+  end)
+
+  it("fn.llamacpp_api_key: an empty LLAMACPP_API_KEY falls through to LLAMA_API_KEY; both empty is nil", function()
+    local a, b = vim.env.LLAMACPP_API_KEY, vim.env.LLAMA_API_KEY
+    vim.env.LLAMACPP_API_KEY = ""
+    vim.env.LLAMA_API_KEY = "server-key"
+    local got = registry.call("fn.llamacpp_api_key")
+    vim.env.LLAMA_API_KEY = ""
+    local none = registry.call("fn.llamacpp_api_key")
+    vim.env.LLAMACPP_API_KEY, vim.env.LLAMA_API_KEY = a, b
+    assert(got == "server-key", "empty LLAMACPP_API_KEY did not fall through: " .. tostring(got))
+    assert(none == nil, "both empty should give nil: " .. tostring(none))
+  end)
+
+  it("fn.list_models (llamacpp) passes llamacpp_base_url to fn.llamacpp_api_key", function()
+    local real = registry.get("fn.llamacpp_api_key")
+    registry.define({ name = "fn.llamacpp_api_key", kind = "fn", doc = "test",
+      source = [[return function(opts) return "k-" .. tostring(opts and opts.base_url) end]] })
+    vim.fn.delete(md .. "/argv")
+    registry.call("fn.list_models", "llamacpp")
+    registry.define({ name = real.name, kind = real.kind, doc = real.doc, source = real.source })
+    local argv = table.concat(vim.fn.readfile(md .. "/argv"), "\n")
+    assert(argv:find("Authorization: Bearer k-http://straps-llama-models.invalid:8080", 1, true),
+      "the key fn did not receive opts.base_url:\n" .. argv)
+  end)
+
+  it("fn.list_models (llamacpp) sends LLAMACPP_API_KEY as a Bearer token", function()
+    assert(argv_key:find("Authorization: Bearer llama-secret", 1, true), "Bearer header missing:\n" .. argv_key)
+    assert(not argv_key:find("x-api-key", 1, true), "x-api-key sent:\n" .. argv_key)
+  end)
+
+  step(function()
+    vim.env.PATH = saved.path
+    vim.env.ANTHROPIC_API_KEY = saved.anthropic_key
+    vim.env.LLAMACPP_API_KEY = saved.llama_key
+    vim.env.LLAMA_API_KEY = saved.llama_server_key
+    vim.env.XDG_CONFIG_HOME = saved.xdg
+    straps.config.provider = saved.provider
+    straps.config.llamacpp_base_url = saved.llamacpp_base_url
   end)
 end

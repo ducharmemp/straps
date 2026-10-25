@@ -7,31 +7,49 @@ local M = {}
 
 M.config = {
   -- Which backend fn.provider dispatches to: "anthropic" (the Anthropic
-  -- Messages API via fn.provider_anthropic) or "openai" (the OpenAI
-  -- Responses API via fn.provider_openai). nil (the default) means "not pinned
+  -- Messages API via fn.provider_anthropic), "openai" (the OpenAI
+  -- Responses API via fn.provider_openai) or "llamacpp" (a llama.cpp
+  -- llama-server via fn.provider_llamacpp). nil (the default) means "not set
   -- here" — fn.provider then reads the persisted choice written by
   -- :StrapsProvider ($XDG_CONFIG_HOME/straps/provider), falling back to
-  -- "anthropic". Setting it here PINS the provider and wins over that file.
+  -- "anthropic". Setting it here wins over that file.
   -- Overridable per session buffer with vim.b[bufnr].straps_provider, so two
   -- sessions can talk to different backends. "openai" reads fn.openai_api_key
   -- (a :StrapsLogin openai ChatGPT login first, else $OPENAI_API_KEY, then
   -- $XDG_CONFIG_HOME/straps/openai_api_key), posts to openai_base_url, and
-  -- uses openai_model.
+  -- uses openai_model. "llamacpp" posts to llamacpp_base_url/v1/messages with
+  -- llamacpp_model, sending $LLAMACPP_API_KEY (else $LLAMA_API_KEY) as a Bearer
+  -- token when one is set.
   provider = nil,
   openai_base_url = "https://api.openai.com",
   -- Model id sent when provider == "openai". Keep this separate from the
-  -- Anthropic default `model` so selecting OpenAI never sends a Claude id.
-  openai_model = "gpt-5",
-  model = "claude-sonnet-5",
-  -- Response token cap per provider call. nil (the default) means "not pinned
-  -- here" — fn.provider then uses the active model's own max output: the
-  -- `max_output` field of the matching config.models entry (seeded below,
-  -- refreshed by :StrapsModel's live /v1/models discovery), else
-  -- default_max_tokens. Setting a number PINS it as an explicit hard cap that
-  -- wins over the per-model value — with one exception: a budget-thinking
-  -- request whose budget_tokens meets or exceeds the cap still bumps above it,
-  -- because the API rejects max_tokens <= budget_tokens. Left nil like
-  -- auto_compact_bytes/session_dir below; vim.tbl_deep_extend ignores the nil.
+  -- Anthropic `model` so selecting OpenAI never sends a Claude id. nil (the
+  -- default) means "not set here": the model is the persisted global
+  -- :StrapsModel pick (fn.model_pref), else gpt-5. A value here (or one set at
+  -- runtime) wins over the persisted pick.
+  openai_model = nil,
+  llamacpp_base_url = "http://127.0.0.1:8080",
+  -- Model id sent when provider == "llamacpp": a llama-server --alias or a
+  -- router-mode model name. nil until set here or picked with :StrapsModel;
+  -- fn.provider_llamacpp raises without one, because router mode rejects a
+  -- request with no model.
+  llamacpp_model = nil,
+  -- Anthropic model id. nil (the default) means "not set here": the model is
+  -- the persisted global :StrapsModel pick (fn.model_pref), else
+  -- claude-sonnet-5. A value here (or one set at runtime) wins over the
+  -- persisted pick.
+  model = nil,
+  -- Response token cap per provider call. nil (the default) means "not set
+  -- here": fn.anthropic_messages then uses the active model's own max output,
+  -- the `max_output` field of its entry in `models` or `llamacpp_models`,
+  -- else default_max_tokens. :StrapsModel discovery fills `max_output` for
+  -- Anthropic models; llama.cpp discovery sets none, so a llamacpp entry needs
+  -- it by hand. The OpenAI backend ignores max_output. Setting a number makes
+  -- it an explicit hard cap that wins over the per-model value — with one
+  -- exception: a budget-thinking request whose budget_tokens meets or exceeds
+  -- the cap still bumps above it, because the API rejects max_tokens <=
+  -- budget_tokens. Left nil like auto_compact_bytes/session_dir below;
+  -- vim.tbl_deep_extend ignores the nil.
   max_tokens = nil,
   -- Fallback response cap when config.max_tokens is nil AND the active model
   -- has no known max_output (an unlisted/custom model, or before :StrapsModel
@@ -56,7 +74,8 @@ M.config = {
   -- gzip the Anthropic request body (Content-Encoding: gzip). The replayed
   -- transcript is the whole request and is re-uploaded every turn; gzip cuts
   -- it 3-4x. Falls back to the plain body when gzip is not on PATH. false for
-  -- a proxy that rejects compressed requests.
+  -- a proxy that rejects compressed requests. The llamacpp provider never
+  -- compresses: llama-server answers a gzip body with HTTP 415.
   gzip = true,
   compact_keep_turns = 2,
   -- Default hook.after_write behaviour: after the agent writes a file, wait
@@ -111,10 +130,11 @@ M.config = {
   tools_expanded = false,
 
   -- Session-window winbar: a window-local status line on each session window
-  -- showing the active model (per-buffer override else config.model), effort,
-  -- and run status. false disables it (e.g. you reserve the winbar for
-  -- something else); the ui.session_status() / ui.session_winbar() components
-  -- stay available for a manual statusline either way.
+  -- showing the active model (per-buffer override, else the provider's model
+  -- key: model, openai_model or llamacpp_model), effort, and run status.
+  -- false disables it (e.g. you reserve the winbar for something else); the
+  -- ui.session_status() / ui.session_winbar() components stay available for a
+  -- manual statusline either way.
   session_winbar = true,
 
   -- Agents-buffer winbar (:StrapsAgents): the keymap legend in a window-local
@@ -124,21 +144,21 @@ M.config = {
 
   -- :StrapsModel picker choices. Each entry is { id, label?, thinking?,
   -- context?, max_output? }. `max_output` is the model's maximum response
-  -- tokens (Anthropic's /v1/models max_tokens); fn.provider uses it as the
-  -- default max_tokens when config.max_tokens is nil, so a run never starves
-  -- its answer on the old fixed 8192. `context` is the input window (winbar
-  -- fill only). `thinking` tags which extended-thinking mechanism the model speaks
-  -- (inferred from Anthropic's /v1/models capabilities.thinking.types):
+  -- tokens (Anthropic's /v1/models max_tokens); fn.anthropic_messages uses it
+  -- as the default max_tokens when config.max_tokens is nil. `context` is the
+  -- input window (winbar fill only). `thinking` tags which extended-thinking
+  -- mechanism the model speaks (inferred from Anthropic's /v1/models
+  -- capabilities.thinking.types):
   --   "adaptive" — thinking={type="adaptive"} + output_config={effort=...}
   --                (newer models: sonnet-5, opus-4-6..4-8, sonnet-4-6, ...)
   --   "budget"   — thinking={type="enabled", budget_tokens=...}
   --                (older models: opus-4-5, opus-4-1, sonnet-4-5, haiku-4-5)
-  -- fn.provider reads the entry matching config.model to pick the right
-  -- shape; an unlisted/custom model sends no thinking block at all (safest
-  -- default — guessing wrong 400s the whole request). Picking one here sets
-  -- config.model. This is a SEED, not an exhaustive menu: :StrapsModel does
-  -- live discovery (fn.list_models -> GET /v1/models) and merges the account's
-  -- real catalog over this list, keeping these curated labels/tags on top.
+  -- fn.anthropic_messages reads the entry matching the active model to pick
+  -- the right shape; an unlisted/custom model sends no thinking block at all
+  -- (safest default — guessing wrong 400s the whole request). This is a SEED,
+  -- not an exhaustive menu: :StrapsModel does live discovery (fn.list_models
+  -- -> GET /v1/models) and merges the account's real catalog over this list,
+  -- keeping these curated labels/tags on top.
   models = {
     { id = "claude-opus-4-8", label = "Opus 4.8 — most capable, slowest", thinking = "adaptive", context = 200000, max_output = 128000 },
     { id = "claude-sonnet-5", label = "Sonnet 5 — balanced (default)", thinking = "adaptive", context = 200000, max_output = 128000 },
@@ -151,16 +171,21 @@ M.config = {
     { id = "gpt-5", label = "GPT-5" },
     { id = "gpt-5-mini", label = "GPT-5 mini" },
   },
+  -- llama.cpp model picker cache, filled by :StrapsModel from the server's
+  -- /v1/models (`context` comes from a loaded model's n_ctx).
+  llamacpp_models = {},
   -- Fallback context window (tokens) for a model not found in the active
-  -- provider's model list with a `context` field — used only to render the winbar's context-fill percentage
-  -- (nothing is sent to the API). nil hides the percentage for unknown models.
+  -- provider's model list with a `context` field — used only to render the
+  -- winbar's context-fill percentage (nothing is sent to the API). nil hides
+  -- the percentage for unknown models.
+  -- Not applied to llamacpp models, whose window depends on the server's -c.
   context_window = 200000,
 
-  -- :StrapsEffort picker choices. `level` feeds output_config.effort for
-  -- "adaptive" Anthropic models, thinking.budget_tokens for "budget"
-  -- Anthropic models, and reasoning.effort for OpenAI models only when the
-  -- matching config.openai_models entry opts in and the active effort has a
-  -- level.
+  -- :StrapsEffort picker choices. For a model whose list entry is tagged
+  -- `thinking` (Anthropic or llamacpp), `level` feeds output_config.effort on
+  -- an "adaptive" model and `budget_tokens` feeds thinking.budget_tokens on a
+  -- "budget" model; for an OpenAI model whose entry sets `reasoning`, `level`
+  -- feeds reasoning.effort. provider.effort_applies states the rule.
   -- config.effort names the currently active entry (by `name`).
   effort = "off",
   efforts = {

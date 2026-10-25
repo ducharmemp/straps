@@ -16,6 +16,10 @@ vim.opt.rtp:prepend(root)
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
 
 
+-- Hermetic config dir: a real ~/.config/straps provider or model_<provider>
+-- pref file would change the provider and model these tests resolve.
+vim.env.XDG_CONFIG_HOME = vim.fn.tempname()
+vim.fn.mkdir(vim.env.XDG_CONFIG_HOME, "p")
 local straps = require("straps").setup({})
 -- Hermetic: durable sessions write under a throwaway dir, never the real data dir.
 straps.config.session_dir = vim.fn.tempname()
@@ -65,10 +69,98 @@ it("a configured label renders as 'label (id)'", function()
   end
 end)
 
+it("fn.model_note marks an effort inert for a model with no thinking style", function()
+  local saved = straps.config.llamacpp_models
+  straps.config.llamacpp_models = { { id = "qwen-dense" } }
+  local ll = state.new_session()
+  vim.b[ll].straps_provider = "llamacpp"
+  vim.b[ll].straps_llamacpp_model = "qwen-dense"
+  vim.b[ll].straps_effort = "high"
+  local note = registry.call("fn.model_note", { bufnr = ll })
+  local an = state.new_session()
+  vim.b[an].straps_model = "claude-sonnet-5"
+  vim.b[an].straps_effort = "high"
+  local anthropic_note = registry.call("fn.model_note", { bufnr = an })
+  straps.config.llamacpp_models = saved
+  assert(note:find("effort high (inert: the model entry marks no thinking style", 1, true),
+    "llama effort should be marked inert with the style reason: " .. note)
+  assert(not anthropic_note:find("inert", 1, true), "a thinking model's effort is not inert: " .. anthropic_note)
+end)
+
+it("provider.effort_applies follows the backend rule for every provider, model style and effort shape", function()
+  local effort_applies = require("straps.provider").effort_applies
+  local efforts = {
+    { name = "off" },
+    { name = "high", level = "high", budget_tokens = 8000 },
+    { name = "lvl", level = "low" },
+    { name = "bud", budget_tokens = 4000 },
+    { name = "zero", budget_tokens = 0 },
+  }
+  local adaptive, budget, untagged = { id = "a", thinking = "adaptive" }, { id = "b", thinking = "budget" }, { id = "u" }
+  local reasoning, reasoning_effort, plain = { id = "r", reasoning = true }, { id = "re", reasoning_effort = true }, { id = "p" }
+  local cases = {
+    { "anthropic", adaptive, "high", true },
+    { "anthropic", adaptive, "bud", false },
+    { "anthropic", budget, "high", true },
+    { "anthropic", budget, "bud", true },
+    { "anthropic", budget, "zero", false },
+    { "anthropic", budget, "lvl", false },
+    { "anthropic", untagged, "high", false },
+    { "anthropic", adaptive, "off", false },
+    { "anthropic", adaptive, "missing", false },
+    { "anthropic", nil, "high", false },
+    { "llamacpp", adaptive, "high", true },
+    { "llamacpp", untagged, "high", false },
+    { "llamacpp", reasoning, "high", false },
+    { "openai", reasoning, "high", true },
+    { "openai", reasoning_effort, "lvl", true },
+    { "openai", reasoning, "bud", false },
+    { "openai", plain, "high", false },
+    { "openai", reasoning, "missing", false },
+    { "llamacpp", budget, "bud", true },
+    { "llamacpp", budget, "zero", false },
+    { "openai", adaptive, "high", false },
+    { "bogus", adaptive, "high", false },
+  }
+  for _, c in ipairs(cases) do
+    local got = effort_applies(c[1], c[2], c[3], efforts)
+    assert(got == c[4], ("%s / %s / %s: expected %s, got %s"):format(c[1], c[2] and c[2].id or "nil", c[3],
+      tostring(c[4]), tostring(got)))
+  end
+end)
+
 it("effort defaults to 'off' when unset", function()
   local me = state.new_session()
   local note = registry.call("fn.model_note", { bufnr = me })
   assert(note:find("effort off", 1, true), "unset effort should read 'off': " .. note)
+  assert(not note:find("inert", 1, true), "effort off should carry no inert marker: " .. note)
+end)
+
+it("fn.model_note marks an OpenAI effort inert unless the model entry sets reasoning", function()
+  local saved = straps.config.openai_models
+  straps.config.openai_models = { { id = "gpt-plain" }, { id = "gpt-reason", reasoning = true } }
+  local plain = state.new_session()
+  vim.b[plain].straps_provider = "openai"
+  vim.b[plain].straps_openai_model = "gpt-plain"
+  vim.b[plain].straps_effort = "high"
+  local reason = state.new_session()
+  vim.b[reason].straps_provider = "openai"
+  vim.b[reason].straps_openai_model = "gpt-reason"
+  vim.b[reason].straps_effort = "high"
+  local plain_note = registry.call("fn.model_note", { bufnr = plain })
+  local reason_note = registry.call("fn.model_note", { bufnr = reason })
+  straps.config.openai_models = saved
+  assert(plain_note:find("effort high (inert", 1, true), "a non-reasoning OpenAI model's effort is inert: " .. plain_note)
+  assert(not reason_note:find("inert", 1, true), "a reasoning OpenAI model's effort applies: " .. reason_note)
+end)
+
+it("fn.model_note marks an effort with no config.efforts entry inert", function()
+  local me = state.new_session()
+  vim.b[me].straps_model = "claude-sonnet-5"
+  vim.b[me].straps_effort = "nonexistent"
+  local note = registry.call("fn.model_note", { bufnr = me })
+  assert(note:find("effort nonexistent (inert: config.efforts has no entry named nonexistent", 1, true),
+    "an unknown effort name should be marked inert: " .. note)
 end)
 
 -- ------------------------------------------------------------ degradation
@@ -202,6 +294,27 @@ it("models follows the session's provider, never mixing catalogs", function()
   assert(out:find("gpt-5", 1, true), "openai ids missing: " .. out)
   assert(not out:find("claude", 1, true),
     "an openai session must not be offered Anthropic ids: " .. out)
+end)
+
+it("models lists llamacpp_models for a llamacpp session", function()
+  local saved = straps.config.llamacpp_models
+  straps.config.llamacpp_models = { { id = "qwen-dense", label = "qwen-dense", context = 131072 } }
+  local ll = state.new_session()
+  vim.b[ll].straps_provider = "llamacpp"
+  vim.b[ll].straps_llamacpp_model = "qwen-dense"
+  local out = registry.call("tool.models", {}, { bufnr = ll })
+  straps.config.llamacpp_models = saved
+  assert(out:find("provider: llamacpp", 1, true), "should report the llamacpp provider: " .. out)
+  assert(out:find("* qwen-dense", 1, true), "llamacpp model missing or unmarked: " .. out)
+  assert(not out:find("claude", 1, true), "a llamacpp session must not be offered Anthropic ids: " .. out)
+end)
+
+it("models refuses an unknown provider instead of listing the Anthropic catalog", function()
+  local me = state.new_session()
+  vim.b[me].straps_provider = "bogus"
+  local out = registry.call("tool.models", {}, { bufnr = me })
+  assert(out:find("unknown provider bogus", 1, true), "unknown provider not reported: " .. out)
+  assert(not out:find("claude", 1, true), "an unknown provider was offered Anthropic ids: " .. out)
 end)
 
 it("models is read-only: auto-allowed and parallel-safe", function()

@@ -920,11 +920,12 @@ function M.rename_session(bufnr, title)
     if t == nil then
       return -- cancelled
     end
-    if state.set_session_title(path, t) then
+    local ok, err = state.set_session_title(path, t)
+    if ok then
       vim.notify(t == "" and "straps: session title cleared"
         or ("straps: session titled " .. t))
     else
-      vim.notify("straps: could not write session title", vim.log.levels.WARN)
+      vim.notify("straps: could not write session title: " .. tostring(err), vim.log.levels.WARN)
     end
   end
   if title ~= nil then
@@ -1230,8 +1231,8 @@ function M.session_winbar(bufnr)
   if not info then
     return ""
   end
-  local left = "straps" .. format_status(info)
-  local usage = format_usage(info)
+  local left = ("straps" .. format_status(info)):gsub("%%", "%%%%")
+  local usage = format_usage(info):gsub("%%", "%%%%")
   local mid = (usage ~= "") and (usage .. "  ") or ""
   local right = (info.status == "running") and "● running" or "○ idle"
   return "%#StrapsWinbar#" .. left .. "%=" .. mid .. right .. " "
@@ -1507,13 +1508,15 @@ function M.pick(items, opts, on_choice)
   end)
 end
 
---- Merge live-discovered models over the static config.models list. The static
---- list wins on hand-curated labels (the user picked those wording); live
+--- Merge live-discovered models over the active provider's static model list.
+--- The static list wins on hand-curated labels (the user picked that wording); live
 --- discovery is authoritative for which models EXIST and their thinking tag
 --- (fetched from the API's own capabilities). Order: configured entries first,
 --- in their configured order, then any live-only models appended. A live entry
 --- with no static counterpart brings its API display_name as the label.
-local function merge_models(static_list, live_list)
+--- server_context = true lets a live `context` replace a stored one (llama.cpp,
+--- whose window is the server's current -c rather than a fixed model fact).
+local function merge_models(static_list, live_list, server_context)
   static_list = type(static_list) == "table" and static_list or {}
   local by_id, order = {}, {}
   local function norm(m)
@@ -1537,7 +1540,7 @@ local function merge_models(static_list, live_list)
       if existing then
         existing.label = existing.label or m.label
         if existing.thinking == nil then existing.thinking = m.thinking end
-        if existing.context == nil then existing.context = m.context end
+        if existing.context == nil or (server_context and m.context ~= nil) then existing.context = m.context end
         if existing.max_output == nil then existing.max_output = m.max_output end
       else
         by_id[m.id] = copy_model(m)
@@ -1553,26 +1556,21 @@ local function merge_models(static_list, live_list)
 end
 M._merge_models = merge_models -- exposed for tests
 
--- Effective provider for a target: per-buffer override, else config.provider.
+-- Effective provider for a target (provider.resolve_provider): the name, which
+-- may be unknown, or nil plus the error when the provider pref file cannot be
+-- read.
 effective_provider = function(straps, bufnr)
-  if bufnr then
-    local p = vim.b[bufnr].straps_provider
-    if p and p ~= "" then return p end
-  end
-  if straps.config.provider and straps.config.provider ~= "" then
-    return straps.config.provider
-  end
-  local pref = require("straps.registry").try_call("fn.provider_pref")
-  if pref == "anthropic" or pref == "openai" then return pref end
-  return "anthropic"
+  local name, _, err = require("straps.provider").resolve_provider(bufnr, straps.config)
+  return name, err
 end
 
 --- Model / effort selection is per-buffer when invoked ON a session buffer
---- (written to vim.b straps_model or straps_openai_model / straps_effort,
---- which fn.provider reads in preference to the global config), and sets the global config default
---- otherwise. These helpers centralize the "session buffer? scope it; else
---- global" decision and report the effective value for the picker's current-*
---- marker. Returns the target bufnr or nil (global).
+--- (written to the provider's model variable — vim.b straps_model,
+--- straps_openai_model or straps_llamacpp_model — and vim.b straps_effort,
+--- which the backends read in preference to the global config), and sets the
+--- global config default otherwise. These helpers centralize the "session
+--- buffer? scope it; else global" decision and report the effective value for
+--- the picker's current-* marker. Returns the target bufnr or nil (global).
 local function session_target_buf()
   local bufnr = vim.api.nvim_get_current_buf()
   local ok = pcall(function() return vim.b[bufnr].straps_session end)
@@ -1582,17 +1580,12 @@ local function session_target_buf()
   return nil
 end
 
---- Effective model for a target (per-buffer override else provider-specific global config).
-local function effective_model(straps, bufnr)
-  if bufnr then
-    local p = effective_provider(straps, bufnr)
-    local m = p == "openai" and vim.b[bufnr].straps_openai_model or vim.b[bufnr].straps_model
-    if m and m ~= "" then return m end
-  end
-  if effective_provider(straps, bufnr) == "openai" then
-    return straps.config.openai_model or "gpt-5"
-  end
-  return straps.config.model
+--- Effective model for a target: provider.resolve_model, the rule fn.provider sends
+--- by; nil for an unknown provider. `provider` is the target's provider when
+--- the caller already resolved it.
+local function effective_model(straps, bufnr, provider)
+  provider = provider or effective_provider(straps, bufnr)
+  return require("straps.provider").resolve_model(provider, bufnr, straps.config)
 end
 
 --- Effective effort for a target (per-buffer override else global config).
@@ -1604,22 +1597,6 @@ local function effective_effort(straps, bufnr)
   return straps.config.effort
 end
 
---- The entry in the active provider's model list matching `model`, or nil.
---- One scan shared by the label and context-window lookups, which want
---- different fields off the same entry.
-local function model_entry(cfg, provider, model)
-  local list = cfg[provider == "openai" and "openai_models" or "models"]
-  if type(list) ~= "table" or not model then
-    return nil
-  end
-  for _, m in ipairs(list) do
-    if type(m) == "table" and m.id == model then
-      return m
-    end
-  end
-  return nil
-end
-
 --- Everything a status component could want about a session buffer, with the
 --- per-buffer-override -> global-config fallback chain ALREADY RESOLVED, so a
 --- caller never has to reimplement it from the raw vim.b vars.
@@ -1627,16 +1604,20 @@ end
 --- Returns nil when `bufnr` (default: the current buffer) is not a valid
 --- session buffer, so a component can early-out with "". Fields:
 ---   bufnr        the buffer this describes
----   provider     "anthropic" | "openai"
----   model        effective model id
----   model_label  its config label if listed, else the raw id (never nil)
+---   provider     "anthropic" | "openai" | "llamacpp", or the unknown name a
+---                source holds (fn.provider raises on it)
+---   model        effective model id; "?" when unset or the provider is unknown
+---   model_label  its config label if listed, else the raw id, or
+---                "unknown provider <name>", or the pref read error (never nil)
+---   error        the provider or model pref read error, or nil
 ---   effort       effective effort name ("off" when unset)
 ---   overridden   true when provider/model/effort DIVERGE from global config
 ---   status       "running" | "idle"
 ---   parent       parent session bufnr for a subagent, else nil
 ---   usage        last turn's token usage table, or nil when none yet
 ---   context_used billed input tokens = the current context fill (0 with no usage)
----   context      resolved context window, or nil when unknown
+---   context      resolved context window, or nil when unknown (always nil
+---                for an unknown provider)
 ---   context_pct  rounded percent of `context` used, nil when context is unknown
 ---   cache_pct    rounded cache hit rate, nil when caching did nothing
 ---
@@ -1657,19 +1638,31 @@ function M.session_info(bufnr)
   end
   local cfg = straps.config
 
-  local provider = effective_provider(straps, bufnr)
-  -- effective_model can return nil (an unset config.model); the raw-id label
-  -- fallback and the "?" placeholder keep every string field non-nil.
-  local model = effective_model(straps, bufnr) or "?"
+  local provider, pref_err = effective_provider(straps, bufnr)
+  -- effective_model can return nil (an unset model key, e.g. llamacpp_model,
+  -- an unknown provider, or an unreadable model pref); the raw-id label
+  -- fallback and the "?" placeholders keep every string field non-nil. A pref
+  -- read error replaces the label and is also returned as `error`.
+  local model_value, model_err = effective_model(straps, bufnr, provider)
+  local model = model_value or "?"
   local effort = effective_effort(straps, bufnr) or "off"
-  local entry = model_entry(cfg, provider, model)
+  local entry = require("straps.provider").model_entry(provider, model, cfg)
   local label = (entry and type(entry.label) == "string" and entry.label ~= "") and entry.label or model
+  local known = require("straps.provider").is_provider(provider)
+  local err = pref_err or model_err
+  if err then
+    label = err
+  elseif not known then
+    label = "unknown provider " .. tostring(provider)
+  end
+  provider = provider or "?"
 
   -- Divergence, not mere presence of an override: a per-buffer value equal to
   -- the global default is not a divergence and gets no marker.
   local global = { config = cfg }
-  local overridden = provider ~= effective_provider(global, nil)
-    or model ~= (effective_model(global, nil) or "?")
+  local global_provider = effective_provider(global, nil)
+  local overridden = provider ~= global_provider
+    or model ~= (effective_model(global, nil, global_provider) or "?")
     or effort ~= (effective_effort(global, nil) or "off")
 
   local info = {
@@ -1677,13 +1670,16 @@ function M.session_info(bufnr)
     provider = provider,
     model = model,
     model_label = label,
+    error = err,
     effort = effort,
     overridden = overridden,
     status = vim.b[bufnr].straps_status or "idle",
     parent = nil,
     usage = nil,
     context_used = 0,
-    context = tonumber(entry and entry.context) or tonumber(cfg.context_window),
+    context = known and (tonumber(entry and entry.context)
+      or (require("straps.provider").provider_slot(provider).server_context ~= true and tonumber(cfg.context_window)))
+      or nil,
     context_pct = nil,
     cache_pct = nil,
   }
@@ -1710,14 +1706,26 @@ function M.session_info(bufnr)
 
   return info
 end
---- Open a picker over the available models; picking one sets the model
---- PER-BUFFER (vim.b straps_model) when run on a session buffer, else the
---- global straps.config.model. The list is config.models (the curated static
---- list) MERGED with a live GET /v1/models via fn.list_models, so the menu
---- reflects what the account can actually use (new models appear without a
---- config edit). A merged entry inherits the API's thinking tag so extended
---- thinking still works. On fetch failure the static list is used with a
---- notify — the picker never breaks. No-op if the straps config isn't loaded.
+-- Config keys a global pick set only because its pref write failed. The next
+-- global pick of that key retries the write instead of treating the key as set
+-- by setup{} or at runtime.
+local unpersisted_picks = {}
+
+--- Open a picker over the active provider's models; picking one sets the
+--- model PER-BUFFER (the provider's vim.b variable: straps_model,
+--- straps_openai_model or straps_llamacpp_model) and saves it with the
+--- provider in the transcript's .meta file (state.set_session_pin) when
+--- run on a session buffer. Elsewhere it persists the pick with its entry
+--- through fn.model_pref ($XDG_CONFIG_HOME/straps/model_<provider>), which
+--- every Neovim reads on its next request; it sets the provider's config key
+--- instead, for this Neovim only, when that key is already set (setup{} or
+--- runtime) or the write fails. The list is that provider's config list
+--- (models, openai_models or llamacpp_models) MERGED with a live GET
+--- /v1/models via fn.list_models, so the menu reflects what the account or
+--- server can actually use (new models appear without a config edit). A
+--- merged entry inherits the API's thinking tag so extended thinking still
+--- works. On fetch failure the static list is used with a notify — the picker
+--- never breaks. No-op if the straps config isn't loaded.
 function M.pick_model()
   local ok, straps = pcall(require, "straps")
   if not ok or type(straps) ~= "table" then
@@ -1725,25 +1733,33 @@ function M.pick_model()
   end
   local target = session_target_buf()
   local provider = effective_provider(straps, target)
-  local model_key = provider == "openai" and "openai_models" or "models"
-  local static_list = type(straps.config[model_key]) == "table" and straps.config[model_key] or {}
+  if not require("straps.provider").is_provider(provider) then
+    return notify_err("straps: unknown provider " .. tostring(provider)
+      .. "; run :StrapsProvider to pick one of: "
+      .. table.concat(require("straps.provider").provider_names(), ", "))
+  end
+  local slot = require("straps.provider").provider_slot(provider)
+  local models_key = slot.models_key
+  local static_list = type(straps.config[models_key]) == "table" and straps.config[models_key] or {}
 
   local live, err = require("straps.registry").try_call("fn.list_models", provider)
   if type(live) ~= "table" then
     if err then
       vim.notify("straps: live model discovery failed (" .. tostring(err)
-        .. "); showing config." .. model_key, vim.log.levels.WARN)
+        .. "); showing config." .. models_key, vim.log.levels.WARN)
     end
     live = nil
   end
-  local models = merge_models(static_list, live)
+  local models = merge_models(static_list, live, slot.server_context)
   if #models == 0 then
-    return notify_err("straps: no models available (config." .. model_key .. " empty and discovery failed)")
+    return notify_err("straps: no models available (config." .. models_key .. " empty and discovery failed)")
   end
 
-  -- Persist the merged provider-specific list so provider calls can look up
-  -- Anthropic thinking/context metadata and repeat pickers are instant offline.
-  straps.config[model_key] = models
+  -- Store the merged provider-specific list in config so the provider backends can
+  -- look up thinking/reasoning tags and max_output, session_info and
+  -- tool.models can read context windows, and repeat pickers are instant
+  -- offline.
+  straps.config[models_key] = models
 
   local current_model = effective_model(straps, target)
   M.pick(models, {
@@ -1761,19 +1777,35 @@ function M.pick_model()
     end
     local id = type(choice) == "table" and choice.id or choice
     if target and vim.api.nvim_buf_is_valid(target) then
-      if provider == "openai" then
-        vim.b[target].straps_openai_model = id
-      else
-        vim.b[target].straps_model = id
-      end
+      require("straps.state").set_session_pin(target, provider, id, type(choice) == "table" and choice or nil)
       vim.notify("straps: " .. provider .. " model = " .. tostring(id) .. " (this session)")
     else
-      if provider == "openai" then
-        straps.config.openai_model = id
+      -- A config key that is set (setup{} or runtime) wins over the persisted
+      -- pick, so the pick goes into config for this Neovim only. Otherwise it
+      -- is written to fn.model_pref alone, which every Neovim reads on its
+      -- next request; config is set only when that write fails.
+      local configured = straps.config[slot.model_key]
+      if type(configured) == "string" and configured ~= "" and not unpersisted_picks[slot.model_key] then
+        straps.config[slot.model_key] = id
+        vim.notify("straps: " .. provider .. " model = " .. tostring(id) .. " (this Neovim only: config."
+          .. slot.model_key .. " is set by setup{} or at runtime)")
       else
-        straps.config.model = id
+        local saved, err = require("straps.registry").try_call("fn.model_pref", provider, id,
+          type(choice) == "table" and choice or nil)
+        if saved then
+          if unpersisted_picks[slot.model_key] then
+            straps.config[slot.model_key] = nil
+            unpersisted_picks[slot.model_key] = nil
+          end
+          vim.notify("straps: " .. provider .. " model = " .. tostring(id)
+            .. " (persisted; sessions that have made a request keep their own)")
+        else
+          straps.config[slot.model_key] = id
+          unpersisted_picks[slot.model_key] = true
+          vim.notify("straps: " .. provider .. " model = " .. tostring(id) .. " (this Neovim only; not persisted: "
+            .. tostring(err) .. ")", vim.log.levels.WARN)
+        end
       end
-      vim.notify("straps: " .. provider .. " model = " .. tostring(id))
     end
     M.redraw_status(true)
   end)
@@ -1781,8 +1813,9 @@ end
 
 --- Open a picker over config.efforts ({ name, budget_tokens? }); picking one
 --- sets the effort PER-BUFFER (vim.b straps_effort) when run on a session
---- buffer, else the global straps.config.effort. Effort controls extended
---- thinking (fn.provider): budget_tokens absent/0 means thinking is off.
+--- buffer, else the global straps.config.effort. provider.effort_applies
+--- decides whether an effort changes the request for the active model
+--- (thinking for Anthropic and llamacpp, reasoning for OpenAI).
 function M.pick_effort()
   local ok, straps = pcall(require, "straps")
   if not ok or type(straps) ~= "table" then
@@ -1823,20 +1856,23 @@ function M.pick_effort()
   end)
 end
 
---- Open a picker over the available backends (anthropic / openai). On a session
---- buffer it sets the provider PER-BUFFER (vim.b straps_provider), session-only
---- like :StrapsModel. Otherwise it sets the GLOBAL default AND persists it to
---- $XDG_CONFIG_HOME/straps/provider (fn.provider_pref) so the choice survives
---- restarts — the durable twin of the key files in the same directory.
+--- Open a picker over the available backends (anthropic / openai / llamacpp).
+--- On a session buffer it sets the provider PER-BUFFER (vim.b straps_provider)
+--- and, for a file-backed transcript, saves it to the transcript's .meta file
+--- (state.set_session_pin) so a resume keeps it. Otherwise it persists the
+--- GLOBAL default to $XDG_CONFIG_HOME/straps/provider (fn.provider_pref),
+--- which every Neovim reads on its next request; config.provider is set only
+--- when it is already set (setup{} or runtime; this Neovim only) or when the
+--- write fails.
 function M.pick_provider()
   local ok, straps = pcall(require, "straps")
   if not ok or type(straps) ~= "table" then
     return notify_err("straps: config not available (call require('straps').setup() first)")
   end
-  local providers = { "anthropic", "openai" }
+  local names = require("straps.provider").provider_names()
   local target = session_target_buf()
   local current = effective_provider(straps, target)
-  M.pick(providers, {
+  M.pick(names, {
     prompt = target and "straps: select provider (this session)" or "straps: select provider (global, persisted)",
     format_item = function(p)
       return (p == current and "* " or "  ") .. p
@@ -1846,20 +1882,39 @@ function M.pick_provider()
       return
     end
     if target and vim.api.nvim_buf_is_valid(target) then
-      vim.b[target].straps_provider = choice
+      local providers = require("straps.provider")
+      local model = providers.resolve_model(choice, target, straps.config)
+      require("straps.state").set_session_pin(target, choice, model, providers.model_entry(choice, model, straps.config))
       vim.notify("straps: provider = " .. choice .. " (this session)")
       vim.schedule(function()
         vim.notify("straps: run :StrapsModel to pick this session's " .. choice .. " model")
       end)
     else
-      straps.config.provider = choice
+      -- Same rule as a global model pick: a config.provider that is set
+      -- (setup{} or runtime) wins, so the pick goes into config for this
+      -- Neovim only; otherwise only the pref file is written, which every
+      -- Neovim reads, and config is set only when that write fails.
+      local configured = straps.config.provider
+      if type(configured) == "string" and configured ~= "" and not unpersisted_picks.provider then
+        straps.config.provider = choice
+        vim.notify("straps: provider = " .. choice
+          .. " (this Neovim only: config.provider is set by setup{} or at runtime)")
+        M.redraw_status(true)
+        return
+      end
       local _, err = require("straps.registry").try_call("fn.provider_pref", choice)
       if err then
+        straps.config.provider = choice
+        unpersisted_picks.provider = true
         vim.notify("straps: provider = " .. choice
           .. " (this Neovim only — could not persist: " .. tostring(err) .. ")",
           vim.log.levels.WARN)
       else
-        vim.notify("straps: provider = " .. choice .. " (persisted)")
+        if unpersisted_picks.provider then
+          straps.config.provider = nil
+          unpersisted_picks.provider = nil
+        end
+        vim.notify("straps: provider = " .. choice .. " (persisted; sessions that have made a request keep their own)")
         vim.schedule(function()
           vim.notify("straps: run :StrapsModel to pick the global " .. choice .. " model")
         end)

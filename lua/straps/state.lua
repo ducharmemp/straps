@@ -444,11 +444,46 @@ function M.persist(bufnr)
   end)
 end
 
--- Path of the companion metadata file (durable session titles) for a
--- transcript: "<name>.straps" -> "<name>.straps.meta". JSON, best-effort.
+-- Path of the companion metadata file (durable session title, pinned
+-- provider and per-session model) for a transcript: "<name>.straps" ->
+-- "<name>.straps.meta". JSON, best-effort.
 local function meta_path(transcript_path)
   return transcript_path .. ".meta"
 end
+
+-- The decoded companion metadata table for a transcript. {} when the file is
+-- absent, not readable or blank; {} plus a reason when its text is not a JSON
+-- object, so the next write replaces it with the fields straps knows now.
+local function read_meta(mp)
+  if vim.fn.filereadable(mp) == 0 then return {} end
+  local text = table.concat(vim.fn.readfile(mp), "\n")
+  if vim.trim(text) == "" then return {} end
+  local ok, decoded = pcall(vim.json.decode, text)
+  if ok and type(decoded) == "table" and text:match("^%s*{") then return decoded end
+  return {}, mp .. " is not a JSON object"
+end
+
+-- Set metadata fields, keeping the others; a false value clears its
+-- field. The file is written to "<mp>.tmp" and renamed over mp, so a crash
+-- mid-write leaves the old file; when no field remains, the file is removed.
+local function write_meta_fields(mp, fields)
+  local meta = read_meta(mp)
+  for key, value in pairs(fields) do
+    if value == false then meta[key] = nil else meta[key] = value end
+  end
+  if next(meta) == nil then
+    if vim.fn.filereadable(mp) == 1 then assert(os.remove(mp)) end
+    return
+  end
+  local tmp = mp .. ".tmp"
+  if vim.fn.writefile({ vim.json.encode(meta) }, tmp) ~= 0 then error("cannot write " .. tmp) end
+  local ok, err = vim.uv.fs_rename(tmp, mp)
+  if not ok then
+    os.remove(tmp)
+    error(err)
+  end
+end
+M._write_meta_fields = write_meta_fields -- exposed for tests
 
 local function _canon_path(path)
   if not path or path == "" then return path end
@@ -552,14 +587,8 @@ end
 function M.session_title(path)
   local ap = _canon_path(path)
   local ok, title = pcall(function()
-    local mp = meta_path(ap)
-    if vim.fn.filereadable(mp) == 0 then
-      return nil
-    end
-    local raw = table.concat(vim.fn.readfile(mp), "\n")
-    local decoded = vim.json.decode(raw)
-    if type(decoded) == "table" and type(decoded.title) == "string"
-      and decoded.title ~= "" then
+    local decoded = read_meta(meta_path(ap))
+    if type(decoded.title) == "string" and decoded.title ~= "" then
       return decoded.title
     end
     return nil
@@ -568,21 +597,85 @@ function M.session_title(path)
 end
 
 --- Set (or clear, with nil/"") the durable title for a session transcript,
---- written to its companion "<path>.meta" JSON file. Returns true on success.
+--- written to its companion "<path>.meta" JSON file. Returns true on success,
+--- or false plus the error.
 function M.set_session_title(path, title)
   local ap = _canon_path(path)
-  local ok = pcall(function()
-    local mp = meta_path(ap)
-    if title == nil or title == "" then
-      if vim.fn.filereadable(mp) == 1 then
-        os.remove(mp)
-      end
-    else
-      vim.fn.writefile({ vim.json.encode({ title = title }) }, mp)
-    end
+  local ok, err = pcall(function()
+    write_meta_fields(meta_path(ap), { title = (title ~= nil and title ~= "") and title or false })
     summary_cache[ap] = nil
   end)
-  return ok
+  if ok then return true end
+  return false, tostring(err)
+end
+
+--- The pin saved for a session transcript, read from the companion
+--- "<path>.meta" JSON file ({ provider, model, model_entry }). Returns the
+--- provider, the model, a reason when the file is not a JSON object, and the
+--- model's saved list entry; each is nil when absent. pcall-safe.
+function M.session_pin(path)
+  local ap = _canon_path(path)
+  local ok, meta, why = pcall(read_meta, meta_path(ap))
+  if not ok then return nil, nil, tostring(meta) end
+  local function str(v) return (type(v) == "string" and v ~= "") and v or nil end
+  local entry = type(meta.model_entry) == "table" and meta.model_entry or nil
+  return str(meta.provider), str(meta.model), why, entry
+end
+
+--- Pin the session buffer's backend: provider, model (nil when none is
+--- resolved yet) and the model's list entry (nil when unlisted). Sets vim.b
+--- straps_provider and the provider slot's buf_model_var, and for a
+--- file-backed buffer writes { provider, model, model_entry } to the
+--- transcript's .meta file, which open_session_file restores. When the model
+--- is unchanged and no entry is given, the saved entry is kept. A failed write
+--- warns once until a write succeeds, because a resume would then use the
+--- global provider. Returns true when the pin is set, false plus the error
+--- when the .meta write failed, nil for a non-session buffer, and nil plus an
+--- error for an unknown provider name (nothing is pinned).
+function M.set_session_pin(bufnr, provider, model, entry)
+  if type(provider) ~= "string" or provider == ""
+    or not vim.api.nvim_buf_is_valid(bufnr) or vim.b[bufnr].straps_session ~= true then
+    return nil
+  end
+  local providers = require("straps.provider")
+  if not providers.is_provider(provider) then return nil, providers.unknown_provider_error(provider) end
+  if type(model) ~= "string" or model == "" then model = nil end
+  if type(entry) ~= "table" or entry.id ~= model then entry = nil end
+  local saved = vim.b[bufnr].straps_pin_saved
+  if entry == nil and type(saved) == "table" and saved.provider == provider and saved.model == model
+    and type(saved.entry) == "string" then
+    local ok_decode, kept = pcall(vim.json.decode, saved.entry)
+    if ok_decode and type(kept) == "table" and kept.id == model then entry = kept end
+  end
+  vim.b[bufnr].straps_provider = provider
+  if model then
+    vim.b[bufnr][providers.provider_slot(provider).buf_model_var] = model
+  end
+  if vim.bo[bufnr].buftype ~= "" then return true end
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  if name == "" then return true end
+  local mp = meta_path(_canon_path(name))
+  local entry_json
+  if entry then
+    local ok_encode, encoded = pcall(vim.json.encode, entry)
+    if ok_encode then entry_json = encoded else entry = nil end
+  end
+  if type(saved) == "table" and saved.provider == provider and saved.model == model and saved.entry == entry_json
+    and saved.path == name and vim.fn.filereadable(mp) == 1 then
+    return true
+  end
+  local ok, err = pcall(write_meta_fields, mp, { provider = provider, model = model or false, model_entry = entry or false })
+  if ok then
+    vim.b[bufnr].straps_pin_saved = { provider = provider, model = model, entry = entry_json, path = name }
+    vim.b[bufnr].straps_pin_warned = nil
+    return true
+  end
+  if not vim.b[bufnr].straps_pin_warned then
+    vim.b[bufnr].straps_pin_warned = true
+    vim.notify(("straps: could not save this session's provider to %s (%s); a resume will use the global provider")
+      :format(mp, tostring(err)), vim.log.levels.WARN)
+  end
+  return false, tostring(err)
 end
 --- A one-line summary of a transcript, read directly from disk (no buffer
 --- load): the durable title when set, else the first non-empty user prompt,
@@ -665,7 +758,14 @@ end
 --- Open an existing transcript file as a session buffer. Reuses the buffer if
 --- one already names the path, else bufadd + bufload; applies the session
 --- buffer options (buftype="", swapfile=false, filetype="straps",
---- fsync=false on 0.12+). Does not modify content. Returns the bufnr.
+--- fsync=false on 0.12+) and restores the pin from the transcript's .meta file
+--- (session_pin): vim.b straps_provider when it is unset, the provider's model
+--- variable when that is unset too, and the saved model entry into the
+--- provider's model list. A .meta file that is not a JSON object restores
+--- nothing and warns; the next successful request replaces it. A transcript
+--- with assistant turns and no saved provider warns once that it will use the
+--- global provider (a transcript copied without its .meta, or one older than
+--- the pin). Does not modify content. Returns the bufnr.
 function M.open_session_file(path)
   local abspath = vim.fn.fnamemodify(path, ":p")
   local bufnr = vim.fn.bufnr(abspath)
@@ -679,6 +779,46 @@ function M.open_session_file(path)
   vim.b[bufnr].straps_session = true
   if vim.fn.has("nvim-0.12") == 1 then
     vim.bo[bufnr].fsync = false
+  end
+  local pinned, model, why, entry = M.session_pin(abspath)
+  local current = vim.b[bufnr].straps_provider
+  local has_provider = current ~= nil and current ~= ""
+  if why then
+    vim.b[bufnr].straps_pin_saved = nil
+    vim.notify("straps: " .. why .. "; " .. (has_provider
+      and ("this session keeps provider " .. current .. ", and its next successful request rewrites the file")
+      or "this session uses the global provider, and its next successful request rewrites the file"),
+      vim.log.levels.WARN)
+  elseif pinned and not has_provider then
+    vim.b[bufnr].straps_provider = pinned
+    local providers = require("straps.provider")
+    if model and providers.is_provider(pinned) then
+      local var = providers.provider_slot(pinned).buf_model_var
+      local have = vim.b[bufnr][var]
+      if have == nil or have == "" then vim.b[bufnr][var] = model end
+      local ok_straps, straps = pcall(require, "straps")
+      if ok_straps and type(straps) == "table" then
+        providers.merge_model_entry(pinned, entry, rawget(straps, "config"))
+      end
+    end
+    vim.b[bufnr].straps_pin_saved = {
+      provider = pinned, model = model, entry = entry and vim.json.encode(entry) or nil,
+      path = vim.api.nvim_buf_get_name(bufnr),
+    }
+  elseif not pinned and not has_provider then
+    local ok_loop, loop = pcall(require, "straps.loop")
+    local running = ok_loop and type(loop.running) == "function" and loop.running(bufnr)
+    local found = 0
+    if not running then
+      vim.api.nvim_buf_call(bufnr, function()
+        found = vim.fn.search("\\V\\^" .. MARKER_PREFIX .. "assistant]%%", "nw")
+      end)
+    end
+    if found > 0 then
+      vim.notify("straps: " .. vim.fn.fnamemodify(abspath, ":t")
+        .. " has no saved provider; it will use the global provider (pick one with :StrapsProvider)",
+        vim.log.levels.WARN)
+    end
   end
   return bufnr
 end

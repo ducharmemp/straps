@@ -66,21 +66,82 @@ local function check_curl()
   end
 end
 
+-- The provider fn.provider would use outside a session buffer
+-- (provider.resolve_provider with no buffer), plus the read error when the
+-- provider pref file exists but cannot be read. The name may be unknown;
+-- check_provider_name reports both, because fn.provider raises on them.
+local function active_provider(config)
+  local ok, provider, _, err = pcall(require("straps.provider").resolve_provider, nil, config)
+  if not ok then return config.provider, tostring(provider) end
+  return provider, err
+end
+
+-- Reports the active provider: an error for an unreadable pref file or an
+-- unknown name, either of which makes every request fail in fn.provider.
+-- Returns true and the name only for a known provider, so the key and model
+-- sections run only then.
+local function check_provider_name(config)
+  health.start("straps: provider")
+  local name, err = active_provider(config)
+  local providers = require("straps.provider")
+  if err then
+    health.error(err .. "; every request will fail",
+      { "fix the file's permissions or contents, or delete it and run :StrapsProvider" })
+    return false
+  end
+  if not providers.is_provider(name) then
+    health.error("unknown provider " .. tostring(name) .. "; every request will fail",
+      { "set provider in setup{} or run :StrapsProvider; valid names: "
+        .. table.concat(providers.provider_names(), ", ") })
+    return false
+  end
+  health.ok("provider: " .. name)
+  return true, name
+end
+
+-- llama-server needs a key only when it runs with --api-key, so a missing key
+-- is reported as info. The key comes from fn.llamacpp_api_key when it is
+-- registered, so a redefined key source is what gets reported.
+local function check_llamacpp_key(config)
+  health.start("straps: API key (llamacpp)")
+  local providers = require("straps.provider")
+  health.info("llamacpp_base_url: " .. providers.redact_url(providers.llamacpp_base_url(config)))
+  local registry = try(function() return require("straps.registry") end)
+  local key
+  if registry and registry.get("fn.llamacpp_api_key") then
+    local ok, got = pcall(registry.call, "fn.llamacpp_api_key",
+      { base_url = require("straps.provider").llamacpp_base_url(config) })
+    if not ok then
+      health.error("fn.llamacpp_api_key raised", { tostring(got) })
+      return
+    end
+    key = got
+  else
+    for _, name in ipairs({ "LLAMACPP_API_KEY", "LLAMA_API_KEY" }) do
+      if not key and vim.env[name] and vim.env[name] ~= "" then key = vim.env[name] end
+    end
+  end
+  if type(key) == "string" and key ~= "" then
+    health.ok("API key set (" .. #key .. " chars), sent as Authorization: Bearer")
+  else
+    health.info("no API key (set $LLAMACPP_API_KEY or $LLAMA_API_KEY if llama-server runs with --api-key)")
+  end
+end
+
 -- The API key, via fn.api_key / fn.openai_api_key when the registry is loaded
 -- (so a redefined key source is what gets reported), else the same default
--- logic. Probes whichever provider config.provider selects. Never print the
--- key: report only where it came from.
+-- logic; llamacpp goes to check_llamacpp_key. Probes the provider
+-- active_provider resolves. Never print the key: report only where it came
+-- from.
 local function check_api_key()
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
-  local provider = config.provider
-  if provider == nil or provider == "" then
-    local ok_pref, pref = pcall(function()
-      return require("straps.registry").try_call("fn.provider_pref")
-    end)
-    if ok_pref and type(pref) == "string" and pref ~= "" then provider = pref end
+  local ok_name, provider = check_provider_name(config)
+  if not ok_name then return end
+  if provider == "llamacpp" then
+    check_llamacpp_key(config)
+    return
   end
-  if provider ~= "openai" then provider = "anthropic" end
   local openai = provider == "openai"
 
   local env_var = openai and "OPENAI_API_KEY" or "ANTHROPIC_API_KEY"
@@ -392,27 +453,37 @@ end
 local function check_model()
   health.start("straps: model")
   local cfg = config()
-  local model = cfg.model
-  if not model then
-    health.warn("config.model is unset (setup() has not run?)")
+  local providers = require("straps.provider")
+  local name = active_provider(cfg)
+  if not providers.is_provider(name) then
+    health.info("skipped: no known provider (see straps: provider)")
     return
   end
-  local tag, listed
-  for _, m in ipairs(cfg.models or {}) do
-    if m.id == model then
-      listed, tag = true, m.thinking
-    end
-  end
-  health.ok("model: " .. model .. (cfg.base_url and ("  @ " .. cfg.base_url) or ""))
-  local effort = cfg.effort or "off"
-  if not listed then
-    health.info(("model is not in config.models — no thinking block will be sent"
-      .. " (effort = %s is inert for it)"):format(effort))
-  elseif effort == "off" then
-    health.info("effort: off — no thinking block sent (thinking style: "
-      .. tostring(tag) .. ")")
+  local slot = providers.provider_slot(name)
+  local model, model_err = providers.resolve_model(slot.name, nil, cfg)
+  local entry = providers.model_entry(slot.name, model, cfg)
+  if model_err then
+    health.error(model_err .. "; every " .. slot.name .. " request will fail",
+      { "fix or delete the file, or pick a model with :StrapsModel" })
+  elseif not model then
+    health.warn("config." .. slot.model_key .. " is unset",
+      { "set " .. slot.model_key .. " in setup{} or run :StrapsModel" })
   else
-    health.ok(("effort: %s  (thinking style: %s)"):format(effort, tostring(tag)))
+    local style = slot.name ~= "openai" and ("thinking style: " .. tostring(entry and entry.thinking)) or nil
+    local base_url = slot.name == "llamacpp" and providers.llamacpp_base_url(cfg) or cfg[slot.base_url_key]
+    health.ok(slot.name .. " model: " .. model .. (base_url and ("  @ " .. providers.redact_url(base_url)) or ""))
+    local effort = cfg.effort or "off"
+    local applies, why = require("straps.provider").effort_applies(slot.name, entry, effort, cfg.efforts)
+    if not entry then
+      health.info(("model is not in config.%s — no thinking or reasoning is sent"
+        .. " (effort = %s is inert for it)"):format(slot.models_key, effort))
+    elseif effort == "off" then
+      health.info("effort: off — no thinking or reasoning is sent" .. (style and (" (" .. style .. ")") or ""))
+    elseif not applies then
+      health.info(("effort = %s is inert for %s: %s"):format(effort, model, why))
+    else
+      health.ok(("effort: %s  (%s)"):format(effort, style or "reasoning"))
+    end
   end
   -- max_tokens is nil by default (per-model max output, else default_max_tokens);
   -- that is the healthy state, not a warning. A value set explicitly is a hard
@@ -420,10 +491,7 @@ local function check_model()
   local turns_info = "max_turns: " .. tostring(cfg.max_turns)
     .. ", stall_limit: " .. tostring(cfg.stall_limit)
   if cfg.max_tokens == nil then
-    local model_max
-    for _, m in ipairs(cfg.models or {}) do
-      if m.id == model then model_max = tonumber(m.max_output) end
-    end
+    local model_max = slot.name ~= "openai" and entry and tonumber(entry.max_output) or nil
     local source = model_max and ("model max " .. model_max)
       or ("default_max_tokens " .. tostring(cfg.default_max_tokens))
     health.ok("max_tokens: auto (" .. source .. "), " .. turns_info)

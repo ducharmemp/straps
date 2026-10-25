@@ -262,7 +262,7 @@ end, { desc = "straps: execute the current buffer as Lua" })
 
 vim.api.nvim_create_user_command("StrapsModel", function()
   require("straps.ui").pick_model()
-end, { desc = "straps: pick the provider-specific model via a picker (snacks.nvim if available)" })
+end, { desc = "straps: pick the provider-specific model (per session on a session buffer; else global, persisted to ~/.config/straps/model_<provider>)" })
 
 vim.api.nvim_create_user_command("StrapsEffort", function()
   require("straps.ui").pick_effort()
@@ -270,7 +270,7 @@ end, { desc = "straps: pick config.effort (extended-thinking budget) via a picke
 
 vim.api.nvim_create_user_command("StrapsProvider", function()
   require("straps.ui").pick_provider()
-end, { desc = "straps: pick the API backend (anthropic/openai); persists the global choice to ~/.config/straps/provider" })
+end, { desc = "straps: pick the API backend (anthropic/openai/llamacpp); persists the global choice to ~/.config/straps/provider" })
 
 vim.api.nvim_create_user_command("StrapsLogin", function(opts)
   require("straps.ui").login(opts.fargs)

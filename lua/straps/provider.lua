@@ -1,13 +1,211 @@
--- straps.provider: registers fn.provider (a backend DISPATCHER selecting
--- fn.provider_anthropic — Anthropic Messages API — or fn.provider_openai —
--- OpenAI Responses API — by config.provider), plus fn.api_key /
--- fn.openai_api_key, the Sign in with ChatGPT entries (fn.openai_oauth_*,
--- fn.openai_device_id), fn.build_tools, the layered system prompt
--- (fn.system_prompt_core/_env/_project composed by fn.system_prompt), fn.log
--- and fn.compact. Everything is a registry entry (a Lua source string), so any
--- of it can be inspected and redefined at runtime.
+-- straps.provider: registers fn.provider (a backend DISPATCHER selecting, by
+-- the provider M.resolve_provider resolves, fn.provider_anthropic for the
+-- Anthropic Messages API, fn.provider_openai for the OpenAI Responses API, or
+-- fn.provider_llamacpp for a llama.cpp llama-server through
+-- fn.anthropic_messages), plus fn.api_key /
+-- fn.openai_api_key / fn.llamacpp_api_key, the Sign in with ChatGPT entries
+-- (fn.openai_oauth_*, fn.openai_device_id), fn.build_tools, the layered system
+-- prompt (fn.system_prompt_core/_env/_project composed by fn.system_prompt),
+-- fn.anthropic_messages (the Messages wire format the Anthropic and llama.cpp
+-- backends share), fn.log and fn.compact. Everything is a registry entry (a
+-- Lua source string), so any of it can be inspected and redefined at runtime.
+-- The exceptions are M.PROVIDERS and the plain functions on this module
+-- table (provider resolution, the effort rule, model-entry lookup and small
+-- helpers), which the statusline and health call directly.
 
 local M = {}
+
+-- Every provider straps knows, in picker order. Each slot names the config
+-- keys and the vim.b variable for that provider (model_key, models_key,
+-- base_url_key, buf_model_var), an optional default_model, and server_context
+-- for a backend whose context window is the running server's (no
+-- config.context_window fallback; a live n_ctx replaces a stored one).
+-- A new slot also needs its own branch in fn.provider, fn.list_models,
+-- health's check_api_key and check_model, and M.effort_applies; without a
+-- fn.list_models branch it falls into the Anthropic request.
+M.PROVIDERS = {
+  {
+    name = "anthropic", model_key = "model", models_key = "models",
+    buf_model_var = "straps_model", base_url_key = "base_url", default_model = "claude-sonnet-5",
+  },
+  {
+    name = "openai", model_key = "openai_model", models_key = "openai_models",
+    buf_model_var = "straps_openai_model", base_url_key = "openai_base_url", default_model = "gpt-5",
+  },
+  {
+    name = "llamacpp", model_key = "llamacpp_model", models_key = "llamacpp_models",
+    buf_model_var = "straps_llamacpp_model", base_url_key = "llamacpp_base_url", server_context = true,
+  },
+}
+
+-- The provider names in M.PROVIDERS order.
+function M.provider_names()
+  local names = {}
+  for _, slot in ipairs(M.PROVIDERS) do
+    names[#names + 1] = slot.name
+  end
+  return names
+end
+
+-- A URL with its user:password part (up to the last "@" before the path,
+-- with or without a scheme) and its query string or fragment replaced, for
+-- text a user or the transcript will show: health output and request errors.
+function M.redact_url(url)
+  local s = tostring(url)
+  if s:find("://", 1, true) then
+    s = s:gsub("//[^/]*@", "//***@")
+  else
+    s = s:gsub("^[^/]*@", "***@")
+  end
+  return (s:gsub("[?#].*$", "?***"))
+end
+
+-- The error text for a provider name not in M.PROVIDERS:
+-- "unknown provider <name> (expected one of: ...)".
+function M.unknown_provider_error(name)
+  return "unknown provider " .. tostring(name) .. " (expected one of: " .. table.concat(M.provider_names(), ", ") .. ")"
+end
+
+-- True when name is a provider in M.PROVIDERS.
+function M.is_provider(name)
+  for _, slot in ipairs(M.PROVIDERS) do
+    if slot.name == name then return true end
+  end
+  return false
+end
+
+-- The M.PROVIDERS slot for name; the anthropic slot for nil or an unknown name,
+-- so a statusline lookup never raises. Use is_provider to validate a name.
+-- The returned slot is the shared table in M.PROVIDERS; treat it as read-only.
+function M.provider_slot(name)
+  for _, slot in ipairs(M.PROVIDERS) do
+    if slot.name == name then return slot end
+  end
+  return M.PROVIDERS[1]
+end
+
+-- Whether the effort named effort_name changes a request for the model whose
+-- list entry is `entry`, under provider. fn.anthropic_messages and
+-- fn.provider_openai call it to decide whether to send thinking or reasoning,
+-- and fn.model_note and health report it. Returns true plus the matching
+-- config.efforts entry, or false plus the reason. `efforts` is config.efforts.
+function M.effort_applies(provider, entry, effort_name, efforts)
+  if not M.is_provider(provider) then return false, "unknown provider " .. tostring(provider) end
+  if effort_name == nil or effort_name == "off" then return false, "effort is off" end
+  if type(entry) ~= "table" then return false, "the model is not in the provider's model list" end
+  local effort
+  for _, e in ipairs(type(efforts) == "table" and efforts or {}) do
+    if type(e) == "table" and e.name == effort_name then
+      effort = e
+      break
+    end
+  end
+  if not effort then return false, "config.efforts has no entry named " .. tostring(effort_name) end
+  if provider == "openai" then
+    if not (entry.reasoning == true or entry.reasoning_effort == true) then
+      return false, "the model entry does not set reasoning"
+    end
+    if not effort.level then return false, "the effort entry has no level" end
+    return true, effort
+  end
+  if entry.thinking == "adaptive" then
+    if not effort.level then return false, "the effort entry has no level" end
+    return true, effort
+  end
+  if entry.thinking == "budget" then
+    local budget = tonumber(effort.budget_tokens)
+    if not (budget and budget > 0) then return false, "the effort entry has no positive budget_tokens" end
+    return true, effort
+  end
+  return false, "the model entry marks no thinking style (set thinking = \"adaptive\" or \"budget\" in it)"
+end
+
+-- The provider a request from buffer bufnr uses, and where the name came
+-- from: vim.b straps_provider, else config.provider (setup{}), else the
+-- persisted fn.provider_pref, else "anthropic". An unknown name is returned
+-- as-is; callers validate it with is_provider. A pref file that exists but
+-- cannot be read gives nil, its source and the error, so no request falls
+-- back to Anthropic over it. Every place that needs the active provider calls
+-- this, so the order is stated once.
+function M.resolve_provider(bufnr, config)
+  local b
+  pcall(function()
+    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then b = vim.b[bufnr].straps_provider end
+  end)
+  if type(b) == "string" and b ~= "" then
+    return b, "the session's vim.b straps_provider (or its .meta file)"
+  end
+  local configured = type(config) == "table" and config.provider or nil
+  if type(configured) == "string" and configured ~= "" then return configured, "setup{ provider }" end
+  local pref, pref_err = require("straps.registry").try_call("fn.provider_pref")
+  if type(pref) == "string" and pref ~= "" then return pref, "the provider pref file (:StrapsProvider)" end
+  if pref_err then return nil, "the provider pref file (:StrapsProvider)", tostring(pref_err) end
+  return "anthropic", "the default"
+end
+
+-- The model a request for provider sends from buffer bufnr: the buffer's model
+-- variable for that provider, else config[model_key] (nil by default, so any
+-- value was set by setup{} or at runtime), else the persisted fn.model_pref
+-- (read on each call, so a global pick from any Neovim, or a redefined
+-- fn.model_pref, applies on the next request), else the slot's default_model;
+-- nil when none is set (llamacpp has no default), and nil plus the error when
+-- the model pref file exists but cannot be read. fn.provider calls it once
+-- per request and hands the result to the backend as ctx.model.
+function M.resolve_model(provider, bufnr, config)
+  if not M.is_provider(provider) then return nil end
+  local slot = M.provider_slot(provider)
+  local model
+  pcall(function()
+    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then model = vim.b[bufnr][slot.buf_model_var] end
+  end)
+  if type(model) == "string" and model ~= "" then return model end
+  model = type(config) == "table" and config[slot.model_key] or nil
+  if type(model) == "string" and model ~= "" then return model end
+  local ok, pref, _, pref_err = pcall(require("straps.registry").try_call, "fn.model_pref", slot.name)
+  if ok and type(pref) == "string" and pref ~= "" then return pref end
+  if ok and pref_err then return nil, tostring(pref_err) end
+  return slot.default_model
+end
+
+-- The first entry with this id in provider's model list (config[models_key]),
+-- else the entry fn.model_pref stored with that id, or nil (also for an
+-- unknown provider).
+function M.model_entry(provider, id, config)
+  if id == nil or type(config) ~= "table" or not M.is_provider(provider) then return nil end
+  local list = config[M.provider_slot(provider).models_key]
+  for _, m in ipairs(type(list) == "table" and list or {}) do
+    if type(m) == "table" and m.id == id then return m end
+  end
+  local ok, pref, entry = pcall(require("straps.registry").try_call, "fn.model_pref", provider)
+  if ok and pref == id and type(entry) == "table" and entry.id == id then return entry end
+  return nil
+end
+
+-- Add a copy of entry (a model-list entry with an id) to provider's model
+-- list unless the list already has an entry with that id, so a model restored
+-- from a pin or the model pref keeps its thinking tag, max_output and context
+-- after a restart and after a later global pick changes the pref. The entry
+-- then also shows in :StrapsModel and the models tool for every session.
+function M.merge_model_entry(provider, entry, config)
+  if type(config) ~= "table" or not M.is_provider(provider) then return end
+  if type(entry) ~= "table" or type(entry.id) ~= "string" or entry.id == "" then return end
+  local key = M.provider_slot(provider).models_key
+  if type(config[key]) ~= "table" then config[key] = {} end
+  for _, m in ipairs(config[key]) do
+    if type(m) == "table" and m.id == entry.id then return end
+  end
+  table.insert(config[key], vim.deepcopy(entry))
+end
+
+-- config.llamacpp_base_url (default http://127.0.0.1:8080) with a trailing
+-- "/" and "/v1" removed, so a URL written for OpenAI-style clients
+-- ("http://host:8080/v1") does not become ".../v1/v1/messages".
+function M.llamacpp_base_url(config)
+  local url = type(config) == "table" and config.llamacpp_base_url or nil
+  if type(url) ~= "string" or url == "" then url = "http://127.0.0.1:8080" end
+  url = url:gsub("/+$", ""):gsub("/v1$", ""):gsub("/+$", "")
+  return url
+end
 
 local API_KEY_SRC = [==[
 return function()
@@ -51,49 +249,43 @@ end
 -- { id, label, thinking }. Synchronous curl (the picker is a one-off UI action,
 -- not the hot path). The `thinking` tag is inferred from the API's own
 -- capabilities.thinking.types — the single source of truth for which of the
--- two mutually incompatible thinking mechanisms a model speaks (fn.provider
--- reads the same tag): adaptive.supported -> "adaptive", else enabled.supported
--- -> "budget", else nil (send no thinking block). Returns a list on success, or
+-- two mutually incompatible thinking mechanisms a model speaks
+-- (fn.anthropic_messages reads the same tag): adaptive.supported ->
+-- "adaptive", else enabled.supported -> "budget", else nil (send no thinking
+-- block). Returns a list on success, or
 -- (nil, errmsg) on any failure so callers can fall back to the static list.
 -- OpenAI returns {data:[{id}]} for an API key and {models:[{slug,
 -- display_name, context_window, visibility}]} for a ChatGPT login; hidden
--- ChatGPT entries are dropped.
+-- ChatGPT entries are dropped. llama-server returns {data:[{id, meta?}]};
+-- meta.n_ctx (present only for a loaded model) becomes `context`, and the key
+-- (fn.llamacpp_api_key) is optional.
 local LIST_MODELS_SRC = [==[
 return function(provider_override)
   local registry = require("straps.registry")
+  local providers = require("straps.provider")
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
 
   -- Discovery must follow the SAME backend the loop would talk to, otherwise
   -- :StrapsModel shows the wrong catalog (e.g. Claude models while the OpenAI
-  -- provider is active). Callers may pass "anthropic"/"openai" explicitly;
-  -- otherwise resolve like fn.provider: per-session buffer override, then
-  -- config.provider, then the persisted file, then Anthropic.
-  local provider = (provider_override == "anthropic" or provider_override == "openai") and provider_override or nil
-  if provider == nil then
-    pcall(function()
-      local bufnr = vim.api.nvim_get_current_buf()
-      if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-        local b = vim.b[bufnr].straps_provider
-        if b and b ~= "" then provider = b end
-      end
-    end)
-  end
-  if provider == nil or provider == "" then
-    provider = config.provider
-  end
-  if provider == nil or provider == "" then
-    provider = registry.try_call("fn.provider_pref")
-  end
-  if provider ~= "anthropic" and provider ~= "openai" then
-    provider = "anthropic"
+  -- provider is active). Callers may pass a provider name explicitly (an
+  -- unknown name returns nil, err); otherwise provider.resolve_provider
+  -- resolves it for the current buffer, as fn.provider does.
+  local provider = (type(provider_override) == "string" and provider_override ~= "") and provider_override
+    or providers.resolve_provider(vim.api.nvim_get_current_buf(), config)
+  if not providers.is_provider(provider) then
+    return nil, providers.unknown_provider_error(provider)
   end
 
   local openai = provider == "openai"
+  local llamacpp = provider == "llamacpp"
   local base_url, headers, key_fn
   if openai then
     base_url = config.openai_base_url or "https://api.openai.com"
     key_fn = "fn.openai_api_key"
+  elseif llamacpp then
+    base_url = providers.llamacpp_base_url(config)
+    key_fn = "fn.llamacpp_api_key"
   else
     base_url = config.base_url or "https://api.anthropic.com"
     key_fn = "fn.api_key"
@@ -107,11 +299,17 @@ return function(provider_override)
   end
 
   local ok_key, api_key = pcall(registry.call, key_fn, { base_url = base_url, wait_ms = 15000 })
-  if not ok_key or type(api_key) ~= "string" or api_key == "" then
+  if llamacpp then
+    if not ok_key then
+      return nil, "fn.llamacpp_api_key failed (" .. tostring(api_key) .. ")"
+    end
+  elseif not ok_key or type(api_key) ~= "string" or api_key == "" then
     return nil, "no API key (" .. tostring(api_key) .. ")"
   end
 
-  if openai then
+  if llamacpp then
+    headers = (type(api_key) == "string" and api_key ~= "") and { "-H", "Authorization: Bearer " .. api_key } or {}
+  elseif openai then
     headers = { "-H", "Authorization: Bearer " .. api_key }
   else
     headers = {
@@ -122,9 +320,9 @@ return function(provider_override)
 
   -- Synchronous: the picker blocks briefly on this, which is fine for a
   -- deliberate UI action and avoids threading the loop's async ctx through.
-  -- Anthropic caps the page with ?limit; OpenAI's /v1/models has no such
-  -- param (and returns the full list), so only send it for Anthropic.
-  local url = base_url .. "/v1/models" .. (openai and "" or "?limit=1000")
+  -- Anthropic caps the page with ?limit; OpenAI's and llama-server's
+  -- /v1/models have no such param, so only send it for Anthropic.
+  local url = base_url .. "/v1/models" .. ((openai or llamacpp) and "" or "?limit=1000")
   local argv = { "curl", "-sS", url }
   vim.list_extend(argv, headers)
   vim.list_extend(argv, { "-w", "\nSTRAPS_HTTP_STATUS:%{http_code}\n" })
@@ -169,6 +367,9 @@ return function(provider_override)
         -- reasoning-effort capabilities, so the id doubles as the label and
         -- static config must opt a model into reasoning.effort explicitly.
         models[#models + 1] = { id = m.id, label = m.id, thinking = nil }
+      elseif llamacpp then
+        local meta = type(m.meta) == "table" and m.meta or {}
+        models[#models + 1] = { id = m.id, label = m.id, thinking = nil, context = tonumber(meta.n_ctx) }
       else
         local types = (((m.capabilities or {}).thinking or {}).types) or {}
         local thinking = nil
@@ -177,9 +378,9 @@ return function(provider_override)
         elseif ((types.enabled or {}).supported) == true then
           thinking = "budget"
         end
-        -- max_tokens is the model's max response tokens; fn.provider uses it as
-        -- the default max_tokens (as `max_output`) so a run never starves on the
-        -- old fixed cap. context (max_input_tokens) drives the winbar fill.
+        -- max_tokens is the model's max response tokens; fn.anthropic_messages
+        -- uses it as the default max_tokens (as `max_output`). context
+        -- (max_input_tokens) drives the winbar fill.
         models[#models + 1] = {
           id = m.id,
           label = m.display_name or m.id,
@@ -301,49 +502,83 @@ return function(ev)
 end
 ]==]
 
-local PROVIDER_ANTHROPIC_SRC = [==[
--- (req, ctx) -> { content = blocks, stop_reason = s }
--- req = { system?, messages, tools }. Streams SSE from the Anthropic
--- Messages API via curl; text deltas go out through ctx.emit; the curl
--- process is killed through ctx.on_cancel; 429/529 retry with backoff.
-return function(req, ctx)
+local ANTHROPIC_MESSAGES_SRC = [==[
+-- (req, ctx, opts?) -> { content = blocks, stop_reason = s, usage?, model? }
+-- model is the id sent, which fn.provider pins.
+-- The Anthropic Messages wire format, shared by fn.provider_anthropic (no
+-- opts) and fn.provider_llamacpp (opts). req = { system?, messages, tools }.
+-- Streams SSE via curl; text deltas go out through ctx.emit; the curl
+-- process is killed through ctx.on_cancel; retryable failures (429/529,
+-- overloaded, curl-level, a stall) retry with backoff until a text delta has
+-- streamed. opts (all optional) points the same wire format at another
+-- server:
+--   base_url      replaces config.base_url
+--   model         replaces ctx.model and the provider.resolve_model fallback;
+--                 with base_url, opts.model or ctx.model is required
+--   model_entry   the model's list entry, used instead of a lookup; with
+--                 base_url, the only source besides ctx.model_entry
+--   auth_headers  argv list replacing the x-api-key header (fn.api_key is not
+--                 called); with base_url set and auth_headers omitted no auth
+--                 header is sent, so the Anthropic key never leaves its host
+--   gzip          false disables request compression
+--   label         names the backend in errors
+-- provider.effort_applies judges the effort for ctx.provider (default
+-- "anthropic").
+return function(req, ctx, opts)
   local registry = require("straps.registry")
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+  opts = type(opts) == "table" and opts or {}
 
-  local api_key = registry.call("fn.api_key")
-  local base_url = config.base_url or "https://api.anthropic.com"
+  local auth_headers = opts.auth_headers
+  if auth_headers == nil then
+    auth_headers = opts.base_url == nil and { "-H", "x-api-key: " .. registry.call("fn.api_key") } or {}
+  end
+  local base_url = opts.base_url or config.base_url or "https://api.anthropic.com"
+  local who = opts.label and ("straps provider (" .. opts.label .. ")") or "straps provider"
 
-  -- Model and effort are per-buffer-overridable (vim.b straps_model /
-  -- straps_effort), falling back to the global config. This lets one session
-  -- run a different model/effort than another — e.g. a cheap subagent under an
-  -- Opus main session (tool.spawn sets these on the child buffer). The pcall
-  -- guards a nil/invalid bufnr (a provider call outside a real session buffer).
-  local b_model, b_effort
+  -- Effort: vim.b straps_effort, else config.effort, so one session can run a
+  -- different effort than another (tool.spawn sets it on a child buffer). The
+  -- pcall guards a nil/invalid bufnr (a call outside a real session buffer).
+  local b_effort
   pcall(function()
     local bufnr = ctx and ctx.bufnr
     if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-      b_model = vim.b[bufnr].straps_model
       b_effort = vim.b[bufnr].straps_effort
     end
   end)
 
-  -- Active model + its config.models entry, resolved BEFORE the body so the
+  -- Active model + its model-list entry, resolved BEFORE the body so the
   -- entry can supply both the default max_tokens (its max_output) and, below,
-  -- the extended-thinking style. model_id duplicated nowhere else now.
-  local model_id = b_model or config.model or "claude-sonnet-5"
-  local models = type(config.models) == "table" and config.models or {}
-  local model_entry = nil
-  for _, m in ipairs(models) do
-    if type(m) == "table" and m.id == model_id then
-      model_entry = m
-      break
+  -- the extended-thinking style. The entry is opts.model_entry when it
+  -- describes the model sent; else ctx.model_entry when the request sends
+  -- ctx.model (fn.provider looked it up once); else, without opts.base_url,
+  -- the Anthropic list entry (provider.model_entry); with opts.base_url, none.
+  local providers = require("straps.provider")
+  local ctx_model = ctx and ctx.model
+  ctx_model = (type(ctx_model) == "string" and ctx_model ~= "") and ctx_model or nil
+  local model_id
+  if opts.base_url ~= nil then
+    model_id = opts.model or ctx_model
+    if model_id == nil or model_id == "" then
+      error(who .. ": opts.base_url is set without opts.model or ctx.model", 0)
     end
+  else
+    model_id = opts.model or ctx_model or providers.resolve_model("anthropic", ctx and ctx.bufnr, config)
+  end
+  local model_entry = nil
+  local ctx_entry = ctx and ctx.model_entry
+  if type(opts.model_entry) == "table" and opts.model_entry.id == model_id then
+    model_entry = opts.model_entry
+  elseif model_id == ctx_model and type(ctx_entry) == "table" and ctx_entry.id == model_id then
+    model_entry = ctx_entry
+  elseif opts.base_url == nil then
+    model_entry = providers.model_entry("anthropic", model_id, config)
   end
   local thinking_style = model_entry and model_entry.thinking or nil
 
   -- max_tokens resolution: an explicit config.max_tokens is a hard cap and
-  -- wins; otherwise the model's own max output (config.models entry, seeded
+  -- wins; otherwise the model's own max output (its model-list entry, seeded
   -- and refreshed by :StrapsModel discovery); otherwise default_max_tokens;
   -- 8192 only as a last resort if a config zeroed default_max_tokens out.
   local model_max = model_entry and tonumber(model_entry.max_output) or nil
@@ -362,21 +597,15 @@ return function(req, ctx)
   -- payload (level / budget_tokens) comes from config.efforts by name.
   -- Unknown/untagged model or "off" effort: send no thinking block at all
   -- (the safe default — guessing wrong fails closed with a 400, silently
-  -- guessing a shape open would fail worse).
-  local efforts = type(config.efforts) == "table" and config.efforts or {}
+  -- guessing a shape open would fail worse). provider.effort_applies decides; it is
+  -- the rule fn.model_note and health report.
   local effort_name = b_effort or config.effort or "off"
-  local effort_entry = nil
-  for _, e in ipairs(efforts) do
-    if type(e) == "table" and e.name == effort_name then
-      effort_entry = e
-      break
-    end
-  end
-  if effort_entry and thinking_style == "adaptive" and effort_entry.level then
+  local effort_provider = ctx and providers.is_provider(ctx.provider) and ctx.provider or "anthropic"
+  local applies, effort_entry = providers.effort_applies(effort_provider, model_entry, effort_name, config.efforts)
+  if applies and thinking_style == "adaptive" then
     body.thinking = { type = "adaptive" }
     body.output_config = { effort = effort_entry.level }
-  elseif effort_entry and thinking_style == "budget"
-    and tonumber(effort_entry.budget_tokens) and tonumber(effort_entry.budget_tokens) > 0 then
+  elseif applies and thinking_style == "budget" then
     local budget_tokens = tonumber(effort_entry.budget_tokens)
     body.thinking = { type = "enabled", budget_tokens = budget_tokens }
     -- Thinking tokens count against max_tokens, and the API rejects
@@ -482,7 +711,7 @@ return function(req, ctx)
   -- with nil falls back to the plain body, so gzip stays optional; a cancel
   -- during compression ends the call the same way a cancel during curl does.
   local wire, wire_headers = payload, {}
-  if config.gzip ~= false and vim.fn.executable("gzip") == 1 then
+  if config.gzip ~= false and opts.gzip ~= false and vim.fn.executable("gzip") == 1 then
     local gz = ctx.await(function(resolve)
       local ok_spawn, p = pcall(vim.system, { "gzip", "-c", "-6" }, { stdin = payload }, resolve)
       if not ok_spawn then
@@ -504,6 +733,9 @@ return function(req, ctx)
   --   { ok = true, content, stop_reason }            on message_stop
   --   { ok = true, cancelled = true, ... }           when we were cancelled
   --   { ok = false, status?, err?, body? }           on any failure
+  -- streamed_text records that a text delta reached the transcript; a retry
+  -- after that would write the same text again, so it ends the retries.
+  local streamed_text = false
   local function start_request(resolve)
     local content = {}    -- finished blocks, in stream order
     local blocks = {}     -- index -> in-flight block state
@@ -544,7 +776,7 @@ return function(req, ctx)
         body = table.concat(raw),
         err = ("stream stalled: no data from %s for %d ms; request killed."
           .. " If your endpoint or model is legitimately slow, raise"
-          .. " config.request_timeout_ms."):format(base_url, idle_ms),
+          .. " config.request_timeout_ms."):format(require("straps.provider").redact_url(base_url), idle_ms),
       })
     end
     local function watchdog_reset()
@@ -586,6 +818,7 @@ return function(req, ctx)
         local b, d = blocks[msg.index], msg.delta or {}
         if b and d.type == "text_delta" then
           b.text = b.text .. (d.text or "")
+          if (d.text or "") ~= "" then streamed_text = true end
           ctx.emit({ type = "text_delta", text = d.text or "" })
         elseif b and d.type == "input_json_delta" then
           b.partial = b.partial .. (d.partial_json or "")
@@ -671,10 +904,12 @@ return function(req, ctx)
     local argv = {
       "curl", "-sS", "--no-buffer",
       "-X", "POST", base_url .. "/v1/messages",
-      "-H", "x-api-key: " .. api_key,
+    }
+    vim.list_extend(argv, auth_headers)
+    vim.list_extend(argv, {
       "-H", "anthropic-version: 2023-06-01",
       "-H", "content-type: application/json",
-    }
+    })
     vim.list_extend(argv, wire_headers)
     vim.list_extend(argv, {
       "-w", "%{stderr}\nSTRAPS_HTTP_STATUS:%{http_code}\n",
@@ -752,7 +987,7 @@ return function(req, ctx)
       return { content = {}, stop_reason = "cancelled" }
     end
     if res.ok then
-      return { content = res.content, stop_reason = res.stop_reason, usage = res.usage }
+      return { content = res.content, stop_reason = res.stop_reason, usage = res.usage, model = body.model }
     end
 
     -- Failure. Pull a structured error out of a plain-JSON error body.
@@ -768,11 +1003,11 @@ return function(req, ctx)
     -- with no HTTP status (connection refused, DNS, TLS, timeout) is also
     -- transient — res.err is then the "curl exited with code N" string.
     local curl_failure = res.status == nil and type(res.err) == "string"
-    local retryable = res.status == 429 or res.status == 529
+    local retryable = not streamed_text and (res.status == 429 or res.status == 529
       or res.status == 500 or res.status == 502 or res.status == 503
       or res.status == 408
       or etype == "rate_limit_error" or etype == "overloaded_error"
-      or curl_failure
+      or curl_failure)
 
     if retryable and attempt < 3 then
       -- Backoff without blocking: deferred resolve, cut short on cancel.
@@ -796,19 +1031,19 @@ return function(req, ctx)
       if detail and #detail > 2000 then
         detail = require("straps.state").utf8_cut(detail, 2000) .. "..."
       end
-      error(("straps provider: request failed (HTTP %s): %s"):format(
-        res.status and tostring(res.status) or "?",
+      error(("%s: request failed (HTTP %s): %s"):format(
+        who, res.status and tostring(res.status) or "?",
         (detail and detail ~= "") and detail or "no response body"))
     end
   end
-  error("straps provider: retries exhausted")
+  error(who .. ": retries exhausted")
 end
 ]==]
 
 local PROVIDER_OPENAI_SRC = [==[
--- (req, ctx) -> { content = blocks, stop_reason = s }
+-- (req, ctx) -> { content = blocks, stop_reason = s, usage?, model? }
 -- The OpenAI Responses backend. Same contract as fn.provider_anthropic
--- (returns { content = blocks, stop_reason, usage } and streams text via
+-- (returns { content = blocks, stop_reason, usage, model } and streams text via
 -- ctx.emit), but speaks OpenAI's wire shape instead of Anthropic's:
 --   auth      Authorization: Bearer <key>            (fn.openai_api_key: ChatGPT login, env, key file)
 --   endpoint  {base_url}/v1/responses                (config.openai_base_url)
@@ -828,19 +1063,21 @@ return function(req, ctx)
     return { content = {}, stop_reason = "cancelled" }
   end
 
-  -- Per-buffer overrides (a subagent under a different model/effort), same as
-  -- the Anthropic backend.
-  local b_model, b_effort
+  -- Per-buffer effort (a subagent under a different effort), same as the
+  -- Anthropic backend.
+  local b_effort
   pcall(function()
     local bufnr = ctx and ctx.bufnr
     if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-      b_model = vim.b[bufnr].straps_openai_model
       b_effort = vim.b[bufnr].straps_effort
     end
   end)
-  -- OpenAI has its own default and per-buffer model slot. Do not fall through
-  -- to config.model/vim.b.straps_model here: those are Anthropic ids.
-  local model_id = b_model or config.openai_model or "gpt-5"
+  -- The model: ctx.model (fn.provider resolves it once per request), else
+  -- provider.resolve_model for the openai slot, which never reads the Anthropic
+  -- config.model / vim.b straps_model.
+  local ctx_model = ctx and ctx.model
+  local model_id = (type(ctx_model) == "string" and ctx_model ~= "") and ctx_model
+    or require("straps.provider").resolve_model("openai", ctx and ctx.bufnr, config)
 
   -- Translate the Anthropic-shaped req.messages into Responses input items,
   -- preserving block order:
@@ -937,27 +1174,22 @@ return function(req, ctx)
   -- models reason (the ChatGPT-login catalog does, but fn.list_models does not
   -- read it), so the configured OpenAI model entry must opt in with
   -- reasoning = true (or reasoning_effort = true). Unlisted models get the
-  -- model's own default.
-  local reasoning_enabled = false
-  for _, m in ipairs(type(config.openai_models) == "table" and config.openai_models or {}) do
-    if type(m) == "table" and m.id == model_id then
-      reasoning_enabled = (m.reasoning == true or m.reasoning_effort == true)
-      break
-    end
-  end
-  if reasoning_enabled then
-    local efforts = type(config.efforts) == "table" and config.efforts or {}
-    local effort_name = b_effort or config.effort or "off"
-    for _, e in ipairs(efforts) do
-      if type(e) == "table" and e.name == effort_name and e.level then
-        body.reasoning = { effort = e.level }
-        break
-      end
-    end
+  -- model's own default. provider.effort_applies decides; it is the rule
+  -- fn.model_note and health report.
+  local ctx_entry = ctx and ctx.model_entry
+  local model_entry = (type(ctx_entry) == "table" and ctx_entry.id == model_id) and ctx_entry
+    or require("straps.provider").model_entry("openai", model_id, config)
+  local applies, effort_entry = require("straps.provider").effort_applies("openai", model_entry,
+    b_effort or config.effort or "off", config.efforts)
+  if applies then
+    body.reasoning = { effort = effort_entry.level }
   end
 
   local payload = require("straps.state").utf8_scrub(vim.json.encode(body))
 
+  -- streamed_text records that a text delta reached the transcript; a retry
+  -- after that would write the same text again, so it ends the retries.
+  local streamed_text = false
   local function start_request(resolve)
     local content = {}        -- finished blocks in order
     local text_block = nil    -- the single streamed text block (created lazily)
@@ -994,7 +1226,7 @@ return function(req, ctx)
         body = table.concat(raw),
         err = ("stream stalled: no data from %s for %d ms; request killed."
           .. " If your endpoint or model is legitimately slow, raise"
-          .. " config.request_timeout_ms."):format(base_url, idle_ms),
+          .. " config.request_timeout_ms."):format(require("straps.provider").redact_url(base_url), idle_ms),
       })
     end
     local function watchdog_reset()
@@ -1071,6 +1303,7 @@ return function(req, ctx)
       end
       text_index = ev.output_index
       text_block.text = text_block.text .. delta
+      streamed_text = true
       ctx.emit({ type = "text_delta", text = delta })
     end
 
@@ -1203,7 +1436,7 @@ return function(req, ctx)
       return { content = {}, stop_reason = "cancelled" }
     end
     if res.ok then
-      return { content = res.content, stop_reason = res.stop_reason, usage = res.usage }
+      return { content = res.content, stop_reason = res.stop_reason, usage = res.usage, model = model_id }
     end
 
     if type(res.err) ~= "table" and res.body and res.body ~= "" then
@@ -1213,9 +1446,9 @@ return function(req, ctx)
       end
     end
     local curl_failure = res.status == nil and type(res.err) == "string"
-    local retryable = res.status == 429 or res.status == 500
+    local retryable = not streamed_text and (res.status == 429 or res.status == 500
       or res.status == 502 or res.status == 503 or res.status == 408
-      or curl_failure or res.retryable == true
+      or curl_failure or res.retryable == true)
 
     if res.status == 401 and key_source == "oauth" and not refreshed then
       refreshed = true
@@ -1261,58 +1494,155 @@ return function(req, ctx)
 end
 ]==]
 
--- The dispatcher: fn.provider selects the backend by, in order,
--- vim.b straps_provider (per session) -> config.provider (if the user set it in
--- setup{}) -> the persisted preference file (fn.provider_pref, written by
--- :StrapsProvider) -> "anthropic". Keeping config.provider nil by default lets
--- the file be the durable default; setting it in setup{} pins it and wins over
--- the file. An unknown nonempty value raises an error.
--- Keeping fn.provider as the single loop-facing entry means the loop, tests and
--- DESIGN contract are unchanged; each backend is its own redefinable entry.
+-- The Anthropic backend: the Messages wire format with no opts, so its
+-- endpoint, key and model come from config.base_url, fn.api_key and
+-- ctx.model (provider.resolve_model).
+local PROVIDER_ANTHROPIC_SRC = [==[
+return function(req, ctx)
+  return require("straps.registry").call("fn.anthropic_messages", req, ctx)
+end
+]==]
+
+-- The dispatcher, the single loop-facing entry (its registry doc states the
+-- contract). It resolves the provider and model once (provider.resolve_provider
+-- and resolve_model), hands them to the backend in ctx, and pins what was sent
+-- to the session (state.set_session_pin), so a later global change or a
+-- resume never moves an existing session to another backend or model.
 local PROVIDER_SRC = [==[
 return function(req, ctx)
   local registry = require("straps.registry")
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
 
-  local provider = config.provider
-  if provider == nil or provider == "" then
-    -- Persisted default (~/.config/straps/provider). Best-effort — a read error
-    -- or missing file just leaves provider nil and we fall through to Anthropic.
-    provider = registry.try_call("fn.provider_pref")
+  local providers = require("straps.provider")
+  local provider, source, pref_err = providers.resolve_provider(ctx and ctx.bufnr, config)
+  if pref_err then error("straps provider: " .. pref_err, 0) end
+  if not providers.is_provider(provider) then
+    error("straps provider: " .. providers.unknown_provider_error(provider) .. ", from " .. source, 0)
   end
-  pcall(function()
-    local bufnr = ctx and ctx.bufnr
-    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-      local b = vim.b[bufnr].straps_provider
-      if b and b ~= "" then provider = b end
-    end
-  end)
 
-  if provider == nil or provider == "" or provider == "anthropic" then
-    return registry.call("fn.provider_anthropic", req, ctx)
-  end
-  if provider == "openai" then
+  local backend
+  if provider == "anthropic" then
+    backend = "fn.provider_anthropic"
+  elseif provider == "openai" then
     -- layers.openai = false leaves fn.provider_openai unregistered; error with
     -- a clean, actionable string instead of the raw "unknown fn" from call().
     if not registry.get("fn.provider_openai") then
       error("straps provider: the openai layer is disabled (setup{ layers = { openai = false } })")
     end
-    return registry.call("fn.provider_openai", req, ctx)
+    backend = "fn.provider_openai"
+  elseif provider == "llamacpp" then
+    backend = "fn.provider_llamacpp"
+  else
+    error("straps provider: no backend branch for provider " .. tostring(provider)
+      .. "; M.PROVIDERS lists it but fn.provider has no route to it", 0)
   end
-  error("straps provider: unknown provider " .. tostring(provider)
-    .. " (expected 'anthropic' or 'openai')")
+  local bufnr = ctx and ctx.bufnr
+  local model, model_err = providers.resolve_model(provider, bufnr, config)
+  if model_err then error("straps provider: " .. model_err, 0) end
+  local model_var = providers.provider_slot(provider).buf_model_var
+  local function buffer_state()
+    local p, m
+    pcall(function()
+      if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+        p, m = vim.b[bufnr].straps_provider, vim.b[bufnr][model_var]
+      end
+    end)
+    return (p ~= "" and p or nil), (m ~= "" and m or nil)
+  end
+  local dispatched_provider, dispatched_model = buffer_state()
+  local entry = providers.model_entry(provider, model, config)
+  -- An entry found only through the model pref goes into the model list, so
+  -- the session keeps it after a later global pick changes the pref.
+  providers.merge_model_entry(provider, entry, config)
+  local backend_ctx = setmetatable({
+    provider = provider,
+    model = model,
+    model_entry = entry,
+  }, { __index = ctx })
+
+  local result = registry.call(backend, req, backend_ctx)
+  if bufnr and type(result) == "table" and result.stop_reason ~= "cancelled" then
+    local now_provider, now_model = buffer_state()
+    if now_provider == dispatched_provider and now_model == dispatched_model then
+      local sent = (type(result.model) == "string" and result.model ~= "") and result.model or model
+      pcall(require("straps.state").set_session_pin, bufnr, provider, sent,
+        providers.model_entry(provider, sent, config))
+    end
+  end
+  return result
 end
 ]==]
 
--- Persisted provider preference: (value?) -> value. Called with no argument it
--- READS the first line of $XDG_CONFIG_HOME/straps/provider (~/.config/straps/
--- provider by default), returning "anthropic"/"openai" or nil when absent/blank.
--- Called with a string it WRITES that value there (creating the dir), and
--- returns it. Mirrors the key-file location convention; unlike the key files
--- this is not a secret, so no mode-600 guard. Never throws on a read miss;
--- a write failure surfaces as (nil, err) for the picker to report.
+local PROVIDER_LLAMACPP_SRC = [==[
+-- The llama.cpp backend: llama-server speaks the Anthropic Messages wire
+-- format at /v1/messages, so this resolves the llamacpp settings and calls
+-- fn.anthropic_messages with opts. It never goes through
+-- fn.provider_anthropic, so a redefined Anthropic backend cannot send
+-- llama.cpp sessions to Anthropic.
+-- Model: ctx.model, else provider.resolve_model; it raises when none is set,
+-- because a router-mode server rejects a request without one.
+-- No gzip: llama-server answers a gzip body with HTTP 415.
+return function(req, ctx)
+  local registry = require("straps.registry")
+  local ok_straps, straps = pcall(require, "straps")
+  local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+
+  local model = ctx and ctx.model
+  if type(model) ~= "string" or model == "" then
+    model = require("straps.provider").resolve_model("llamacpp", ctx and ctx.bufnr, config)
+  end
+  if type(model) ~= "string" or model == "" then
+    error("straps provider (llamacpp): no model; set llamacpp_model in setup{} or run :StrapsModel", 0)
+  end
+
+  local base_url = require("straps.provider").llamacpp_base_url(config)
+  local key = registry.call("fn.llamacpp_api_key", { base_url = base_url })
+  local auth_headers = (type(key) == "string" and key ~= "") and { "-H", "Authorization: Bearer " .. key } or {}
+  -- The entry fn.provider resolved (ctx.model_entry, which can come from the
+  -- model pref) when it describes this model, else the llamacpp_models lookup.
+  local providers = require("straps.provider")
+  local entry = (ctx and ctx.model == model and type(ctx.model_entry) == "table") and ctx.model_entry
+    or providers.model_entry("llamacpp", model, config)
+  return registry.call("fn.anthropic_messages", req, ctx, {
+    base_url = base_url,
+    model = model,
+    model_entry = entry,
+    auth_headers = auth_headers,
+    gzip = false,
+    label = "llamacpp",
+  })
+end
+]==]
+
+local LLAMACPP_API_KEY_SRC = [==[
+return function()
+  for _, name in ipairs({ "LLAMACPP_API_KEY", "LLAMA_API_KEY" }) do
+    local key = vim.env[name]
+    if key and key ~= "" then
+      return key
+    end
+  end
+  return nil
+end
+]==]
+
+-- Persisted provider preference. Called with no argument it READS the first
+-- line of $XDG_CONFIG_HOME/straps/provider (~/.config/straps/provider by
+-- default) and returns its trimmed value, nil when absent or blank, or
+-- (nil, err) when the file exists but cannot be read; provider.resolve_provider
+-- passes that error on, so fn.provider raises instead of falling back to
+-- Anthropic. An unknown value is returned as-is, so fn.provider raises on it.
+-- Called with a string it validates the name and WRITES it through a temp file
+-- and a rename (creating the dir), returning it, or (nil, err) for an unknown
+-- name or a failed write. Not a secret, so no mode-600 guard. A read reuses
+-- the last value while the file's mtime, size and inode are unchanged, so the
+-- winbar costs one stat per redraw.
 local PROVIDER_PREF_SRC = [==[
+local cache = {}
+local function stat_key(st)
+  return table.concat({ st.mtime.sec, st.mtime.nsec, st.size, st.ino }, ":")
+end
 return function(value)
   local config_home = vim.env.XDG_CONFIG_HOME
   if not config_home or config_home == "" then
@@ -1328,31 +1658,120 @@ return function(value)
 
   if value ~= nil then
     value = tostring(value)
-    if value ~= "anthropic" and value ~= "openai" then
-      return nil, "unknown provider " .. value .. " (expected anthropic or openai)"
+    local providers = require("straps.provider")
+    if not providers.is_provider(value) then
+      return nil, providers.unknown_provider_error(value)
     end
     if vim.fn.isdirectory(dir) == 0 then
       local ok = pcall(vim.fn.mkdir, dir, "p")
       if not ok then return nil, "could not create " .. dir end
     end
-    local f, err = io.open(path, "w")
-    if not f then return nil, "could not write " .. path .. " (" .. tostring(err) .. ")" end
+    local tmp = path .. ".tmp"
+    local f, err = io.open(tmp, "w")
+    if not f then return nil, "could not write " .. tmp .. " (" .. tostring(err) .. ")" end
     f:write(tostring(value) .. "\n")
     f:close()
+    local renamed, rerr = vim.uv.fs_rename(tmp, path)
+    if not renamed then
+      os.remove(tmp)
+      return nil, "could not write " .. path .. " (" .. tostring(rerr) .. ")"
+    end
+    cache[path] = nil
     return value
   end
 
   -- Read.
   local st = vim.uv.fs_stat(path)
   if not (st and st.type == "file") then return nil end
-  local f = io.open(path, "r")
-  if not f then return nil end
+  local key = stat_key(st)
+  local hit = cache[path]
+  if hit and hit.key == key then return hit.value end
+  local f, open_err = io.open(path, "r")
+  if not f then return nil, path .. " exists but could not be read (" .. tostring(open_err) .. ")" end
   local line = f:read("*l")
   f:close()
   line = line and vim.trim(line) or ""
-  if line == "" then return nil end
-  if line ~= "anthropic" and line ~= "openai" then return nil end
-  return line
+  local result = line ~= "" and line or nil
+  cache[path] = { key = key, value = result }
+  return result
+end
+]==]
+
+-- The persisted global model choice per provider, the model twin of
+-- fn.provider_pref: (provider) READS $XDG_CONFIG_HOME/straps/model_<provider>,
+-- one JSON object { id, entry? }, and returns the id plus the stored
+-- model-list entry (nil when absent or blank; nil, nil and an error when the
+-- file exists but cannot be read or is not that shape);
+-- (provider, value, entry?) WRITES them and returns value, or (nil, err).
+-- M.resolve_model and M.model_entry read it on each call, so a pick made in
+-- another Neovim or a redefined fn.model_pref applies at once; a global
+-- :StrapsModel pick writes it.
+local MODEL_PREF_SRC = [==[
+local cache = {}
+local function stat_key(st)
+  return table.concat({ st.mtime.sec, st.mtime.nsec, st.size, st.ino }, ":")
+end
+return function(provider, value, entry)
+  local providers = require("straps.provider")
+  if not providers.is_provider(provider) then
+    if value == nil then return nil, nil, providers.unknown_provider_error(provider) end
+    return nil, providers.unknown_provider_error(provider)
+  end
+  local config_home = vim.env.XDG_CONFIG_HOME
+  if not config_home or config_home == "" then
+    local home = vim.env.HOME
+    config_home = (home and home ~= "") and (home .. "/.config") or nil
+  end
+  if not config_home then
+    if value ~= nil then return nil, "no $XDG_CONFIG_HOME or $HOME to write under" end
+    return nil
+  end
+  local dir = config_home .. "/straps"
+  local path = dir .. "/model_" .. provider
+
+  if value ~= nil then
+    value = tostring(value)
+    if vim.fn.isdirectory(dir) == 0 then
+      local ok = pcall(vim.fn.mkdir, dir, "p")
+      if not ok then return nil, "could not create " .. dir end
+    end
+    local record = { id = value }
+    if type(entry) == "table" and entry.id == value then record.entry = entry end
+    local tmp = path .. ".tmp"
+    local f, err = io.open(tmp, "w")
+    if not f then return nil, "could not write " .. tmp .. " (" .. tostring(err) .. ")" end
+    f:write(vim.json.encode(record) .. "\n")
+    f:close()
+    local renamed, rerr = vim.uv.fs_rename(tmp, path)
+    if not renamed then
+      os.remove(tmp)
+      return nil, "could not write " .. path .. " (" .. tostring(rerr) .. ")"
+    end
+    cache[path] = nil
+    return value
+  end
+
+  local st = vim.uv.fs_stat(path)
+  if not (st and st.type == "file") then return nil end
+  local key = stat_key(st)
+  local hit = cache[path]
+  if hit and hit.key == key then return hit.id, hit.entry, hit.err end
+  local f, open_err = io.open(path, "r")
+  if not f then return nil, nil, path .. " exists but could not be read (" .. tostring(open_err) .. ")" end
+  local text = f:read("*a")
+  f:close()
+  local id, stored, read_err
+  if vim.trim(text or "") ~= "" then
+    local ok, record = pcall(vim.json.decode, text)
+    if ok and type(record) == "table" and type(record.id) == "string" and record.id ~= "" then
+      id = record.id
+      stored = (type(record.entry) == "table" and record.entry.id == record.id) and record.entry or nil
+    else
+      read_err = path .. " is not a JSON object { id, entry? }; pick a model with :StrapsModel or delete the file"
+    end
+  end
+  cache[path] = { key = key, id = id, entry = stored, err = read_err }
+  return id, stored, read_err
 end
 ]==]
 
@@ -2771,8 +3190,20 @@ function M.register()
   define({
     name = "fn.provider_pref",
     kind = "fn",
-    doc = "Read/write the persisted provider choice ($XDG_CONFIG_HOME/straps/provider). (value?) -> value: no arg reads, a string writes.",
+    doc = "Read/write the persisted provider choice ($XDG_CONFIG_HOME/straps/provider). () -> value? | (nil, err) when the file exists but cannot be read (fn.provider then raises); (value) -> value | (nil, err) for an unknown name or a failed write.",
     source = PROVIDER_PREF_SRC,
+  })
+  define({
+    name = "fn.model_pref",
+    kind = "fn",
+    doc = "Read/write the persisted global model choice for a provider ($XDG_CONFIG_HOME/straps/model_<provider>, one JSON object { id, entry? }). (provider, value?, entry?) -> value, entry?: no value reads the id and its stored model-list entry; a string writes the id and, when given, the entry; (nil, err) for an unknown provider or a failed write. Read on each call by provider.resolve_model and provider.model_entry.",
+    source = MODEL_PREF_SRC,
+  })
+  define({
+    name = "fn.llamacpp_api_key",
+    kind = "fn",
+    doc = "(opts?) -> key?; opts.base_url is the server the key is for. Return the optional llama-server API key: $LLAMACPP_API_KEY, else $LLAMA_API_KEY (the variable llama-server reads for --api-key); nil when both are unset or empty.",
+    source = LLAMACPP_API_KEY_SRC,
   })
   -- layers.openai = false skips this openai-only entry (setup{ layers = {
   -- openai = false } }); nil-safe so register() called without setup() (10
@@ -2830,7 +3261,7 @@ function M.register()
   define({
     name = "fn.list_models",
     kind = "fn",
-    doc = "GET /v1/models from the effective backend, or an explicit provider argument ('anthropic'/'openai'), and return picker entries { id, label, thinking } (Anthropic infers the thinking tag from capabilities; OpenAI has none); (nil, err) on failure.",
+    doc = "GET /v1/models from the effective backend, or an explicit provider argument ('anthropic'/'openai'/'llamacpp'), and return picker entries { id, label, thinking, context?, max_output? } (Anthropic infers the thinking tag from capabilities; OpenAI and llama.cpp have none); (nil, err) on failure.",
     source = LIST_MODELS_SRC,
   })
   define({
@@ -2852,10 +3283,22 @@ function M.register()
     source = COMPACT_SRC,
   })
   define({
+    name = "fn.anthropic_messages",
+    kind = "fn",
+    doc = "The Anthropic Messages wire format over streaming SSE via curl. (req, ctx, opts?) -> { content, stop_reason, usage?, model? } (model: the id sent, which fn.provider pins); opts { base_url, model, model_entry, auth_headers, gzip, label } points it at another Messages-compatible server.",
+    source = ANTHROPIC_MESSAGES_SRC,
+  })
+  define({
     name = "fn.provider_anthropic",
     kind = "fn",
-    doc = "Anthropic Messages API over streaming SSE via curl. (req, ctx) -> { content, stop_reason }.",
+    doc = "Anthropic Messages API backend: fn.anthropic_messages with no opts. (req, ctx) -> { content, stop_reason, usage?, model? }.",
     source = PROVIDER_ANTHROPIC_SRC,
+  })
+  define({
+    name = "fn.provider_llamacpp",
+    kind = "fn",
+    doc = "llama.cpp llama-server (/v1/messages at config.llamacpp_base_url) through fn.anthropic_messages with opts; model from ctx.model (provider.resolve_model: vim.b straps_llamacpp_model, config.llamacpp_model, the model pref); raises when none is set. (req, ctx) -> { content, stop_reason, usage?, model? }.",
+    source = PROVIDER_LLAMACPP_SRC,
   })
   -- layers.openai = false skips this openai-only entry; see the matching
   -- guard around fn.openai_api_key above.
@@ -2863,14 +3306,14 @@ function M.register()
     define({
       name = "fn.provider_openai",
       kind = "fn",
-      doc = "OpenAI Responses API (/v1/responses) over streaming SSE via curl. (req, ctx) -> { content, stop_reason }.",
+      doc = "OpenAI Responses API (/v1/responses) over streaming SSE via curl. (req, ctx) -> { content, stop_reason, usage?, model? }.",
       source = PROVIDER_OPENAI_SRC,
     })
   end
   define({
     name = "fn.provider",
     kind = "fn",
-    doc = "Dispatch to fn.provider_openai or fn.provider_anthropic by config.provider (or vim.b straps_provider). (req, ctx) -> { content, stop_reason }.",
+    doc = "Dispatch to fn.provider_anthropic, fn.provider_openai or fn.provider_llamacpp by vim.b straps_provider, else config.provider, else fn.provider_pref, else \"anthropic\"; raises on an unknown name. Resolves the model once (provider.resolve_model) and passes ctx.provider, ctx.model and ctx.model_entry to the backend. After a successful, uncancelled request it pins the session's provider, the model sent (result.model, else ctx.model) and its list entry (state.set_session_pin), unless the session's provider or model variable changed during the request. (req, ctx) -> { content, stop_reason, model? }.",
     source = PROVIDER_SRC,
   })
 end

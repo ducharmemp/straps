@@ -201,12 +201,80 @@ end)
 
 it("a grant without chatgpt.tokens.use.direct is rejected and nothing is saved", function()
   registry.call("fn.openai_oauth_credential", false)
+  registry.call("fn.api_key_store", "openai", "sk-keep")
   set_mode("noscope")
   local _, q = login_url()
   local err = complete("http://127.0.0.1:1455/auth/callback?code=c&client_id=cid&state=" .. q.state)
   set_mode("ok")
+  local kept = registry.call("fn.api_key_store", "openai")
+  registry.call("fn.api_key_store", "openai", false)
   assert(err and tostring(err):find("chatgpt.tokens.use.direct", 1, true), tostring(err))
   assert(registry.call("fn.openai_oauth_credential") == nil)
+  assert(kept == "sk-keep", "a rejected login must keep the stored key: " .. tostring(kept))
+end)
+
+it("a failed token exchange keeps the stored OpenAI key", function()
+  registry.call("fn.openai_oauth_credential", false)
+  registry.call("fn.api_key_store", "openai", "sk-keep")
+  set_mode("fail")
+  local _, q = login_url()
+  local err = complete("http://127.0.0.1:1455/auth/callback?code=c&client_id=cid&state=" .. q.state)
+  set_mode("ok")
+  local kept = registry.call("fn.api_key_store", "openai")
+  registry.call("fn.api_key_store", "openai", false)
+  assert(err ~= nil, "the exchange should fail")
+  assert(kept == "sk-keep", "a failed login must keep the stored key: " .. tostring(kept))
+end)
+
+it("a login whose openai_base_url changes to another host before completion is not saved and keeps the key", function()
+  set_mode("ok")
+  set_sleep(0)
+  registry.call("fn.openai_oauth_credential", false)
+  registry.call("fn.api_key_store", "openai", "sk-keep")
+  local _, q = login_url()
+  local saved = straps.config.openai_base_url
+  straps.config.openai_base_url = "https://router.example/api"
+  local err = complete("http://127.0.0.1:1455/auth/callback?code=c&client_id=cid&state=" .. q.state)
+  straps.config.openai_base_url = saved
+  local kept = registry.call("fn.api_key_store", "openai")
+  registry.call("fn.api_key_store", "openai", false)
+  assert(err and tostring(err):find("a ChatGPT login only works with https://api.openai.com", 1, true)
+    and tostring(err):find("the ChatGPT login was not saved", 1, true) and not tostring(err):find("router.example", 1, true), tostring(err))
+  assert(registry.call("fn.openai_oauth_credential") == nil, "the login must not be saved")
+  assert(kept == "sk-keep", "the stored key must stay: " .. tostring(kept))
+end)
+
+it("a non-string openai_base_url refuses a login at start and at completion, naming the config key", function()
+  set_mode("ok")
+  set_sleep(0)
+  registry.call("fn.openai_oauth_credential", false)
+  local saved = straps.config.openai_base_url
+  straps.config.openai_base_url = 1
+  oauth.pending_login = nil
+  local ok, err = pcall(registry.call, "fn.openai_oauth_login", { open = function() end })
+  local pending = oauth.pending_login
+  straps.config.openai_base_url = saved
+  local _, q = login_url()
+  straps.config.openai_base_url = 1
+  local done_err = complete("http://127.0.0.1:1455/auth/callback?code=c&client_id=cid&state=" .. q.state)
+  straps.config.openai_base_url = saved
+  assert(not ok and tostring(err):find("config.openai_base_url must be a URL string (got number)", 1, true), tostring(err))
+  assert(pending == nil, "no login should start")
+  assert(tostring(done_err):find("config.openai_base_url must be a URL string (got number); the ChatGPT login was not saved", 1, true),
+    tostring(done_err))
+  assert(registry.call("fn.openai_oauth_credential") == nil, "the login must not be saved")
+end)
+
+it("a ChatGPT login starts with openai_base_url set to https://api.openai.com/v1/", function()
+  local saved = straps.config.openai_base_url
+  straps.config.openai_base_url = "https://api.openai.com/v1/"
+  oauth.pending_login = nil
+  local ok, err = pcall(registry.call, "fn.openai_oauth_login", { open = function() end })
+  straps.config.openai_base_url = saved
+  local pending = oauth.pending_login
+  oauth.pending_login = nil
+  assert(ok, tostring(err))
+  assert(pending ~= nil, "the login should start")
 end)
 
 it("logout during an in-flight exchange deletes the stored login and the new one is not saved", function()
@@ -218,10 +286,14 @@ it("logout during an in-flight exchange deletes the stored login and the new one
     on_done = function(e) done, err = true, e end })
   local lo = false
   registry.call("fn.openai_oauth_logout", function() lo = true end)
+  registry.call("fn.api_key_store", "openai", "sk-keep")
   assert(vim.wait(20000, function() return done and lo end, 10))
   set_sleep(0)
+  local kept = registry.call("fn.api_key_store", "openai")
+  registry.call("fn.api_key_store", "openai", false)
   assert(err and tostring(err):find("cancelled", 1, true), tostring(err))
   assert(registry.call("fn.openai_oauth_credential") == nil, "cancelled login must not be saved")
+  assert(kept == "sk-keep", "a cancelled login must keep the stored key: " .. tostring(kept))
 end)
 
 it("a cancel that arrives while the login save waits on the lock drops the credential", function()
@@ -353,13 +425,15 @@ it("fn.openai_api_key: a stored login wins over the key file", function()
   assert(key == "acc-stored" and source == "oauth", tostring(key) .. " " .. tostring(source))
 end)
 
-it("fn.openai_api_key: a failed refresh errors and does not fall back to the env key", function()
+it("fn.openai_api_key: a failed refresh errors and does not fall back to the key file or env key", function()
   store(cred_fixture({ expires = 0 }))
   vim.env.OPENAI_API_KEY = "env-key"
+  registry.call("fn.api_key_store", "openai", "file-key")
   set_mode("fail")
   local ok, err = pcall(registry.call, "fn.openai_api_key")
   set_mode("ok")
   vim.env.OPENAI_API_KEY = nil
+  registry.call("fn.api_key_store", "openai", false)
   assert(not ok and tostring(err):find(":StrapsLogin openai", 1, true), tostring(err))
 end)
 
@@ -374,7 +448,75 @@ it("fn.openai_api_key: the login token is never sent to a custom base URL", func
   store(cred_fixture())
   local ok, err = pcall(registry.call, "fn.openai_api_key", { base_url = "https://proxy.example" })
   assert(not ok and tostring(err):find("openai_base_url", 1, true), tostring(err))
+  assert(tostring(err):find(":StrapsLogin openai key", 1, true), tostring(err))
   assert(registry.call("fn.openai_api_key", { base_url = "https://api.openai.com/" }) == "acc-stored")
+  assert(registry.call("fn.openai_api_key", { base_url = "https://api.openai.com/v1" }) == "acc-stored")
+  local saved = straps.config.openai_base_url
+  straps.config.openai_base_url = "https://api.openai.com/v1/"
+  local ok_cfg, key = pcall(registry.call, "fn.openai_api_key")
+  straps.config.openai_base_url = saved
+  assert(ok_cfg and key == "acc-stored", tostring(key))
+end)
+
+it("fn.openai_api_key: without a ChatGPT login, the env key is used once the key file is gone", function()
+  registry.call("fn.openai_oauth_credential", false)
+  registry.call("fn.api_key_store", "openai", "file-key")
+  vim.env.OPENAI_API_KEY = "env-key"
+  local key1, source1 = registry.call("fn.openai_api_key")
+  registry.call("fn.api_key_store", "openai", false)
+  local key2, source2 = registry.call("fn.openai_api_key")
+  vim.env.OPENAI_API_KEY = nil
+  assert(key1 == "file-key" and source1 == "stored", tostring(key1) .. " " .. tostring(source1))
+  assert(key2 == "env-key" and source2 == "env", tostring(key2) .. " " .. tostring(source2))
+end)
+
+it("a completed ChatGPT login deletes a stored OpenAI key file", function()
+  set_mode("ok")
+  set_sleep(0)
+  registry.call("fn.api_key_store", "openai", "file-key")
+  local msgs = {}
+  local orig = vim.notify
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  local _, q = login_url()
+  local done = false
+  registry.call("fn.openai_oauth_login", { callback_url = "http://127.0.0.1:1455/auth/callback?code=c&client_id=cid&state=" .. q.state })
+  done = vim.wait(20000, function() return #msgs > 0 end, 10)
+  vim.notify = orig
+  assert(done, "login never reported")
+  assert(registry.call("fn.openai_oauth_credential") ~= nil, "login not saved")
+  assert(registry.call("fn.api_key_store", "openai") == nil, "key file should be deleted")
+  assert(msgs[1]:find("signed in with ChatGPT; deleted " .. xdg .. "/straps/openai_api_key", 1, true), vim.inspect(msgs))
+end)
+
+local function login_notices()
+  local msgs = {}
+  local orig = vim.notify
+  vim.notify = function(m, lvl) msgs[#msgs + 1] = { msg = tostring(m), level = lvl } end
+  local _, q = login_url()
+  registry.call("fn.openai_oauth_login", { callback_url = "http://127.0.0.1:1455/auth/callback?code=c&client_id=cid&state=" .. q.state })
+  local done = vim.wait(20000, function() return #msgs > 0 end, 10)
+  vim.notify = orig
+  assert(done, "login never reported")
+  return msgs
+end
+
+it("a completed ChatGPT login with no key file reports only the sign-in", function()
+  set_mode("ok")
+  set_sleep(0)
+  registry.call("fn.api_key_store", "openai", false)
+  local msgs = login_notices()
+  assert(#msgs == 1 and msgs[1].msg == "straps: signed in with ChatGPT", vim.inspect(msgs))
+end)
+
+it("a completed ChatGPT login whose key-file delete fails still reports success, with a note", function()
+  set_mode("ok")
+  set_sleep(0)
+  vim.fn.mkdir(xdg .. "/straps/openai_api_key/blocker", "p")
+  local msgs = login_notices()
+  vim.fn.delete(xdg .. "/straps/openai_api_key", "rf")
+  assert(registry.call("fn.openai_oauth_credential") ~= nil, "login not saved")
+  assert(#msgs == 1 and msgs[1].level ~= vim.log.levels.ERROR, vim.inspect(msgs))
+  assert(msgs[1].msg:find("^straps: signed in with ChatGPT; could not delete the stored OpenAI API key"), vim.inspect(msgs))
 end)
 
 local function provider_call(opts)
@@ -492,17 +634,225 @@ local function has(msgs, s)
   for _, m in ipairs(msgs) do if m.msg:find(s, 1, true) then return m end end
 end
 
-it(":StrapsLogin rejects other providers and extra arguments; completion offers openai", function()
+it(":StrapsLogin rejects unknown providers (not echoed) and extra arguments; completion offers providers and key", function()
   local ui = require("straps.ui")
-  local msgs = capture_notify(function() ui.login({ "anthropic" }) end)
-  assert(has(msgs, "only `openai` supports login"), vim.inspect(msgs))
+  local msgs = capture_notify(function() ui.login({ "sk-secret" }) end)
+  local m = has(msgs, "unknown provider")
+  assert(m and not m.msg:find("sk-secret", 1, true) and m.msg:find("anthropic, openai, llamacpp", 1, true), vim.inspect(msgs))
   msgs = capture_notify(function() ui.login({ "openai", "a", "b" }) end)
   assert(has(msgs, "usage"), vim.inspect(msgs))
   vim.g.loaded_straps = nil
   vim.cmd.source(root .. "/plugin/straps.lua")
   assert(vim.deep_equal(vim.fn.getcompletion("StrapsLogin o", "cmdline"), { "openai" }))
+  assert(vim.deep_equal(vim.fn.getcompletion("StrapsLogin ", "cmdline"), { "anthropic", "openai", "llamacpp" }))
   assert(#vim.fn.getcompletion("StrapsLogin x", "cmdline") == 0)
-  assert(#vim.fn.getcompletion("StrapsLogin openai ", "cmdline") == 0)
+  assert(vim.deep_equal(vim.fn.getcompletion("StrapsLogin openai ", "cmdline"), { "key" }))
+  assert(vim.deep_equal(vim.fn.getcompletion("StrapsLogin anthropic ", "cmdline"), { "key" }))
+  assert(#vim.fn.getcompletion("StrapsLogin nope ", "cmdline") == 0)
+  assert(vim.deep_equal(vim.fn.getcompletion("StrapsLogout l", "cmdline"), { "llamacpp" }))
+end)
+
+it(":StrapsLogin openai key stores the key, then signs out of ChatGPT and cancels a pending login", function()
+  local ui = require("straps.ui")
+  store(cred_fixture())
+  login_url()
+  assert(oauth.pending_login ~= nil)
+  local orig_input = vim.fn.inputsecret
+  vim.fn.inputsecret = function() return "  sk-typed  " end
+  local msgs = {}
+  local orig = vim.notify
+  vim.notify = function(mm) msgs[#msgs + 1] = tostring(mm) end
+  local ok, err = pcall(ui.login, { "openai", "key" })
+  vim.wait(5000, function() return #msgs > 0 end, 10)
+  vim.notify = orig
+  vim.fn.inputsecret = orig_input
+  local pending = oauth.pending_login
+  local cred = registry.call("fn.openai_oauth_credential")
+  local stored = registry.call("fn.api_key_store", "openai")
+  registry.call("fn.api_key_store", "openai", false)
+  assert(ok, tostring(err))
+  assert(pending == nil, "pending login should be cancelled")
+  assert(cred == nil, "ChatGPT login should be deleted")
+  assert(stored == "sk-typed", "key file should hold the typed key")
+  assert(msgs[1] and msgs[1]:find("saved the openai API key", 1, true) and msgs[1]:find("signed out of ChatGPT", 1, true),
+    vim.inspect(msgs))
+end)
+
+it(":StrapsLogin openai key with an empty answer keeps the ChatGPT login", function()
+  local ui = require("straps.ui")
+  store(cred_fixture())
+  local orig_input = vim.fn.inputsecret
+  vim.fn.inputsecret = function() return "" end
+  local msgs = capture_notify(function() ui.login({ "openai", "key" }) end)
+  vim.fn.inputsecret = orig_input
+  assert(has(msgs, "login cancelled"), vim.inspect(msgs))
+  assert(registry.call("fn.openai_oauth_credential") ~= nil, "the ChatGPT login should stay")
+  assert(registry.call("fn.api_key_store", "openai") == nil, "no key should be written")
+end)
+
+it(":StrapsLogin openai key stores the key and says the login still wins when the sign-out fails", function()
+  local ui = require("straps.ui")
+  store(cred_fixture())
+  registry.call("fn.api_key_store", "openai", "sk-old")
+  local real = registry.get("fn.openai_oauth_logout")
+  registry.define({ name = real.name, kind = "fn", doc = "test",
+    source = [[return function(cb) vim.schedule(function() cb("could not lock the ChatGPT login: busy") end) end]] })
+  local orig_input = vim.fn.inputsecret
+  vim.fn.inputsecret = function() return "sk-new" end
+  local msgs = {}
+  local orig = vim.notify
+  vim.notify = function(m, lvl) msgs[#msgs + 1] = { msg = tostring(m), level = lvl } end
+  local ok, err = pcall(ui.login, { "openai", "key" })
+  vim.wait(2000, function() return #msgs > 0 end, 10)
+  vim.notify = orig
+  vim.fn.inputsecret = orig_input
+  registry.define({ name = real.name, kind = real.kind, doc = real.doc, source = real.source })
+  local left = registry.call("fn.api_key_store", "openai")
+  registry.call("fn.api_key_store", "openai", false)
+  local cred = registry.call("fn.openai_oauth_credential")
+  registry.call("fn.openai_oauth_credential", false)
+  assert(ok, tostring(err))
+  assert(msgs[1] and msgs[1].level == vim.log.levels.ERROR and msgs[1].msg:find("saved the openai API key", 1, true)
+    and msgs[1].msg:find("could not lock", 1, true) and msgs[1].msg:find("still takes precedence", 1, true), vim.inspect(msgs))
+  assert(left == "sk-new", "the new key should be stored: " .. tostring(left))
+  assert(cred ~= nil, "the ChatGPT login was not signed out")
+end)
+
+it(":StrapsLogin openai key reports a sign-out that raises", function()
+  local ui = require("straps.ui")
+  store(cred_fixture())
+  local real = registry.get("fn.openai_oauth_logout")
+  registry.define({ name = real.name, kind = "fn", doc = "test", source = [[return function() error("straps: lock broken", 0) end]] })
+  local orig_input = vim.fn.inputsecret
+  vim.fn.inputsecret = function() return "sk-raise" end
+  local ok, msgs = pcall(capture_notify, function() ui.login({ "openai", "key" }) end)
+  vim.fn.inputsecret = orig_input
+  registry.define({ name = real.name, kind = real.kind, doc = real.doc, source = real.source })
+  local left = registry.call("fn.api_key_store", "openai")
+  registry.call("fn.api_key_store", "openai", false)
+  registry.call("fn.openai_oauth_credential", false)
+  assert(ok, tostring(msgs))
+  local e = has(msgs, "lock broken")
+  assert(e and e.level == vim.log.levels.ERROR and e.msg:find("saved the openai API key", 1, true)
+    and e.msg:find("still takes precedence", 1, true), vim.inspect(msgs))
+  assert(left == "sk-raise", tostring(left))
+end)
+
+it(":StrapsLogin with no argument and openai as the resolved provider starts the ChatGPT login", function()
+  local ui = require("straps.ui")
+  oauth.pending_login = nil
+  local asked = false
+  local orig_input, orig_open = vim.fn.inputsecret, vim.ui.open
+  vim.fn.inputsecret = function() asked = true return "x" end
+  vim.ui.open = function() return nil, "no browser" end
+  local msgs = capture_notify(function() ui.login({}) end)
+  vim.fn.inputsecret, vim.ui.open = orig_input, orig_open
+  local pending = oauth.pending_login
+  oauth.pending_login = nil
+  assert(not asked, "no key prompt should run")
+  assert(pending ~= nil and has(msgs, oauth.AUTHORIZE_URL), vim.inspect(msgs))
+end)
+
+it(":StrapsLogin openai key with an invalid key keeps the ChatGPT login and the old key", function()
+  local ui = require("straps.ui")
+  store(cred_fixture())
+  registry.call("fn.api_key_store", "openai", "sk-old")
+  local orig_input = vim.fn.inputsecret
+  vim.fn.inputsecret = function() return "sk new" end
+  local msgs = capture_notify(function() ui.login({ "openai", "key" }) end)
+  vim.fn.inputsecret = orig_input
+  local left = registry.call("fn.api_key_store", "openai")
+  registry.call("fn.api_key_store", "openai", false)
+  local e = has(msgs, "the key has spaces or control characters")
+  assert(e and e.level == vim.log.levels.ERROR and not e.msg:find("sk new", 1, true), vim.inspect(msgs))
+  assert(registry.call("fn.openai_oauth_credential") ~= nil, "the ChatGPT login should stay")
+  assert(left == "sk-old", "the old key should stay: " .. tostring(left))
+end)
+
+it(":StrapsLogin openai key with no ChatGPT login says only that the key was saved", function()
+  local ui = require("straps.ui")
+  registry.call("fn.openai_oauth_credential", false)
+  oauth.pending_login = nil
+  local orig_input = vim.fn.inputsecret
+  vim.fn.inputsecret = function() return "sk-only" end
+  local msgs = {}
+  local orig = vim.notify
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  ui.login({ "openai", "key" })
+  vim.wait(2000, function() return #msgs > 0 end, 10)
+  vim.notify = orig
+  vim.fn.inputsecret = orig_input
+  registry.call("fn.api_key_store", "openai", false)
+  assert(msgs[1] == "straps: saved the openai API key to " .. xdg .. "/straps/openai_api_key", vim.inspect(msgs))
+end)
+
+it(":StrapsLogin openai key during a pending ChatGPT login reports the cancel", function()
+  local ui = require("straps.ui")
+  registry.call("fn.openai_oauth_credential", false)
+  login_url()
+  local orig_input = vim.fn.inputsecret
+  vim.fn.inputsecret = function() return "sk-p" end
+  local msgs = {}
+  local orig = vim.notify
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  ui.login({ "openai", "key" })
+  vim.wait(2000, function() return #msgs > 0 end, 10)
+  vim.notify = orig
+  vim.fn.inputsecret = orig_input
+  registry.call("fn.api_key_store", "openai", false)
+  assert(msgs[1] and msgs[1]:find("; pending ChatGPT login cancelled$"), vim.inspect(msgs))
+  assert(oauth.pending_login == nil)
+end)
+
+it(":StrapsLogin openai with a non-URL argument shows the usage without echoing it", function()
+  local ui = require("straps.ui")
+  local msgs = capture_notify(function() ui.login({ "openai", "sk-pasted" }) end)
+  local m = has(msgs, "usage: :StrapsLogin openai [redirect-url | key]")
+  assert(m and not m.msg:find("sk-pasted", 1, true), vim.inspect(msgs))
+end)
+
+it("a ChatGPT login is refused with a custom openai_base_url, and the stored key stays", function()
+  local ui = require("straps.ui")
+  registry.call("fn.api_key_store", "openai", "sk-router")
+  oauth.pending_login = nil
+  local saved = straps.config.openai_base_url
+  straps.config.openai_base_url = "https://router.example/api"
+  local msgs = capture_notify(function() ui.login({ "openai" }) end)
+  straps.config.openai_base_url = saved
+  local left = registry.call("fn.api_key_store", "openai")
+  registry.call("fn.api_key_store", "openai", false)
+  local m = has(msgs, "a ChatGPT login only works with https://api.openai.com")
+  assert(m and m.msg:find(":StrapsLogin openai key", 1, true), vim.inspect(msgs))
+  assert(oauth.pending_login == nil, "no login should start")
+  assert(left == "sk-router", "the stored key should stay")
+end)
+
+it("opts.on_done gets a note when a completed ChatGPT login deletes the stored key", function()
+  set_mode("ok")
+  set_sleep(0)
+  registry.call("fn.api_key_store", "openai", "sk-old")
+  local _, q = login_url()
+  local done, err, note = false, nil, nil
+  registry.call("fn.openai_oauth_login", { callback_url = "http://127.0.0.1:1455/auth/callback?code=c&client_id=cid&state=" .. q.state,
+    on_done = function(e, n) done, err, note = true, e, n end })
+  assert(vim.wait(20000, function() return done end, 10), "login never finished")
+  assert(err == nil, tostring(err))
+  assert(note == "deleted " .. xdg .. "/straps/openai_api_key", tostring(note))
+end)
+
+it(":StrapsLogout openai with only a pending login reports the cancel", function()
+  local ui = require("straps.ui")
+  registry.call("fn.openai_oauth_credential", false)
+  registry.call("fn.api_key_store", "openai", false)
+  login_url()
+  local msgs = {}
+  local orig = vim.notify
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  ui.logout({ "openai" })
+  vim.wait(2000, function() return #msgs > 0 end, 10)
+  vim.notify = orig
+  assert(msgs[1] == "straps: pending ChatGPT login cancelled", vim.inspect(msgs))
+  assert(oauth.pending_login == nil)
 end)
 
 it(":StrapsLogin openai starts a login and prints the URL; a bad paste is reported without a prefix twice", function()
@@ -530,10 +880,23 @@ it(":StrapsLogout reports what it did", function()
   store(cred_fixture())
   ui.logout({ "openai" })
   vim.wait(5000, function() return #msgs > 1 end, 10)
+  registry.call("fn.api_key_store", "openai", "file-key")
+  ui.logout({ "openai" })
+  vim.wait(5000, function() return #msgs > 2 end, 10)
+  store(cred_fixture())
+  registry.call("fn.api_key_store", "openai", "file-key")
+  vim.env.OPENAI_API_KEY = "env-key"
+  ui.logout({ "openai" })
+  vim.wait(5000, function() return #msgs > 3 end, 10)
+  vim.env.OPENAI_API_KEY = nil
   vim.notify = orig
-  assert(msgs[1].msg:find("no ChatGPT login stored", 1, true), vim.inspect(msgs))
-  assert(msgs[2] and msgs[2].msg:find("signed out", 1, true), vim.inspect(msgs))
+  assert(msgs[1].msg:find("no stored openai credential", 1, true), vim.inspect(msgs))
+  assert(msgs[2] and msgs[2].msg == "straps: signed out of ChatGPT", vim.inspect(msgs))
+  assert(msgs[3] and msgs[3].msg == "straps: deleted " .. xdg .. "/straps/openai_api_key", vim.inspect(msgs))
+  assert(msgs[4] and msgs[4].msg:find("signed out of ChatGPT", 1, true) and msgs[4].msg:find("deleted ", 1, true)
+    and msgs[4].msg:find("$OPENAI_API_KEY is still set", 1, true), vim.inspect(msgs))
   assert(registry.call("fn.openai_oauth_credential") == nil)
+  assert(registry.call("fn.api_key_store", "openai") == nil)
 end)
 
 it("health reports a stored login, its source, and a missing client id", function()
@@ -545,7 +908,8 @@ it("health reports a stored login, its source, and a missing client id", functio
   end
   local function run()
     rec = {}
-    pcall(require("straps.health").check)
+    local ok, err = pcall(require("straps.health").check)
+    assert(ok, tostring(err))
     return rec
   end
   local function find(kind, s)

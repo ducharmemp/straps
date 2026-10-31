@@ -61,13 +61,15 @@ provider, tools, editor tools and UI. It is idempotent: registration uses
 `define_default`, which skips names that already exist, so a redefinition
 (yours or the agent's) survives a re-run of `setup()`.
 
-The API key is read by |fn.api_key|: `$ANTHROPIC_API_KEY` first, then the
-first line of `$XDG_CONFIG_HOME/straps/api_key` (which must be chmod 600).
-The OpenAI provider reads |fn.openai_api_key|, which also accepts a ChatGPT
-login made with |:StrapsLogin|. The llama.cpp provider needs a key only when
-`llama-server` runs with `--api-key`; |fn.llamacpp_api_key| reads
-`$LLAMACPP_API_KEY`, else `$LLAMA_API_KEY` (the variable `llama-server` reads),
-and the key is sent as `Authorization: Bearer`.
+Every provider reads its key the same way: the key stored by |:StrapsLogin|
+(|fn.api_key_store|, `$XDG_CONFIG_HOME/straps/<provider>_api_key`, which must
+be chmod 600) first, then the environment. |fn.anthropic_api_key| reads
+`$ANTHROPIC_API_KEY`; |fn.openai_api_key| tries a ChatGPT login made with
+|:StrapsLogin| before the stored key, then reads `$OPENAI_API_KEY`;
+|fn.llamacpp_api_key| reads `$LLAMACPP_API_KEY`, else `$LLAMA_API_KEY` (the
+variable `llama-server` reads). The llama.cpp key is optional: `llama-server`
+needs one only when it runs with `--api-key`. Anthropic sends the key as
+`x-api-key`, OpenAI and llama.cpp as `Authorization: Bearer`.
 
 The commands work without `setup()` (they `require` lazily), but folding, the
 `gf` mapping and rendering are only fully wired once `setup()` has run.
@@ -175,6 +177,19 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			disk.
 
 							*:StrapsLogin*
+:StrapsLogin [{provider} [key]]
+			Store a key for {provider} (default: the current
+			buffer's provider; for openai the bare form is the
+			ChatGPT sign-in below). anthropic and llamacpp prompt
+			for the key (not echoed) with or without `key` and
+			write it with |fn.api_key_store|. The key is never an
+			argument; any other extra argument is rejected and its
+			line removed from command history (the |quote_:|
+			register keeps it until the next command line; it is
+			not written to ShaDa). With a key already stored, the
+			prompt says that it replaces the stored key. The
+			success message names any set key variable that the
+			stored key overrides.
 :StrapsLogin openai [{url}]
 			Sign in with ChatGPT for the OpenAI provider. Without
 			{url} it opens the ChatGPT sign-in page and prints its
@@ -183,12 +198,25 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			full URL from the address bar and run
 			`:StrapsLogin openai {url}`. The login is stored in
 			$XDG_CONFIG_HOME/straps/openai_oauth.json (mode 600),
-			refreshed automatically, and wins over $OPENAI_API_KEY
-			and the key file. See |fn.openai_api_key|.
+			refreshed automatically, and wins over the stored key
+			and $OPENAI_API_KEY. Completing the login deletes a
+			stored OpenAI API key through |fn.api_key_store| and
+			the success message says so; a symlinked key file is
+			left in place and the ChatGPT login takes precedence
+			over it. Refused when `openai_base_url` is not
+			https://api.openai.com. See |fn.openai_api_key|.
+:StrapsLogin openai key
+			Prompt for an OpenAI API key and store it, then sign
+			out of ChatGPT (cancelling a pending login). A
+			rejected key changes nothing; if the sign-out fails
+			the key stays stored and the ChatGPT login still wins.
 
 							*:StrapsLogout*
-:StrapsLogout openai	Cancel a pending ChatGPT login and delete the stored
-			one.
+:StrapsLogout [{provider}]
+			Delete {provider}'s stored key; for openai also cancel
+			a pending ChatGPT login and delete the stored one.
+			Names any variable the default key fn would still
+			read. Without {provider} it asks first.
 
 							*:StrapsAuto*
 :StrapsAuto [off|{cats}]
@@ -438,18 +466,27 @@ efforts			(list) off/low/medium/high, each { name, level?,
 			budget_tokens? }.
 base_url		(string|nil) nil -> https://api.anthropic.com. Prefixes
 			/v1/messages, so a compatible proxy is a config knob.
+			Every base URL (this one, `openai_base_url` and
+			`llamacpp_base_url`) must start with http:// or
+			https:// and a host, and have no whitespace, control
+			characters, query or fragment. A trailing "/" or "/v1"
+			is dropped, the scheme and host are lowercased and a
+			default port (:80, :443) is dropped
+			(provider.base_url).
 provider		(string|nil) nil. Backend for |fn.provider|:
 			"anthropic", "openai" or "llamacpp". nil -> the
 			|:StrapsProvider| persisted choice
 			(~/.config/straps/provider) else "anthropic".
 			Per session via b:straps_provider.
 openai_base_url		(string|nil) nil -> https://api.openai.com. Prefixes
-			/v1/responses for the OpenAI backend.
+			/v1/responses for the OpenAI backend. See `base_url`
+			for the URL rule.
 openai_model		(string|nil) nil. Model id when provider == "openai";
 			kept separate from Anthropic `model`. nil uses the
 			persisted global pick, else "gpt-5".
-llamacpp_base_url	(string|nil) "http://127.0.0.1:8080". Prefixes
+llamacpp_base_url	(string|nil) nil -> http://127.0.0.1:8080. Prefixes
 			/v1/messages and /v1/models for the llama.cpp backend.
+			See `base_url` for the URL rule.
 llamacpp_model		(string|nil) nil. Model id when provider ==
 			"llamacpp": the server's --alias or a router-mode
 			model name. Required: |fn.provider_llamacpp| raises
@@ -848,9 +885,9 @@ fn.provider(req, ctx) -> { content, stop_reason, usage }
 						*fn.provider_anthropic*
 fn.provider_anthropic(req, ctx)	The Anthropic backend: calls
 		|fn.anthropic_messages| with no `opts`, so endpoint, key and
-		model come from config `base_url`, |fn.api_key| and
-		b:straps_model / config `model`. Redefining it changes only
-		Anthropic sessions.
+		model come from `provider.base_url`,
+		|fn.anthropic_api_key| and b:straps_model / config `model`.
+		Redefining it changes only Anthropic sessions.
 						*fn.anthropic_messages*
 fn.anthropic_messages(req, ctx, opts?)
 		The Anthropic Messages wire format over streaming SSE via
@@ -859,27 +896,31 @@ fn.anthropic_messages(req, ctx, opts?)
 		server: `base_url`, `model` (replaces b:straps_model /
 		config `model`), `models` (replaces config `models`),
 		`auth_headers` (argv list replacing the x-api-key header;
-		|fn.api_key| is not called; with `base_url` set and
+		|fn.anthropic_api_key| is not called; with `base_url` set and
 		`auth_headers` omitted, no auth header is sent), `gzip`
 		(false disables compression) and `label` (names the backend
 		in errors). |fn.provider_llamacpp| routes through it, so a
 		redefinition must accept and honor `opts`.
 						*fn.provider_llamacpp*
 fn.provider_llamacpp(req, ctx)	A llama.cpp `llama-server` through
-		|fn.anthropic_messages| with `opts`: endpoint config
-		`llamacpp_base_url`, model b:straps_llamacpp_model else
-		config `llamacpp_model` (an error when both are unset), no
-		gzip, and an optional Bearer key from |fn.llamacpp_api_key|.
+		|fn.anthropic_messages| with `opts`: endpoint
+		`provider.base_url("llamacpp")`, model b:straps_llamacpp_model
+		else config `llamacpp_model` (an error when both are unset),
+		no gzip, and an optional Bearer key from
+		|fn.llamacpp_api_key|.
 						*fn.llamacpp_api_key*
-fn.llamacpp_api_key(opts?) -> key?	`$LLAMACPP_API_KEY`, else
-		`$LLAMA_API_KEY`, or nil when both are unset or empty.
-		`opts.base_url` is the server the key is for; every caller
-		passes it, so a redefinition can pick a key per server.
+fn.llamacpp_api_key(opts?) -> key?, source
+		The stored key (|fn.api_key_store|), else `$LLAMACPP_API_KEY`,
+		else `$LLAMA_API_KEY`, or nil when none is set. `source` is
+		"stored" or "env". `opts.base_url` is the server the key is
+		for; every caller passes it, so a redefinition can pick a key
+		per server.
 						*fn.provider_openai*
 fn.provider_openai(req, ctx)	The OpenAI Responses API over streaming
 		SSE via curl. Translates the request/response to and from the
 		same block shape; Bearer auth via |fn.openai_api_key|, endpoint
-		config `openai_base_url`, and model config `openai_model`.
+		`provider.base_url("openai")`, and model config
+		`openai_model`.
 						*fn.provider_pref*
 fn.provider_pref(value?)	Read (no arg) or write (a string) the persisted
 		provider choice at $XDG_CONFIG_HOME/straps/provider. Written by
@@ -892,24 +933,59 @@ fn.model_pref(provider, value?, entry?) -> value, entry?
 		|:StrapsModel| pick. Read on each request, so it applies to every
 		model key that setup{} did not set, and to other running Neovim
 		instances at once.
-						*fn.api_key*
-fn.api_key() -> string		Resolve the Anthropic API key (see |straps-setup|).
+						*fn.api_key_store*
+fn.api_key_store(provider, value?)
+		The stored key at $XDG_CONFIG_HOME/straps/<provider>_api_key
+		(mode 600, directory 700), written by |:StrapsLogin|. A
+		relative $XDG_CONFIG_HOME or $HOME is ignored. No value
+		reads it:
+		key?, path (nil key when the path is absent, blank or not a
+		file; raises on a file accessible by group or other, an
+		unreadable one, a symlink to a missing file, or a key that
+		provider.clean_key refuses). A string writes the key as
+		provider.clean_key cleans it (ends trimmed; refused with
+		spaces, control or non-ASCII characters inside): key, path.
+		false deletes it: removed, path. Raises for an unknown
+		provider. With no config directory, a read or delete gives
+		nil, nil and a write raises. Every failure raises (unlike
+		the pref entries, which return nil, err). A symlink at the
+		path is read through; a write or delete on it raises.
+		Redefine it to keep keys elsewhere (a keychain, `pass`); a
+		redefinition handles all three modes, and a delete returns
+		true only when it removed a key. The key fns, |:StrapsLogin|,
+		|:StrapsLogout| and health all call it. See
+		|fn.openai_api_key| for how a ChatGPT login takes precedence
+		over the stored openai key.
+						*fn.anthropic_api_key*
+fn.anthropic_api_key(opts?) -> key, source
+		Resolve the Anthropic key: the stored key
+		(|fn.api_key_store|), else $ANTHROPIC_API_KEY (see
+		|straps-setup|). `source` is "stored" or "env". Raises when
+		neither is set. `opts.base_url` is the server the key is for
+		(the default ignores it).
 						*fn.openai_api_key*
 fn.openai_api_key(opts?) -> key, source
 		Resolve the OpenAI key. A stored ChatGPT login (|:StrapsLogin|)
-		wins, refreshed when it expires within 5 minutes; else
-		$OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key
-		(chmod 600). `source` is "oauth", "env" or "file". opts:
-		`ctx` (wait for a refresh through ctx.await), `refresh = false`
-		(never refresh; used by health), `base_url` (the login token is
-		refused for anything but https://api.openai.com), `wait_ms`
-		(synchronous refresh wait cap). A failed refresh raises; it does
-		not fall back to the env key or key file.
+		wins, refreshed when it expires within 5 minutes; else the
+		stored key (|fn.api_key_store|, |:StrapsLogin| openai key),
+		then $OPENAI_API_KEY. `source` is "oauth", "stored" or
+		"env"; with `opts.ctx` cancelled during a refresh it returns
+		nil, "cancelled". opts: `ctx` (wait for a refresh through
+		ctx.await), `refresh = false` (never refresh; used by
+		health), `base_url` (the login token is refused for anything
+		but https://api.openai.com after normalization, so "/v1",
+		upper case and ":443" are accepted), `wait_ms` (synchronous
+		refresh wait cap). A failed refresh raises; it does not fall
+		back to the stored key or the env key.
 						*fn.openai_oauth_login*
 fn.openai_oauth_login(opts)	Sign in with ChatGPT. `{}` starts a login
 		(PKCE, state) and opens/returns the authorize URL; `{ callback_url
-		= url }` completes it from the pasted redirect URL; `{ cancel =
-		true }` cancels. The pending login lives in `straps.oauth`.
+		= url }` completes it from the pasted redirect URL and deletes
+		a stored OpenAI API key; `{ cancel = true }` cancels. Starting
+		raises when `openai_base_url` is not https://api.openai.com.
+		`opts.on_done(err?, note?)` replaces the notify; `note` reports
+		what deleting the stored key did. The pending login lives
+		in `straps.oauth`.
 						*fn.openai_oauth_refresh*
 fn.openai_oauth_refresh(opts, done)	Refresh the stored login under
 		|fn.openai_oauth_lock|; `opts.rejected_access` forces a refresh
@@ -926,7 +1002,8 @@ fn.openai_oauth_post(form, cb)	POST a form to the OpenAI token endpoint
 		(body on stdin, never argv).
 						*fn.openai_oauth_logout*
 fn.openai_oauth_logout(cb?)	Cancel a pending login and delete the stored
-		one.
+		one under the lock: cb(err?, "deleted"|"cancelled"|"none").
+		|:StrapsLogout| openai also deletes the stored API key.
 						*fn.openai_device_id*
 fn.openai_device_id()		This installation's UUIDv4, sent as
 		`ext_agent_host_id`.
@@ -1294,15 +1371,17 @@ category, add `vcs` to the grantable list, then `:StrapsAuto vcs` grants it. >lu
 	:checkhealth straps
 <
 Diagnoses everything that can be wrong before a session runs: the Neovim
-version, `curl` (and optional ripgrep), the API key (including a group/other
-readable key file, the ChatGPT login file for OpenAI, which source the key
-comes from, and for llama.cpp the `llamacpp_base_url` and whether
-|fn.llamacpp_api_key| returns a key), a writable `session_dir`, the tree-sitter `straps` parser
-and its queries, the `.straps.lua` trust state, the loaded registry (entry
-counts, redefinitions, missing core entries), the active provider's
-model/effort pairing, and
-any runs still in flight. Every probe is isolated, so the report runs even
-when `setup()` never ran or the data dir is unwritable.
+version, `curl` (and optional ripgrep), the API key (the provider's base URL,
+which source the key fn returned a key from, the ChatGPT login's expiry for
+OpenAI, and problems: a stored key file accessible by group or other,
+unreadable or malformed, a dangling symlink, a non-file at the key path or a
+key file with an empty first line, a key that requests refuse, a bad ChatGPT
+login file; a missing llama.cpp key is info), a writable `session_dir`, the
+tree-sitter `straps` parser and its queries, the `.straps.lua` trust state,
+the loaded registry (entry counts, redefinitions, missing core entries), the
+active provider's model/effort pairing, and any runs still in flight. Every
+probe is isolated, so the report runs even when `setup()` never ran or the
+data dir is unwritable.
 
 ==============================================================================
 15. HIGHLIGHT GROUPS					*straps-highlights*

@@ -99,103 +99,69 @@ local function check_provider_name(config)
   return true, name
 end
 
--- llama-server needs a key only when it runs with --api-key, so a missing key
--- is reported as info. The key comes from fn.llamacpp_api_key when it is
--- registered, so a redefined key source is what gets reported.
-local function check_llamacpp_key(config)
-  health.start("straps: API key (llamacpp)")
-  local providers = require("straps.provider")
-  health.info("llamacpp_base_url: " .. providers.redact_url(providers.llamacpp_base_url(config)))
-  local registry = try(function() return require("straps.registry") end)
-  local key
-  if registry and registry.get("fn.llamacpp_api_key") then
-    local ok, got = pcall(registry.call, "fn.llamacpp_api_key",
-      { base_url = require("straps.provider").llamacpp_base_url(config) })
-    if not ok then
-      health.error("fn.llamacpp_api_key raised", { tostring(got) })
-      return
-    end
-    key = got
-  else
-    for _, name in ipairs({ "LLAMACPP_API_KEY", "LLAMA_API_KEY" }) do
-      if not key and vim.env[name] and vim.env[name] ~= "" then key = vim.env[name] end
-    end
-  end
-  if type(key) == "string" and key ~= "" then
-    health.ok("API key set (" .. #key .. " chars), sent as Authorization: Bearer")
-  else
-    health.info("no API key (set $LLAMACPP_API_KEY or $LLAMA_API_KEY if llama-server runs with --api-key)")
-  end
-end
-
--- The API key, via fn.api_key / fn.openai_api_key when the registry is loaded
--- (so a redefined key source is what gets reported), else the same default
--- logic; llamacpp goes to check_llamacpp_key. Probes the provider
--- active_provider resolves. Never print the key: report only where it came
--- from.
+-- The API key section for the provider check_provider_name resolves: the
+-- base URL, the slot's key_fn verdict (which source it returned, so a
+-- redefined or reordered key fn is described as it runs), the ChatGPT
+-- login's expiry and problems. A missing key is an error when key_required,
+-- else info. Never print the key: report only where it came from.
 local function check_api_key()
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
   local ok_name, provider = check_provider_name(config)
   if not ok_name then return end
-  if provider == "llamacpp" then
-    check_llamacpp_key(config)
-    return
+  local providers = require("straps.provider")
+  local slot = providers.provider_slot(provider)
+  local base_url, url_err = providers.base_url(provider, config)
+
+  health.start("straps: API key (" .. provider .. ")")
+  if base_url then
+    health.info(slot.base_url_key .. ": " .. providers.redact_url(base_url))
+  else
+    health.error(url_err .. "; every " .. provider .. " request will fail",
+      { "set " .. slot.base_url_key .. " to a URL string in setup{}, or remove it for the default" })
   end
-  local openai = provider == "openai"
-
-  local env_var = openai and "OPENAI_API_KEY" or "ANTHROPIC_API_KEY"
-  local entry_name = openai and "fn.openai_api_key" or "fn.api_key"
-  local file_name = openai and "openai_api_key" or "api_key"
-
-  health.start("straps: API key (" .. (openai and "openai" or "anthropic") .. ")")
   local registry = try(function() return require("straps.registry") end)
-  local entry = registry and registry.get(entry_name)
+  local entry = registry and registry.get(slot.key_fn)
   if not entry then
-    if openai and entry_name == "fn.openai_api_key" and (config.layers or {}).openai == false then
+    if provider == "openai" and (config.layers or {}).openai == false then
       health.info("openai layer disabled (setup{ layers = { openai = false } }) — skipping key check")
     else
-      health.warn(entry_name .. " is not registered (setup() has not run yet)",
+      health.warn(slot.key_fn .. " is not registered (setup() has not run yet)",
         { "Call require('straps').setup{} in your config." })
     end
+    return
   end
+  local login_cmd = ":StrapsLogin " .. provider .. " key"
+  local store_err
 
-  if vim.env[env_var] and vim.env[env_var] ~= "" then
-    health.ok("$" .. env_var .. " is set (" .. #vim.env[env_var] .. " chars)")
+  -- Problems with the stored key: a raise (mode, unreadable, bad content)
+  -- or a path that holds no usable key.
+  if not registry.get("fn.api_key_store") then
+    health.warn("fn.api_key_store is not registered (setup() has not run yet)",
+      { "Call require('straps').setup{} in your config." })
   else
-    health.info("$" .. env_var .. " is not set")
-  end
-
-  -- The key file gets its own probe because its failure mode (mode 600) is
-  -- the one users hit and cannot see.
-  local config_home = vim.env.XDG_CONFIG_HOME
-  if not config_home or config_home == "" then
-    local home = vim.env.HOME
-    config_home = (home and home ~= "") and (home .. "/.config") or nil
-  end
-  local path = config_home and (config_home .. "/straps/" .. file_name)
-  local st = path and try(function() return vim.uv.fs_stat(path) end)
-  if st and st.type == "file" then
-    if st.mode % 64 ~= 0 then
-      health.error(("%s is accessible by group/other (mode %03o)")
-        :format(path, st.mode % 4096),
-        { "run: chmod 600 " .. path })
-    else
-      health.ok("key file: " .. path .. " (mode 600)")
+    local ok, key, path = pcall(registry.call, "fn.api_key_store", provider)
+    local st = ok and not key and path and try(function() return vim.uv.fs_stat(path) end)
+    if not ok then
+      store_err = tostring(key)
+      health.error((store_err:gsub("^straps: ", "")))
+    elseif st and st.type ~= "file" then
+      health.warn(path .. " is a " .. st.type .. ", not a key file", { "remove it, then run " .. login_cmd })
+    elseif st then
+      health.warn("stored key file " .. path .. " has no key on its first line", { "put the key on its first line" })
     end
-  elseif path then
-    health.info("no key file at " .. path)
   end
 
-  if openai and entry and config_home then
-    local login = config_home .. "/straps/openai_oauth.json"
+  local dir = require("straps.oauth").config_dir()
+  if provider == "openai" and dir then
+    local login = dir .. "/" .. require("straps.oauth").LOGIN_FILE
     local lst = try(function() return vim.uv.fs_stat(login) end)
     if lst and lst.type == "file" then
       if lst.mode % 64 ~= 0 then
         health.error(("%s is accessible by group/other (mode %03o)"):format(login, lst.mode % 4096),
           { "run: chmod 600 " .. login })
       end
-      local cred = registry and try(function() return registry.call("fn.openai_oauth_credential") end)
+      local cred = try(function() return registry.call("fn.openai_oauth_credential") end)
       if type(cred) == "table" then
         if type(cred.client_id) ~= "string" or cred.client_id == "" then
           health.error("ChatGPT login at " .. login .. " has no client id", { "run :StrapsLogin openai" })
@@ -206,20 +172,31 @@ local function check_api_key()
             left > 0 and ("valid for " .. math.ceil(left / 60) .. " min") or "expired; refreshes on next request"))
         end
       end
-    else
-      health.info("no ChatGPT login (run :StrapsLogin openai to sign in)")
     end
   end
 
-  -- The verdict that matters: does the registered entry actually yield a key?
-  if entry then
-    local ok, key, source = pcall(registry.call, entry_name, { refresh = false })
-    if ok and type(key) == "string" and key ~= "" then
-      health.ok(entry_name .. " resolves a key (" .. #key .. " chars"
-        .. (source and (", source: " .. tostring(source)) or "") .. ")")
-    else
-      health.error(entry_name .. " did not return a key", { ok and "unknown error" or tostring(key) })
-    end
+  local ok, key, source = pcall(registry.call, slot.key_fn, { base_url = base_url, refresh = false })
+  local hint = "run " .. login_cmd .. " or set $" .. table.concat(slot.key_env, " or $") .. " (read by the default " .. slot.key_fn .. ")"
+  local from = source and (", source: " .. tostring(source)) or ""
+  -- provider.clean_key is the rule requests apply (through auth_headers), so
+  -- health cannot report OK for a key every request refuses.
+  local clean, why
+  if ok then clean, why = providers.clean_key(key) end
+  if clean then
+    health.ok(slot.key_fn .. " resolves a key (" .. #clean .. " chars" .. from .. ")")
+  elseif ok and why ~= "empty" then
+    health.error(slot.key_fn .. " resolves a key that requests refuse" .. (source and (" (source: " .. tostring(source) .. ")") or ""),
+      { "the key has " .. why, "rewrite it: " .. hint })
+  elseif not ok and store_err == tostring(key) then
+    health.error(slot.key_fn .. " raised the stored key error above")
+  elseif not ok and url_err and tostring(key) == "straps: " .. url_err then
+    health.error(slot.key_fn .. " raised the base URL error above")
+  elseif not ok then
+    health.error(slot.key_fn .. " raised", { tostring(key) })
+  elseif slot.key_required then
+    health.error(slot.key_fn .. " returned no key", { hint })
+  else
+    health.info("no API key; requests send no auth header. If the server requires a key, " .. hint)
   end
 end
 
@@ -470,7 +447,7 @@ local function check_model()
       { "set " .. slot.model_key .. " in setup{} or run :StrapsModel" })
   else
     local style = slot.name ~= "openai" and ("thinking style: " .. tostring(entry and entry.thinking)) or nil
-    local base_url = slot.name == "llamacpp" and providers.llamacpp_base_url(cfg) or cfg[slot.base_url_key]
+    local base_url = providers.base_url(slot.name, cfg)
     health.ok(slot.name .. " model: " .. model .. (base_url and ("  @ " .. providers.redact_url(base_url)) or ""))
     local effort = cfg.effort or "off"
     local applies, why = require("straps.provider").effort_applies(slot.name, entry, effort, cfg.efforts)

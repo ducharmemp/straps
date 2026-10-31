@@ -2,16 +2,18 @@
 -- the provider M.resolve_provider resolves, fn.provider_anthropic for the
 -- Anthropic Messages API, fn.provider_openai for the OpenAI Responses API, or
 -- fn.provider_llamacpp for a llama.cpp llama-server through
--- fn.anthropic_messages), plus fn.api_key /
--- fn.openai_api_key / fn.llamacpp_api_key, the Sign in with ChatGPT entries
--- (fn.openai_oauth_*, fn.openai_device_id), fn.build_tools, the layered system
--- prompt (fn.system_prompt_core/_env/_project composed by fn.system_prompt),
+-- fn.anthropic_messages), plus fn.anthropic_api_key / fn.openai_api_key /
+-- fn.llamacpp_api_key and the key store they read before the environment
+-- (fn.api_key_store), the Sign in with ChatGPT entries (fn.openai_oauth_*,
+-- fn.openai_device_id), fn.build_tools, the layered system prompt
+-- (fn.system_prompt_core/_env/_project composed by fn.system_prompt),
 -- fn.anthropic_messages (the Messages wire format the Anthropic and llama.cpp
 -- backends share), fn.log and fn.compact. Everything is a registry entry (a
 -- Lua source string), so any of it can be inspected and redefined at runtime.
 -- The exceptions are M.PROVIDERS and the plain functions on this module
--- table (provider resolution, the effort rule, model-entry lookup and small
--- helpers), which the statusline and health call directly.
+-- table (provider and base URL resolution, the auth header builder, the
+-- effort rule, model-entry lookup and small helpers), which the entries,
+-- the statusline and health call directly.
 
 local M = {}
 
@@ -20,21 +22,29 @@ local M = {}
 -- base_url_key, buf_model_var), an optional default_model, and server_context
 -- for a backend whose context window is the running server's (no
 -- config.context_window fallback; a live n_ctx replaces a stored one).
--- A new slot also needs its own branch in fn.provider, fn.list_models,
--- health's check_api_key and check_model, and M.effort_applies; without a
--- fn.list_models branch it falls into the Anthropic request.
+-- The auth fields: default_base_url (M.base_url's fallback), key_fn (the
+-- registry entry returning the key), key_env (the variables the default
+-- key_fn reads, in order), key_required (false: a missing key sends no auth
+-- header) and auth_header ("x-api-key" or "bearer", for M.auth_headers).
+-- DESIGN.md's provider.lua section lists what else a new slot needs.
 M.PROVIDERS = {
   {
     name = "anthropic", model_key = "model", models_key = "models",
     buf_model_var = "straps_model", base_url_key = "base_url", default_model = "claude-sonnet-5",
+    default_base_url = "https://api.anthropic.com", key_fn = "fn.anthropic_api_key",
+    key_env = { "ANTHROPIC_API_KEY" }, key_required = true, auth_header = "x-api-key",
   },
   {
     name = "openai", model_key = "openai_model", models_key = "openai_models",
     buf_model_var = "straps_openai_model", base_url_key = "openai_base_url", default_model = "gpt-5",
+    default_base_url = "https://api.openai.com", key_fn = "fn.openai_api_key",
+    key_env = { "OPENAI_API_KEY" }, key_required = true, auth_header = "bearer",
   },
   {
     name = "llamacpp", model_key = "llamacpp_model", models_key = "llamacpp_models",
     buf_model_var = "straps_llamacpp_model", base_url_key = "llamacpp_base_url", server_context = true,
+    default_base_url = "http://127.0.0.1:8080", key_fn = "fn.llamacpp_api_key",
+    key_env = { "LLAMACPP_API_KEY", "LLAMA_API_KEY" }, key_required = false, auth_header = "bearer",
   },
 }
 
@@ -197,51 +207,197 @@ function M.merge_model_entry(provider, entry, config)
   table.insert(config[key], vim.deepcopy(entry))
 end
 
--- config.llamacpp_base_url (default http://127.0.0.1:8080) with a trailing
--- "/" and "/v1" removed, so a URL written for OpenAI-style clients
--- ("http://host:8080/v1") does not become ".../v1/v1/messages".
-function M.llamacpp_base_url(config)
-  local url = type(config) == "table" and config.llamacpp_base_url or nil
-  if type(url) ~= "string" or url == "" then url = "http://127.0.0.1:8080" end
-  url = url:gsub("/+$", ""):gsub("/v1$", ""):gsub("/+$", "")
-  return url
+-- url with every trailing "/" and "/v1" removed from its path, so a URL
+-- written for OpenAI-style clients ("http://host:8080/v1") does not become
+-- ".../v1/v1/messages". The scheme and host are lowercased and a default
+-- port (:80 for http, :443 for https) is dropped, so the ChatGPT origin
+-- check matches any spelling of https://api.openai.com; a host named v1
+-- survives. nil for a non-string. It does not validate; requests take URLs
+-- through check_base_url, which calls it.
+function M.normalize_base_url(url)
+  if type(url) ~= "string" then return nil end
+  local origin, path = "", url
+  local scheme, authority, rest = url:match("^(%a[%w+.-]*)://([^/]*)(.*)$")
+  if scheme then
+    scheme = scheme:lower()
+    local userinfo, host = authority:match("^(.*@)(.*)$")
+    if not userinfo then userinfo, host = "", authority end
+    host = host:lower()
+    if (scheme == "http" and host:match(":80$")) or (scheme == "https" and host:match(":443$")) then
+      host = host:gsub(":%d+$", "")
+    end
+    origin, path = scheme .. "://" .. userinfo .. host, rest
+  end
+  repeat
+    local before = path
+    path = path:gsub("/+$", ""):gsub("/v1$", "")
+  until path == before
+  return origin .. path
 end
 
-local API_KEY_SRC = [==[
-return function()
-  local key = vim.env.ANTHROPIC_API_KEY
-  if key and key ~= "" then
-    return key
+-- The one base URL rule: `url` (named `label` in errors) checked and
+-- normalized. Returns the normalized URL, or nil and an error for a value
+-- that is not a string, does not start with http:// or https:// and a host,
+-- holds whitespace or control characters, or has a query or fragment (the
+-- request path is appended to it).
+function M.check_base_url(url, label)
+  if type(url) ~= "string" then return nil, label .. " must be a URL string (got " .. type(url) .. ")" end
+  if not url:lower():match("^https?://") then return nil, label .. " must start with http:// or https://" end
+  if url:find("[%s%c]") then return nil, label .. " must not contain whitespace or control characters" end
+  if not url:match("^%a+://[^/:@]") then return nil, label .. " must name a host after the scheme" end
+  if url:find("[?#]") then
+    return nil, label .. " must not contain a query or fragment (the request path is appended to it)"
   end
-  local config_home = vim.env.XDG_CONFIG_HOME
-  if not config_home or config_home == "" then
-    local home = vim.env.HOME
-    config_home = (home and home ~= "") and (home .. "/.config") or nil
+  return M.normalize_base_url(url)
+end
+
+-- The base URL requests for provider `name` go to: config[slot.base_url_key],
+-- else (nil or "") slot.default_base_url, through check_base_url. Returns nil
+-- and an error for an unknown provider or a value check_base_url refuses, so
+-- health and fn.list_models can report it without a pcall; request paths
+-- raise it.
+function M.base_url(name, config)
+  if not M.is_provider(name) then return nil, M.unknown_provider_error(name) end
+  local slot = M.provider_slot(name)
+  local url
+  if type(config) == "table" then url = config[slot.base_url_key] end
+  if url == nil or url == "" then url = slot.default_base_url end
+  return M.check_base_url(url, "config." .. slot.base_url_key)
+end
+
+-- The one key rule: `key` with surrounding whitespace removed. Returns the
+-- key, or nil and one of three reasons:
+-- - "empty" for nil, a non-string or a blank key. Callers test for this
+--   value to tell a missing key from a refused one.
+-- - "spaces or control characters" for either inside the key. A control
+--   character such as CR or LF would split the curl header; a space is a
+--   paste error.
+-- - "non-ASCII characters" for a byte above 127, such as a pasted no-break
+--   or zero-width space.
+function M.clean_key(key)
+  if type(key) ~= "string" then return nil, "empty" end
+  key = vim.trim(key)
+  if key == "" then return nil, "empty" end
+  if key:find("[%s%c]") then return nil, "spaces or control characters" end
+  if key:find("[\128-\255]") then return nil, "non-ASCII characters" end
+  return key
+end
+
+-- The curl argv carrying `key` for provider `name`: x-api-key or
+-- Authorization: Bearer, per slot.auth_header, with the key cleaned by
+-- clean_key. An empty key gives {} for a provider whose key is optional;
+-- it raises for one that requires it, for a key clean_key refuses, and for
+-- an unknown provider or header style, so no request goes out with a bad or
+-- missing key.
+function M.auth_headers(name, key)
+  if not M.is_provider(name) then error("straps: " .. M.unknown_provider_error(name), 0) end
+  local slot = M.provider_slot(name)
+  local clean, why = M.clean_key(key)
+  if not clean then
+    if why ~= "empty" then error("straps: " .. slot.key_fn .. " returned a key with " .. why, 0) end
+    if slot.key_required then error("straps: " .. slot.key_fn .. " returned no key", 0) end
+    return {}
   end
-  local path = config_home and (config_home .. "/straps/api_key")
-  local st = path and vim.uv.fs_stat(path)
-  if st and st.type == "file" then
+  if slot.auth_header == "x-api-key" then return { "-H", "x-api-key: " .. clean } end
+  if slot.auth_header == "bearer" then return { "-H", "Authorization: Bearer " .. clean } end
+  error("straps: unknown auth_header " .. tostring(slot.auth_header) .. " for provider " .. name, 0)
+end
+
+-- The per-provider key store: $XDG_CONFIG_HOME/straps/<provider>_api_key,
+-- written by :StrapsLogin and read by the default key fns before the
+-- environment (after the ChatGPT login for openai).
+local API_KEY_STORE_SRC = [==[
+return function(provider, value)
+  local providers = require("straps.provider")
+  local oauth = require("straps.oauth")
+  if not providers.is_provider(provider) then
+    error("straps: fn.api_key_store: " .. providers.unknown_provider_error(provider), 0)
+  end
+  local dir = oauth.config_dir()
+  if not dir then
+    if value == nil or value == false then return nil, nil end
+    error("straps: no $XDG_CONFIG_HOME or $HOME to store the " .. provider .. " API key under", 0)
+  end
+  local path = dir .. "/" .. provider .. "_api_key"
+  -- A symlink belongs to whatever made it (a secret manager); read through
+  -- it, but never replace or remove it.
+  if value ~= nil then
+    local lst = vim.uv.fs_lstat(path)
+    if lst and lst.type == "link" then
+      error("straps: " .. path .. " is a symlink; manage the key with the tool that created it", 0)
+    end
+  end
+  if value == false then
+    local ok, err, code = vim.uv.fs_unlink(path)
+    if ok then return true, path end
+    if code == "ENOENT" then return false, path end
+    error("straps: could not delete " .. path .. " (" .. tostring(err) .. ")", 0)
+  end
+  if value == nil then
+    local st = vim.uv.fs_stat(path)
+    local lst = vim.uv.fs_lstat(path)
+    local linked = lst and lst.type == "link"
+    if not st and linked then
+      error("straps: " .. path .. " is a symlink to a missing file; fix it with the tool that created it", 0)
+    end
+    if not (st and st.type == "file") then return nil, path end
+    -- The tool that placed a symlink owns its target, so chmod or
+    -- :StrapsLogin would not fix it.
+    local remedy = linked and "fix it with the tool that created it"
     -- Refuse a key file that group/other can access (the low six mode
     -- bits), the way ssh treats private keys.
     if st.mode % 64 ~= 0 then
-      error(("straps: %s is accessible by group/other (mode %03o); "
-        .. "run chmod 600 on it."):format(path, st.mode % 4096))
+      error(("straps: %s is accessible by group/other (mode %03o); %s."):format(path, st.mode % 4096, remedy or "run chmod 600 on it"), 0)
     end
     local f, open_err = io.open(path, "r")
-    if not f then
-      error("straps: " .. path .. " exists but could not be read ("
-        .. tostring(open_err) .. ").")
-    end
-    key = f:read("*l")
+    if not f then error("straps: " .. path .. " exists but could not be read (" .. tostring(open_err) .. ").", 0) end
+    local line = f:read("*l")
     f:close()
-    key = key and vim.trim(key) or ""
-    if key ~= "" then
-      return key
+    local key, why = providers.clean_key(line)
+    if not key and why ~= "empty" then
+      error("straps: " .. path .. " has " .. why .. " in its key; " .. (remedy or ("rewrite it with :StrapsLogin " .. provider .. " key")), 0)
     end
+    return key, path
   end
-  error("straps: no API key found. Export ANTHROPIC_API_KEY in your shell, "
-    .. "write the key to " .. (path or "$XDG_CONFIG_HOME/straps/api_key")
-    .. ", or redefine fn.api_key to fetch the key from somewhere else.")
+  if type(value) ~= "string" then
+    error("straps: fn.api_key_store: the value must be a key string, false or nil (got " .. type(value) .. ")", 0)
+  end
+  local key, why = providers.clean_key(value)
+  if not key then
+    error("straps: fn.api_key_store: the key " .. (why == "empty" and "is empty" or ("has " .. why)), 0)
+  end
+  oauth.ensure_dir(dir)
+  local tmp = path .. ".tmp." .. oauth.random_b64url(8)
+  local fd, oerr = vim.uv.fs_open(tmp, "wx", 384)
+  if not fd then error("straps: could not write " .. tmp .. " (" .. tostring(oerr) .. ")", 0) end
+  local _, werr = vim.uv.fs_write(fd, key .. "\n")
+  vim.uv.fs_close(fd)
+  if werr then
+    vim.uv.fs_unlink(tmp)
+    error("straps: could not write " .. tmp .. " (" .. tostring(werr) .. ")", 0)
+  end
+  local ok, rerr = vim.uv.fs_rename(tmp, path)
+  if not ok then
+    vim.uv.fs_unlink(tmp)
+    error("straps: could not save " .. path .. " (" .. tostring(rerr) .. ")", 0)
+  end
+  return key, path
+end
+]==]
+
+local ANTHROPIC_API_KEY_SRC = [==[
+return function()
+  local key, path = require("straps.registry").call("fn.api_key_store", "anthropic")
+  if key then return key, "stored" end
+  local key_env = require("straps.provider").provider_slot("anthropic").key_env
+  for _, name in ipairs(key_env) do
+    local env = vim.trim(vim.env[name] or "")
+    if env ~= "" then return env, "env" end
+  end
+  error("straps: no Anthropic API key found. Run :StrapsLogin anthropic to store one, export "
+    .. table.concat(key_env, " or ") .. " in your shell, "
+    .. (path and ("write the key to " .. path .. " (chmod 600), ") or "")
+    .. "or redefine fn.anthropic_api_key to fetch the key from somewhere else.", 0)
 end
 ]==]
 
@@ -257,8 +413,9 @@ end
 -- OpenAI returns {data:[{id}]} for an API key and {models:[{slug,
 -- display_name, context_window, visibility}]} for a ChatGPT login; hidden
 -- ChatGPT entries are dropped. llama-server returns {data:[{id, meta?}]};
--- meta.n_ctx (present only for a loaded model) becomes `context`, and the key
--- (fn.llamacpp_api_key) is optional.
+-- meta.n_ctx (present only for a loaded model) becomes `context`. The URL is
+-- provider.base_url, the key comes from the slot's key_fn (optional for a
+-- slot with key_required = false), and provider.auth_headers builds the header.
 local LIST_MODELS_SRC = [==[
 return function(provider_override)
   local registry = require("straps.registry")
@@ -279,43 +436,27 @@ return function(provider_override)
 
   local openai = provider == "openai"
   local llamacpp = provider == "llamacpp"
-  local base_url, headers, key_fn
-  if openai then
-    base_url = config.openai_base_url or "https://api.openai.com"
-    key_fn = "fn.openai_api_key"
-  elseif llamacpp then
-    base_url = providers.llamacpp_base_url(config)
-    key_fn = "fn.llamacpp_api_key"
-  else
-    base_url = config.base_url or "https://api.anthropic.com"
-    key_fn = "fn.api_key"
-  end
+  local slot = providers.provider_slot(provider)
+  local base_url, url_err = providers.base_url(provider, config)
+  if not base_url then return nil, url_err end
+  local key_fn = slot.key_fn
 
   -- The openai layer may be off (setup{ layers = { openai = false } }), in
   -- which case fn.openai_api_key was never registered; the pcall below would
-  -- otherwise report a generic "no API key" that hides the real cause.
-  if openai and not registry.get("fn.openai_api_key") then
+  -- otherwise report only the missing entry, not that the layer is off.
+  if openai and not registry.get(key_fn) then
     return nil, "openai layer disabled (setup{ layers = { openai = false } })"
   end
 
   local ok_key, api_key = pcall(registry.call, key_fn, { base_url = base_url, wait_ms = 15000 })
-  if llamacpp then
-    if not ok_key then
-      return nil, "fn.llamacpp_api_key failed (" .. tostring(api_key) .. ")"
-    end
-  elseif not ok_key or type(api_key) ~= "string" or api_key == "" then
-    return nil, "no API key (" .. tostring(api_key) .. ")"
+  if not ok_key then
+    return nil, key_fn .. " failed (" .. tostring(api_key):gsub("^straps: ", "") .. ")"
   end
 
-  if llamacpp then
-    headers = (type(api_key) == "string" and api_key ~= "") and { "-H", "Authorization: Bearer " .. api_key } or {}
-  elseif openai then
-    headers = { "-H", "Authorization: Bearer " .. api_key }
-  else
-    headers = {
-      "-H", "x-api-key: " .. api_key,
-      "-H", "anthropic-version: 2023-06-01",
-    }
+  local ok_headers, headers = pcall(providers.auth_headers, provider, api_key)
+  if not ok_headers then return nil, (tostring(headers):gsub("^straps: ", "")) end
+  if provider == "anthropic" then
+    vim.list_extend(headers, { "-H", "anthropic-version: 2023-06-01" })
   end
 
   -- Synchronous: the picker blocks briefly on this, which is fine for a
@@ -323,7 +464,7 @@ return function(provider_override)
   -- Anthropic caps the page with ?limit; OpenAI's and llama-server's
   -- /v1/models have no such param, so only send it for Anthropic.
   local url = base_url .. "/v1/models" .. ((openai or llamacpp) and "" or "?limit=1000")
-  local argv = { "curl", "-sS", url }
+  local argv = { "curl", "-sS", "-g", url }
   vim.list_extend(argv, headers)
   vim.list_extend(argv, { "-w", "\nSTRAPS_HTTP_STATUS:%{http_code}\n" })
   local res = vim.system(argv, { text = true }):wait(15000)
@@ -512,14 +653,14 @@ local ANTHROPIC_MESSAGES_SRC = [==[
 -- overloaded, curl-level, a stall) retry with backoff until a text delta has
 -- streamed. opts (all optional) points the same wire format at another
 -- server:
---   base_url      replaces config.base_url
+--   base_url      replaces provider.base_url("anthropic", config)
 --   model         replaces ctx.model and the provider.resolve_model fallback;
 --                 with base_url, opts.model or ctx.model is required
 --   model_entry   the model's list entry, used instead of a lookup; with
 --                 base_url, the only source besides ctx.model_entry
---   auth_headers  argv list replacing the x-api-key header (fn.api_key is not
---                 called); with base_url set and auth_headers omitted no auth
---                 header is sent, so the Anthropic key never leaves its host
+--   auth_headers  argv list replacing the x-api-key header (fn.anthropic_api_key
+--                 is not called); with base_url set and auth_headers omitted no
+--                 auth header is sent, so the Anthropic key never leaves its host
 --   gzip          false disables request compression
 --   label         names the backend in errors
 -- provider.effort_applies judges the effort for ctx.provider (default
@@ -530,11 +671,20 @@ return function(req, ctx, opts)
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
   opts = type(opts) == "table" and opts or {}
 
+  local providers = require("straps.provider")
+  local base_url, url_err
+  if opts.base_url ~= nil then
+    base_url, url_err = providers.check_base_url(opts.base_url, "opts.base_url")
+  else
+    base_url, url_err = providers.base_url("anthropic", config)
+  end
+  if not base_url then error("straps provider: " .. url_err, 0) end
   local auth_headers = opts.auth_headers
   if auth_headers == nil then
-    auth_headers = opts.base_url == nil and { "-H", "x-api-key: " .. registry.call("fn.api_key") } or {}
+    auth_headers = opts.base_url == nil
+      and providers.auth_headers("anthropic",
+        registry.call(providers.provider_slot("anthropic").key_fn, { base_url = base_url })) or {}
   end
-  local base_url = opts.base_url or config.base_url or "https://api.anthropic.com"
   local who = opts.label and ("straps provider (" .. opts.label .. ")") or "straps provider"
 
   -- Effort: vim.b straps_effort, else config.effort, so one session can run a
@@ -554,7 +704,6 @@ return function(req, ctx, opts)
   -- describes the model sent; else ctx.model_entry when the request sends
   -- ctx.model (fn.provider looked it up once); else, without opts.base_url,
   -- the Anthropic list entry (provider.model_entry); with opts.base_url, none.
-  local providers = require("straps.provider")
   local ctx_model = ctx and ctx.model
   ctx_model = (type(ctx_model) == "string" and ctx_model ~= "") and ctx_model or nil
   local model_id
@@ -902,7 +1051,7 @@ return function(req, ctx, opts)
     -- Body on stdin (avoids argv length limits). \n in -w is interpreted by
     -- curl; %{stderr} routes the status marker to stderr, clear of the SSE.
     local argv = {
-      "curl", "-sS", "--no-buffer",
+      "curl", "-sS", "-g", "--no-buffer",
       "-X", "POST", base_url .. "/v1/messages",
     }
     vim.list_extend(argv, auth_headers)
@@ -1045,8 +1194,8 @@ local PROVIDER_OPENAI_SRC = [==[
 -- The OpenAI Responses backend. Same contract as fn.provider_anthropic
 -- (returns { content = blocks, stop_reason, usage, model } and streams text via
 -- ctx.emit), but speaks OpenAI's wire shape instead of Anthropic's:
---   auth      Authorization: Bearer <key>            (fn.openai_api_key: ChatGPT login, env, key file)
---   endpoint  {base_url}/v1/responses                (config.openai_base_url)
+--   auth      Authorization: Bearer <key>            (fn.openai_api_key: ChatGPT login, stored key, env)
+--   endpoint  {base_url}/v1/responses                (provider.base_url("openai", config))
 --   request   instructions + input items             (translated from req)
 --   stream    typed events (response.*)              (translated back)
 -- fn.provider dispatches here when config.provider (or vim.b straps_provider)
@@ -1057,8 +1206,10 @@ return function(req, ctx)
   local ok_straps, straps = pcall(require, "straps")
   local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
 
-  local base_url = config.openai_base_url or "https://api.openai.com"
-  local api_key, key_source = registry.call("fn.openai_api_key", { ctx = ctx, base_url = base_url })
+  local base_url, url_err = require("straps.provider").base_url("openai", config)
+  if not base_url then error("straps provider (openai): " .. url_err, 0) end
+  local api_key, key_source = registry.call(require("straps.provider").provider_slot("openai").key_fn,
+    { ctx = ctx, base_url = base_url })
   if ctx.cancelled() or (api_key == nil and key_source == "cancelled") then
     return { content = {}, stop_reason = "cancelled" }
   end
@@ -1191,6 +1342,9 @@ return function(req, ctx)
   -- after that would write the same text again, so it ends the retries.
   local streamed_text = false
   local function start_request(resolve)
+    -- Built per attempt (the 401 retry replaces api_key) and before the
+    -- watchdog timer, so a refused key raises with nothing to close.
+    local auth_argv = require("straps.provider").auth_headers("openai", api_key)
     local content = {}        -- finished blocks in order
     local text_block = nil    -- the single streamed text block (created lazily)
     local text_index = nil    -- output_index of the text item last appended to
@@ -1370,14 +1524,14 @@ return function(req, ctx)
       end
     end
 
-    local ok_spawn, spawned = pcall(vim.system, {
-      "curl", "-sS", "--no-buffer",
-      "-X", "POST", base_url .. "/v1/responses",
-      "-H", "Authorization: Bearer " .. api_key,
+    local argv = { "curl", "-sS", "-g", "--no-buffer", "-X", "POST", base_url .. "/v1/responses" }
+    vim.list_extend(argv, auth_argv)
+    vim.list_extend(argv, {
       "-H", "content-type: application/json",
       "-w", "%{stderr}\nSTRAPS_HTTP_STATUS:%{http_code}\n",
       "--data-binary", "@-",
-    }, { stdin = payload, stdout = on_stdout }, function(res)
+    })
+    local ok_spawn, spawned = pcall(vim.system, argv, { stdin = payload, stdout = on_stdout }, function(res)
       watchdog_close()
       if ctx.cancelled() then
         resolve({ ok = true, cancelled = true, content = {}, stop_reason = "cancelled" })
@@ -1495,8 +1649,8 @@ end
 ]==]
 
 -- The Anthropic backend: the Messages wire format with no opts, so its
--- endpoint, key and model come from config.base_url, fn.api_key and
--- ctx.model (provider.resolve_model).
+-- endpoint, key and model come from provider.base_url, fn.anthropic_api_key
+-- and ctx.model (provider.resolve_model).
 local PROVIDER_ANTHROPIC_SRC = [==[
 return function(req, ctx)
   return require("straps.registry").call("fn.anthropic_messages", req, ctx)
@@ -1596,12 +1750,13 @@ return function(req, ctx)
     error("straps provider (llamacpp): no model; set llamacpp_model in setup{} or run :StrapsModel", 0)
   end
 
-  local base_url = require("straps.provider").llamacpp_base_url(config)
-  local key = registry.call("fn.llamacpp_api_key", { base_url = base_url })
-  local auth_headers = (type(key) == "string" and key ~= "") and { "-H", "Authorization: Bearer " .. key } or {}
+  local providers = require("straps.provider")
+  local base_url, url_err = providers.base_url("llamacpp", config)
+  if not base_url then error("straps provider (llamacpp): " .. url_err, 0) end
+  local key = registry.call(providers.provider_slot("llamacpp").key_fn, { base_url = base_url })
+  local auth_headers = providers.auth_headers("llamacpp", key)
   -- The entry fn.provider resolved (ctx.model_entry, which can come from the
   -- model pref) when it describes this model, else the llamacpp_models lookup.
-  local providers = require("straps.provider")
   local entry = (ctx and ctx.model == model and type(ctx.model_entry) == "table") and ctx.model_entry
     or providers.model_entry("llamacpp", model, config)
   return registry.call("fn.anthropic_messages", req, ctx, {
@@ -1617,11 +1772,11 @@ end
 
 local LLAMACPP_API_KEY_SRC = [==[
 return function()
-  for _, name in ipairs({ "LLAMACPP_API_KEY", "LLAMA_API_KEY" }) do
-    local key = vim.env[name]
-    if key and key ~= "" then
-      return key
-    end
+  local key = require("straps.registry").call("fn.api_key_store", "llamacpp")
+  if key then return key, "stored" end
+  for _, name in ipairs(require("straps.provider").provider_slot("llamacpp").key_env) do
+    local env = vim.trim(vim.env[name] or "")
+    if env ~= "" then return env, "env" end
   end
   return nil
 end
@@ -1644,16 +1799,11 @@ local function stat_key(st)
   return table.concat({ st.mtime.sec, st.mtime.nsec, st.size, st.ino }, ":")
 end
 return function(value)
-  local config_home = vim.env.XDG_CONFIG_HOME
-  if not config_home or config_home == "" then
-    local home = vim.env.HOME
-    config_home = (home and home ~= "") and (home .. "/.config") or nil
-  end
-  if not config_home then
+  local dir = require("straps.oauth").config_dir()
+  if not dir then
     if value ~= nil then return nil, "no $XDG_CONFIG_HOME or $HOME to write under" end
     return nil
   end
-  local dir = config_home .. "/straps"
   local path = dir .. "/provider"
 
   if value ~= nil then
@@ -1717,16 +1867,11 @@ return function(provider, value, entry)
     if value == nil then return nil, nil, providers.unknown_provider_error(provider) end
     return nil, providers.unknown_provider_error(provider)
   end
-  local config_home = vim.env.XDG_CONFIG_HOME
-  if not config_home or config_home == "" then
-    local home = vim.env.HOME
-    config_home = (home and home ~= "") and (home .. "/.config") or nil
-  end
-  if not config_home then
+  local dir = require("straps.oauth").config_dir()
+  if not dir then
     if value ~= nil then return nil, "no $XDG_CONFIG_HOME or $HOME to write under" end
     return nil
   end
-  local dir = config_home .. "/straps"
   local path = dir .. "/model_" .. provider
 
   if value ~= nil then
@@ -1780,14 +1925,24 @@ return function(opts)
   opts = type(opts) == "table" and opts or {}
   local registry = require("straps.registry")
   local oauth = require("straps.oauth")
+  local providers = require("straps.provider")
   local cred = registry.call("fn.openai_oauth_credential")
   if cred then
     local ok_straps, straps = pcall(require, "straps")
     local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
-    local base = tostring(opts.base_url or config.openai_base_url or oauth.API_ORIGIN):gsub("/+$", "")
+    local base, url_err
+    if opts.base_url ~= nil then
+      base, url_err = providers.check_base_url(opts.base_url, "opts.base_url")
+    else
+      base, url_err = providers.base_url("openai", config)
+    end
+    if not base then error("straps: " .. url_err, 0) end
+    -- fn.openai_oauth_login's origin_error applies the same rule when a login
+    -- starts and completes; change both together.
     if base ~= oauth.API_ORIGIN then
       error("straps: the ChatGPT login token is only sent to " .. oauth.API_ORIGIN
-        .. "; unset openai_base_url, or run :StrapsLogout openai to use an API key.", 0)
+        .. "; unset openai_base_url, run :StrapsLogout openai to use $OPENAI_API_KEY, or run :StrapsLogin openai key"
+        .. " to store an API key (it replaces the ChatGPT login and wins over $OPENAI_API_KEY).", 0)
     end
     if opts.refresh == false or oauth.now_ms() + oauth.REFRESH_WINDOW_MS < (tonumber(cred.expires) or 0) then
       return cred.access, "oauth"
@@ -1813,39 +1968,17 @@ return function(opts)
     return got.access, "oauth"
   end
 
-  local key = vim.env.OPENAI_API_KEY
-  if key and key ~= "" then
-    return key, "env"
-  end
-  local config_home = vim.env.XDG_CONFIG_HOME
-  if not config_home or config_home == "" then
-    local home = vim.env.HOME
-    config_home = (home and home ~= "") and (home .. "/.config") or nil
-  end
-  local path = config_home and (config_home .. "/straps/openai_api_key")
-  local st = path and vim.uv.fs_stat(path)
-  if st and st.type == "file" then
-    -- Refuse a key file group/other can access, like fn.api_key does.
-    if st.mode % 64 ~= 0 then
-      error(("straps: %s is accessible by group/other (mode %03o); "
-        .. "run chmod 600 on it."):format(path, st.mode % 4096))
-    end
-    local f, open_err = io.open(path, "r")
-    if not f then
-      error("straps: " .. path .. " exists but could not be read ("
-        .. tostring(open_err) .. ").")
-    end
-    key = f:read("*l")
-    f:close()
-    key = key and vim.trim(key) or ""
-    if key ~= "" then
-      return key, "file"
-    end
+  local key, path = registry.call("fn.api_key_store", "openai")
+  if key then return key, "stored" end
+  local key_env = providers.provider_slot("openai").key_env
+  for _, name in ipairs(key_env) do
+    local env = vim.trim(vim.env[name] or "")
+    if env ~= "" then return env, "env" end
   end
   error("straps: no OpenAI API key found. Run :StrapsLogin openai to sign in with ChatGPT, "
-    .. "export OPENAI_API_KEY in your shell, "
-    .. "write the key to " .. (path or "$XDG_CONFIG_HOME/straps/openai_api_key")
-    .. ", or redefine fn.openai_api_key to fetch the key from somewhere else.")
+    .. ":StrapsLogin openai key to store an API key, export " .. table.concat(key_env, " or ") .. " in your shell, "
+    .. (path and ("write the key to " .. path .. " (chmod 600), ") or "")
+    .. "or redefine fn.openai_api_key to fetch the key from somewhere else.", 0)
 end
 ]==]
 
@@ -1857,7 +1990,7 @@ return function(value)
     if value == nil or value == false then return nil end
     error("straps: no $XDG_CONFIG_HOME or $HOME to store the ChatGPT login under", 0)
   end
-  local path = dir .. "/openai_oauth.json"
+  local path = dir .. "/" .. oauth.LOGIN_FILE
   if value == false then
     local ok, err, code = vim.uv.fs_unlink(path)
     if not ok and code ~= "ENOENT" then error("straps: could not delete " .. path .. " (" .. tostring(err) .. ")", 0) end
@@ -2107,13 +2240,28 @@ return function(opts)
   opts = type(opts) == "table" and opts or {}
   local registry = require("straps.registry")
   local oauth = require("straps.oauth")
+  local key_note
   local function report(err)
     if opts.on_done then
-      pcall(opts.on_done, err)
+      pcall(opts.on_done, err, key_note and key_note:gsub("^; ", "") or nil)
     elseif err then
       vim.notify("straps: " .. tostring(err):gsub("^straps: ", ""), vim.log.levels.ERROR)
     else
-      vim.notify("straps: signed in with ChatGPT")
+      vim.notify("straps: signed in with ChatGPT" .. (key_note or ""))
+    end
+  end
+
+  -- The login token is only sent to oauth.API_ORIGIN (fn.openai_api_key),
+  -- and a completed login deletes the stored API key, so a login is refused
+  -- at start and again at completion when openai_base_url is another host.
+  local function origin_error()
+    local ok_straps, straps = pcall(require, "straps")
+    local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+    local base, url_err = require("straps.provider").base_url("openai", config)
+    if not base then return url_err end
+    if base ~= oauth.API_ORIGIN then
+      return "a ChatGPT login only works with " .. oauth.API_ORIGIN .. "; unset openai_base_url to sign in,"
+        .. " or run :StrapsLogin openai key to store an API key"
     end
   end
 
@@ -2127,6 +2275,8 @@ return function(opts)
   end
 
   if not opts.callback_url then
+    local refused = origin_error()
+    if refused then error("straps: " .. refused, 0) end
     if current then current.cancelled = true end
     local verifier, challenge = oauth.pkce()
     local rec = {
@@ -2192,7 +2342,18 @@ return function(opts)
           end
           release = rel
           if rec.cancelled then return finish_login(cancelled_msg) end
+          -- openai_base_url can change while the login is pending.
+          local refused = origin_error()
+          if refused then return finish_login(refused .. "; the ChatGPT login was not saved") end
           registry.call("fn.openai_oauth_credential", cred)
+          -- One stored openai credential: the ChatGPT login replaces a stored
+          -- key. The login is saved either way, so a failed delete is a note.
+          local ok_key, removed, key_path = pcall(registry.call, "fn.api_key_store", "openai", false)
+          if not ok_key then
+            key_note = "; could not delete the stored OpenAI API key (" .. tostring(removed):gsub("^straps: ", "") .. ")"
+          elseif removed == true then
+            key_note = "; deleted " .. (key_path or "the stored OpenAI API key")
+          end
           finish_login(nil)
         end)
         if not ok_save then finish_login(save_err) end
@@ -2211,7 +2372,7 @@ return function(cb)
   cb = cb or function() end
   local cancelled = registry.call("fn.openai_oauth_login", { cancel = true })
   local dir = oauth.config_dir()
-  if not dir or not vim.uv.fs_stat(dir .. "/openai_oauth.json") then
+  if not dir or not vim.uv.fs_stat(dir .. "/" .. oauth.LOGIN_FILE) then
     vim.schedule(function() cb(nil, cancelled and "cancelled" or "none") end)
     return
   end
@@ -3182,10 +3343,16 @@ function M.register()
     source = MULTIPLAYER_SKILL_SRC,
   })
   define({
-    name = "fn.api_key",
+    name = "fn.api_key_store",
     kind = "fn",
-    doc = "Return the Anthropic API key (default: $ANTHROPIC_API_KEY, then $XDG_CONFIG_HOME/straps/api_key; the file must be chmod 600).",
-    source = API_KEY_SRC,
+    doc = "(provider, value?) the stored API key at $XDG_CONFIG_HOME/straps/<provider>_api_key (mode 600). No value reads -> key?, path (nil key when absent, blank or not a file; raises on a file accessible by group or other, an unreadable one, a symlink to a missing file, or a key provider.clean_key refuses); a string writes the key provider.clean_key returns -> key, path; false deletes -> removed, path. A write sets the straps directory to mode 700. A symlink at the path is read through; a write or delete on it raises. Raises for an unknown provider; with no config dir, read and delete give nil, nil and a write raises.",
+    source = API_KEY_STORE_SRC,
+  })
+  define({
+    name = "fn.anthropic_api_key",
+    kind = "fn",
+    doc = "(opts?) -> key, source; opts.base_url is the server the key is for (the default ignores it). The Anthropic key: fn.api_key_store('anthropic') (:StrapsLogin anthropic), else $ANTHROPIC_API_KEY; raises when neither is set. source is stored/env.",
+    source = ANTHROPIC_API_KEY_SRC,
   })
   define({
     name = "fn.provider_pref",
@@ -3202,7 +3369,7 @@ function M.register()
   define({
     name = "fn.llamacpp_api_key",
     kind = "fn",
-    doc = "(opts?) -> key?; opts.base_url is the server the key is for. Return the optional llama-server API key: $LLAMACPP_API_KEY, else $LLAMA_API_KEY (the variable llama-server reads for --api-key); nil when both are unset or empty.",
+    doc = "(opts?) -> key?, source; opts.base_url is the server the key is for (the default ignores it). Return the optional llama-server API key: fn.api_key_store('llamacpp') (:StrapsLogin llamacpp), else $LLAMACPP_API_KEY, else $LLAMA_API_KEY (the variable llama-server reads for --api-key); nil when none is set. source is stored/env.",
     source = LLAMACPP_API_KEY_SRC,
   })
   -- layers.openai = false skips this openai-only entry (setup{ layers = {
@@ -3212,7 +3379,7 @@ function M.register()
     define({
       name = "fn.openai_api_key",
       kind = "fn",
-      doc = "(opts?) -> key, source. The OpenAI key: a stored ChatGPT login (:StrapsLogin openai) wins and is refreshed; else $OPENAI_API_KEY, then $XDG_CONFIG_HOME/straps/openai_api_key (chmod 600). source is oauth/env/file.",
+      doc = "(opts?) -> key, source. The OpenAI key: a stored ChatGPT login (:StrapsLogin openai) wins and is refreshed; else fn.api_key_store('openai') (:StrapsLogin openai key), then $OPENAI_API_KEY. source is oauth/stored/env; nil, \"cancelled\" when opts.ctx is cancelled during a refresh.",
       source = OPENAI_API_KEY_SRC,
     })
     define({
@@ -3248,13 +3415,13 @@ function M.register()
     define({
       name = "fn.openai_oauth_login",
       kind = "fn",
-      doc = "Sign in with ChatGPT. {} starts a login and returns the authorize URL; { callback_url } completes it; { cancel = true } cancels.",
+      doc = "Sign in with ChatGPT. {} starts a login and returns the authorize URL (raises when openai_base_url is not https://api.openai.com); { callback_url } completes it and deletes the stored OpenAI API key (one stored openai credential); { cancel = true } cancels. opts.on_done(err?, note?) replaces the notify; note reports what deleting the stored key did.",
       source = OPENAI_OAUTH_LOGIN_SRC,
     })
     define({
       name = "fn.openai_oauth_logout",
       kind = "fn",
-      doc = "(cb?) cancel a pending ChatGPT login and delete the stored one under the lock.",
+      doc = "(cb?) -> cb(err?, \"deleted\"|\"cancelled\"|\"none\"): cancel a pending ChatGPT login and delete the stored one under the lock. :StrapsLogout openai also deletes the stored API key through fn.api_key_store.",
       source = OPENAI_OAUTH_LOGOUT_SRC,
     })
   end
@@ -3297,7 +3464,7 @@ function M.register()
   define({
     name = "fn.provider_llamacpp",
     kind = "fn",
-    doc = "llama.cpp llama-server (/v1/messages at config.llamacpp_base_url) through fn.anthropic_messages with opts; model from ctx.model (provider.resolve_model: vim.b straps_llamacpp_model, config.llamacpp_model, the model pref); raises when none is set. (req, ctx) -> { content, stop_reason, usage?, model? }.",
+    doc = "llama.cpp llama-server (/v1/messages at provider.base_url('llamacpp')) through fn.anthropic_messages with opts; model from ctx.model (provider.resolve_model: vim.b straps_llamacpp_model, config.llamacpp_model, the model pref); raises when none is set. (req, ctx) -> { content, stop_reason, usage?, model? }.",
     source = PROVIDER_LLAMACPP_SRC,
   })
   -- layers.openai = false skips this openai-only entry; see the matching

@@ -1056,9 +1056,10 @@ step(function()
   vim.env.PATH = real_path
   straps.config.base_url = nil
 
-  -- --------------------------------------------------------------- fn.api_key
-  -- Sourcing order: $ANTHROPIC_API_KEY first, then the first line of
-  -- $XDG_CONFIG_HOME/straps/api_key, else a readable error naming both.
+  -- --------------------------------------------------------------- fn.anthropic_api_key
+  -- Sourcing order: the first line of $XDG_CONFIG_HOME/straps/anthropic_api_key
+  -- (fn.api_key_store), then $ANTHROPIC_API_KEY, else an error naming :StrapsLogin
+  -- anthropic, the variable and the key path.
   saved_key = vim.env.ANTHROPIC_API_KEY
   saved_xdg = vim.env.XDG_CONFIG_HOME
   keydir = vim.fn.tempname()
@@ -1066,90 +1067,114 @@ step(function()
   vim.env.XDG_CONFIG_HOME = keydir
 end)
 
--- The file fallback refuses group/other-accessible key files, and writefile's
+-- The key store refuses group/other-accessible key files, and writefile's
 -- mode depends on the umask — pin every key file the tests expect to be read.
 local function write_key_file(kf, lines)
   vim.fn.writefile(lines, kf)
   vim.fn.setfperm(kf, "rw-------")
 end
 
-it("fn.api_key: env var wins over the config file", function()
-  write_key_file(keydir .. "/straps/api_key", { "file-key" })
+it("fn.anthropic_api_key: the key file wins over the env var; without it the env var is used", function()
+  write_key_file(keydir .. "/straps/anthropic_api_key", { "file-key" })
   vim.env.ANTHROPIC_API_KEY = "env-key"
-  assert(registry.call("fn.api_key") == "env-key", "env var should take precedence over the file")
+  local key, source = registry.call("fn.anthropic_api_key")
+  assert(key == "file-key" and source == "stored", "the key file should take precedence: " .. tostring(key))
+  vim.fn.delete(keydir .. "/straps/anthropic_api_key")
+  key, source = registry.call("fn.anthropic_api_key")
+  assert(key == "env-key" and source == "env", "env fallback wrong: " .. tostring(key))
 end)
 
-it("fn.api_key: falls back to $XDG_CONFIG_HOME/straps/api_key, trimmed", function()
-  write_key_file(keydir .. "/straps/api_key", { "  file-key  " })
+it("fn.anthropic_api_key: a group/other-accessible key file fails even with the env var set", function()
+  local kf = keydir .. "/straps/anthropic_api_key"
+  vim.fn.writefile({ "leaky-key" }, kf)
+  vim.fn.setfperm(kf, "rw-r--r--")
+  vim.env.ANTHROPIC_API_KEY = "env-key"
+  local ok, err = pcall(registry.call, "fn.anthropic_api_key")
   vim.env.ANTHROPIC_API_KEY = nil
-  local got = registry.call("fn.api_key")
-  assert(got == "file-key", "file fallback wrong: " .. vim.inspect(got))
+  vim.fn.delete(kf)
+  assert(not ok and tostring(err):find("chmod 600", 1, true), "expected the mode error: " .. tostring(err))
 end)
 
-it("fn.api_key: a group/other-accessible key file is refused", function()
-  local kf = keydir .. "/straps/api_key"
+it("fn.anthropic_api_key: a blank key file falls through to the env var", function()
+  write_key_file(keydir .. "/straps/anthropic_api_key", { "   " })
+  vim.env.ANTHROPIC_API_KEY = "env-key"
+  local key, source = registry.call("fn.anthropic_api_key")
+  vim.env.ANTHROPIC_API_KEY = nil
+  assert(key == "env-key" and source == "env", "blank file should fall through: " .. tostring(key))
+end)
+
+it("fn.anthropic_api_key: reads the key file, trimmed", function()
+  write_key_file(keydir .. "/straps/anthropic_api_key", { "  file-key  " })
+  vim.env.ANTHROPIC_API_KEY = nil
+  local got = registry.call("fn.anthropic_api_key")
+  assert(got == "file-key", "stored key wrong: " .. vim.inspect(got))
+end)
+
+it("fn.anthropic_api_key: a group/other-accessible key file is refused without echoing the key", function()
+  local kf = keydir .. "/straps/anthropic_api_key"
   vim.fn.writefile({ "leaky-key" }, kf)
   vim.fn.setfperm(kf, "rw-r--r--")
   vim.env.ANTHROPIC_API_KEY = nil
-  local ok, err = pcall(registry.call, "fn.api_key")
+  local ok, err = pcall(registry.call, "fn.anthropic_api_key")
   assert(not ok, "expected an error for a group-readable key file")
   assert(tostring(err):find("chmod 600", 1, true), "error should say how to fix it: " .. tostring(err))
   assert(not tostring(err):find("leaky-key", 1, true), "the key itself must not appear in the error")
 end)
 
-it("fn.api_key: an unreadable key file gets its own error, not the generic one", function()
-  local kf = keydir .. "/straps/api_key"
+it("fn.anthropic_api_key: an unreadable key file gets its own error, not the generic one", function()
+  local kf = keydir .. "/straps/anthropic_api_key"
   vim.fn.writefile({ "unreachable-key" }, kf)
   vim.fn.setfperm(kf, "---------")
   vim.env.ANTHROPIC_API_KEY = nil
-  local ok, err = pcall(registry.call, "fn.api_key")
+  local ok, err = pcall(registry.call, "fn.anthropic_api_key")
   vim.fn.setfperm(kf, "rw-------") -- so later cases can delete/rewrite it
   assert(not ok, "expected an error for an unreadable key file")
   assert(tostring(err):find("could not be read", 1, true),
     "unreadable file should not fall through to the generic error: " .. tostring(err))
 end)
 
-it("fn.api_key: a present-but-blank key file still errors", function()
-  write_key_file(keydir .. "/straps/api_key", { "   " })
+it("fn.anthropic_api_key: a present-but-blank key file with no env var errors", function()
+  write_key_file(keydir .. "/straps/anthropic_api_key", { "   " })
   vim.env.ANTHROPIC_API_KEY = nil
-  local ok, err = pcall(registry.call, "fn.api_key")
+  local ok, err = pcall(registry.call, "fn.anthropic_api_key")
   assert(not ok, "expected an error for a whitespace-only key file")
-  assert(tostring(err):find("no API key found", 1, true), "wrong error: " .. tostring(err))
+  assert(tostring(err):find("no Anthropic API key found", 1, true), "wrong error: " .. tostring(err))
+  assert(tostring(err):find(":StrapsLogin anthropic", 1, true), "error should name :StrapsLogin: " .. tostring(err))
 end)
 
-it("fn.api_key: no env var and no file errors naming the file path", function()
-  vim.fn.delete(keydir .. "/straps/api_key")
+it("fn.anthropic_api_key: no env var and no file errors naming the file path", function()
+  vim.fn.delete(keydir .. "/straps/anthropic_api_key")
   vim.env.ANTHROPIC_API_KEY = nil
-  local ok, err = pcall(registry.call, "fn.api_key")
+  local ok, err = pcall(registry.call, "fn.anthropic_api_key")
   assert(not ok, "expected an error when no key source is available")
-  assert(tostring(err):find(keydir .. "/straps/api_key", 1, true),
-    "error should name the fallback file path: " .. tostring(err))
+  assert(tostring(err):find(keydir .. "/straps/anthropic_api_key", 1, true),
+    "error should name the key file path: " .. tostring(err))
 end)
 
-it("fn.api_key: falls back to $HOME/.config when XDG_CONFIG_HOME is unset", function()
+it("fn.anthropic_api_key: falls back to $HOME/.config when XDG_CONFIG_HOME is unset", function()
   vim.fn.mkdir(keydir .. "/.config/straps", "p")
-  write_key_file(keydir .. "/.config/straps/api_key", { "home-key" })
+  write_key_file(keydir .. "/.config/straps/anthropic_api_key", { "home-key" })
   local saved_home = vim.env.HOME
   vim.env.XDG_CONFIG_HOME = nil
   vim.env.HOME = keydir
   vim.env.ANTHROPIC_API_KEY = nil
-  local ok, got = pcall(registry.call, "fn.api_key")
+  local ok, got = pcall(registry.call, "fn.anthropic_api_key")
   vim.env.HOME = saved_home
   vim.env.XDG_CONFIG_HOME = keydir
   assert(ok and got == "home-key", "HOME fallback wrong: " .. vim.inspect(got))
 end)
 
-it("fn.api_key: XDG_CONFIG_HOME and HOME both unset errors with the generic path", function()
+it("fn.anthropic_api_key: XDG_CONFIG_HOME and HOME both unset errors naming :StrapsLogin and no file", function()
   local saved_home = vim.env.HOME
   vim.env.XDG_CONFIG_HOME = nil
   vim.env.HOME = nil
   vim.env.ANTHROPIC_API_KEY = nil
-  local ok, err = pcall(registry.call, "fn.api_key")
+  local ok, err = pcall(registry.call, "fn.anthropic_api_key")
   vim.env.HOME = saved_home
   vim.env.XDG_CONFIG_HOME = keydir
   assert(not ok, "expected an error with no key source at all")
-  assert(tostring(err):find("$XDG_CONFIG_HOME/straps/api_key", 1, true),
-    "error should show the generic path: " .. tostring(err))
+  assert(tostring(err):find(":StrapsLogin anthropic to store one", 1, true) and not tostring(err):find("write the key to", 1, true),
+    "error should name :StrapsLogin and no file: " .. tostring(err))
 end)
 
 step(function()
@@ -2589,21 +2614,30 @@ do
     vim.env.XDG_CONFIG_HOME = kd
   end)
 
-  it("fn.openai_api_key: env var wins over the config file", function()
+  it("fn.openai_api_key: the key file wins over the env var", function()
     vim.fn.writefile({ "file-oai" }, kd .. "/straps/openai_api_key")
     vim.fn.setfperm(kd .. "/straps/openai_api_key", "rw-------")
     vim.env.OPENAI_API_KEY = "env-oai"
-    assert(registry.call("fn.openai_api_key") == "env-oai", "env var should take precedence")
+    local key, source = registry.call("fn.openai_api_key")
+    assert(key == "file-oai" and source == "stored", "the key file should take precedence: " .. tostring(key))
   end)
 
-  it("fn.openai_api_key: falls back to the config file, trimmed", function()
+  it("fn.openai_api_key: a group/other-accessible key file fails even with the env var set", function()
+    vim.fn.writefile({ "leaky-oai" }, kd .. "/straps/openai_api_key")
+    vim.fn.setfperm(kd .. "/straps/openai_api_key", "rw-r--r--")
+    vim.env.OPENAI_API_KEY = "env-oai"
+    local ok, err = pcall(registry.call, "fn.openai_api_key")
+    assert(not ok and tostring(err):find("chmod 600", 1, true), "expected the mode error: " .. tostring(err))
+  end)
+
+  it("fn.openai_api_key: reads the key file, trimmed", function()
     vim.fn.writefile({ "  file-oai  " }, kd .. "/straps/openai_api_key")
     vim.fn.setfperm(kd .. "/straps/openai_api_key", "rw-------")
     vim.env.OPENAI_API_KEY = nil
-    assert(registry.call("fn.openai_api_key") == "file-oai", "file fallback wrong")
+    assert(registry.call("fn.openai_api_key") == "file-oai", "stored key wrong")
   end)
 
-  it("fn.openai_api_key: a group/other-accessible key file is refused", function()
+  it("fn.openai_api_key: a group/other-accessible key file is refused without echoing the key", function()
     vim.fn.writefile({ "leaky-oai" }, kd .. "/straps/openai_api_key")
     vim.fn.setfperm(kd .. "/straps/openai_api_key", "rw-r--r--")
     vim.env.OPENAI_API_KEY = nil
@@ -2617,7 +2651,8 @@ do
     vim.env.OPENAI_API_KEY = nil
     local ok, err = pcall(registry.call, "fn.openai_api_key")
     assert(not ok and tostring(err):find("OPENAI_API_KEY", 1, true), "wrong error: " .. tostring(err))
-    assert(tostring(err):find(":StrapsLogin openai", 1, true), "error should mention :StrapsLogin: " .. tostring(err))
+    assert(tostring(err):find(":StrapsLogin openai key", 1, true), "error should mention :StrapsLogin: " .. tostring(err))
+    assert(tostring(err):find(kd .. "/straps/openai_api_key", 1, true), "error should name the key file: " .. tostring(err))
   end)
 
   step(function()

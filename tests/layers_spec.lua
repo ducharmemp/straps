@@ -4,13 +4,17 @@
 -- reset; a second setup() in the same process could not un-register). Covers:
 -- editor tools absent, core tools intact, fn.build_tools omits editor tools,
 -- openai-only fns absent while fn.provider_anthropic stays, fn.provider
--- raising a clean "disabled" message for provider "openai", and fn.list_models
--- returning (nil, err) rather than raising.
+-- raising a clean "disabled" message for provider "openai", fn.list_models
+-- returning (nil, err) rather than raising, :StrapsLogin/:StrapsLogout openai
+-- reporting the disabled layer while the key store still works, and health
+-- suggesting no :StrapsLogin openai command.
 
 local script = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(script, ":p"), ":h:h")
 vim.opt.runtimepath:prepend(root)
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
+vim.env.XDG_CONFIG_HOME = vim.fn.tempname()
+vim.env.HOME = vim.fn.tempname()
 
 local straps = require("straps").setup({ layers = { editor = false, openai = false } })
 straps.config.session_dir = vim.fn.tempname()
@@ -47,6 +51,58 @@ it("openai = false: openai-only fns absent, anthropic stays", function()
     assert(registry.get(name) == nil, name .. " should be absent")
   end
   assert(registry.get("fn.provider_anthropic"), "fn.provider_anthropic should be present")
+  assert(registry.get("fn.anthropic_api_key"), "fn.anthropic_api_key should be present")
+  assert(registry.get("fn.api_key_store"), "fn.api_key_store should be present")
+end)
+
+it("openai = false: the ChatGPT login forms report the disabled layer; logout still deletes the key file", function()
+  local saved_xdg = vim.env.XDG_CONFIG_HOME
+  vim.env.XDG_CONFIG_HOME = vim.fn.tempname()
+  local msgs = {}
+  local orig = vim.notify
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  local ui = require("straps.ui")
+  local asked = false
+  local orig_input = vim.fn.inputsecret
+  vim.fn.inputsecret = function() asked = true return "" end
+  local stored
+  local ok, err = pcall(function()
+    ui.login({ "openai" })
+    ui.login({ "openai", "key" })
+    vim.fn.inputsecret = orig_input
+    stored = pcall(registry.call, "fn.api_key_store", "openai", "sk-layer-off")
+    ui.logout({ "openai" })
+  end)
+  vim.fn.inputsecret = orig_input
+  vim.notify = orig
+  assert(ok, tostring(err))
+  local left = registry.call("fn.api_key_store", "openai")
+  vim.env.XDG_CONFIG_HOME = saved_xdg
+  assert(stored, "fn.api_key_store should work with the openai layer off")
+  assert(not asked, "the key prompt should not run with the openai layer off")
+  assert(msgs[1] and msgs[1]:find("the openai layer is disabled", 1, true), vim.inspect(msgs))
+  assert(msgs[2] and msgs[2]:find("the openai layer is disabled", 1, true), vim.inspect(msgs))
+  assert(msgs[3] and msgs[3]:find("straps: deleted ", 1, true), vim.inspect(msgs))
+  assert(left == nil, "the key file should be gone")
+end)
+
+it("openai = false: health does not suggest a :StrapsLogin openai command", function()
+  local rec = {}
+  local orig = {}
+  for _, k in ipairs({ "start", "ok", "warn", "error", "info" }) do
+    orig[k] = vim.health[k]
+    vim.health[k] = function(msg, advice) rec[#rec + 1] = tostring(msg) .. " " .. vim.inspect(advice) end
+  end
+  local saved_provider, saved_xdg = straps.config.provider, vim.env.XDG_CONFIG_HOME
+  straps.config.provider = "openai"
+  vim.env.XDG_CONFIG_HOME = vim.fn.tempname()
+  local ok, err = pcall(require("straps.health").check)
+  straps.config.provider, vim.env.XDG_CONFIG_HOME = saved_provider, saved_xdg
+  for k, f in pairs(orig) do vim.health[k] = f end
+  assert(ok, tostring(err))
+  local text = table.concat(rec, "\n")
+  assert(text:find("openai layer disabled", 1, true), text)
+  assert(not text:find(":StrapsLogin openai", 1, true), "health suggested a command that errors:\n" .. text)
 end)
 
 it("openai = false: fn.provider raises a clean disabled message", function()
@@ -64,4 +120,22 @@ it("openai = false: fn.list_models returns (nil, err), does not raise", function
   assert(out == nil, "fn.list_models should return nil result")
   assert(type(err) == "string" and err:find("disabled", 1, true),
     "err should mention 'disabled': " .. tostring(err))
+end)
+
+it("openai = false: :StrapsLogout openai says the ChatGPT login file stays", function()
+  local saved_xdg = vim.env.XDG_CONFIG_HOME
+  vim.env.XDG_CONFIG_HOME = vim.fn.tempname()
+  vim.fn.mkdir(vim.env.XDG_CONFIG_HOME .. "/straps", "p")
+  local login = vim.env.XDG_CONFIG_HOME .. "/straps/openai_oauth.json"
+  vim.fn.writefile({ "{}" }, login)
+  local msgs = {}
+  local orig = vim.notify
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  require("straps.ui").logout({ "openai" })
+  vim.notify = orig
+  local still = vim.uv.fs_stat(login) ~= nil
+  vim.env.XDG_CONFIG_HOME = saved_xdg
+  assert(still, "the login file should not be deleted with the layer off")
+  assert(msgs[1] and msgs[1]:find("the ChatGPT login at " .. login .. " was not removed (the openai layer is off)", 1, true)
+    and not msgs[1]:find("no stored openai credential", 1, true), vim.inspect(msgs))
 end)

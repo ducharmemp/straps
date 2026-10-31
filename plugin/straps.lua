@@ -272,20 +272,33 @@ vim.api.nvim_create_user_command("StrapsProvider", function()
   require("straps.ui").pick_provider()
 end, { desc = "straps: pick the API backend (anthropic/openai/llamacpp); persists the global choice to ~/.config/straps/provider" })
 
+local function provider_complete(arglead)
+  local out = {}
+  for _, name in ipairs(require("straps.provider").provider_names()) do
+    if vim.startswith(name, arglead) then out[#out + 1] = name end
+  end
+  return out
+end
+
 vim.api.nvim_create_user_command("StrapsLogin", function(opts)
   require("straps.ui").login(opts.fargs)
-end, { nargs = "+", complete = function(arglead, line)
-  local after = line:match("StrapsLogin!?%s+(.*)$") or ""
-  if after:find("%s") then return {} end
-  return vim.startswith("openai", arglead) and { "openai" } or {}
-end, desc = "straps: sign in with ChatGPT (:StrapsLogin openai, then :StrapsLogin openai <redirect-url>)" })
+end, { nargs = "*", bang = true, complete = function(arglead, line)
+  local after = line:match("StrapsLog%a*!?%s+(.*)$") or ""
+  if not after:find("%s") then return provider_complete(arglead) end
+  local first = after:match("^(%S+)%s+%S*$")
+  if first and vim.tbl_contains(require("straps.provider").provider_names(), first) and vim.startswith("key", arglead) then
+    return { "key" }
+  end
+  return {}
+end, desc = "straps: store a provider credential (:StrapsLogin [provider [key]]; openai signs in with ChatGPT, then :StrapsLogin openai <redirect-url>; key stores an API key)" })
 
 vim.api.nvim_create_user_command("StrapsLogout", function(opts)
   require("straps.ui").logout(opts.fargs)
-end, { nargs = 1, complete = function(arglead)
-  return vim.startswith("openai", arglead) and { "openai" } or {}
+end, { nargs = "*", bang = true, complete = function(arglead, line)
+  local after = line:match("StrapsLog%a*!?%s+(.*)$") or ""
+  return after:find("%s") and {} or provider_complete(arglead)
 end,
-  desc = "straps: cancel a pending ChatGPT login and delete the stored one" })
+  desc = "straps: delete a provider's stored credentials (:StrapsLogout [provider])" })
 
 vim.api.nvim_create_user_command("StrapsAuto", function(opts)
   require("straps.ui").auto(opts.args)

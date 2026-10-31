@@ -68,11 +68,12 @@ All modules return a table `M`. `provider.lua`, `tools.lua` expose
 `M.register()` which defines their registry entries; `init.setup()` calls these.
 `provider.lua` also exposes `M.PROVIDERS`, `M.provider_names()`,
 `M.is_provider(name)`, `M.provider_slot(name)`, `M.effort_applies`,
-`M.resolve_provider`, `M.resolve_model`, `M.model_entry`, `M.merge_model_entry` and
-`M.llamacpp_base_url`: the provider name set, each provider's config keys and
-model buffer variable, the effort rule and the helpers (see the provider.lua
-section).
-Nothing registers at `require` time except `registry.lua`'s own module table.
+`M.resolve_provider`, `M.resolve_model`, `M.model_entry`, `M.merge_model_entry`,
+`M.normalize_base_url`, `M.check_base_url`, `M.base_url`, `M.clean_key` and
+`M.auth_headers`: the provider name set, each provider's config keys, model
+buffer variable and auth facts, the effort rule and the helpers (see the
+provider.lua section). Nothing registers at `require` time except
+`registry.lua`'s own module table.
 
 ---
 
@@ -687,7 +688,7 @@ edit.
 - Context is the transcript, so pruning old tool results is deleting buffer
   lines. `config.log_file` enables structured event logs for long runs.
 
-## provider.lua — registers `fn.provider` (+ `fn.anthropic_messages`, `fn.provider_anthropic`, `fn.provider_openai`, `fn.provider_llamacpp`, `fn.provider_pref`, `fn.model_pref`, `fn.api_key`, `fn.openai_api_key`, `fn.llamacpp_api_key`, `fn.openai_oauth_*`, `fn.openai_device_id`, `fn.list_models`, `fn.build_tools`, `fn.system_prompt`)
+## provider.lua — registers `fn.provider` (+ `fn.anthropic_messages`, `fn.provider_anthropic`, `fn.provider_openai`, `fn.provider_llamacpp`, `fn.provider_pref`, `fn.model_pref`, `fn.api_key_store`, `fn.anthropic_api_key`, `fn.openai_api_key`, `fn.llamacpp_api_key`, `fn.openai_oauth_*`, `fn.openai_device_id`, `fn.list_models`, `fn.build_tools`, `fn.system_prompt`)
 
 `fn.provider` is a thin **dispatcher**: `function(req, ctx) -> { content =
 blocks, stop_reason = s }` that selects a backend and delegates. Resolution
@@ -774,49 +775,125 @@ Neither backend calls the other, so redefining `fn.provider_anthropic` changes
 only Anthropic sessions and can never send a llama.cpp session to Anthropic.
 
 The provider NAME SET is the first of the module-table pieces that are not
-registry entries (the helpers below are the others).
-`provider.lua`'s module table holds `M.PROVIDERS`, an ordered list of
-`{ name, model_key, models_key, buf_model_var, base_url_key, default_model?,
-server_context? }`: each provider's config key for its model, its model list
-and its base URL, its `vim.b` model variable, and for llama.cpp
-`server_context = true` (the context window belongs to the running server). `fn.provider_pref`,
-`fn.list_models`, `ui.lua` (`effective_provider`, `effective_model`,
-`session_info`, `pick_model`, `pick_provider`), `tool.spawn` (its `provider`
-enum and validation), `tool.models` and `health.lua` read it through
-`M.provider_slot(name)`, `M.is_provider(name)` or `M.provider_names()`.
-`M.provider_slot` returns the `anthropic` slot for an unknown
-name so `session_info` on the statusline never raises. This is a stated limit
-on invariant 2: a redefined `fn.provider` alone cannot add a fourth backend,
-because the pickers, the persisted preference and `spawn` would still reject
-its name. Adding a provider means editing `provider.lua`: a `M.PROVIDERS`
-entry, a branch in the `fn.provider` dispatcher, a branch in `fn.list_models`,
-the key probe in `health.lua`'s `check_api_key`, the provider-specific lines
-in `health.lua`'s `check_model`, and a branch in `M.effort_applies`. Inserting into
-`M.PROVIDERS` at runtime is unsupported: the pickers and validation would
-accept the name while the dispatcher rejects it and the `tool.spawn` schema
-enum, built at registration, still omits it. A registry entry for the table
-was rejected because the statusline path and the specs that call
-`tools.register()` without `provider.register()` would each need a fallback
-for an absent or broken entry.
+registry entries (the helpers below are the others). `provider.lua`'s module
+table holds `M.PROVIDERS`, an ordered list of `{ name, model_key, models_key,
+buf_model_var, base_url_key, default_model?, server_context?, default_base_url,
+key_fn, key_env, key_required, auth_header }`: each provider's config key for
+its model, its model list and its base URL, its `vim.b` model variable, for
+llama.cpp `server_context = true` (the context window belongs to the running
+server), and its auth facts: the base URL used when the config key is unset, the
+registry entry that returns its key, the environment variables the default key
+entry reads, whether a missing key is an error (false for llama.cpp, which then
+sends no auth header), and the header style (`x-api-key` for Anthropic, `bearer`
+for OpenAI and llama.cpp). `fn.provider_pref`, `fn.list_models`, `ui.lua`
+(`effective_provider`, `effective_model`, `session_info`, `pick_model`,
+`pick_provider`), `tool.spawn` (its `provider` enum and validation),
+`tool.models` and `health.lua` read it through `M.provider_slot(name)`,
+`M.is_provider(name)` or `M.provider_names()`. `M.provider_slot` returns the
+`anthropic` slot for an unknown name so `session_info` on the statusline never
+raises. This is a stated limit on invariant 2: a redefined `fn.provider` alone
+cannot add a fourth backend, because the pickers, the persisted preference and
+`spawn` would still reject its name. The URL and key rules
+(`M.check_base_url`, `M.clean_key`) are module functions too, so redefining
+`fn.api_key_store` or a key fn cannot relax them; a redefined backend that
+builds its own headers, or a caller passing `opts.auth_headers` to
+`fn.anthropic_messages`, skips them. Adding a provider means editing
+`provider.lua`: a `M.PROVIDERS` entry, a branch in the `fn.provider` dispatcher,
+a branch in `fn.list_models` (for its URL path and response shape; the URL, key
+and auth header come from the slot), a `key_fn` registry entry for the slot to
+name, the provider-specific lines in `health.lua`'s `check_model`, and a branch
+in `M.effort_applies`. `health.lua`'s `check_api_key` needs no new branch: it
+reads the slot (its openai branches cover the ChatGPT login). Inserting into
+`M.PROVIDERS` at runtime is unsupported: the pickers and validation would accept
+the name while the dispatcher rejects it and the `tool.spawn` schema enum, built
+at registration, still omits it. A registry entry for the table was rejected
+because the statusline path and the specs that call `tools.register()` without
+`provider.register()` would each need a fallback for an absent or broken entry.
 
 `M.effort_applies(provider, entry, effort_name, efforts)` is the second
 module-table exception: the rule for whether an effort changes a request.
 `fn.anthropic_messages` (for `ctx.provider`, "anthropic" when unset) and
-`fn.provider_openai` call it to decide whether to
-send `thinking` / `output_config` or `reasoning`, and `fn.model_note` and
-`health.lua`'s `check_model` call it to report an inert effort, each with the
-session's provider name. It returns `true` plus the matching `config.efforts`
-entry, or `false` plus a reason. A redefined backend that skips it can send
-something the note and health do not report. The plain helpers on the same
-table are `M.resolve_provider(bufnr, config)` (the provider and where its name
-came from), `M.resolve_model(provider, bufnr, config)` (the model a request
-sends), `M.model_entry(provider, id, config)` (the first list entry with that
-id, else the entry stored with the model pref; the one lookup every caller
-uses), `M.merge_model_entry(provider, entry, config)`,
-`M.unknown_provider_error(name)` and `M.llamacpp_base_url(config)`
-(`config.llamacpp_base_url` with its default and with a trailing `/` or `/v1`
-removed). Each takes `config` last; `resolve_model` and `model_entry` return
-nil for an unknown provider.
+`fn.provider_openai` call it to decide whether to send `thinking` /
+`output_config` or `reasoning`, and `fn.model_note` and `health.lua`'s
+`check_model` call it to report an inert effort, each with the session's
+provider name. It returns `true` plus the matching `config.efforts` entry, or
+`false` plus a reason. A redefined backend that skips it can send something the
+note and health do not report. The plain helpers on the same table are listed
+below. Those that take `config` take it last; `resolve_model` and `model_entry`
+return nil for an unknown provider.
+
+- `M.resolve_provider(bufnr, config)`: the provider and where its name came
+  from.
+- `M.resolve_model(provider, bufnr, config)`: the model a request sends.
+- `M.model_entry(provider, id, config)`: the first list entry with that id, else
+  the entry stored with the model pref. Every caller uses this one lookup.
+- `M.merge_model_entry(provider, entry, config)` and
+  `M.unknown_provider_error(name)`.
+- `M.normalize_base_url(url)`: removes every trailing `/` and `/v1` from the
+  path, lowercases the scheme and host, and drops a default port (`:80` for
+  http, `:443` for https). It does not validate.
+- `M.check_base_url(url, label)`: the one base URL rule. The URL must start
+  with `http://` or `https://` and a host that does not begin with `:` or `@`.
+  It must hold no whitespace or control characters, and no query or fragment,
+  since the request path is appended. It returns the normalized URL, else
+  `nil, err` naming `label`. `M.base_url` uses it, and so does the
+  `opts.base_url` check in `fn.anthropic_messages` and `fn.openai_api_key`.
+- `M.base_url(name, config)`: `config[slot.base_url_key]`, else
+  `slot.default_base_url` when that is nil or `""`, through `check_base_url`.
+  The three base URL keys default to nil. It returns `nil, err` for an unknown
+  provider or a refused value; health reports the error and continues,
+  `fn.list_models` returns it, and the request paths raise it.
+- `M.clean_key(key)`: the one key rule. It removes surrounding whitespace and
+  returns `nil, "empty"` for nil, a non-string or a blank key; callers test for
+  that value. It returns `nil, "spaces or control characters"` for either
+  inside the key, since a control character such as CR or LF would split the
+  curl header and a space inside a key is a paste error. It returns `nil,
+  "non-ASCII characters"` for a byte above 127, such as a pasted no-break or
+  zero-width space. `fn.api_key_store`, `M.auth_headers` and health use it.
+- `M.auth_headers(name, key)`: the curl argv for the slot's header style, with
+  the key cleaned by `clean_key`. An empty key gives `{}` for a slot whose key
+  is optional and raises "<key_fn> returned no key" for one with
+  `key_required`. It raises for a key `clean_key` refuses, an unknown provider
+  or an unknown `auth_header`, so no request goes out with a bad or missing
+  key. It does no I/O, so it stays a module function while key lookup and
+  storage are entries.
+
+Every curl request to a provider base URL (the three backends and
+`fn.list_models`) passes `-g`, so `{}` and `[]` in a base URL are not expanded
+into several requests.
+
+**Keys.** Every provider resolves its key the same way, through entries:
+`fn.api_key_store(provider, value?)` is the key store at
+`$XDG_CONFIG_HOME/straps/<provider>_api_key`. `oauth.config_dir` ignores a
+relative `$XDG_CONFIG_HOME` (the XDG spec requires it) and a relative `$HOME`, so
+the store, the ChatGPT login and the provider and model prefs never resolve
+inside the working directory. An unknown provider raises, so no
+caller can build a path outside the directory. It has three modes:
+
+- read (no value) returns `key?, path`. A blank file or a non-file reads a nil
+  key. It raises on a file accessible by group or other, an unreadable one, a
+  symlink to a missing file, or a key `M.clean_key` refuses.
+- write (a string) refuses a value that is not a string or a key `M.clean_key`
+  refuses, sets the straps directory to mode 700, writes the cleaned key with
+  mode 600 through a temp file and a rename, and returns `key, path`.
+- delete (`false`) returns `removed, path`.
+
+A symlink at the path, such as one a secret manager places, is read through, but
+a write or delete on it raises. The default key entries `fn.anthropic_api_key`,
+`fn.openai_api_key` and `fn.llamacpp_api_key` return `key, source`: for OpenAI a
+ChatGPT login first (source "oauth"), then the stored key ("stored"), then each
+variable in `slot.key_env` that is not blank after trimming ("env", the trimmed
+value). A stored key wins over the environment so `:StrapsLogin` takes effect
+while a variable is exported; the cost is that a key file accessible by group or
+other fails every request for its provider even with the variable set. A
+required provider raises naming `:StrapsLogin`, the variables and the file;
+llama.cpp returns nil. `:StrapsLogin`, `:StrapsLogout`, health and the key
+entries all call `fn.api_key_store`, so redefining that one entry moves key
+storage elsewhere. A completed ChatGPT login deletes the stored openai key
+through `fn.api_key_store` and its success message reports what the store did.
+The store's errors carry their own remedy (`chmod 600`, `:StrapsLogin <provider>
+key`, or, for a symlink, the tool that created it), and health and
+`:StrapsLogin` print them without adding advice.
 
 `fn.provider_pref(value?)` is the persistence seam: called with no argument it
 reads the first line of `$XDG_CONFIG_HOME/straps/provider`
@@ -832,13 +909,10 @@ file's mtime, size and inode. It is not a secret, so no mode-600 guard.
 
 ### `fn.provider_anthropic` and `fn.anthropic_messages` — the Anthropic Messages API backend
 
-- POST `https://api.anthropic.com/v1/messages` with headers `x-api-key`
-  (from `registry.call("fn.api_key")`, default entry reads
-  `vim.env.ANTHROPIC_API_KEY`, falling back to the first line of
-  `$XDG_CONFIG_HOME/straps/api_key` — `~/.config/straps/api_key` when
-  `XDG_CONFIG_HOME` is unset — refusing a group/other-accessible key file,
-  distinct error for a present-but-unreadable file, error with clear message
-  if neither source yields a key),
+- POST `{M.base_url("anthropic", config)}/v1/messages` with headers `x-api-key`
+  (from `registry.call("fn.anthropic_api_key", { base_url })` through
+  `M.auth_headers`; the default entry reads the stored key, then
+  `$ANTHROPIC_API_KEY`; see **Keys** above),
   `anthropic-version: 2023-06-01`, `content-type: application/json`.
 - Body: `{ model=(opts.model or ctx.model or M.resolve_model), max_tokens=(config.max_tokens or the model's
   max_output or config.default_max_tokens), stream=true,
@@ -896,27 +970,27 @@ file's mtime, size and inode. It is not a secret, so no mode-600 guard.
   non-empty text delta has reached the transcript, the request is not
   retried: a retry would stream the same text a second time. The OpenAI
   backend retries the same status set (429/500/502/503/408 + curl failures).
-- `config.base_url` (default `https://api.anthropic.com`) prefixes
-  `/v1/messages` so Anthropic-compatible servers/proxies are a config knob.
+- `config.base_url` (nil means `https://api.anthropic.com`; see `M.base_url`)
+  prefixes `/v1/messages` so Anthropic-compatible servers/proxies are a config
+  knob.
 - The request code is `fn.anthropic_messages`; `fn.provider_anthropic` is a
-  one-line entry that calls it with no `opts`. An optional third argument
-  `opts` points the same wire format at another server without copying it:
-  `opts.base_url` replaces `config.base_url`; `opts.model` replaces
-  `ctx.model` and the `M.resolve_model` fallback (effort still comes from
-  `vim.b straps_effort` / `config.effort`); `opts.model_entry` supplies the
-  model's list entry for `max_output` and thinking (else `ctx.model_entry`
-  when the model is `ctx.model`, else, without `opts.base_url`, the Anthropic
-  list entry); the success result carries `model`, the id sent, which
-  `fn.provider` pins; `opts.auth_headers` (an argv list, `{}`
-  allowed) replaces the `x-api-key` header, and `fn.api_key` is then not
-  called (`anthropic-version` and `content-type` stay); with `opts.base_url`
-  set and `opts.auth_headers` omitted no auth header is sent, so the Anthropic
-  key never goes to another host; `opts.gzip = false`
-  skips compression; `opts.label` names the backend in the "request failed"
-  and "retries exhausted" errors (`straps provider (llamacpp): ...`). With no
-  `opts` the request and messages are unchanged. A redefinition of
-  `fn.anthropic_messages` must accept and honor `opts`, because
-  `fn.provider_llamacpp` routes through it.
+  one-line entry that calls it with no `opts`. An optional third argument `opts`
+  points the same wire format at another server without copying it:
+  `opts.base_url` replaces `M.base_url("anthropic", config)`; `opts.model`
+  replaces `ctx.model` and the `M.resolve_model` fallback (effort still comes
+  from `vim.b straps_effort` / `config.effort`); `opts.model_entry` supplies the
+  model's list entry for `max_output` and thinking (else `ctx.model_entry` when
+  the model is `ctx.model`, else, without `opts.base_url`, the Anthropic list
+  entry); the success result carries `model`, the id sent, which `fn.provider`
+  pins; `opts.auth_headers` (an argv list, `{}` allowed) replaces the
+  `x-api-key` header, and `fn.anthropic_api_key` is then not called
+  (`anthropic-version` and `content-type` stay); with `opts.base_url` set and
+  `opts.auth_headers` omitted no auth header is sent, so the Anthropic key never
+  goes to another host; `opts.gzip = false` skips compression; `opts.label`
+  names the backend in the "request failed" and "retries exhausted" errors
+  (`straps provider (llamacpp): ...`). With no `opts` the request and messages
+  are unchanged. A redefinition of `fn.anthropic_messages` must accept and honor
+  `opts`, because `fn.provider_llamacpp` routes through it.
 - Idle watchdog: `config.request_timeout_ms` (default 300000) — a uv timer
   armed at spawn and reset on every stdout chunk. On expiry it kills curl AND
   resolves the await immediately with a descriptive error (never wait for the
@@ -929,7 +1003,7 @@ file's mtime, size and inode. It is not a secret, so no mode-600 guard.
 (streaming, tool use, `cache_control` accepted), so this backend resolves the
 llama.cpp settings and calls `fn.anthropic_messages(req, ctx, opts)`:
 
-- `base_url = M.llamacpp_base_url(config)` (`config.llamacpp_base_url`,
+- `base_url = M.base_url("llamacpp", config)` (`config.llamacpp_base_url`,
   default `http://127.0.0.1:8080`, with a trailing `/` or `/v1` removed).
 - Model: `ctx.model`, which `fn.provider` resolves with `M.resolve_model`
   (`vim.b[bufnr].straps_llamacpp_model`, then `config.llamacpp_model`, then
@@ -943,8 +1017,9 @@ llama.cpp settings and calls `fn.anthropic_messages(req, ctx, opts)`:
   `max_output`): `max_tokens` is `config.max_tokens`, else the entry's
   `max_output` when you configure one, else `default_max_tokens`; the server
   accepts a value above the model's `n_ctx`.
-- `auth_headers`: `Authorization: Bearer <key>` when `fn.llamacpp_api_key`
-  returns one (`$LLAMACPP_API_KEY`, else `$LLAMA_API_KEY`, the variable
+- `auth_headers`: `M.auth_headers("llamacpp", key)`, so
+  `Authorization: Bearer <key>` when `fn.llamacpp_api_key` returns one (the
+  stored key, else `$LLAMACPP_API_KEY`, else `$LLAMA_API_KEY`, the variable
   llama-server binds to `--api-key`), else `{}`. llama-server's `--api-key`
   check accepts `Authorization: Bearer` and `X-Api-Key`.
 - `gzip = false`, `label = "llamacpp"`.
@@ -963,10 +1038,11 @@ that reason by default (gpt-5.6-sol, gpt-6.1-sol) unless `reasoning_effort`
 is `"none"`, while other models reject `"none"`; the Responses API accepts
 function tools together with any reasoning effort.
 
-- POST `{config.openai_base_url}/v1/responses` (default
+- POST `{M.base_url("openai", config)}/v1/responses` (default
   `https://api.openai.com`) with `Authorization: Bearer <key>`
   (from `registry.call("fn.openai_api_key", { ctx, base_url })`; see "Sign in
-  with ChatGPT" below for the order of sources) and
+  with ChatGPT" below for the order of sources; `M.auth_headers` builds the
+  header inside each attempt, so the 401 retry sends the refreshed token) and
   `content-type: application/json`.
 - **HTTP 401 with a ChatGPT login token** (`source == "oauth"`): one
   `fn.openai_oauth_refresh{ rejected_access = <token> }` through `ctx.await`,
@@ -1062,13 +1138,37 @@ second backend.
   `:StrapsStop` during a refresh cannot lose a rotated refresh token. A file
   deleted mid-refresh (logout) wins.
 - **Key order.** `fn.openai_api_key(opts?) -> key, source`: a stored login
-  wins (Pi's rule), then `$OPENAI_API_KEY`, then the key file. With a login
-  stored, a failed refresh raises naming `:StrapsLogin openai` and never falls
-  back to an API key. The login token is refused for any `base_url` other
-  than `https://api.openai.com`. `opts.ctx` waits for a refresh through
+  wins (Pi's rule), then the stored key (`fn.api_key_store("openai")`), then
+  `$OPENAI_API_KEY`. With a login stored, a failed refresh raises naming
+  `:StrapsLogin openai` and never falls back to an API key. The login token is
+  refused for any `base_url` other than `https://api.openai.com` after
+  `M.check_base_url` (so `https://api.openai.com/v1` is accepted).
+  `opts.ctx` waits for a refresh through
   `ctx.await` (cancel returns `nil, "cancelled"`); without ctx it waits with
   `vim.wait(opts.wait_ms or 50000)` (`fn.list_models` passes 15000);
   `opts.refresh = false` never refreshes (health).
+- **One stored credential.** OpenAI keeps either a ChatGPT login or a stored
+  API key. A login does not start when `openai_base_url` is not
+  `https://api.openai.com`, since its token would be refused there and its
+  completion would delete the key that host needs; completion checks
+  `openai_base_url` again inside the lock and refuses to save the login if it
+  changed to another host. A completed login deletes the stored OpenAI key
+  through `fn.api_key_store` after saving the credential (inside the lock); a failed
+  delete is a note on the success message (and the second argument of
+  `opts.on_done`), since the login is already stored. `:StrapsLogin openai key`
+  reads the key and writes it through `fn.api_key_store` first, so a rejected
+  key changes nothing; then it calls `fn.openai_oauth_logout` (cancel the
+  pending login, delete the stored login under the lock). If that fails the
+  key stays stored, the ChatGPT login keeps winning, and the error says so.
+  Within one Neovim a login completing later cannot delete the new key;
+  across two Neovim processes it can, since the key write runs outside the
+  lock. `fn.openai_oauth_logout(cb)` handles only the ChatGPT login and
+  reports `cb(err?, "deleted"|"cancelled"|"none")`; `:StrapsLogout openai`
+  deletes the key file itself. The two directions live in different places:
+  a completed login removes the key inside `fn.openai_oauth_login`, and
+  `ui.login` owns the other direction (store the key, then sign out). A key
+  written to `fn.api_key_store` directly while a ChatGPT login is stored is
+  therefore ignored until the login is removed.
 - **Secrets.** Form bodies go to curl on stdin (`fn.openai_oauth_post`), never
   argv. A failed token request reports the HTTP status and the full response
   body (capped at 2000 bytes), with any request form value of 8 or more
@@ -1084,19 +1184,23 @@ same backend `fn.provider` would use**. It resolves the effective provider exact
 current buffer → `config.provider` → the persisted `fn.provider_pref` file), so discovery never disagrees with the loop: under the OpenAI
 provider it lists GPT models, not Claude ones.
 
+- Every provider's URL is `M.base_url(provider, config)`, its key comes
+  from the slot's `key_fn` with `{ base_url, wait_ms = 15000 }` (a missing
+  key is an error only when `key_required`), and `M.auth_headers` builds the
+  header.
 - **Anthropic**: `GET {base_url}/v1/models?limit=1000` with
-  `x-api-key`/`anthropic-version` headers (key from `fn.api_key`). Each model
-  becomes `{ id, label = display_name, thinking, max_output = max_tokens,
-  context = max_input_tokens }`. The `thinking` tag is
-  inferred from the API's own `capabilities.thinking.types`:
-  `adaptive.supported` → `"adaptive"`, else `enabled.supported` → `"budget"`,
-  else `nil` (no thinking block) — the SAME tag `fn.provider` reads to choose
-  between the two incompatible thinking mechanisms, so a discovered model gets
-  extended thinking correctly without a hand-written config entry. `max_output`
-  is the model's own response cap, which `fn.provider` uses as the default
-  `max_tokens` for that model.
-- **OpenAI**: `GET {openai_base_url}/v1/models` with `Authorization: Bearer`
-  (key from `fn.openai_api_key` with `{ base_url, wait_ms = 15000 }`, so a
+  `x-api-key`/`anthropic-version` headers (key from `fn.anthropic_api_key`).
+  Each model becomes `{ id, label = display_name, thinking, max_output =
+  max_tokens, context = max_input_tokens }`. The `thinking` tag is inferred from
+  the API's own `capabilities.thinking.types`: `adaptive.supported` →
+  `"adaptive"`, else `enabled.supported` → `"budget"`, else `nil` (no thinking
+  block) — the SAME tag `fn.provider` reads to choose between the two
+  incompatible thinking mechanisms, so a discovered model gets extended thinking
+  correctly without a hand-written config entry. `max_output` is the model's own
+  response cap, which `fn.provider` uses as the default `max_tokens` for that
+  model.
+- **OpenAI**: `GET {base_url}/v1/models` with `Authorization: Bearer`
+  (key from `fn.openai_api_key`, so a
   ChatGPT login token is refused for a custom base URL). With an API key the
   catalog is `{data:[{id}]}` and carries no display name or
   thinking/reasoning-effort capabilities, so the id doubles as the label. With
@@ -1106,7 +1210,7 @@ provider it lists GPT models, not Claude ones.
   with `visibility = "hide"` are dropped. `thinking` stays `nil` for both
   shapes; static `config.openai_models` entries must opt in to
   `reasoning.effort` with `reasoning = true` (or `reasoning_effort = true`).
-- **llama.cpp**: `GET {llamacpp_base_url}/v1/models` with no `?limit` and
+- **llama.cpp**: `GET {base_url}/v1/models` with no `?limit` and
   `Authorization: Bearer` only when `fn.llamacpp_api_key` returns a key (no
   key is not an error). The catalog is `{data:[{id, status, meta?}]}`: the id
   doubles as the label, `thinking` is `nil`, and `meta.n_ctx`, present only
@@ -1268,7 +1372,11 @@ mechanics (trigger language in the tool doc itself lifts usage).
   `load_project_registry`, so a project `.straps.lua` can OVERRIDE a global
   entry (later `define` wins), and both land after builtins in seq order.
 - Plain Lua — `registry.define` calls; `registry.dump()` output is valid
-  content — same shape as `.straps.lua`.
+  content — same shape as `.straps.lua`. A dumped entry pins the source it had
+  when dumped and replaces the default, so a corpus dumped from an older
+  straps can call module functions that no longer exist. After upgrading,
+  keep only the entries you changed and delete the dumped defaults; dumping
+  again from a session that loaded the file writes the old sources back.
 
 **.straps.lua auto-load (init.lua) — direnv-style trust:**
 - `M.load_project_registry(opts?) -> loaded(bool), info(string)`. Finds the
@@ -2194,11 +2302,34 @@ Existing suites must all still pass.
   or when the write fails; the next global pick after a failed write retries
   it. A global `:StrapsModel` pick follows the same rule. `effective_provider` mirrors
   `effective_model`/`effective_effort` for the picker's current-* marker.
-- `:StrapsLogin openai [url]` / `:StrapsLogout openai` (`ui.login`,
-  `ui.logout`) call `fn.openai_oauth_login` / `fn.openai_oauth_logout` and
-  report through `vim.notify`. Any provider other than `openai`, or
-  `layers.openai = false`, is an error message. A completed paste removes the
-  `:StrapsLogin` line from command history, since it carries the code.
+- `:StrapsLogin [provider [key]]` / `:StrapsLogout [provider]` (`ui.login`,
+  `ui.logout`) act on the named provider, else the current buffer's
+  (`M.resolve_provider`, reporting a pref read error). An unknown name is an
+  error that does not echo the name, since it may be a key typed in the wrong
+  place. For anthropic and llamacpp (with or without `key`) and `:StrapsLogin
+  openai key`, login reads the key with `vim.fn.inputsecret` (an empty answer
+  cancels) and writes it through `fn.api_key_store`; the key is never an
+  argument, and any other extra argument is rejected. `:StrapsLogin openai
+  [url]` calls `fn.openai_oauth_login`; an argument that is neither `key` nor an
+  http(s) URL gets the usage message. With a key already stored (read through
+  `fn.api_key_store`), the key prompt says that it replaces the stored key. A
+  call with an extra argument or an unknown name, which can carry a code or a
+  key, removes the last command-line history entry once, when that entry
+  contains `StrapsLog`: a typed line is that entry, and a call from a mapping or
+  Lua adds none, so it can remove only an earlier StrapsLogin/StrapsLogout line.
+  The `:` register still holds a typed line until the next command line; it is
+  not written to ShaDa. Logout without a provider argument asks first
+  (`vim.fn.confirm`), since a provider console cannot show an API key again. It
+  deletes the stored key through `fn.api_key_store` (a store with no path is
+  reported as "the stored <provider> API key"), for openai then calls
+  `fn.openai_oauth_logout`, reports each item removed or that nothing was
+  stored, and names each `slot.key_env` variable still set; with more than one
+  set, it says the default key fn reads the first one set, in `key_env` order.
+  Both commands accept a bang and ignore it, so `:StrapsLogin! <provider> <key>`
+  still reaches the history removal instead of failing with E477. With
+  `layers.openai = false`, every `:StrapsLogin openai` form, `key` included, is
+  an error message, health suggests no `:StrapsLogin openai` command, and
+  `:StrapsLogout openai` deletes only the key file.
 - Folding for the session buffer: foldexpr folds `tool_use`/`tool_result`
   pairs and the system block (level 1); user/assistant turns never fold.
   `foldlevel=0` so tool calls start closed and the conversation stays visible.
@@ -2226,22 +2357,36 @@ session runs, so the checks must survive a half-loaded plugin: every probe is
 info}` rather than throwing. It runs even when `setup()` never ran (it reports
 that as the error) and when the data dir is unwritable.
 
-Sections: nvim version (>= 0.11), dependencies (curl required, ripgrep
-optional), API key (env, key-file mode 600, for OpenAI the ChatGPT login file's
-mode, expiry and client id, and whether `fn.api_key` / `fn.openai_api_key`
-resolves a key and from which source, without refreshing; for llama.cpp only
-`llamacpp_base_url` as info, a key from `fn.llamacpp_api_key` as OK and no key as info,
-with no Anthropic key-file or `fn.api_key` probe), sessions (dir writable + transcript count), transcript rendering
-(tree-sitter `straps` parser + queries, `config.render`), project registry
-(`.straps.lua` trust state against the sha256 store), registry (entry counts,
-redefinitions, missing core entries, `fn.log`), layers (each `config.layers`
-flag's on/off state; on but sentinel entry missing is an error, off is info),
-model (the ACTIVE provider's model, model list and base URL from its
-`M.PROVIDERS` slot, and the model/effort pairing, the mismatch that 400s a
-request; an effort other than "off" on a model whose list entry marks no
-thinking style, or for OpenAI no `reasoning` flag, is reported as inert, and
-an unset `llamacpp_model` warns with the `:StrapsModel` remedy), and active
-runs (a warning that quitting cancels in-flight sessions). It is read-only and touches no windows.
+Sections:
+
+- nvim version (>= 0.11) and dependencies (curl required, ripgrep optional).
+- API key, one check driven by the active provider's slot. It shows the
+  redacted base URL. It reports problems with the stored key through a pcall of
+  `fn.api_key_store`: a raised mode, read or content error, a non-file at the
+  key path, or an empty first line. For OpenAI it reports the ChatGPT login
+  file's mode and client id, and an OK line with the minutes left on the access
+  token. The verdict names the source `slot.key_fn` returned a key from,
+  without refreshing, and checks the key with `provider.clean_key`, so a key
+  every request refuses is an error. A missing key is an error when
+  `key_required`, else info. When the key fn raises the stored key error or
+  the base URL error already shown, health says so instead of printing it
+  again. Health does not restate the key fns' lookup order, so a change to that
+  order or a redefined key fn cannot make it describe the wrong source.
+- sessions (dir writable + transcript count).
+- transcript rendering (tree-sitter `straps` parser + queries,
+  `config.render`).
+- project registry (`.straps.lua` trust state against the sha256 store).
+- registry (entry counts, redefinitions, missing core entries, `fn.log`).
+- layers (each `config.layers` flag's on/off state; on but sentinel entry
+  missing is an error, off is info).
+- model: the ACTIVE provider's model, model list and base URL from its
+  `M.PROVIDERS` slot, and the model/effort pairing, the mismatch that 400s a
+  request. An effort other than "off" on a model whose list entry marks no
+  thinking style, or for OpenAI no `reasoning` flag, is reported as inert, and
+  an unset `llamacpp_model` warns with the `:StrapsModel` remedy.
+- active runs (a warning that quitting cancels in-flight sessions).
+
+Health is read-only and touches no windows.
 `tests/health_spec.lua` stubs `vim.health.*` to collect the report and asserts
 the healthy and broken-state paths (no setup, unwritable dir) both classify
 without throwing.

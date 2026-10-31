@@ -23,8 +23,9 @@ StrapsRunStart	straps.txt	/*StrapsRunStart*
 StrapsStatusChanged	straps.txt	/*StrapsStatusChanged*
 b:straps_run_reason	straps.txt	/*b:straps_run_reason*
 b:straps_status	straps.txt	/*b:straps_status*
+fn.anthropic_api_key	straps.txt	/*fn.anthropic_api_key*
 fn.anthropic_messages	straps.txt	/*fn.anthropic_messages*
-fn.api_key	straps.txt	/*fn.api_key*
+fn.api_key_store	straps.txt	/*fn.api_key_store*
 fn.autocmd_bridge	straps.txt	/*fn.autocmd_bridge*
 fn.build_tools	straps.txt	/*fn.build_tools*
 fn.capability	straps.txt	/*fn.capability*

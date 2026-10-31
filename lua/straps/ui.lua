@@ -1924,58 +1924,203 @@ function M.pick_provider()
   end)
 end
 
-local function oauth_entry(provider, name)
-  if provider ~= "openai" then
-    notify_err("straps: only `openai` supports login (got " .. tostring(provider) .. ")")
-    return nil
+-- Removes the last command-line history entry when it contains "StrapsLog".
+-- A typed :StrapsLogin / :StrapsLogout line is that entry and can carry a
+-- key or an authorization code. A call from a mapping or from Lua adds no
+-- entry, so it can remove an earlier line that contains "StrapsLog". The `:`
+-- register keeps the typed line until the next command line; Lua cannot
+-- clear it.
+local function scrub_history()
+  local last = vim.fn.histget(":", -1)
+  if last:find("StrapsLog", 1, true) then pcall(vim.fn.histdel, ":", -1) end
+end
+
+-- The provider :StrapsLogin / :StrapsLogout act on: `name`, else the current
+-- buffer's provider (provider.resolve_provider). nil after reporting an
+-- unknown name or an unreadable provider pref. An unknown name is not echoed:
+-- it may be a key typed in the wrong place.
+local function auth_provider(name, cmd)
+  local providers = require("straps.provider")
+  if name == nil or name == "" then
+    local resolved, _, pref_err = providers.resolve_provider(vim.api.nvim_get_current_buf(), require("straps").config)
+    if pref_err then
+      notify_err("straps: " .. cmd .. ": " .. pref_err)
+      return nil
+    end
+    name = resolved
   end
-  if not require("straps.registry").get(name) then
-    notify_err("straps: the openai layer is disabled (setup{ layers = { openai = false } })")
+  if not providers.is_provider(name) then
+    notify_err("straps: " .. cmd .. ": unknown provider (expected one of: "
+      .. table.concat(providers.provider_names(), ", ") .. ")")
     return nil
   end
   return name
+end
+
+-- Reports and returns false when an entry login or logout needs is missing:
+-- `layer` (the config.layers flag that registers every entry in names) is
+-- off, or setup() has not run.
+local function require_entries(names, layer)
+  local registry = require("straps.registry")
+  local layers = (require("straps").config or {}).layers or {}
+  for _, name in ipairs(names) do
+    if not registry.get(name) then
+      if layer and layers[layer] == false then
+        notify_err("straps: the " .. layer .. " layer is disabled (setup{ layers = { " .. layer .. " = false } })")
+      else
+        notify_err("straps: " .. name .. " is not registered (setup() has not run)")
+      end
+      return false
+    end
+  end
+  return true
 end
 
 local function strip_prefix(msg)
   return "straps: " .. (tostring(msg):gsub("^straps: ", ""))
 end
 
+--- :StrapsLogin [provider [key]] — store a credential for a provider
+--- (default: the current buffer's). anthropic and llamacpp store an API key,
+--- with or without `key`. openai signs in with ChatGPT (:StrapsLogin openai,
+--- then :StrapsLogin openai <redirect-url>) or, with `key`, stores an API key.
+--- A key is read with inputsecret and never taken as an argument. OpenAI keeps
+--- one stored credential: an API key replaces a ChatGPT login and the reverse.
 function M.login(fargs)
-  local name = oauth_entry(fargs[1], "fn.openai_oauth_login")
+  local providers = require("straps.provider")
+  local key_form = #fargs == 2 and fargs[2] == "key" and providers.is_provider(fargs[1])
+  if (#fargs >= 2 and not key_form) or (fargs[1] and not providers.is_provider(fargs[1])) then
+    scrub_history()
+  end
+  local name = auth_provider(fargs[1], ":StrapsLogin")
   if not name then return end
-  if #fargs > 2 then
-    return notify_err("straps: usage: :StrapsLogin openai [redirect-url]")
+  local registry = require("straps.registry")
+  if name == "openai" and fargs[2] ~= "key" then
+    if not require_entries({ "fn.openai_oauth_login" }, "openai") then return end
+    local url = fargs[2]
+    if #fargs > 2 or (url and not url:match("^https?://")) then
+      return notify_err("straps: usage: :StrapsLogin openai [redirect-url | key]")
+    end
+    local ok, res, opened = pcall(registry.call, "fn.openai_oauth_login", url and { callback_url = url } or {})
+    if not ok then
+      return notify_err(strip_prefix(res))
+    end
+    if url then
+      vim.notify("straps: exchanging the ChatGPT authorization code...")
+    else
+      vim.notify("straps: " .. (opened and "sign in at the page that opened (URL below)" or "open this URL and sign in")
+        .. ". The browser then fails to load " .. require("straps.oauth").REDIRECT_ORIGIN
+        .. "; copy that page's full URL from the address bar and run :StrapsLogin openai <url>"
+        .. "\n" .. tostring(res))
+    end
+    return
   end
-  local url = fargs[2]
-  local ok, res, opened = pcall(require("straps.registry").call, name, url and { callback_url = url } or {})
-  if not ok then
-    return notify_err(strip_prefix(res))
+  if #fargs > 1 and not key_form then
+    return notify_err("straps: usage: :StrapsLogin " .. name .. (name == "openai" and " [redirect-url | key]" or " [key]")
+      .. " (the key is asked for; do not pass it)")
   end
-  if url then
-    pcall(vim.fn.histdel, ":", -1)
-    vim.notify("straps: exchanging the ChatGPT authorization code...")
-  else
-    vim.notify("straps: " .. (opened and "sign in at the page that opened (URL below)" or "open this URL and sign in")
-      .. ". The browser then fails to load " .. require("straps.oauth").REDIRECT_ORIGIN
-      .. "; copy that page's full URL from the address bar and run :StrapsLogin openai <url>\n" .. tostring(res))
+  if not require_entries({ "fn.api_key_store" }) then return end
+  if name == "openai" and not require_entries({ "fn.openai_oauth_logout" }, "openai") then return end
+  -- A provider console cannot show a key again, so say when this key
+  -- replaces a stored one.
+  local ok_old, old = pcall(registry.call, "fn.api_key_store", name)
+  local replaces = (not ok_old or old) and " (replaces the stored key)" or ""
+  local key = vim.trim(vim.fn.inputsecret("straps: " .. name .. " API key" .. replaces .. ": ") or "")
+  if key == "" then return vim.notify("straps: login cancelled") end
+  -- Store (and so validate) the key before touching the ChatGPT login, so a
+  -- rejected key leaves every existing credential in place.
+  local ok_key, saved, path = pcall(registry.call, "fn.api_key_store", name, key)
+  if not ok_key then return notify_err(strip_prefix(saved)) end
+  local done = "straps: saved the " .. name .. " API key" .. (path and (" to " .. path) or "")
+  local set = {}
+  for _, var in ipairs(providers.provider_slot(name).key_env) do
+    if vim.trim(vim.env[var] or "") ~= "" then set[#set + 1] = "$" .. var end
   end
+  if #set > 0 then
+    done = done .. "; the default " .. providers.provider_slot(name).key_fn .. " reads it before " .. table.concat(set, " and ")
+  end
+  if name ~= "openai" then return vim.notify(done) end
+  -- A stored ChatGPT login wins over the key, so sign out of it (under the
+  -- login lock, cancelling a pending login whose completion would delete the
+  -- key).
+  local function signout_failed(err)
+    notify_err(done .. ", but signing out of ChatGPT failed (" .. (tostring(err):gsub("^straps: ", ""))
+      .. "); the ChatGPT login still takes precedence. Run :StrapsLogout openai, then :StrapsLogin openai key.")
+  end
+  local ok, err = pcall(registry.call, "fn.openai_oauth_logout", function(lerr, what)
+    if lerr then return signout_failed(lerr) end
+    vim.notify(done .. (what == "deleted" and "; signed out of ChatGPT"
+      or what == "cancelled" and "; pending ChatGPT login cancelled" or ""))
+  end)
+  if not ok then signout_failed(err) end
 end
 
+--- :StrapsLogout [provider] — delete the provider's stored key (and, for
+--- openai, the ChatGPT login and a pending login), then name any variable the
+--- default key fn would still read. Without a provider argument it asks first,
+--- since a provider console cannot show an API key again.
 function M.logout(fargs)
-  local name = oauth_entry(fargs[1], "fn.openai_oauth_logout")
+  local providers = require("straps.provider")
+  if #fargs > 1 or (fargs[1] and not providers.is_provider(fargs[1])) then scrub_history() end
+  if #fargs > 1 then return notify_err("straps: usage: :StrapsLogout [provider]") end
+  local name = auth_provider(fargs[1], ":StrapsLogout")
   if not name then return end
-  local ok, err = pcall(require("straps.registry").call, name, function(lerr, what)
-    if lerr then
-      notify_err(strip_prefix(lerr))
-    elseif what == "none" then
-      vim.notify("straps: no ChatGPT login stored")
-    elseif what == "cancelled" then
-      vim.notify("straps: pending ChatGPT login cancelled")
-    else
-      vim.notify("straps: signed out of ChatGPT")
+  if not require_entries({ "fn.api_key_store" }) then return end
+  if not fargs[1] and vim.fn.confirm("straps: delete the stored " .. name .. " credentials?", "&Yes\n&No", 2) ~= 1 then
+    return vim.notify("straps: logout cancelled")
+  end
+  local registry = require("straps.registry")
+  local slot = providers.provider_slot(name)
+  local said, failed = {}, false
+  local ok_key, removed, path = pcall(registry.call, "fn.api_key_store", name, false)
+  if not ok_key then
+    failed = true
+    notify_err(strip_prefix(removed))
+  elseif removed == true then
+    said[#said + 1] = "deleted " .. (path or ("the stored " .. name .. " API key"))
+  end
+  local function finish()
+    if #said == 0 and not failed then said[1] = "no stored " .. name .. " credential" end
+    local set = {}
+    for _, var in ipairs(slot.key_env) do
+      if vim.trim(vim.env[var] or "") ~= "" then set[#set + 1] = "$" .. var end
     end
+    if #set == 1 then
+      said[#said + 1] = set[1] .. " is still set (the default " .. slot.key_fn .. " reads it)"
+    elseif #set > 1 then
+      said[#said + 1] = table.concat(set, " and ") .. " are still set (the default " .. slot.key_fn
+        .. " reads the first one set, in that order)"
+    end
+    if #said > 0 then vim.notify("straps: " .. table.concat(said, "; ")) end
+  end
+  if name ~= "openai" then return finish() end
+  if not registry.get("fn.openai_oauth_logout") then
+    -- The openai layer is off, so the ChatGPT login entries are not
+    -- registered; say what stays on disk instead of claiming nothing is stored.
+    local oauth = require("straps.oauth")
+    local dir = oauth.config_dir()
+    local login = dir and (dir .. "/" .. oauth.LOGIN_FILE)
+    if login and vim.uv.fs_stat(login) then
+      said[#said + 1] = "the ChatGPT login at " .. login .. " was not removed (the openai layer is off)"
+    end
+    return finish()
+  end
+  local ok, err = pcall(registry.call, "fn.openai_oauth_logout", function(lerr, what)
+    if lerr then
+      failed = true
+      notify_err(strip_prefix(lerr))
+    elseif what == "deleted" then
+      table.insert(said, 1, "signed out of ChatGPT")
+    elseif what == "cancelled" then
+      table.insert(said, 1, "pending ChatGPT login cancelled")
+    end
+    finish()
   end)
-  if not ok then notify_err(strip_prefix(err)) end
+  if not ok then
+    failed = true
+    notify_err(strip_prefix(err))
+    finish()
+  end
 end
 
 --- :StrapsAuto — grant permission categories to THIS session (auto mode). A

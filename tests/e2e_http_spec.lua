@@ -23,6 +23,10 @@ if vim.fn.executable("curl") == 0 then
   return
 end
 
+-- Hermetic config dir: a stored key file (read before $ANTHROPIC_API_KEY) or a
+-- provider pref in the real ~/.config/straps must not reach the test server.
+vim.env.XDG_CONFIG_HOME = vim.fn.tempname()
+vim.fn.mkdir(vim.env.XDG_CONFIG_HOME, "p")
 local straps = require("straps").setup({})
 straps.config.session_dir = vim.fn.tempname()
 -- Pin the Anthropic backend: this e2e suite points fn.provider at an in-process

@@ -16,25 +16,17 @@ Straps puts a coding agent inside the editor instead of beside it. Agents can in
 - `curl` on `PATH`
 - An Anthropic or OpenAI API key, a ChatGPT subscription for the OpenAI provider, or a llama.cpp `llama-server`
 
-Set a key in the environment:
+Every provider finds its key the same way: the key stored by `:StrapsLogin <provider> key` first (after a ChatGPT login for OpenAI), then the environment. Store a key with `:StrapsLogin anthropic`, `:StrapsLogin openai key` or `:StrapsLogin llamacpp`; straps prompts for the key without echoing it and writes it to `$XDG_CONFIG_HOME/straps/<provider>_api_key` (mode 600, and the `straps` directory mode 700). A relative `$XDG_CONFIG_HOME` is ignored. Or set it in the environment:
 
 ```sh
 export ANTHROPIC_API_KEY=...
 # or
 export OPENAI_API_KEY=...
+# or, for llama.cpp
+export LLAMACPP_API_KEY=...
 ```
 
-You can instead store the first line of the key in:
-
-- `$XDG_CONFIG_HOME/straps/api_key` for Anthropic
-- `$XDG_CONFIG_HOME/straps/openai_api_key` for OpenAI
-
-Key files must not be accessible by group or other users. With the default configuration directory:
-
-```sh
-chmod 600 ~/.config/straps/api_key
-chmod 600 ~/.config/straps/openai_api_key
-```
+A key file you write by hand (`~/.config/straps/anthropic_api_key`, `openai_api_key` or `llamacpp_api_key`, first line) must not be accessible by group or other users: straps refuses it, even when the variable is set, until you run `chmod 600` on it. `:StrapsLogout <provider>` deletes the stored key and names any variable that is still set; without a provider argument it asks before deleting the current provider's key.
 
 To use the OpenAI provider with a ChatGPT subscription instead of an API key, sign in with ChatGPT:
 
@@ -42,7 +34,9 @@ To use the OpenAI provider with a ChatGPT subscription instead of an API key, si
 2. Sign in. The browser then fails to load a `http://127.0.0.1:1455/auth/callback?...` page; that is expected.
 3. Copy the full URL from the address bar and run `:StrapsLogin openai <url>`.
 
-Straps stores the login in `$XDG_CONFIG_HOME/straps/openai_oauth.json` (mode 600) and refreshes it automatically. While a login is stored it takes precedence over `$OPENAI_API_KEY` and the key file; `:StrapsLogout openai` removes it. `:checkhealth straps` reports which source is in use. The login token is only sent to `https://api.openai.com`, so it does not work with a custom `openai_base_url`.
+Straps stores the login in `$XDG_CONFIG_HOME/straps/openai_oauth.json` (mode 600) and refreshes it automatically. OpenAI keeps one stored credential: a ChatGPT login deletes a stored OpenAI API key (a symlinked key file is left in place, and the login takes precedence over it), and `:StrapsLogin openai key` signs out of ChatGPT. A stored login takes precedence over `$OPENAI_API_KEY`; `:StrapsLogout openai` removes it. `:checkhealth straps` reports which source is in use. The login token is only sent to `https://api.openai.com`, so it does not work with a custom `openai_base_url`.
+
+Each provider has a default base URL: `https://api.anthropic.com`, `https://api.openai.com` and `http://127.0.0.1:8080` for llama.cpp. Set `base_url`, `openai_base_url` or `llamacpp_base_url` in `setup()` to change it. The URL must start with `http://` or `https://` and a host, and have no whitespace, query or fragment; a trailing `/` or `/v1` is dropped, the scheme and host are lowercased, and a default port (`:80` for http, `:443` for https) is dropped.
 
 Ripgrep is optional. Straps has no required Lua dependencies.
 
@@ -64,7 +58,7 @@ A global `:StrapsModel` pick is saved per provider in `~/.config/straps/model_<p
 
 Straps sends the whole conversation, and the key if one is set, in plain text when `llamacpp_base_url` starts with `http://`. Anyone on the network path between Neovim and a remote server can read both and can alter the response, including the tool calls the model requests. For a server on another host, put it behind TLS or reach it through an SSH tunnel to `127.0.0.1`.
 
-The server needs no key unless it runs with `--api-key`. In that case, export the key; straps sends it as `Authorization: Bearer`:
+The server needs no key unless it runs with `--api-key`. In that case, store the key with `:StrapsLogin llamacpp` or export it; straps sends it as `Authorization: Bearer`:
 
 ```sh
 export LLAMACPP_API_KEY=...
@@ -72,7 +66,7 @@ export LLAMACPP_API_KEY=...
 
 Straps falls back to `$LLAMA_API_KEY`, the variable `llama-server` itself reads for `--api-key`, so one variable can serve both.
 
-To verify the setup, run `:checkhealth straps`. The API key section reads `straps: API key (llamacpp)` and names `llamacpp_base_url`, and the model section reads `llamacpp model: <id>`.
+To verify the setup, run `:checkhealth straps`. The API key section reads `straps: API key (llamacpp)` and names `llamacpp_base_url`, and the model section reads `llamacpp model: <id>  @ <url>`.
 
 
 ## Install
@@ -139,6 +133,8 @@ Straps then finds the nearest `.straps.lua` above the working directory. It asks
 
 Both files contain Lua and run with your Neovim process's privileges. Review them before execution.
 
+A personal entries file saved with `registry.dump()` pins the entry sources it had when dumped, defaults included. After upgrading straps, keep only the entries you changed and delete the dumped defaults; dumping again from a session that loaded the file writes the old sources back.
+
 ## Commands
 
 | Command | Purpose |
@@ -151,8 +147,8 @@ Both files contain Lua and run with your Neovim process's privileges. Review the
 | `:StrapsAgents` | Open the agent dashboard: session trees, status, details, and management actions. |
 | `:StrapsProvider` | Choose Anthropic, OpenAI or llama.cpp. In a session buffer, the choice affects that session. Elsewhere, it persists globally and applies to new sessions; a session keeps the provider and model of its first successful request, including after a restart. |
 | `:StrapsModel` | Choose a model for the active provider. In a session buffer, the choice affects that session and is kept after a restart. Elsewhere, it persists per provider and applies to new sessions; a model set in `setup()` wins over it. |
-| `:StrapsLogin openai [url]` | Sign in with ChatGPT for the OpenAI provider; run again with the browser's redirect URL to finish. |
-| `:StrapsLogout openai` | Cancel a pending ChatGPT login and delete the stored one. |
+| `:StrapsLogin [provider [key]]` | Store a key for a provider (default: the current one); straps prompts for it. For OpenAI, `:StrapsLogin openai [url]` signs in with ChatGPT (run again with the browser's redirect URL to finish) and `:StrapsLogin openai key` stores an API key. |
+| `:StrapsLogout [provider]` | Delete a provider's stored key; for OpenAI also the ChatGPT login and a pending login. Without a provider it asks first. |
 | `:StrapsRegistry` | List registry entries. |
 | `:StrapsEdit {name}` | Edit and redefine a registry entry. |
 | `:StrapsHelp [tag]` | Open the reference documentation. |

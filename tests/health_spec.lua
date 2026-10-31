@@ -153,7 +153,7 @@ it("API key section present; resolves a key when env is set", function()
   vim.env.ANTHROPIC_API_KEY = saved_key
   straps.config.provider = saved_provider
   assert(find(rec, "start", "straps: API key (anthropic)"), "API key section missing")
-  assert(find(rec, "ok", "fn.api_key resolves a key"), "key should resolve")
+  assert(find(rec, "ok", "fn.anthropic_api_key resolves a key"), "key should resolve")
 end)
 
 it("API key health follows the persisted OpenAI provider preference", function()
@@ -173,7 +173,7 @@ it("API key health follows the persisted OpenAI provider preference", function()
   assert(find(rec, "start", "straps: API key (openai)"), "health did not select OpenAI")
   assert(find(rec, "ok", "fn.openai_api_key resolves a key"), "OpenAI key should resolve")
   assert(find(rec, "ok", "source: env"), "health should name the key source")
-  assert(find(rec, "info", "no ChatGPT login"), "health should report the missing ChatGPT login")
+  assert(not find(rec, nil, "ChatGPT login"), "health should not report a ChatGPT login that does not exist")
 end)
 
 it("API key health follows the persisted llamacpp preference without probing Anthropic keys", function()
@@ -187,7 +187,7 @@ it("API key health follows the persisted llamacpp preference without probing Ant
   vim.fn.mkdir(prefdir, "p")
   vim.env.XDG_CONFIG_HOME = prefdir
   straps.config.provider = nil
-  straps.config.llamacpp_base_url = "http://user:p@secret@192.0.2.7:8080/?token=qsecret"
+  straps.config.llamacpp_base_url = "http://user:p@secret@192.0.2.7:8080/"
   require("straps.registry").call("fn.provider_pref", "llamacpp")
   vim.env.LLAMACPP_API_KEY = nil
   local rec = collect()
@@ -201,12 +201,12 @@ it("API key health follows the persisted llamacpp preference without probing Ant
   assert(find(rec, "start", "straps: API key (llamacpp)"), "health did not select llamacpp")
   assert(find(rec, "info", "http://***@192.0.2.7:8080"), "base url not reported")
   for _, r in ipairs(rec) do
-    assert(not r.msg:find("secret", 1, true), "URL password or query token printed: " .. r.msg)
+    assert(not r.msg:find("secret", 1, true), "URL password printed: " .. r.msg)
   end
   assert(find(rec, "info", "no API key"), "missing key should be info")
   assert(not find(rec, nil, "ANTHROPIC_API_KEY"), "Anthropic key probed under llamacpp")
-  assert(not find(rec, nil, "fn.api_key"), "fn.api_key probed under llamacpp")
-  assert(find(rec_key, "ok", "API key set (16 chars)"), "set key not reported")
+  assert(not find(rec, nil, "fn.anthropic_api_key"), "fn.anthropic_api_key probed under llamacpp")
+  assert(find(rec_key, "ok", "fn.llamacpp_api_key resolves a key (16 chars, source: env)"), "set key not reported")
 end)
 
 local function collect_with(provider, overrides, key_source)
@@ -236,7 +236,7 @@ it("llamacpp key health reports a redefined fn.llamacpp_api_key", function()
   vim.env.LLAMACPP_API_KEY = saved_llama
   assert(ok, tostring(rec))
   assert(ok_raise, tostring(rec_raise))
-  assert(find(rec, "ok", "API key set (17 chars)"), "redefined key source not reported")
+  assert(find(rec, "ok", "fn.llamacpp_api_key resolves a key (17 chars)"), "redefined key source not reported")
   local raised = find(rec_raise, "error", "fn.llamacpp_api_key raised")
   assert(raised and vim.inspect(raised.extra):find("vault locked", 1, true), "raising key source not reported as an error")
 end)

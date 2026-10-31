@@ -39,7 +39,7 @@ local demo_path = tmp .. "/demo.txt"
 
 it("setup registers provider, tools, hooks", function()
   for _, name in ipairs({
-    "fn.provider", "fn.build_tools", "fn.system_prompt", "fn.api_key",
+    "fn.provider", "fn.build_tools", "fn.system_prompt", "fn.anthropic_api_key", "fn.api_key_store",
     "tool.write_file", "tool.read_file", "tool.registry_define", "hook.confirm", "hook.after_write",
   }) do
     assert(registry.get(name), "missing " .. name)

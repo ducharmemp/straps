@@ -11,7 +11,7 @@ package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.pa
 local registry = require("straps.registry")
 local state = require("straps.state")
 local loop = require("straps.loop")
--- Registers fn.provider/fn.api_key/fn.build_tools/fn.system_prompt and, as a
+-- Registers fn.provider/fn.anthropic_api_key/fn.build_tools/fn.system_prompt and, as a
 -- side effect, syntax-checks + compiles every embedded provider source.
 require("straps.provider").register()
 -- Hermetic: durable sessions write under a throwaway dir, never the real data dir.
@@ -53,7 +53,7 @@ end
 allow_all()
 
 it("provider entries registered and compiled", function()
-  for _, name in ipairs({ "fn.provider", "fn.api_key", "fn.build_tools", "fn.system_prompt" }) do
+  for _, name in ipairs({ "fn.provider", "fn.anthropic_api_key", "fn.build_tools", "fn.system_prompt" }) do
     local e = registry.get(name)
     assert(e, name .. " not registered")
     assert(e.fn == nil, name .. " view must not expose the compiled fn")

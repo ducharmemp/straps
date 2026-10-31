@@ -5,6 +5,7 @@ M.TOKEN_URL = "https://auth.openai.com/api/accounts/oauth/token"
 M.RESOURCE = "https://api.openai.com/v1"
 M.API_ORIGIN = "https://api.openai.com"
 M.REDIRECT_ORIGIN = "http://127.0.0.1:1455"
+M.LOGIN_FILE = "openai_oauth.json"
 M.REDIRECT_PATH = "/auth/callback"
 M.REDIRECT_URI = M.REDIRECT_ORIGIN .. M.REDIRECT_PATH
 M.DYNAMIC_CLIENT_ID = "dynamic_agent_client"
@@ -24,11 +25,17 @@ function M.now_ms()
   return sec * 1000 + math.floor(usec / 1000)
 end
 
+-- The XDG spec says to ignore a relative $XDG_CONFIG_HOME; a relative
+-- $HOME is ignored too, so the store never lands in the working directory.
+local function absolute(path)
+  return path and path ~= "" and vim.startswith(path, "/") and path or nil
+end
+
 function M.config_dir()
-  local config_home = vim.env.XDG_CONFIG_HOME
-  if not config_home or config_home == "" then
-    local home = vim.env.HOME
-    config_home = (home and home ~= "") and (home .. "/.config") or nil
+  local config_home = absolute(vim.env.XDG_CONFIG_HOME)
+  if not config_home then
+    local home = absolute(vim.env.HOME)
+    config_home = home and (home .. "/.config")
   end
   return config_home and (config_home .. "/straps") or nil
 end

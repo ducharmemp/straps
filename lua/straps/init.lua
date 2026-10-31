@@ -14,21 +14,27 @@ M.config = {
   -- :StrapsProvider ($XDG_CONFIG_HOME/straps/provider), falling back to
   -- "anthropic". Setting it here wins over that file.
   -- Overridable per session buffer with vim.b[bufnr].straps_provider, so two
-  -- sessions can talk to different backends. "openai" reads fn.openai_api_key
-  -- (a :StrapsLogin openai ChatGPT login first, else $OPENAI_API_KEY, then
-  -- $XDG_CONFIG_HOME/straps/openai_api_key), posts to openai_base_url, and
-  -- uses openai_model. "llamacpp" posts to llamacpp_base_url/v1/messages with
-  -- llamacpp_model, sending $LLAMACPP_API_KEY (else $LLAMA_API_KEY) as a Bearer
-  -- token when one is set.
+  -- sessions can talk to different backends. Every provider reads the key
+  -- stored by :StrapsLogin <provider> key ($XDG_CONFIG_HOME/straps/<provider>_api_key),
+  -- else its environment variables ($ANTHROPIC_API_KEY, $OPENAI_API_KEY,
+  -- $LLAMACPP_API_KEY then $LLAMA_API_KEY). openai tries a ChatGPT login first
+  -- and stores a key with :StrapsLogin openai key. The llamacpp key is
+  -- optional.
   provider = nil,
-  openai_base_url = "https://api.openai.com",
+  -- Base URLs: base_url (Anthropic), openai_base_url and llamacpp_base_url.
+  -- nil (the default) means https://api.anthropic.com, https://api.openai.com
+  -- and http://127.0.0.1:8080. A value must start with http:// or https://
+  -- and have no query or fragment. A trailing "/" or "/v1" is dropped, so
+  -- "http://host:8080/v1" works.
+  base_url = nil,
+  openai_base_url = nil,
+  llamacpp_base_url = nil,
   -- Model id sent when provider == "openai". Keep this separate from the
   -- Anthropic `model` so selecting OpenAI never sends a Claude id. nil (the
   -- default) means "not set here": the model is the persisted global
   -- :StrapsModel pick (fn.model_pref), else gpt-5. A value here (or one set at
   -- runtime) wins over the persisted pick.
   openai_model = nil,
-  llamacpp_base_url = "http://127.0.0.1:8080",
   -- Model id sent when provider == "llamacpp": a llama-server --alias or a
   -- router-mode model name. nil until set here or picked with :StrapsModel;
   -- fn.provider_llamacpp raises without one, because router mode rejects a

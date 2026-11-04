@@ -36,6 +36,15 @@ To use the OpenAI provider with a ChatGPT subscription instead of an API key, si
 
 Straps stores the login in `$XDG_CONFIG_HOME/straps/openai_oauth.json` (mode 600) and refreshes it automatically. OpenAI keeps one stored credential: a ChatGPT login deletes a stored OpenAI API key (a symlinked key file is left in place, and the login takes precedence over it), and `:StrapsLogin openai key` signs out of ChatGPT. A stored login takes precedence over `$OPENAI_API_KEY`; `:StrapsLogout openai` removes it. `:checkhealth straps` reports which source is in use. The login token is only sent to `https://api.openai.com`, so it does not work with a custom `openai_base_url`.
 
+For accounts or models that login does not serve, sign in the way the Codex CLI does:
+
+1. Run `:StrapsLogin openai codex`. Stop any running `codex login` first; it listens on port 1455 and takes the code.
+2. Sign in. The browser then fails to load a `http://localhost:1455/auth/callback?...` page.
+3. Copy the full URL and run `:StrapsLogin openai <url>`.
+4. Pick a Codex model with `:StrapsModel`.
+
+Straps stores this login in `$XDG_CONFIG_HOME/straps/openai_codex.json` (mode 600) and sends requests to `https://chatgpt.com/backend-api/codex/responses`. It replaces the ChatGPT login and the stored key, and each of those replaces it. Like the ChatGPT login, it does not work with a custom `openai_base_url`.
+
 Each provider has a default base URL: `https://api.anthropic.com`, `https://api.openai.com` and `http://127.0.0.1:8080` for llama.cpp. Set `base_url`, `openai_base_url` or `llamacpp_base_url` in `setup()` to change it. The URL must start with `http://` or `https://` and a host, and have no whitespace, query or fragment; a trailing `/` or `/v1` is dropped, the scheme and host are lowercased, and a default port (`:80` for http, `:443` for https) is dropped.
 
 Ripgrep is optional. Straps has no required Lua dependencies.
@@ -147,8 +156,8 @@ A personal entries file saved with `registry.dump()` pins the entry sources it h
 | `:StrapsAgents` | Open the agent dashboard: session trees, status, details, and management actions. |
 | `:StrapsProvider` | Choose Anthropic, OpenAI or llama.cpp. In a session buffer, the choice affects that session. Elsewhere, it persists globally and applies to new sessions; a session keeps the provider and model of its first successful request, including after a restart. |
 | `:StrapsModel` | Choose a model for the active provider. In a session buffer, the choice affects that session and is kept after a restart. Elsewhere, it persists per provider and applies to new sessions; a model set in `setup()` wins over it. |
-| `:StrapsLogin [provider [key]]` | Store a key for a provider (default: the current one); straps prompts for it. For OpenAI, `:StrapsLogin openai [url]` signs in with ChatGPT (run again with the browser's redirect URL to finish) and `:StrapsLogin openai key` stores an API key. |
-| `:StrapsLogout [provider]` | Delete a provider's stored key; for OpenAI also the ChatGPT login and a pending login. Without a provider it asks first. |
+| `:StrapsLogin [provider [key]]` | Store a key for a provider (default: the current one); straps prompts for it. For OpenAI, `:StrapsLogin openai` signs in with ChatGPT, `:StrapsLogin openai codex` signs in the way the Codex CLI does (run `:StrapsLogin openai <url>` with the browser's redirect URL to finish either), and `:StrapsLogin openai key` stores an API key. |
+| `:StrapsLogout [provider]` | Delete a provider's stored key; for OpenAI also the ChatGPT and Codex logins and a pending login. Without a provider it asks first. |
 | `:StrapsRegistry` | List registry entries. |
 | `:StrapsEdit {name}` | Edit and redefine a registry entry. |
 | `:StrapsHelp [tag]` | Open the reference documentation. |

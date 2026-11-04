@@ -286,11 +286,12 @@ end, { nargs = "*", bang = true, complete = function(arglead, line)
   local after = line:match("StrapsLog%a*!?%s+(.*)$") or ""
   if not after:find("%s") then return provider_complete(arglead) end
   local first = after:match("^(%S+)%s+%S*$")
-  if first and vim.tbl_contains(require("straps.provider").provider_names(), first) and vim.startswith("key", arglead) then
-    return { "key" }
+  if first and vim.tbl_contains(require("straps.provider").provider_names(), first) then
+    local forms = first == "openai" and { "codex", "key" } or { "key" }
+    return vim.tbl_filter(function(f) return vim.startswith(f, arglead) end, forms)
   end
   return {}
-end, desc = "straps: store a provider credential (:StrapsLogin [provider [key]]; openai signs in with ChatGPT, then :StrapsLogin openai <redirect-url>; key stores an API key)" })
+end, desc = "straps: store a provider credential (:StrapsLogin [provider [key]]; openai signs in with ChatGPT, openai codex signs in the way the Codex CLI does, then :StrapsLogin openai <redirect-url>; key stores an API key)" })
 
 vim.api.nvim_create_user_command("StrapsLogout", function(opts)
   require("straps.ui").logout(opts.fargs)

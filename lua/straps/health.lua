@@ -101,8 +101,8 @@ end
 
 -- The API key section for the provider check_provider_name resolves: the
 -- base URL, the slot's key_fn verdict (which source it returned, so a
--- redefined or reordered key fn is described as it runs), the ChatGPT
--- login's expiry and problems. A missing key is an error when key_required,
+-- redefined or reordered key fn is described as it runs), the ChatGPT and
+-- Codex logins' expiry and problems, and a model outside the Codex list. A missing key is an error when key_required,
 -- else info. Never print the key: report only where it came from.
 local function check_api_key()
   local ok_straps, straps = pcall(require, "straps")
@@ -170,6 +170,28 @@ local function check_api_key()
           local left = (tonumber(cred.expires) or 0) / 1000 - sec
           health.ok(("ChatGPT login: %s (access token %s)"):format(login,
             left > 0 and ("valid for " .. math.ceil(left / 60) .. " min") or "expired; refreshes on next request"))
+        end
+      end
+    end
+    local codex_login = dir .. "/" .. require("straps.oauth").CODEX_LOGIN_FILE
+    local cst = try(function() return vim.uv.fs_stat(codex_login) end)
+    if cst and cst.type == "file" and registry.get("fn.openai_codex_credential") then
+      local ok_c, cred = pcall(registry.call, "fn.openai_codex_credential")
+      if not ok_c then
+        health.error((tostring(cred):gsub("^straps: ", "")), { "run :StrapsLogin openai codex" })
+      elseif type(cred) == "table" then
+        local sec = vim.uv.gettimeofday()
+        local left = (tonumber(cred.expires) or 0) / 1000 - sec
+        health.ok(("Codex login: %s (access token %s)"):format(codex_login,
+          left > 0 and ("valid for " .. math.ceil(left / 60) .. " min") or "expired; refreshes on next request"))
+        local model = providers.resolve_model("openai", nil, config)
+        local known = false
+        for _, m in ipairs(require("straps.oauth").CODEX_MODELS) do
+          if m.id == model then known = true end
+        end
+        if not known then
+          health.warn("openai model " .. tostring(model) .. " is not in the built-in Codex model list; the Codex backend may reject it",
+            { "pick a Codex model with :StrapsModel" })
         end
       end
     end

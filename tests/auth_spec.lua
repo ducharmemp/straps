@@ -682,7 +682,10 @@ it(":StrapsLogout openai reports a key store or ChatGPT logout that fails", func
       end)
     end)
   with_entry("fn.openai_oauth_logout", [[return function() error("straps: lock broken", 0) end]],
-    function() m2 = capture_notify(function() ui.logout({ "openai" }) end) end)
+    function() m2 = capture_notify(function()
+      ui.logout({ "openai" })
+      vim.wait(2000, function() return false end, 10)
+    end) end)
   local e1 = has(m1, "vault locked")
   local e2 = has(m2, "lock broken")
   assert(e1 and e1.level == vim.log.levels.ERROR and not has(m1, "no stored openai credential") and #m1 == 1, vim.inspect(m1))
@@ -876,7 +879,7 @@ end)
 it("completion works on an abbreviated command name", function()
   vim.g.loaded_straps = nil
   vim.cmd.source(root .. "/plugin/straps.lua")
-  assert(vim.deep_equal(vim.fn.getcompletion("StrapsLogi openai ", "cmdline"), { "key" }),
+  assert(vim.deep_equal(vim.fn.getcompletion("StrapsLogi openai ", "cmdline"), { "codex", "key" }),
     vim.inspect(vim.fn.getcompletion("StrapsLogi openai ", "cmdline")))
   assert(#vim.fn.getcompletion("StrapsLogin openai key ", "cmdline") == 0,
     vim.inspect(vim.fn.getcompletion("StrapsLogin openai key ", "cmdline")))
@@ -894,7 +897,7 @@ end)
 
 it(":StrapsLogin openai key with an extra argument shows the one openai usage", function()
   local msgs = capture_notify(function() ui.login({ "openai", "key", "extra" }) end)
-  assert(has(msgs, "usage: :StrapsLogin openai [redirect-url | key]"), vim.inspect(msgs))
+  assert(has(msgs, "usage: :StrapsLogin openai [codex | redirect-url | key]"), vim.inspect(msgs))
 end)
 
 it("login and logout report an unregistered key store", function()

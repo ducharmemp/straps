@@ -5,7 +5,8 @@
 -- fn.anthropic_messages), plus fn.anthropic_api_key / fn.openai_api_key /
 -- fn.llamacpp_api_key and the key store they read before the environment
 -- (fn.api_key_store), the Sign in with ChatGPT entries (fn.openai_oauth_*,
--- fn.openai_device_id), fn.build_tools, the layered system prompt
+-- fn.openai_device_id), the Codex login entries (fn.openai_codex_*),
+-- fn.build_tools, the layered system prompt
 -- (fn.system_prompt_core/_env/_project composed by fn.system_prompt),
 -- fn.anthropic_messages (the Messages wire format the Anthropic and llama.cpp
 -- backends share), fn.log and fn.compact. Everything is a registry entry (a
@@ -305,7 +306,7 @@ end
 
 -- The per-provider key store: $XDG_CONFIG_HOME/straps/<provider>_api_key,
 -- written by :StrapsLogin and read by the default key fns before the
--- environment (after the ChatGPT login for openai).
+-- environment (after the ChatGPT and Codex logins for openai).
 local API_KEY_STORE_SRC = [==[
 return function(provider, value)
   local providers = require("straps.provider")
@@ -412,7 +413,9 @@ end
 -- (nil, errmsg) on any failure so callers can fall back to the static list.
 -- OpenAI returns {data:[{id}]} for an API key and {models:[{slug,
 -- display_name, context_window, visibility}]} for a ChatGPT login; hidden
--- ChatGPT entries are dropped. llama-server returns {data:[{id, meta?}]};
+-- ChatGPT entries are dropped. A Codex login reads the Codex catalog (same
+-- shape, every entry reasoning = true) and falls back to oauth.CODEX_MODELS.
+-- llama-server returns {data:[{id, meta?}]};
 -- meta.n_ctx (present only for a loaded model) becomes `context`. The URL is
 -- provider.base_url, the key comes from the slot's key_fn (optional for a
 -- slot with key_required = false), and provider.auth_headers builds the header.
@@ -448,15 +451,29 @@ return function(provider_override)
     return nil, "openai layer disabled (setup{ layers = { openai = false } })"
   end
 
-  local ok_key, api_key = pcall(registry.call, key_fn, { base_url = base_url, wait_ms = 15000 })
+  local ok_key, api_key, key_source, account_id = pcall(registry.call, key_fn, { base_url = base_url, wait_ms = 15000 })
   if not ok_key then
     return nil, key_fn .. " failed (" .. tostring(api_key):gsub("^straps: ", "") .. ")"
   end
+  local codex = openai and key_source == "codex"
 
   local ok_headers, headers = pcall(providers.auth_headers, provider, api_key)
   if not ok_headers then return nil, (tostring(headers):gsub("^straps: ", "")) end
   if provider == "anthropic" then
     vim.list_extend(headers, { "-H", "anthropic-version: 2023-06-01" })
+  end
+  local oauth = require("straps.oauth")
+  if codex then
+    vim.list_extend(headers, {
+      "-H", "chatgpt-account-id: " .. tostring(account_id),
+      "-H", "originator: " .. oauth.CODEX_ORIGINATOR,
+    })
+  end
+  local function codex_fallback(why)
+    local list = vim.deepcopy(oauth.CODEX_MODELS)
+    vim.notify("straps: the Codex model list request failed (" .. tostring(why) .. "); showing the built-in Codex models",
+      vim.log.levels.WARN)
+    return list
   end
 
   -- Synchronous: the picker blocks briefly on this, which is fine for a
@@ -464,32 +481,39 @@ return function(provider_override)
   -- Anthropic caps the page with ?limit; OpenAI's and llama-server's
   -- /v1/models have no such param, so only send it for Anthropic.
   local url = base_url .. "/v1/models" .. ((openai or llamacpp) and "" or "?limit=1000")
+  if codex then
+    url = oauth.CODEX_BASE_URL .. "/codex/models?client_version=" .. oauth.CODEX_CLIENT_VERSION
+  end
   local argv = { "curl", "-sS", "-g", url }
   vim.list_extend(argv, headers)
   vim.list_extend(argv, { "-w", "\nSTRAPS_HTTP_STATUS:%{http_code}\n" })
   local res = vim.system(argv, { text = true }):wait(15000)
 
+  local function fail(msg)
+    if codex then return codex_fallback(msg) end
+    return nil, msg
+  end
   if not res then
-    return nil, "model list request timed out"
+    return fail("model list request timed out")
   end
   local out = res.stdout or ""
   local status = tonumber(out:match("STRAPS_HTTP_STATUS:(%d+)"))
   out = out:gsub("%s*STRAPS_HTTP_STATUS:%d+%s*$", "")
   if res.code ~= 0 then
-    return nil, "curl exited " .. res.code .. ": " .. (res.stderr or "")
+    return fail("curl exited " .. res.code .. ": " .. (res.stderr or ""))
   end
   if status and status >= 400 then
-    return nil, "HTTP " .. status .. ": " .. out:sub(1, 300)
+    return fail("HTTP " .. status .. ": " .. out:sub(1, 300))
   end
   local ok_json, body = pcall(vim.json.decode, out)
   if not ok_json or type(body) ~= "table" then
-    return nil, "could not parse /v1/models response"
+    return fail("could not parse /v1/models response")
   end
 
   local models = {}
   local chatgpt_catalog = openai and type(body.data) ~= "table" and type(body.models) == "table"
   if not chatgpt_catalog and type(body.data) ~= "table" then
-    return nil, "could not parse /v1/models response"
+    return fail("could not parse /v1/models response")
   end
   for _, m in ipairs(chatgpt_catalog and body.models or {}) do
     if type(m) == "table" and type(m.slug) == "string" and m.visibility ~= "hide" then
@@ -498,6 +522,7 @@ return function(provider_override)
         label = type(m.display_name) == "string" and m.display_name or m.slug,
         thinking = nil,
         context = tonumber(m.context_window),
+        reasoning = codex or nil,
       }
     end
   end
@@ -533,7 +558,7 @@ return function(provider_override)
     end
   end
   if #models == 0 then
-    return nil, "/v1/models returned no usable models"
+    return fail("/v1/models returned no usable models")
   end
   return models
 end
@@ -1194,8 +1219,9 @@ local PROVIDER_OPENAI_SRC = [==[
 -- The OpenAI Responses backend. Same contract as fn.provider_anthropic
 -- (returns { content = blocks, stop_reason, usage, model } and streams text via
 -- ctx.emit), but speaks OpenAI's wire shape instead of Anthropic's:
---   auth      Authorization: Bearer <key>            (fn.openai_api_key: ChatGPT login, stored key, env)
---   endpoint  {base_url}/v1/responses                (provider.base_url("openai", config))
+--   auth      Authorization: Bearer <key>            (fn.openai_api_key: ChatGPT login, Codex login, stored key, env)
+--   endpoint  {base_url}/v1/responses                (provider.base_url("openai", config); a Codex
+--                                                    login uses fn.openai_codex_request's URL)
 --   request   instructions + input items             (translated from req)
 --   stream    typed events (response.*)              (translated back)
 -- fn.provider dispatches here when config.provider (or vim.b straps_provider)
@@ -1208,11 +1234,13 @@ return function(req, ctx)
 
   local base_url, url_err = require("straps.provider").base_url("openai", config)
   if not base_url then error("straps provider (openai): " .. url_err, 0) end
-  local api_key, key_source = registry.call(require("straps.provider").provider_slot("openai").key_fn,
+  local api_key, key_source, account_id = registry.call(require("straps.provider").provider_slot("openai").key_fn,
     { ctx = ctx, base_url = base_url })
   if ctx.cancelled() or (api_key == nil and key_source == "cancelled") then
     return { content = {}, stop_reason = "cancelled" }
   end
+  local codex = key_source == "codex"
+  local label = codex and "openai (codex)" or "openai"
 
   -- Per-buffer effort (a subagent under a different effort), same as the
   -- Anthropic backend.
@@ -1323,7 +1351,8 @@ return function(req, ctx)
   end
   -- Reasoning effort: the API-key /v1/models catalog does not expose which
   -- models reason (the ChatGPT-login catalog does, but fn.list_models does not
-  -- read it), so the configured OpenAI model entry must opt in with
+  -- read it; a Codex login marks every catalog entry reasoning = true), so the
+  -- configured OpenAI model entry must opt in with
   -- reasoning = true (or reasoning_effort = true). Unlisted models get the
   -- model's own default. provider.effort_applies decides; it is the rule
   -- fn.model_note and health report.
@@ -1336,6 +1365,15 @@ return function(req, ctx)
     body.reasoning = { effort = effort_entry.level }
   end
 
+  local request_url = base_url .. "/v1/responses"
+  local function codex_request()
+    local codex_ctx = setmetatable({ codex_entry = model_entry }, { __index = ctx })
+    local url, headers = registry.call("fn.openai_codex_request", body, codex_ctx, account_id)
+    request_url = url
+    return headers
+  end
+  local extra_headers = codex and codex_request() or {}
+
   local payload = require("straps.state").utf8_scrub(vim.json.encode(body))
 
   -- streamed_text records that a text delta reached the transcript; a retry
@@ -1345,12 +1383,14 @@ return function(req, ctx)
     -- Built per attempt (the 401 retry replaces api_key) and before the
     -- watchdog timer, so a refused key raises with nothing to close.
     local auth_argv = require("straps.provider").auth_headers("openai", api_key)
+    vim.list_extend(auth_argv, extra_headers)
     local content = {}        -- finished blocks in order
     local text_block = nil    -- the single streamed text block (created lazily)
     local text_index = nil    -- output_index of the text item last appended to
     local tool_blocks = {}    -- output_index -> tool_use block
     local tool_order = {}     -- preserves first-seen order of function_call items
     local usage = nil
+    local finalized = false
     local function merge_usage(u)
       if type(u) ~= "table" then return end
       usage = usage or {}
@@ -1417,6 +1457,8 @@ return function(req, ctx)
     end
 
     local function finalize(stop_reason, completed_only)
+      if finalized then return end
+      finalized = true
       -- Text first (one assistant text block), then tools in output order. A
       -- truncated response keeps only the function calls the API finished, so a
       -- half-written call never runs with empty input.
@@ -1442,6 +1484,7 @@ return function(req, ctx)
     -- unless text already streamed into the transcript (a retry would repeat it).
     local retry_codes = { rate_limit_exceeded = true, server_error = true }
     local function fail(err)
+      finalized = true
       if proc then pcall(function() proc:kill(9) end) end
       resolve({ ok = false, body = table.concat(raw), err = err,
         retryable = text_block == nil and type(err) == "table" and retry_codes[err.code] == true })
@@ -1465,6 +1508,7 @@ return function(req, ctx)
     -- Only visible output text, refusals and function calls enter the durable
     -- transcript.
     local function handle_event(ev)
+      if finalized then return end
       local t = ev.type
       if t == "response.output_text.delta" or t == "response.refusal.delta" then
         append_text(ev)
@@ -1478,7 +1522,11 @@ return function(req, ctx)
         if type(ev.delta) == "string" then slot.partial = slot.partial .. ev.delta end
       elseif t == "response.function_call_arguments.done" then
         if type(ev.arguments) == "string" then tool_slot(ev.output_index or 0).partial = ev.arguments end
-      elseif t == "response.completed" then
+      elseif t == "response.done" and type(ev.response) == "table" and ev.response.status == "incomplete" then
+        handle_event({ type = "response.incomplete", response = ev.response })
+      elseif t == "response.done" and type(ev.response) == "table" and ev.response.status == "failed" then
+        handle_event({ type = "response.failed", response = ev.response })
+      elseif t == "response.completed" or t == "response.done" then
         merge_usage(type(ev.response) == "table" and ev.response.usage)
         finalize("end_turn", false)
       elseif t == "response.incomplete" then
@@ -1524,7 +1572,7 @@ return function(req, ctx)
       end
     end
 
-    local argv = { "curl", "-sS", "-g", "--no-buffer", "-X", "POST", base_url .. "/v1/responses" }
+    local argv = { "curl", "-sS", "-g", "--no-buffer", "-X", "POST", request_url }
     vim.list_extend(argv, auth_argv)
     vim.list_extend(argv, {
       "-H", "content-type: application/json",
@@ -1600,23 +1648,37 @@ return function(req, ctx)
       end
     end
     local curl_failure = res.status == nil and type(res.err) == "string"
-    local retryable = not streamed_text and (res.status == 429 or res.status == 500
+    local usage_limit = false
+    if codex and type(res.err) == "table" then
+      local code = tostring(res.err.code or res.err.type or "")
+      usage_limit = code == "usage_limit_reached" or code == "usage_not_included"
+    end
+    local retryable = not streamed_text and not usage_limit and (res.status == 429 or res.status == 500
       or res.status == 502 or res.status == 503 or res.status == 408
       or curl_failure or res.retryable == true)
 
-    if res.status == 401 and key_source == "oauth" and not refreshed then
+    if res.status == 401 and (key_source == "oauth" or codex) and not refreshed then
       refreshed = true
+      local refresh_fn = codex and "fn.openai_codex_refresh" or "fn.openai_oauth_refresh"
       local cred, rerr = ctx.await(function(resolve)
-        registry.call("fn.openai_oauth_refresh", { rejected_access = api_key }, resolve)
+        registry.call(refresh_fn, { rejected_access = api_key }, resolve)
         ctx.on_cancel(function() resolve(nil, "cancelled") end)
       end)
       if ctx.cancelled() or (cred == nil and (rerr == nil or rerr == "cancelled")) then
         return { content = {}, stop_reason = "cancelled" }
       end
       if not cred then
-        error("straps provider (openai): HTTP 401 and " .. tostring(rerr), 0)
+        error("straps provider (" .. label .. "): HTTP 401 and " .. tostring(rerr), 0)
       end
       api_key = cred.access
+      if codex then
+        account_id = cred.account_id
+        for i = 1, #extra_headers - 1 do
+          if extra_headers[i] == "-H" and extra_headers[i + 1]:find("^chatgpt%-account%-id:") then
+            extra_headers[i + 1] = "chatgpt-account-id: " .. account_id
+          end
+        end
+      end
     elseif retryable and attempt < 3 then
       local delay_ms = 1000 * attempt * attempt
       ctx.await(function(resolve)
@@ -1628,6 +1690,16 @@ return function(req, ctx)
       end
       attempt = attempt + 1
     else
+      if codex and (usage_limit or res.status == 429) then
+        local e = type(res.err) == "table" and res.err or {}
+        local plan = type(e.plan_type) == "string" and (" (" .. e.plan_type:lower() .. " plan)") or ""
+        local when = ""
+        if type(e.resets_at) == "number" then
+          when = (" Try again in ~%d min."):format(math.max(0, math.floor((e.resets_at * 1000 - require("straps.oauth").now_ms()) / 60000 + 0.5)))
+        end
+        error(("straps provider (%s): You have hit your ChatGPT usage limit%s.%s (HTTP %s)"):format(
+          label, plan, when, res.status and tostring(res.status) or "?"), 0)
+      end
       local detail
       if type(res.err) == "table" then
         detail = vim.json.encode(res.err)
@@ -1639,12 +1711,12 @@ return function(req, ctx)
       if detail and #detail > 2000 then
         detail = require("straps.state").utf8_cut(detail, 2000) .. "..."
       end
-      error(("straps provider (openai): request failed (HTTP %s): %s"):format(
-        res.status and tostring(res.status) or "?",
+      error(("straps provider (%s): request failed (HTTP %s): %s"):format(
+        label, res.status and tostring(res.status) or "?",
         (detail and detail ~= "") and detail or "no response body"))
     end
   end
-  error("straps provider (openai): retries exhausted")
+  error("straps provider (" .. label .. "): retries exhausted")
 end
 ]==]
 
@@ -1968,6 +2040,46 @@ return function(opts)
     return got.access, "oauth"
   end
 
+  local codex = registry.get("fn.openai_codex_credential") and registry.call("fn.openai_codex_credential") or nil
+  if codex then
+    local ok_straps, straps = pcall(require, "straps")
+    local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+    local base, url_err
+    if opts.base_url ~= nil then
+      base, url_err = providers.check_base_url(opts.base_url, "opts.base_url")
+    else
+      base, url_err = providers.base_url("openai", config)
+    end
+    if not base then error("straps: " .. url_err, 0) end
+    if base ~= oauth.API_ORIGIN then
+      error("straps: the Codex login is only used while openai_base_url is " .. oauth.API_ORIGIN
+        .. "; unset openai_base_url, run :StrapsLogout openai to use $OPENAI_API_KEY, or run :StrapsLogin openai key"
+        .. " to store an API key (it replaces the Codex login and wins over $OPENAI_API_KEY).", 0)
+    end
+    if opts.refresh == false or oauth.now_ms() + oauth.REFRESH_WINDOW_MS < (tonumber(codex.expires) or 0) then
+      return codex.access, "codex", codex.account_id
+    end
+    local ctx = opts.ctx
+    local got, err
+    if type(ctx) == "table" and ctx.await then
+      got, err = ctx.await(function(resolve)
+        registry.call("fn.openai_codex_refresh", {}, resolve)
+        if ctx.on_cancel then ctx.on_cancel(function() resolve(nil, "cancelled") end) end
+      end)
+      if (ctx.cancelled and ctx.cancelled()) or (got == nil and (err == nil or err == "cancelled")) then
+        return nil, "cancelled"
+      end
+    else
+      local finished = false
+      registry.call("fn.openai_codex_refresh", {}, function(c, e) finished, got, err = true, c, e end)
+      if not vim.wait(opts.wait_ms or 50000, function() return finished end, 20) then
+        error("straps: Codex token refresh still running; retry.", 0)
+      end
+    end
+    if not got then error("straps: " .. tostring(err), 0) end
+    return got.access, "codex", got.account_id
+  end
+
   local key, path = registry.call("fn.api_key_store", "openai")
   if key then return key, "stored" end
   local key_env = providers.provider_slot("openai").key_env
@@ -1976,6 +2088,7 @@ return function(opts)
     if env ~= "" then return env, "env" end
   end
   error("straps: no OpenAI API key found. Run :StrapsLogin openai to sign in with ChatGPT, "
+    .. ":StrapsLogin openai codex to sign in the way the Codex CLI does, "
     .. ":StrapsLogin openai key to store an API key, export " .. table.concat(key_env, " or ") .. " in your shell, "
     .. (path and ("write the key to " .. path .. " (chmod 600), ") or "")
     .. "or redefine fn.openai_api_key to fetch the key from somewhere else.", 0)
@@ -2062,7 +2175,7 @@ end
 ]==]
 
 local OPENAI_OAUTH_LOCK_SRC = [==[
-return function(cb)
+return function(cb, name)
   local oauth = require("straps.oauth")
   local called = false
   local function reply(...)
@@ -2071,9 +2184,11 @@ return function(cb)
     local args = { n = select("#", ...), ... }
     vim.schedule(function() cb(unpack(args, 1, args.n)) end)
   end
+  name = name or "openai_oauth"
+  if type(name) ~= "string" or not name:match("^[%w_]+$") then return reply(nil, "invalid lock name") end
   local dir = oauth.config_dir()
   if not dir then return reply(nil, "no $XDG_CONFIG_HOME or $HOME") end
-  local lock = dir .. "/openai_oauth.lock"
+  local lock = dir .. "/" .. name .. ".lock"
   local token = oauth.random_b64url(16)
   local deadline = oauth.now_ms() + oauth.LOCK_DEADLINE_MS
   local attempt = 0
@@ -2139,10 +2254,12 @@ end
 ]==]
 
 local OPENAI_OAUTH_POST_SRC = [==[
-return function(form, cb)
+return function(form, cb, opts)
+  opts = type(opts) == "table" and opts or {}
   local oauth = require("straps.oauth")
+  local label = opts.label or "OpenAI OAuth"
   local argv = {
-    "curl", "-sS", "--max-time", "15", "-X", "POST", oauth.TOKEN_URL,
+    "curl", "-sS", "--max-time", "15", "-X", "POST", opts.token_url or oauth.TOKEN_URL,
     "-H", "accept: application/json",
     "-H", "content-type: application/x-www-form-urlencoded",
     "--data-binary", "@-",
@@ -2153,7 +2270,7 @@ return function(form, cb)
     local status = tonumber(out:match("STRAPS_HTTP_STATUS:(%d+)"))
     out = out:gsub("%s*STRAPS_HTTP_STATUS:%d+%s*$", "")
     if res.code ~= 0 then
-      return cb(nil, "OpenAI OAuth token request failed: curl exited with code " .. res.code)
+      return cb(nil, label .. " token request failed: curl exited with code " .. res.code)
     end
     local okj, data = pcall(vim.json.decode, out)
     if not status or status < 200 or status > 299 then
@@ -2168,11 +2285,11 @@ return function(form, cb)
         end
       end
       if #body > 2000 then body = require("straps.state").utf8_cut(body, 2000) .. "..." end
-      return cb(nil, ("OpenAI OAuth token request failed (HTTP %s): %s"):format(
+      return cb(nil, (label .. " token request failed (HTTP %s): %s"):format(
         status and tostring(status) or "?", body ~= "" and body or "no response body"))
     end
     if not okj or type(data) ~= "table" then
-      return cb(nil, "OpenAI OAuth token response is not a JSON object")
+      return cb(nil, label .. " token response is not a JSON object")
     end
     cb(data)
   end))
@@ -2278,6 +2395,7 @@ return function(opts)
     local refused = origin_error()
     if refused then error("straps: " .. refused, 0) end
     if current then current.cancelled = true end
+    if registry.get("fn.openai_codex_login") then pcall(registry.call, "fn.openai_codex_login", { cancel = true }) end
     local verifier, challenge = oauth.pkce()
     local rec = {
       verifier = verifier,
@@ -2354,7 +2472,23 @@ return function(opts)
           elseif removed == true then
             key_note = "; deleted " .. (key_path or "the stored OpenAI API key")
           end
-          finish_login(nil)
+          if not registry.get("fn.openai_codex_logout") then return finish_login(nil) end
+          if oauth.pending_login == rec then oauth.pending_login = nil end
+          release = nil
+          pcall(rel)
+          local ok_out, out_err = pcall(registry.call, "fn.openai_codex_logout", function(lerr, what)
+            if lerr then
+              key_note = (key_note or "") .. "; could not sign out of the Codex login ("
+                .. tostring(lerr):gsub("^straps: ", "") .. ")"
+            elseif what == "deleted" then
+              key_note = (key_note or "") .. "; signed out of the Codex login"
+            end
+            finish_login(nil)
+          end)
+          if not ok_out then
+            key_note = (key_note or "") .. "; could not sign out of the Codex login (" .. tostring(out_err) .. ")"
+            finish_login(nil)
+          end
         end)
         if not ok_save then finish_login(save_err) end
       end)
@@ -2383,6 +2517,302 @@ return function(cb)
     cb(not ok and tostring(err) or nil, "deleted")
   end)
   if not ok_lock then vim.schedule(function() cb(tostring(lock_err)) end) end
+end
+]==]
+
+local OPENAI_CODEX_CREDENTIAL_SRC = [==[
+return function(value)
+  local oauth = require("straps.oauth")
+  local dir = oauth.config_dir()
+  if not dir then
+    if value == nil or value == false then return nil end
+    error("straps: no $XDG_CONFIG_HOME or $HOME to store the Codex login under", 0)
+  end
+  local path = dir .. "/" .. oauth.CODEX_LOGIN_FILE
+  if value == false then
+    local ok, err, code = vim.uv.fs_unlink(path)
+    if not ok and code ~= "ENOENT" then error("straps: could not delete " .. path .. " (" .. tostring(err) .. ")", 0) end
+    return true
+  end
+  if value == nil then
+    local st = vim.uv.fs_stat(path)
+    if not (st and st.type == "file") then return nil end
+    if st.mode % 64 ~= 0 then
+      error(("straps: %s is accessible by group/other (mode %03o); run chmod 600 on it."):format(path, st.mode % 4096), 0)
+    end
+    local f = io.open(path, "r")
+    if not f then error("straps: " .. path .. " exists but could not be read", 0) end
+    local text = f:read("*a")
+    f:close()
+    local ok, cred = pcall(vim.json.decode, text)
+    if not ok or type(cred) ~= "table" or type(cred.access) ~= "string" or type(cred.refresh) ~= "string"
+      or type(cred.account_id) ~= "string" or cred.account_id == "" or cred.account_id:find("[%s%c\128-\255]") then
+      error("straps: " .. path .. " is not a valid Codex login; run :StrapsLogin openai codex", 0)
+    end
+    return cred
+  end
+  oauth.ensure_dir(dir)
+  local tmp = path .. ".tmp." .. oauth.random_b64url(8)
+  local fd, oerr = vim.uv.fs_open(tmp, "wx", 384)
+  if not fd then error("straps: could not write " .. tmp .. " (" .. tostring(oerr) .. ")", 0) end
+  local _, werr = vim.uv.fs_write(fd, vim.json.encode(value))
+  vim.uv.fs_close(fd)
+  if werr then
+    vim.uv.fs_unlink(tmp)
+    error("straps: could not write " .. tmp .. " (" .. tostring(werr) .. ")", 0)
+  end
+  local ok, rerr = vim.uv.fs_rename(tmp, path)
+  if not ok then
+    vim.uv.fs_unlink(tmp)
+    error("straps: could not save " .. path .. " (" .. tostring(rerr) .. ")", 0)
+  end
+  return value
+end
+]==]
+
+local OPENAI_CODEX_REFRESH_SRC = [==[
+return function(opts, done)
+  opts = type(opts) == "table" and opts or {}
+  local registry = require("straps.registry")
+  local oauth = require("straps.oauth")
+  local relogin = "; run :StrapsLogin openai codex"
+  local finished, release = false, nil
+  local function finish(err, cred)
+    if finished then return end
+    finished = true
+    vim.schedule(function() done(cred, err) end)
+    if release then pcall(release) end
+  end
+  local function body()
+    local cred = registry.call("fn.openai_codex_credential")
+    if not cred then return finish("logged out of Codex" .. relogin) end
+    if opts.rejected_access then
+      if cred.access ~= opts.rejected_access then return finish(nil, cred) end
+    elseif oauth.now_ms() + oauth.REFRESH_WINDOW_MS < (tonumber(cred.expires) or 0) then
+      return finish(nil, cred)
+    end
+    local form = oauth.form_encode({
+      { "grant_type", "refresh_token" },
+      { "refresh_token", cred.refresh },
+      { "client_id", oauth.CODEX_CLIENT_ID },
+    })
+    registry.call("fn.openai_oauth_post", form, function(token, perr)
+      local ok, err = pcall(function()
+        if not token then return finish("Codex token refresh failed: " .. tostring(perr) .. relogin) end
+        local fresh = oauth.codex_credential_from_token(token)
+        if not registry.call("fn.openai_codex_credential") then
+          return finish("logged out of Codex" .. relogin)
+        end
+        registry.call("fn.openai_codex_credential", fresh)
+        finish(nil, fresh)
+      end)
+      if not ok then finish(tostring(err)) end
+    end, { token_url = oauth.CODEX_TOKEN_URL, label = "Codex OAuth" })
+  end
+  local ok, err = pcall(registry.call, "fn.openai_oauth_lock", function(rel, lerr)
+    if not rel then return finish("could not lock the Codex login: " .. tostring(lerr)) end
+    release = rel
+    local ok_body, berr = pcall(body)
+    if not ok_body then finish(tostring(berr)) end
+  end, "openai_codex")
+  if not ok then finish(tostring(err)) end
+end
+]==]
+
+local OPENAI_CODEX_LOGIN_SRC = [==[
+return function(opts)
+  opts = type(opts) == "table" and opts or {}
+  local registry = require("straps.registry")
+  local oauth = require("straps.oauth")
+  local notes = {}
+  local function report(err)
+    local note = #notes > 0 and table.concat(notes, "; ") or nil
+    if opts.on_done then
+      pcall(opts.on_done, err, note)
+    elseif err then
+      vim.notify("straps: " .. tostring(err):gsub("^straps: ", ""), vim.log.levels.ERROR)
+    else
+      vim.notify("straps: signed in with ChatGPT (Codex)" .. (note and ("; " .. note) or "")
+        .. ". Pick a Codex model with :StrapsModel.")
+    end
+  end
+
+  local function origin_error()
+    local ok_straps, straps = pcall(require, "straps")
+    local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+    local base, url_err = require("straps.provider").base_url("openai", config)
+    if not base then return url_err end
+    if base ~= oauth.API_ORIGIN then
+      return "a Codex login only works when openai_base_url is " .. oauth.API_ORIGIN .. "; unset openai_base_url to sign in,"
+        .. " or run :StrapsLogin openai key to store an API key"
+    end
+  end
+
+  local current = oauth.pending_codex_login
+  if opts.cancel then
+    if current then
+      current.cancelled = true
+      oauth.pending_codex_login = nil
+    end
+    return current ~= nil
+  end
+
+  if not opts.callback_url then
+    local refused = origin_error()
+    if refused then error("straps: " .. refused, 0) end
+    if current then current.cancelled = true end
+    if registry.get("fn.openai_oauth_login") then pcall(registry.call, "fn.openai_oauth_login", { cancel = true }) end
+    local verifier, challenge = oauth.pkce()
+    local rec = {
+      verifier = verifier,
+      state = oauth.random_b64url(32),
+      expires_at = oauth.now_ms() + oauth.LOGIN_TTL_MS,
+    }
+    rec.url = oauth.CODEX_AUTHORIZE_URL .. "?" .. oauth.form_encode({
+      { "response_type", "code" },
+      { "client_id", oauth.CODEX_CLIENT_ID },
+      { "redirect_uri", oauth.CODEX_REDIRECT_URI },
+      { "scope", oauth.CODEX_SCOPE },
+      { "code_challenge", challenge },
+      { "code_challenge_method", "S256" },
+      { "state", rec.state },
+      { "id_token_add_organizations", "true" },
+      { "codex_cli_simplified_flow", "true" },
+      { "originator", oauth.CODEX_ORIGINATOR },
+    })
+    oauth.pending_codex_login = rec
+    local open = opts.open or vim.ui.open
+    local ok_open, opened, open_err = pcall(open, rec.url)
+    return rec.url, ok_open and opened ~= nil and open_err == nil
+  end
+
+  local rec = current
+  if not rec or rec.cancelled or oauth.now_ms() > rec.expires_at then
+    oauth.pending_codex_login = nil
+    error("straps: no pending Codex login; run :StrapsLogin openai codex first", 0)
+  end
+  if rec.exchanging then error("straps: this Codex login is already being completed", 0) end
+  local parsed = oauth.parse_callback(opts.callback_url, rec.state,
+    { origin = oauth.CODEX_REDIRECT_ORIGIN, cmd = ":StrapsLogin openai codex", require_client_id = false, label = "Codex" })
+  rec.exchanging = true
+
+  local finished, release = false, nil
+  local function finish_login(err)
+    if finished then return end
+    finished = true
+    if oauth.pending_codex_login == rec then oauth.pending_codex_login = nil end
+    if release then pcall(release) end
+    report(err)
+  end
+  local cancelled_msg = "Codex login cancelled"
+  local function remove_others()
+    local ok_key, removed, key_path = pcall(registry.call, "fn.api_key_store", "openai", false)
+    if not ok_key then
+      notes[#notes + 1] = "could not delete the stored OpenAI API key (" .. tostring(removed):gsub("^straps: ", "") .. ")"
+    elseif removed == true then
+      notes[#notes + 1] = "deleted " .. (key_path or "the stored OpenAI API key")
+    end
+    if not registry.get("fn.openai_oauth_logout") then return finish_login(nil) end
+    local function signout_failed(e)
+      finish_login("the Codex login was saved, but signing out of the ChatGPT login failed ("
+        .. tostring(e):gsub("^straps: ", "") .. "); the ChatGPT login still takes precedence."
+        .. " Run :StrapsLogout openai, then :StrapsLogin openai codex")
+    end
+    local ok_out, out_err = pcall(registry.call, "fn.openai_oauth_logout", function(lerr, what)
+      if lerr then return signout_failed(lerr) end
+      if what == "deleted" then notes[#notes + 1] = "signed out of the ChatGPT login" end
+      finish_login(nil)
+    end)
+    if not ok_out then signout_failed(out_err) end
+  end
+  local form = oauth.form_encode({
+    { "grant_type", "authorization_code" },
+    { "client_id", oauth.CODEX_CLIENT_ID },
+    { "code", parsed.code },
+    { "code_verifier", rec.verifier },
+    { "redirect_uri", oauth.CODEX_REDIRECT_URI },
+  })
+  local ok, err = pcall(registry.call, "fn.openai_oauth_post", form, function(token, perr)
+    local ok_cb, cb_err = pcall(function()
+      if not token then return finish_login(perr) end
+      if rec.cancelled then return finish_login(cancelled_msg) end
+      local cred = oauth.codex_credential_from_token(token)
+      registry.call("fn.openai_oauth_lock", function(rel, lerr)
+        local ok_save, save_err = pcall(function()
+          if not rel then
+            return finish_login("could not save the Codex login (" .. tostring(lerr)
+              .. "); run :StrapsLogin openai codex again")
+          end
+          release = rel
+          if rec.cancelled then return finish_login(cancelled_msg) end
+          local refused = origin_error()
+          if refused then return finish_login(refused .. "; the Codex login was not saved") end
+          registry.call("fn.openai_codex_credential", cred)
+          if oauth.pending_codex_login == rec then oauth.pending_codex_login = nil end
+          release = nil
+          pcall(rel)
+          remove_others()
+        end)
+        if not ok_save then finish_login(save_err) end
+      end, "openai_codex")
+    end)
+    if not ok_cb then finish_login(cb_err) end
+  end, { token_url = oauth.CODEX_TOKEN_URL, label = "Codex OAuth" })
+  if not ok then finish_login(err) end
+end
+]==]
+
+local OPENAI_CODEX_LOGOUT_SRC = [==[
+return function(cb)
+  local registry = require("straps.registry")
+  local oauth = require("straps.oauth")
+  cb = cb or function() end
+  local cancelled = registry.call("fn.openai_codex_login", { cancel = true })
+  local dir = oauth.config_dir()
+  if not dir or not vim.uv.fs_stat(dir .. "/" .. oauth.CODEX_LOGIN_FILE) then
+    vim.schedule(function() cb(nil, cancelled and "cancelled" or "none") end)
+    return
+  end
+  local ok_lock, lock_err = pcall(registry.call, "fn.openai_oauth_lock", function(release, lerr)
+    if not release then return cb("could not lock the Codex login: " .. tostring(lerr)) end
+    local ok, err = pcall(registry.call, "fn.openai_codex_credential", false)
+    pcall(release)
+    cb(not ok and tostring(err) or nil, "deleted")
+  end, "openai_codex")
+  if not ok_lock then vim.schedule(function() cb(tostring(lock_err)) end) end
+end
+]==]
+
+local OPENAI_CODEX_REQUEST_SRC = [==[
+return function(body, ctx, account_id)
+  local oauth = require("straps.oauth")
+  local session_id = require("straps.state").codex_session_id(ctx and ctx.bufnr)
+  body.max_output_tokens = nil
+  if type(body.instructions) ~= "string" or body.instructions == "" then
+    body.instructions = "You are a helpful assistant."
+  end
+  body.store = false
+  body.stream = true
+  body.text = { verbosity = "low" }
+  body.include = { "reasoning.encrypted_content" }
+  body.tool_choice = "auto"
+  body.parallel_tool_calls = true
+  body.prompt_cache_key = session_id
+  if body.reasoning then
+    body.reasoning.summary = "auto"
+  elseif ctx and type(ctx.codex_entry) == "table"
+    and (ctx.codex_entry.reasoning == true or ctx.codex_entry.reasoning_effort == true) then
+    body.reasoning = { effort = "none" }
+  end
+  local headers = {
+    "-H", "chatgpt-account-id: " .. account_id,
+    "-H", "OpenAI-Beta: responses=experimental",
+    "-H", "originator: " .. oauth.CODEX_ORIGINATOR,
+    "-H", "accept: text/event-stream",
+    "-H", "session-id: " .. session_id,
+    "-H", "x-client-request-id: " .. session_id,
+  }
+  return oauth.CODEX_BASE_URL .. "/codex/responses", headers
 end
 ]==]
 
@@ -3379,7 +3809,7 @@ function M.register()
     define({
       name = "fn.openai_api_key",
       kind = "fn",
-      doc = "(opts?) -> key, source. The OpenAI key: a stored ChatGPT login (:StrapsLogin openai) wins and is refreshed; else fn.api_key_store('openai') (:StrapsLogin openai key), then $OPENAI_API_KEY. source is oauth/stored/env; nil, \"cancelled\" when opts.ctx is cancelled during a refresh.",
+      doc = "(opts?) -> key, source, account_id?. The OpenAI key: a stored ChatGPT login (:StrapsLogin openai) wins and is refreshed; else a stored Codex login (:StrapsLogin openai codex), refreshed, with its ChatGPT account id; else fn.api_key_store('openai') (:StrapsLogin openai key), then $OPENAI_API_KEY. source is oauth/codex/stored/env; nil, \"cancelled\" when opts.ctx is cancelled during a refresh. Either login raises when the base URL is not https://api.openai.com.",
       source = OPENAI_API_KEY_SRC,
     })
     define({
@@ -3397,13 +3827,13 @@ function M.register()
     define({
       name = "fn.openai_oauth_lock",
       kind = "fn",
-      doc = "(cb) -> cb(release) or cb(nil, err): take the cross-process lock directory guarding the ChatGPT login file.",
+      doc = "(cb, name?) -> cb(release) or cb(nil, err): take the cross-process lock directory <name>.lock (default openai_oauth, guarding the ChatGPT login file; the Codex login uses openai_codex).",
       source = OPENAI_OAUTH_LOCK_SRC,
     })
     define({
       name = "fn.openai_oauth_post",
       kind = "fn",
-      doc = "(form, cb) -> cb(json) or cb(nil, err): POST a form to the OpenAI OAuth token endpoint; the body goes on stdin, never argv.",
+      doc = "(form, cb, opts?) -> cb(json) or cb(nil, err): POST a form to an OAuth token endpoint (opts.token_url, default the ChatGPT login's; opts.label prefixes errors); the body goes on stdin, never argv.",
       source = OPENAI_OAUTH_POST_SRC,
     })
     define({
@@ -3423,6 +3853,36 @@ function M.register()
       kind = "fn",
       doc = "(cb?) -> cb(err?, \"deleted\"|\"cancelled\"|\"none\"): cancel a pending ChatGPT login and delete the stored one under the lock. :StrapsLogout openai also deletes the stored API key through fn.api_key_store.",
       source = OPENAI_OAUTH_LOGOUT_SRC,
+    })
+    define({
+      name = "fn.openai_codex_credential",
+      kind = "fn",
+      doc = "Read (no arg), write (table) or delete (false) the Codex login { access, refresh, expires, account_id } at $XDG_CONFIG_HOME/straps/openai_codex.json (mode 600).",
+      source = OPENAI_CODEX_CREDENTIAL_SRC,
+    })
+    define({
+      name = "fn.openai_codex_refresh",
+      kind = "fn",
+      doc = "(opts, done) -> done(cred) or done(nil, err): refresh the Codex login under the openai_codex lock; opts.rejected_access forces a refresh after a 401. The account id is read again from the new access token.",
+      source = OPENAI_CODEX_REFRESH_SRC,
+    })
+    define({
+      name = "fn.openai_codex_login",
+      kind = "fn",
+      doc = "Sign in the way the Codex CLI does (client app_EMoamEEZ73f0CkXaXp7hrann, redirect http://localhost:1455/auth/callback). {} starts a login, cancels a pending ChatGPT login and returns the authorize URL (raises when openai_base_url is not https://api.openai.com); { callback_url } completes it, then deletes the stored OpenAI API key and the ChatGPT login (one stored openai credential); { cancel = true } cancels. opts.on_done(err?, note?) replaces the notify.",
+      source = OPENAI_CODEX_LOGIN_SRC,
+    })
+    define({
+      name = "fn.openai_codex_logout",
+      kind = "fn",
+      doc = "(cb?) -> cb(err?, \"deleted\"|\"cancelled\"|\"none\"): cancel a pending Codex login and delete the stored one under the openai_codex lock.",
+      source = OPENAI_CODEX_LOGOUT_SRC,
+    })
+    define({
+      name = "fn.openai_codex_request",
+      kind = "fn",
+      doc = "(body, ctx, account_id) -> url, header_argv: turn an OpenAI Responses body into a Codex backend request in place (no max_output_tokens; instructions, text, include, tool_choice, parallel_tool_calls, prompt_cache_key; reasoning summary, or effort none for a reasoning entry with effort off) and return https://chatgpt.com/backend-api/codex/responses plus the Codex headers. ctx.codex_entry is the model entry.",
+      source = OPENAI_CODEX_REQUEST_SRC,
     })
   end
   define({

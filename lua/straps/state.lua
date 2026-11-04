@@ -677,6 +677,26 @@ function M.set_session_pin(bufnr, provider, model, entry)
   end
   return false, tostring(err)
 end
+function M.codex_session_id(bufnr)
+  local valid = bufnr and vim.api.nvim_buf_is_valid(bufnr)
+  local id = valid and vim.b[bufnr].straps_codex_session_id or nil
+  local mp
+  if valid and vim.b[bufnr].straps_session == true and vim.bo[bufnr].buftype == "" then
+    local name = vim.api.nvim_buf_get_name(bufnr)
+    if name ~= "" then mp = meta_path(_canon_path(name)) end
+  end
+  if (type(id) ~= "string" or id == "") and mp then
+    local stored = read_meta(mp).codex_session_id
+    if type(stored) == "string" and stored ~= "" then id = stored end
+  end
+  if type(id) ~= "string" or id == "" then
+    id = require("straps.oauth").uuid4()
+    if mp then pcall(write_meta_fields, mp, { codex_session_id = id }) end
+  end
+  id = id:sub(1, 64)
+  if valid then vim.b[bufnr].straps_codex_session_id = id end
+  return id
+end
 --- A one-line summary of a transcript, read directly from disk (no buffer
 --- load): the durable title when set, else the first non-empty user prompt,
 --- else nil. Escaped/marker lines are unescaped; the summary is trimmed and

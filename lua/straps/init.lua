@@ -17,7 +17,8 @@ M.config = {
   -- sessions can talk to different backends. Every provider reads the key
   -- stored by :StrapsLogin <provider> key ($XDG_CONFIG_HOME/straps/<provider>_api_key),
   -- else its environment variables ($ANTHROPIC_API_KEY, $OPENAI_API_KEY,
-  -- $LLAMACPP_API_KEY then $LLAMA_API_KEY). openai tries a ChatGPT login first
+  -- $LLAMACPP_API_KEY then $LLAMA_API_KEY). openai tries a ChatGPT login, then
+  -- a Codex login (:StrapsLogin openai codex), first
   -- and stores a key with :StrapsLogin openai key. The llamacpp key is
   -- optional.
   provider = nil,
@@ -209,7 +210,7 @@ M.config = {
   -- require("straps.editor").register() (the LSP/tree-sitter tool group);
   -- openai = false skips the OpenAI-only entries inside provider.lua's
   -- register() (fn.openai_api_key, fn.provider_openai and the
-  -- fn.openai_oauth_* / fn.openai_device_id login entries) —
+  -- fn.openai_oauth_* / fn.openai_codex_* / fn.openai_device_id login entries) —
   -- fn.provider then errors with a clear message if asked to dispatch to
   -- "openai", and fn.list_models returns (nil, err) instead of raising.
   layers = {

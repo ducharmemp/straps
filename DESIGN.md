@@ -42,7 +42,7 @@ lua/straps/init.lua        -- setup(), config, wires everything together
 lua/straps/registry.lua    -- the late-bound registry (heart of the plugin)
 lua/straps/state.lua       -- transcript buffer format: create/append/parse
 lua/straps/provider.lua    -- registers fn.provider plus Anthropic/OpenAI/llama.cpp curl backends
-lua/straps/oauth.lua       -- Sign in with ChatGPT: constants, PKCE/URL helpers, pending-login state
+lua/straps/oauth.lua       -- Sign in with ChatGPT and the Codex login: constants, PKCE/URL/JWT helpers, pending-login state
 lua/straps/loop.lua        -- coroutine agent loop
 lua/straps/tools.lua       -- registration dispatcher; composes builtin-tool layer manifests
 lua/straps/layers/*.lua    -- layer manifests: builtin tools/hooks/fns grouped by layer (files, agents, exec, session, search, selfext, net, permissions)
@@ -881,7 +881,8 @@ caller can build a path outside the directory. It has three modes:
 A symlink at the path, such as one a secret manager places, is read through, but
 a write or delete on it raises. The default key entries `fn.anthropic_api_key`,
 `fn.openai_api_key` and `fn.llamacpp_api_key` return `key, source`: for OpenAI a
-ChatGPT login first (source "oauth"), then the stored key ("stored"), then each
+ChatGPT login first (source "oauth"), then a Codex login ("codex", with the
+ChatGPT account id as a third return value), then the stored key ("stored"), then each
 variable in `slot.key_env` that is not blank after trimming ("env", the trimmed
 value). A stored key wins over the environment so `:StrapsLogin` takes effect
 while a variable is exported; the cost is that a key file accessible by group or
@@ -889,7 +890,7 @@ other fails every request for its provider even with the variable set. A
 required provider raises naming `:StrapsLogin`, the variables and the file;
 llama.cpp returns nil. `:StrapsLogin`, `:StrapsLogout`, health and the key
 entries all call `fn.api_key_store`, so redefining that one entry moves key
-storage elsewhere. A completed ChatGPT login deletes the stored openai key
+storage elsewhere. A completed ChatGPT or Codex login deletes the stored openai key
 through `fn.api_key_store` and its success message reports what the store did.
 The store's errors carry their own remedy (`chmod 600`, `:StrapsLogin <provider>
 key`, or, for a symlink, the tool that created it), and health and
@@ -1044,12 +1045,18 @@ function tools together with any reasoning effort.
   with ChatGPT" below for the order of sources; `M.auth_headers` builds the
   header inside each attempt, so the 401 retry sends the refreshed token) and
   `content-type: application/json`.
-- **HTTP 401 with a ChatGPT login token** (`source == "oauth"`): one
-  `fn.openai_oauth_refresh{ rejected_access = <token> }` through `ctx.await`,
-  then one retry with the refreshed token; the retry does not consume one of
-  the three backoff attempts. A second 401, or a failed refresh, raises. A
-  redefined `fn.openai_api_key` that returns no `source` never takes this
-  path.
+- **HTTP 401 with a login token** (`source == "oauth"` or `"codex"`): one
+  `fn.openai_oauth_refresh{ rejected_access = <token> }` (Codex:
+  `fn.openai_codex_refresh`) through `ctx.await`, then one retry with the
+  refreshed token (Codex: and the refreshed account id in
+  `chatgpt-account-id`); the retry does not consume one of the three backoff attempts. A
+  second 401, or a failed refresh, raises. A redefined `fn.openai_api_key` that
+  returns no `source` never takes this path.
+- **Codex login** (`source == "codex"`): `fn.openai_codex_request(body, ctx,
+  account_id)` rewrites the body in place and returns the URL and extra
+  headers; the request then goes to
+  `https://chatgpt.com/backend-api/codex/responses` instead of
+  `{base_url}/v1/responses`. See "Codex login" below.
 - **Request translation** (Anthropic-shaped `req` → Responses input items, in
   block order): `req.system` → `instructions`; text blocks → `{ role, content }`
   message items (text before and after a tool call stays in separate items);
@@ -1069,7 +1076,11 @@ function tools together with any reasoning effort.
   `response.function_call_arguments.delta`/`.done` → one `tool_use` block per
   `output_index`, arguments decoded at the end. `response.completed` finalizes
   with `stop_reason` `tool_use` when any function call is present, else
-  `end_turn`. `response.incomplete` keeps only function calls whose
+  `end_turn`. `response.done` (sent by the Codex backend) is dispatched on
+  `response.status`: `incomplete` takes the `response.incomplete` path,
+  `failed` the `response.failed` path, and any other or missing status the
+  `response.completed` path, as Pi does. The first terminal event finalizes;
+  a later one is ignored. `response.incomplete` keeps only function calls whose
   `output_item.done` arrived, so a half-written call never runs; reason
   `max_output_tokens` maps to `max_tokens`, other reasons to `end_turn`.
   `response.failed` and the `error` event kill curl and
@@ -1082,7 +1093,9 @@ function tools together with any reasoning effort.
   their configured `config.openai_models` entry has `reasoning = true` or
   `reasoning_effort = true` and the active `config.efforts` entry has a
   `level`, with or without tools. Untagged models, `"off"`, and entries with no
-  level send no `reasoning` field, so the model uses its own default. Reasoning
+  level send no `reasoning` field, so the model uses its own default; under a
+  Codex login a tagged entry with effort off sends `{ effort = "none" }` (see
+  "Codex login"). Reasoning
   items and reasoning/summary events are ignored so provider reasoning never
   enters the durable transcript. With `store=false` no reasoning items are
   passed back between turns.
@@ -1137,9 +1150,9 @@ second backend.
   saved from the curl exit callback, independent of any coroutine, so
   `:StrapsStop` during a refresh cannot lose a rotated refresh token. A file
   deleted mid-refresh (logout) wins.
-- **Key order.** `fn.openai_api_key(opts?) -> key, source`: a stored login
-  wins (Pi's rule), then the stored key (`fn.api_key_store("openai")`), then
-  `$OPENAI_API_KEY`. With a login stored, a failed refresh raises naming
+- **Key order.** `fn.openai_api_key(opts?) -> key, source, account_id?`: a
+  stored ChatGPT login wins (Pi's rule), then a stored Codex login (below),
+  then the stored key (`fn.api_key_store("openai")`), then `$OPENAI_API_KEY`. With a login stored, a failed refresh raises naming
   `:StrapsLogin openai` and never falls back to an API key. The login token is
   refused for any `base_url` other than `https://api.openai.com` after
   `M.check_base_url` (so `https://api.openai.com/v1` is accepted).
@@ -1147,8 +1160,9 @@ second backend.
   `ctx.await` (cancel returns `nil, "cancelled"`); without ctx it waits with
   `vim.wait(opts.wait_ms or 50000)` (`fn.list_models` passes 15000);
   `opts.refresh = false` never refreshes (health).
-- **One stored credential.** OpenAI keeps either a ChatGPT login or a stored
-  API key. A login does not start when `openai_base_url` is not
+- **One stored credential.** OpenAI keeps one of a ChatGPT login, a Codex
+  login or a stored API key. The rules below for a ChatGPT login apply to a
+  Codex login too; "Codex login" lists what differs. A login does not start when `openai_base_url` is not
   `https://api.openai.com`, since its token would be refused there and its
   completion would delete the key that host needs; completion checks
   `openai_base_url` again inside the lock and refuses to save the login if it
@@ -1172,7 +1186,98 @@ second backend.
 - **Secrets.** Form bodies go to curl on stdin (`fn.openai_oauth_post`), never
   argv. A failed token request reports the HTTP status and the full response
   body (capped at 2000 bytes), with any request form value of 8 or more
-  characters that the server echoes replaced by `[redacted]`.
+  characters that the server echoes replaced by `[redacted]`. Request headers,
+  including `Authorization: Bearer` for every provider and the Codex
+  `chatgpt-account-id`, are curl arguments, so another local user can read
+  them with `ps` while a request runs.
+
+### Codex login (`fn.openai_codex_*`, `lua/straps/oauth.lua`)
+
+A port of Pi's "OpenAI Codex" login (badlogic/pi-mono,
+`packages/ai/src/auth/oauth/openai-codex.ts` and
+`packages/ai/src/api/openai-codex-responses.ts`): the Codex CLI's OAuth client
+and the ChatGPT Codex backend, for accounts and models the ChatGPT login does
+not serve. It is the openai provider's third stored credential, so no
+provider slot is added.
+
+- **Login.** `:StrapsLogin openai codex` calls `fn.openai_codex_login{}`: PKCE
+  (S256), a random `state`, and `https://auth.openai.com/oauth/authorize` with
+  `client_id=app_EMoamEEZ73f0CkXaXp7hrann`,
+  `redirect_uri=http://localhost:1455/auth/callback`, scope
+  `openid profile email offline_access`, `id_token_add_organizations=true`,
+  `codex_cli_simplified_flow=true` and `originator=straps`. The user pastes the
+  redirect URL into `:StrapsLogin openai <url>`; `ui.login` routes a
+  `http://localhost:1455` URL to the Codex login and `http://127.0.0.1:1455` to
+  the ChatGPT login. Port 1455 is the Codex CLI's login port, so a running
+  Codex CLI login takes the code first; the start notice says so. Pi also
+  accepts a bare code or `code#state`; straps requires the full URL with a
+  matching `state`. The exchange (`https://auth.openai.com/oauth/token`, no
+  `resource`) requires `access_token`, `refresh_token`, `expires_in > 0` and
+  the account id: the claim `["https://api.openai.com/auth"].chatgpt_account_id`
+  of the access token's JWT payload (base64url), with no whitespace, control
+  or non-ASCII characters, since it becomes a request header.
+- **State.** `require("straps.oauth").pending_codex_login`, beside
+  `pending_login`. Starting either login cancels the other's pending login.
+- **Storage and lock.** `fn.openai_codex_credential` writes
+  `$XDG_CONFIG_HOME/straps/openai_codex.json` `{ access, refresh, expires,
+  account_id }` as the ChatGPT login is written. Its lock is
+  `fn.openai_oauth_lock(cb, "openai_codex")` (directory `openai_codex.lock`).
+- **Refresh.** `fn.openai_codex_refresh` follows `fn.openai_oauth_refresh`
+  with the form `grant_type=refresh_token`, `refresh_token`, `client_id`, and
+  reads the account id again from the new access token.
+- **One stored credential.** A completed Codex login saves its credential
+  under its own lock, releases it, then deletes the stored key and calls
+  `fn.openai_oauth_logout`. A failed ChatGPT sign-out there is reported as an
+  error, since the ChatGPT login would keep winning; a failed key delete is a
+  note, since the Codex login wins over the key. A completed ChatGPT login
+  saves its credential and deletes the key under its own lock, releases it,
+  then calls `fn.openai_codex_logout`; a failure there is a note, since the
+  ChatGPT login wins over a Codex login. `:StrapsLogin openai key` calls both
+  logout fns. No code holds both locks. Each logout takes the lock that owns its file, and
+  each refresh re-reads its file under its lock before writing, so a refresh in
+  flight cannot write a deleted login back. Two Neovim processes that complete
+  a ChatGPT and a Codex login at the same moment can each delete the other's
+  login; both report success and no login remains.
+- **Bad file.** A Codex login file that cannot be read (group/other mode, no
+  valid account id) makes `fn.openai_api_key` raise, as a bad ChatGPT login
+  file does; the stored key and `$OPENAI_API_KEY` are not used until the file
+  is fixed or removed with `:StrapsLogout openai`.
+- **Host rule.** The Codex token goes only to `https://chatgpt.com`. The login
+  does not start or complete, and `fn.openai_api_key` raises, when
+  `openai_base_url` is not `https://api.openai.com`, so a user who points openai
+  at another server never has requests moved to chatgpt.com.
+- **Request.** `fn.openai_codex_request` sets the URL
+  `https://chatgpt.com/backend-api/codex/responses`, the headers
+  `chatgpt-account-id`, `OpenAI-Beta: responses=experimental`,
+  `originator: straps`, `accept: text/event-stream`, and `session-id` and
+  `x-client-request-id` set to the session id; it drops `max_output_tokens`,
+  sets `instructions` (default "You are a helpful assistant."),
+  `text.verbosity=low`, `include=["reasoning.encrypted_content"]`,
+  `tool_choice=auto`, `parallel_tool_calls=true` and `prompt_cache_key` (the
+  session id). Reasoning: `{ effort = level, summary = "auto" }` when the effort
+  applies; `{ effort = "none" }` for an entry marked `reasoning` with effort off
+  (Pi's rule); otherwise omitted.
+- **Session id.** `state.codex_session_id(bufnr)`: `vim.b
+  straps_codex_session_id`, else the `codex_session_id` field of the session's
+  `.meta`, else a new UUIDv4 written there, clamped to 64 characters. A resumed
+  session keeps its id; another buffer, a spawned child included, gets its own.
+- **401.** The retry sends the body encoded for the first attempt and
+  replaces only the `Authorization` and `chatgpt-account-id` headers.
+- **Errors.** A 429 is retried as before unless `error.code` or `error.type` is
+  `usage_limit_reached` or `usage_not_included`; those, and a 429 that outlasts
+  the retries, raise "You have hit your ChatGPT usage limit (<plan> plan). Try
+  again in ~N min." from `plan_type` and `resets_at`. Error labels read
+  `openai (codex)`.
+- **Models.** With a Codex login, `fn.list_models("openai")` reads
+  `https://chatgpt.com/backend-api/codex/models?client_version=<v>` with the
+  Codex headers and marks every entry `reasoning = true`; on any failure it
+  returns `oauth.CODEX_MODELS` (Pi's list) with a warning, including a
+  catalog with no visible models. `openai_model` keeps
+  its default (`gpt-5`), which the Codex backend may reject; the login notice
+  says to pick a model with `:StrapsModel`, and health warns when the model is
+  not in `oauth.CODEX_MODELS`. Unverified against the live backend: the
+  `/codex/models` response shape and `client_version`, the `originator=straps`
+  value, and whether every listed model accepts `effort = "none"`.
 
 `fn.system_prompt` default source returns the default system prompt (below).
 
@@ -1210,6 +1315,11 @@ provider it lists GPT models, not Claude ones.
   with `visibility = "hide"` are dropped. `thinking` stays `nil` for both
   shapes; static `config.openai_models` entries must opt in to
   `reasoning.effort` with `reasoning = true` (or `reasoning_effort = true`).
+  With a Codex login the request goes to the Codex catalog instead, with the
+  same `{models:[...]}` shape, every entry marked `reasoning = true`, and
+  `oauth.CODEX_MODELS` returned on failure (see "Codex login"). The model
+  picker's merge keeps a live entry's `reasoning` when the static entry has
+  none.
 - **llama.cpp**: `GET {base_url}/v1/models` with no `?limit` and
   `Authorization: Bearer` only when `fn.llamacpp_api_key` returns a key (no
   key is not an error). The catalog is `{data:[{id, status, meta?}]}`: the id
@@ -2309,9 +2419,11 @@ Existing suites must all still pass.
   place. For anthropic and llamacpp (with or without `key`) and `:StrapsLogin
   openai key`, login reads the key with `vim.fn.inputsecret` (an empty answer
   cancels) and writes it through `fn.api_key_store`; the key is never an
-  argument, and any other extra argument is rejected. `:StrapsLogin openai
-  [url]` calls `fn.openai_oauth_login`; an argument that is neither `key` nor an
-  http(s) URL gets the usage message. With a key already stored (read through
+  argument, and any other extra argument is rejected. `:StrapsLogin openai`
+  calls `fn.openai_oauth_login`, `:StrapsLogin openai codex` calls
+  `fn.openai_codex_login`, and `:StrapsLogin openai <url>` completes the login
+  its origin names (`http://localhost:1455` Codex, else ChatGPT); an argument
+  that is none of `key`, `codex` or an http(s) URL gets the usage message. With a key already stored (read through
   `fn.api_key_store`), the key prompt says that it replaces the stored key. A
   call with an extra argument or an unknown name, which can carry a code or a
   key, removes the last command-line history entry once, when that entry
@@ -2322,14 +2434,15 @@ Existing suites must all still pass.
   (`vim.fn.confirm`), since a provider console cannot show an API key again. It
   deletes the stored key through `fn.api_key_store` (a store with no path is
   reported as "the stored <provider> API key"), for openai then calls
-  `fn.openai_oauth_logout`, reports each item removed or that nothing was
+  `fn.openai_oauth_logout` and `fn.openai_codex_logout`, reports each item removed or that nothing was
   stored, and names each `slot.key_env` variable still set; with more than one
   set, it says the default key fn reads the first one set, in `key_env` order.
   Both commands accept a bang and ignore it, so `:StrapsLogin! <provider> <key>`
   still reaches the history removal instead of failing with E477. With
   `layers.openai = false`, every `:StrapsLogin openai` form, `key` included, is
   an error message, health suggests no `:StrapsLogin openai` command, and
-  `:StrapsLogout openai` deletes only the key file.
+  `:StrapsLogout openai` deletes only the key file and names any ChatGPT or
+  Codex login file left on disk.
 - Folding for the session buffer: foldexpr folds `tool_use`/`tool_result`
   pairs and the system block (level 1); user/assistant turns never fold.
   `foldlevel=0` so tool calls start closed and the conversation stays visible.
@@ -2365,7 +2478,8 @@ Sections:
   `fn.api_key_store`: a raised mode, read or content error, a non-file at the
   key path, or an empty first line. For OpenAI it reports the ChatGPT login
   file's mode and client id, and an OK line with the minutes left on the access
-  token. The verdict names the source `slot.key_fn` returned a key from,
+  token; for a Codex login file, a read error (mode, account id) or the same OK
+  line, plus a warning when the openai model is not in `oauth.CODEX_MODELS`. The verdict names the source `slot.key_fn` returned a key from,
   without refreshing, and checks the key with `provider.clean_key`, so a key
   every request refuses is an error. A missing key is an error when
   `key_required`, else info. When the key fn raises the stored key error or

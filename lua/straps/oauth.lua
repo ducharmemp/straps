@@ -18,7 +18,30 @@ M.LOGIN_TTL_MS = 15 * 60 * 1000
 M.LOCK_STALE_MS = 20 * 1000
 M.LOCK_DEADLINE_MS = 30 * 1000
 
+M.CODEX_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
+M.CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
+M.CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+M.CODEX_REDIRECT_ORIGIN = "http://localhost:1455"
+M.CODEX_REDIRECT_URI = M.CODEX_REDIRECT_ORIGIN .. M.REDIRECT_PATH
+M.CODEX_SCOPE = "openid profile email offline_access"
+M.CODEX_LOGIN_FILE = "openai_codex.json"
+M.CODEX_BASE_URL = "https://chatgpt.com/backend-api"
+M.CODEX_ORIGINATOR = "straps"
+M.CODEX_CLIENT_VERSION = "0.99.0"
+M.JWT_AUTH_CLAIM = "https://api.openai.com/auth"
+M.CODEX_MODELS = {
+  { id = "gpt-6.1-sol", label = "GPT-6.1 Sol", context = 500000, reasoning = true },
+  { id = "gpt-6.1-terra", label = "GPT-6.1 Terra", context = 500000, reasoning = true },
+  { id = "gpt-6-astra", label = "GPT-6 Astra", context = 272000, reasoning = true },
+  { id = "gpt-6-sol", label = "GPT-6 Sol", context = 272000, reasoning = true },
+  { id = "gpt-6-luna", label = "GPT-6 Luna", context = 272000, reasoning = true },
+  { id = "gpt-5.6-luna", label = "GPT-5.6 Luna", context = 272000, reasoning = true },
+  { id = "gpt-5.6-sol", label = "GPT-5.6 Sol", context = 272000, reasoning = true },
+  { id = "gpt-5.6-terra", label = "GPT-5.6 Terra", context = 272000, reasoning = true },
+}
+
 M.pending_login = nil
+M.pending_codex_login = nil
 
 function M.now_ms()
   local sec, usec = vim.uv.gettimeofday()
@@ -99,27 +122,92 @@ function M.parse_query(query)
   return out
 end
 
-function M.parse_callback(url, expected_state)
+function M.callback_origin(url)
+  local origin = vim.trim(url or ""):match("^(https?://[^/?#]+)")
+  return origin and origin:lower()
+end
+
+function M.parse_callback(url, expected_state, opts)
+  opts = opts or {}
+  local want_origin = opts.origin or M.REDIRECT_ORIGIN
+  local cmd = opts.cmd or ":StrapsLogin openai"
   url = vim.trim(url or "")
   local origin, path = url:match("^(https?://[^/?#]+)(/[^?#]*)")
   if not origin then
     error("straps: paste the full callback URL from the browser's address bar", 0)
   end
-  if origin ~= M.REDIRECT_ORIGIN or path ~= M.REDIRECT_PATH then
-    error("straps: the pasted URL must start with " .. M.REDIRECT_URI, 0)
+  if origin:lower() ~= want_origin or path ~= M.REDIRECT_PATH then
+    error("straps: the pasted URL must start with " .. want_origin .. M.REDIRECT_PATH, 0)
   end
   local params = M.parse_query(url:match("%?([^#]*)") or "")
   if params.error and params.error ~= "" then
-    error("straps: ChatGPT authorization failed: " .. params.error, 0)
+    error("straps: " .. (opts.label or "ChatGPT") .. " authorization failed: " .. params.error, 0)
   end
   if not params.code or params.code == "" then error("straps: the pasted URL has no authorization code", 0) end
   if not params.state or params.state == "" then error("straps: the pasted URL has no OAuth state", 0) end
   if params.state ~= expected_state then
-    error("straps: OAuth state mismatch; paste the URL from the most recent :StrapsLogin openai", 0)
+    error("straps: OAuth state mismatch; paste the URL from the most recent " .. cmd, 0)
   end
+  if opts.require_client_id == false then return { code = params.code } end
   local client_id = vim.trim(params.client_id or "")
   if client_id == "" then error("straps: the pasted URL has no issued client_id", 0) end
   return { code = params.code, client_id = client_id }
+end
+
+function M.jwt_payload(token)
+  if type(token) ~= "string" then return nil end
+  local part = token:match("^[^.]+%.([^.]+)%.[^.]*$")
+  if not part then return nil end
+  local b64 = part:gsub("%-", "+"):gsub("_", "/")
+  local rem = #b64 % 4
+  if rem == 1 then return nil end
+  if rem > 0 then b64 = b64 .. string.rep("=", 4 - rem) end
+  local ok, raw = pcall(vim.base64.decode, b64)
+  if not ok then return nil end
+  local okj, payload = pcall(vim.json.decode, raw)
+  if not okj or type(payload) ~= "table" then return nil end
+  return payload
+end
+
+function M.codex_account_id(access)
+  local payload = M.jwt_payload(access)
+  local auth = payload and payload[M.JWT_AUTH_CLAIM]
+  local id = type(auth) == "table" and auth.chatgpt_account_id or nil
+  if type(id) ~= "string" or id == "" or id:find("[%s%c\128-\255]") then return nil end
+  return id
+end
+
+function M.codex_credential_from_token(token)
+  if type(token) ~= "table" then error("straps: Codex OAuth token response is not an object", 0) end
+  for _, field in ipairs({ "access_token", "refresh_token" }) do
+    if type(token[field]) ~= "string" or vim.trim(token[field]) == "" then
+      error("straps: Codex OAuth token response has invalid " .. field, 0)
+    end
+  end
+  if type(token.expires_in) ~= "number" or token.expires_in <= 0 then
+    error("straps: Codex OAuth token response has invalid expires_in", 0)
+  end
+  local account_id = M.codex_account_id(token.access_token)
+  if not account_id then
+    error("straps: the Codex access token has no usable ChatGPT account id", 0)
+  end
+  return {
+    access = token.access_token,
+    refresh = token.refresh_token,
+    expires = M.now_ms() + token.expires_in * 1000 - M.EXPIRY_MARGIN_MS,
+    account_id = account_id,
+  }
+end
+
+function M.uuid4()
+  local bit = require("bit")
+  local b = { vim.uv.random(16):byte(1, 16) }
+  b[7] = bit.bor(bit.band(b[7], 0x0f), 0x40)
+  b[9] = bit.bor(bit.band(b[9], 0x3f), 0x80)
+  local hex = {}
+  for i = 1, 16 do hex[i] = ("%02x"):format(b[i]) end
+  local h = table.concat(hex)
+  return h:sub(1, 8) .. "-" .. h:sub(9, 12) .. "-" .. h:sub(13, 16) .. "-" .. h:sub(17, 20) .. "-" .. h:sub(21, 32)
 end
 
 function M.credential_from_token(token, client_id, require_id_token)

@@ -1542,6 +1542,7 @@ local function merge_models(static_list, live_list, server_context)
         if existing.thinking == nil then existing.thinking = m.thinking end
         if existing.context == nil or (server_context and m.context ~= nil) then existing.context = m.context end
         if existing.max_output == nil then existing.max_output = m.max_output end
+        if existing.reasoning == nil then existing.reasoning = m.reasoning end
       else
         by_id[m.id] = copy_model(m)
         order[#order + 1] = m.id
@@ -1980,47 +1981,87 @@ local function strip_prefix(msg)
   return "straps: " .. (tostring(msg):gsub("^straps: ", ""))
 end
 
+local function openai_logins_logout(done)
+  local registry = require("straps.registry")
+  local steps = { { "fn.openai_oauth_logout", "ChatGPT" } }
+  if registry.get("fn.openai_codex_logout") then steps[#steps + 1] = { "fn.openai_codex_logout", "Codex" } end
+  local errs, said = {}, {}
+  local i = 0
+  local function step()
+    i = i + 1
+    local s = steps[i]
+    if not s then return done(errs, said) end
+    local called = false
+    local ok, err = pcall(registry.call, s[1], function(lerr, what)
+      if called then return end
+      called = true
+      if lerr then
+        errs[#errs + 1] = "signing out of the " .. s[2] .. " login failed (" .. (tostring(lerr):gsub("^straps: ", "")) .. ")"
+      elseif what == "deleted" then
+        said[#said + 1] = s[2] == "ChatGPT" and "signed out of ChatGPT" or "signed out of the Codex login"
+      elseif what == "cancelled" then
+        said[#said + 1] = "pending " .. s[2] .. " login cancelled"
+      end
+      step()
+    end)
+    if not ok and not called then
+      called = true
+      errs[#errs + 1] = "signing out of the " .. s[2] .. " login failed (" .. (tostring(err):gsub("^straps: ", "")) .. ")"
+      step()
+    end
+  end
+  step()
+end
+
 --- :StrapsLogin [provider [key]] — store a credential for a provider
 --- (default: the current buffer's). anthropic and llamacpp store an API key,
---- with or without `key`. openai signs in with ChatGPT (:StrapsLogin openai,
---- then :StrapsLogin openai <redirect-url>) or, with `key`, stores an API key.
---- A key is read with inputsecret and never taken as an argument. OpenAI keeps
---- one stored credential: an API key replaces a ChatGPT login and the reverse.
+--- with or without `key`. openai signs in with ChatGPT (:StrapsLogin openai),
+--- signs in the way the Codex CLI does (:StrapsLogin openai codex), and either
+--- login completes with :StrapsLogin openai <redirect-url>, routed by the URL's
+--- origin; with `key` it stores an API key. A key is read with inputsecret and
+--- never taken as an argument. OpenAI keeps one stored credential: each of the
+--- API key, the ChatGPT login and the Codex login replaces the other two.
 function M.login(fargs)
   local providers = require("straps.provider")
   local key_form = #fargs == 2 and fargs[2] == "key" and providers.is_provider(fargs[1])
-  if (#fargs >= 2 and not key_form) or (fargs[1] and not providers.is_provider(fargs[1])) then
+  local codex_form = #fargs == 2 and fargs[1] == "openai" and fargs[2] == "codex"
+  if (#fargs >= 2 and not key_form and not codex_form) or (fargs[1] and not providers.is_provider(fargs[1])) then
     scrub_history()
   end
   local name = auth_provider(fargs[1], ":StrapsLogin")
   if not name then return end
   local registry = require("straps.registry")
+  local oauth = require("straps.oauth")
   if name == "openai" and fargs[2] ~= "key" then
-    if not require_entries({ "fn.openai_oauth_login" }, "openai") then return end
-    local url = fargs[2]
+    local url = not codex_form and fargs[2] or nil
     if #fargs > 2 or (url and not url:match("^https?://")) then
-      return notify_err("straps: usage: :StrapsLogin openai [redirect-url | key]")
+      return notify_err("straps: usage: :StrapsLogin openai [codex | redirect-url | key]")
     end
-    local ok, res, opened = pcall(registry.call, "fn.openai_oauth_login", url and { callback_url = url } or {})
+    local codex = codex_form or (url ~= nil and oauth.callback_origin(url) == oauth.CODEX_REDIRECT_ORIGIN)
+    local login_fn = codex and "fn.openai_codex_login" or "fn.openai_oauth_login"
+    if not require_entries({ login_fn }, "openai") then return end
+    local ok, res, opened = pcall(registry.call, login_fn, url and { callback_url = url } or {})
     if not ok then
       return notify_err(strip_prefix(res))
     end
     if url then
-      vim.notify("straps: exchanging the ChatGPT authorization code...")
+      vim.notify("straps: exchanging the " .. (codex and "Codex" or "ChatGPT") .. " authorization code...")
     else
       vim.notify("straps: " .. (opened and "sign in at the page that opened (URL below)" or "open this URL and sign in")
-        .. ". The browser then fails to load " .. require("straps.oauth").REDIRECT_ORIGIN
+        .. ". The browser then fails to load " .. (codex and oauth.CODEX_REDIRECT_ORIGIN or oauth.REDIRECT_ORIGIN)
         .. "; copy that page's full URL from the address bar and run :StrapsLogin openai <url>"
+        .. (codex and (". If a Codex CLI login is running, it holds port 1455 and takes the code first;"
+          .. " stop it and sign in again") or "")
         .. "\n" .. tostring(res))
     end
     return
   end
   if #fargs > 1 and not key_form then
-    return notify_err("straps: usage: :StrapsLogin " .. name .. (name == "openai" and " [redirect-url | key]" or " [key]")
+    return notify_err("straps: usage: :StrapsLogin " .. name .. (name == "openai" and " [codex | redirect-url | key]" or " [key]")
       .. " (the key is asked for; do not pass it)")
   end
   if not require_entries({ "fn.api_key_store" }) then return end
-  if name == "openai" and not require_entries({ "fn.openai_oauth_logout" }, "openai") then return end
+  if name == "openai" and not require_entries({ "fn.openai_oauth_logout", "fn.openai_codex_logout" }, "openai") then return end
   -- A provider console cannot show a key again, so say when this key
   -- replaces a stored one.
   local ok_old, old = pcall(registry.call, "fn.api_key_store", name)
@@ -2040,25 +2081,23 @@ function M.login(fargs)
     done = done .. "; the default " .. providers.provider_slot(name).key_fn .. " reads it before " .. table.concat(set, " and ")
   end
   if name ~= "openai" then return vim.notify(done) end
-  -- A stored ChatGPT login wins over the key, so sign out of it (under the
-  -- login lock, cancelling a pending login whose completion would delete the
-  -- key).
-  local function signout_failed(err)
-    notify_err(done .. ", but signing out of ChatGPT failed (" .. (tostring(err):gsub("^straps: ", ""))
-      .. "); the ChatGPT login still takes precedence. Run :StrapsLogout openai, then :StrapsLogin openai key.")
-  end
-  local ok, err = pcall(registry.call, "fn.openai_oauth_logout", function(lerr, what)
-    if lerr then return signout_failed(lerr) end
-    vim.notify(done .. (what == "deleted" and "; signed out of ChatGPT"
-      or what == "cancelled" and "; pending ChatGPT login cancelled" or ""))
+  -- A stored ChatGPT or Codex login wins over the key, so sign out of both
+  -- (under each login's lock, cancelling a pending login whose completion
+  -- would delete the key).
+  openai_logins_logout(function(errs, said)
+    if #errs > 0 then
+      return notify_err(done .. (#said > 0 and ("; " .. table.concat(said, "; ")) or "")
+        .. ", but signing out failed (" .. table.concat(errs, "; ")
+        .. "); that login still takes precedence. Run :StrapsLogout openai, then :StrapsLogin openai key.")
+    end
+    vim.notify(done .. (#said > 0 and ("; " .. table.concat(said, "; ")) or ""))
   end)
-  if not ok then signout_failed(err) end
 end
 
 --- :StrapsLogout [provider] — delete the provider's stored key (and, for
---- openai, the ChatGPT login and a pending login), then name any variable the
---- default key fn would still read. Without a provider argument it asks first,
---- since a provider console cannot show an API key again.
+--- openai, the ChatGPT and Codex logins and any pending login), then name any
+--- variable the default key fn would still read. Without a provider argument
+--- it asks first, since a provider console cannot show an API key again.
 function M.logout(fargs)
   local providers = require("straps.provider")
   if #fargs > 1 or (fargs[1] and not providers.is_provider(fargs[1])) then scrub_history() end
@@ -2095,32 +2134,26 @@ function M.logout(fargs)
   end
   if name ~= "openai" then return finish() end
   if not registry.get("fn.openai_oauth_logout") then
-    -- The openai layer is off, so the ChatGPT login entries are not
-    -- registered; say what stays on disk instead of claiming nothing is stored.
+    -- The openai layer is off, so the login entries are not registered; say
+    -- what stays on disk instead of claiming nothing is stored.
     local oauth = require("straps.oauth")
     local dir = oauth.config_dir()
-    local login = dir and (dir .. "/" .. oauth.LOGIN_FILE)
-    if login and vim.uv.fs_stat(login) then
-      said[#said + 1] = "the ChatGPT login at " .. login .. " was not removed (the openai layer is off)"
+    for _, f in ipairs({ { oauth.LOGIN_FILE, "ChatGPT" }, { oauth.CODEX_LOGIN_FILE, "Codex" } }) do
+      local login = dir and (dir .. "/" .. f[1])
+      if login and vim.uv.fs_stat(login) then
+        said[#said + 1] = "the " .. f[2] .. " login at " .. login .. " was not removed (the openai layer is off)"
+      end
     end
     return finish()
   end
-  local ok, err = pcall(registry.call, "fn.openai_oauth_logout", function(lerr, what)
-    if lerr then
+  openai_logins_logout(function(errs, done_said)
+    for _, e in ipairs(errs) do
       failed = true
-      notify_err(strip_prefix(lerr))
-    elseif what == "deleted" then
-      table.insert(said, 1, "signed out of ChatGPT")
-    elseif what == "cancelled" then
-      table.insert(said, 1, "pending ChatGPT login cancelled")
+      notify_err("straps: " .. e)
     end
+    for i = #done_said, 1, -1 do table.insert(said, 1, done_said[i]) end
     finish()
   end)
-  if not ok then
-    failed = true
-    notify_err(strip_prefix(err))
-    finish()
-  end
 end
 
 --- :StrapsAuto — grant permission categories to THIS session (auto mode). A

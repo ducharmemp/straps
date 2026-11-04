@@ -64,8 +64,8 @@ provider, tools, editor tools and UI. It is idempotent: registration uses
 Every provider reads its key the same way: the key stored by |:StrapsLogin|
 (|fn.api_key_store|, `$XDG_CONFIG_HOME/straps/<provider>_api_key`, which must
 be chmod 600) first, then the environment. |fn.anthropic_api_key| reads
-`$ANTHROPIC_API_KEY`; |fn.openai_api_key| tries a ChatGPT login made with
-|:StrapsLogin| before the stored key, then reads `$OPENAI_API_KEY`;
+`$ANTHROPIC_API_KEY`; |fn.openai_api_key| tries a ChatGPT login, then a Codex
+login, made with |:StrapsLogin| before the stored key, then reads `$OPENAI_API_KEY`;
 |fn.llamacpp_api_key| reads `$LLAMACPP_API_KEY`, else `$LLAMA_API_KEY` (the
 variable `llama-server` reads). The llama.cpp key is optional: `llama-server`
 needs one only when it runs with `--api-key`. Anthropic sends the key as
@@ -205,18 +205,33 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			left in place and the ChatGPT login takes precedence
 			over it. Refused when `openai_base_url` is not
 			https://api.openai.com. See |fn.openai_api_key|.
+:StrapsLogin openai codex
+			Sign in the way the Codex CLI does, for accounts or
+			models the ChatGPT sign-in does not serve. It opens
+			the sign-in page; after sign-in the browser fails to
+			load http://localhost:1455/auth/callback?...; run
+			`:StrapsLogin openai {url}` with that URL. A running
+			Codex CLI login listens on port 1455 and takes the
+			code; stop it first. The login is stored in
+			$XDG_CONFIG_HOME/straps/openai_codex.json (mode 600)
+			and requests go to
+			https://chatgpt.com/backend-api/codex/responses.
+			Completing it deletes the stored key and the ChatGPT
+			login. Pick a Codex model with |:StrapsModel|. Refused
+			when `openai_base_url` is not https://api.openai.com.
 :StrapsLogin openai key
 			Prompt for an OpenAI API key and store it, then sign
-			out of ChatGPT (cancelling a pending login). A
-			rejected key changes nothing; if the sign-out fails
-			the key stays stored and the ChatGPT login still wins.
+			out of ChatGPT and the Codex login (cancelling a
+			pending login). A rejected key changes nothing; if a
+			sign-out fails the key stays stored and that login
+			still wins.
 
 							*:StrapsLogout*
 :StrapsLogout [{provider}]
 			Delete {provider}'s stored key; for openai also cancel
-			a pending ChatGPT login and delete the stored one.
-			Names any variable the default key fn would still
-			read. Without {provider} it asks first.
+			a pending ChatGPT or Codex login and delete the stored
+			ones. Names any variable the default key fn would
+			still read. Without {provider} it asks first.
 
 							*:StrapsAuto*
 :StrapsAuto [off|{cats}]
@@ -503,8 +518,8 @@ layers			(table) { editor = true, openai = true }. Which
 			`editor` gates the LSP/tree-sitter tool set
 			(lua/straps/editor.lua); `openai` gates the OpenAI
 			backend fns (`fn.openai_api_key`, `fn.provider_openai`,
-			and the ChatGPT login fns `fn.openai_oauth_*`,
-			`fn.openai_device_id`).
+			and the ChatGPT and Codex login fns `fn.openai_oauth_*`,
+			`fn.openai_codex_*`, `fn.openai_device_id`).
 			A registration gate, not a kill switch: false skips
 			registering that group; it does not unregister entries
 			an earlier `setup()` call already registered (restart
@@ -964,11 +979,13 @@ fn.anthropic_api_key(opts?) -> key, source
 		neither is set. `opts.base_url` is the server the key is for
 		(the default ignores it).
 						*fn.openai_api_key*
-fn.openai_api_key(opts?) -> key, source
+fn.openai_api_key(opts?) -> key, source, account_id?
 		Resolve the OpenAI key. A stored ChatGPT login (|:StrapsLogin|)
-		wins, refreshed when it expires within 5 minutes; else the
+		wins, refreshed when it expires within 5 minutes; else a stored
+		Codex login (`:StrapsLogin openai codex`), refreshed the same
+		way, with its ChatGPT account id as the third value; else the
 		stored key (|fn.api_key_store|, |:StrapsLogin| openai key),
-		then $OPENAI_API_KEY. `source` is "oauth", "stored" or
+		then $OPENAI_API_KEY. `source` is "oauth", "codex", "stored" or
 		"env"; with `opts.ctx` cancelled during a refresh it returns
 		nil, "cancelled". opts: `ctx` (wait for a refresh through
 		ctx.await), `refresh = false` (never refresh; used by
@@ -994,12 +1011,14 @@ fn.openai_oauth_refresh(opts, done)	Refresh the stored login under
 fn.openai_oauth_credential(value?)	Read (no arg), write (table) or
 		delete (false) $XDG_CONFIG_HOME/straps/openai_oauth.json.
 						*fn.openai_oauth_lock*
-fn.openai_oauth_lock(cb)	Take the lock directory
-		$XDG_CONFIG_HOME/straps/openai_oauth.lock; cb(release) or
+fn.openai_oauth_lock(cb, name?)	Take the lock directory
+		$XDG_CONFIG_HOME/straps/<name>.lock (default
+		`openai_oauth`; the Codex login uses `openai_codex`); cb(release) or
 		cb(nil, err). Stale after 20 s; waiters give up after 30 s.
 						*fn.openai_oauth_post*
-fn.openai_oauth_post(form, cb)	POST a form to the OpenAI token endpoint
-		(body on stdin, never argv).
+fn.openai_oauth_post(form, cb, opts?)	POST a form to a token endpoint
+		(body on stdin, never argv). opts: `token_url` (default the
+		ChatGPT login's), `label` (error prefix).
 						*fn.openai_oauth_logout*
 fn.openai_oauth_logout(cb?)	Cancel a pending login and delete the stored
 		one under the lock: cb(err?, "deleted"|"cancelled"|"none").
@@ -1007,6 +1026,31 @@ fn.openai_oauth_logout(cb?)	Cancel a pending login and delete the stored
 						*fn.openai_device_id*
 fn.openai_device_id()		This installation's UUIDv4, sent as
 		`ext_agent_host_id`.
+						*fn.openai_codex_login*
+fn.openai_codex_login(opts)	Sign in the way the Codex CLI does.
+		`{}` starts a login, cancels a pending ChatGPT login and
+		opens/returns the authorize URL; `{ callback_url = url }`
+		completes it, then deletes the stored key and the ChatGPT
+		login; `{ cancel = true }` cancels. Raises at start, and
+		refuses to save at completion, when `openai_base_url` is not
+		https://api.openai.com.
+						*fn.openai_codex_refresh*
+fn.openai_codex_refresh(opts, done)	Refresh the Codex login under
+		the `openai_codex` lock; `opts.rejected_access` forces a refresh
+		after an HTTP 401. done(cred) or done(nil, err).
+						*fn.openai_codex_credential*
+fn.openai_codex_credential(value?)	Read, write or delete
+		$XDG_CONFIG_HOME/straps/openai_codex.json { access, refresh,
+		expires, account_id }.
+						*fn.openai_codex_logout*
+fn.openai_codex_logout(cb?)	Cancel a pending Codex login and delete
+		the stored one: cb(err?, "deleted"|"cancelled"|"none").
+						*fn.openai_codex_request*
+fn.openai_codex_request(body, ctx, account_id) -> url, headers
+		Rewrite a Responses body for the Codex backend and return
+		https://chatgpt.com/backend-api/codex/responses and the Codex
+		headers. |fn.provider_openai| calls it when the key source is
+		"codex".
 						*fn.list_models*
 fn.list_models(provider?) -> entries
 			Live GET /v1/models for |:StrapsModel|. Optional provider is

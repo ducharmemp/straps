@@ -36,6 +36,11 @@ fn.log	straps.txt	/*fn.log*
 fn.model_note	straps.txt	/*fn.model_note*
 fn.model_pref	straps.txt	/*fn.model_pref*
 fn.openai_api_key	straps.txt	/*fn.openai_api_key*
+fn.openai_codex_credential	straps.txt	/*fn.openai_codex_credential*
+fn.openai_codex_login	straps.txt	/*fn.openai_codex_login*
+fn.openai_codex_logout	straps.txt	/*fn.openai_codex_logout*
+fn.openai_codex_refresh	straps.txt	/*fn.openai_codex_refresh*
+fn.openai_codex_request	straps.txt	/*fn.openai_codex_request*
 fn.openai_device_id	straps.txt	/*fn.openai_device_id*
 fn.openai_oauth_credential	straps.txt	/*fn.openai_oauth_credential*
 fn.openai_oauth_lock	straps.txt	/*fn.openai_oauth_lock*

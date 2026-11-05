@@ -477,9 +477,9 @@ local function check_model()
       health.info(("model is not in config.%s — no thinking or reasoning is sent"
         .. " (effort = %s is inert for it)"):format(slot.models_key, effort))
     elseif effort == "off" then
-      health.info("effort: off — no thinking or reasoning is sent" .. (style and (" (" .. style .. ")") or ""))
+      health.info("effort: off — " .. providers.unapplied_effort_note(slot.name, entry) .. (style and (" (" .. style .. ")") or ""))
     elseif not applies then
-      health.info(("effort = %s is inert for %s: %s"):format(effort, model, why))
+      health.info(("effort = %s is inert for %s: %s; %s"):format(effort, model, why, providers.unapplied_effort_note(slot.name, entry)))
     else
       health.ok(("effort: %s  (%s)"):format(effort, style or "reasoning"))
     end

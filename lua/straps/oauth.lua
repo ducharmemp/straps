@@ -27,18 +27,21 @@ M.CODEX_SCOPE = "openid profile email offline_access"
 M.CODEX_LOGIN_FILE = "openai_codex.json"
 M.CODEX_BASE_URL = "https://chatgpt.com/backend-api"
 M.CODEX_ORIGINATOR = "straps"
-M.CODEX_CLIENT_VERSION = "0.99.0"
+M.CODEX_CLIENT_VERSION = "0.159.0"
 M.JWT_AUTH_CLAIM = "https://api.openai.com/auth"
+local LEVELS_TO_ULTRA = { "low", "medium", "high", "xhigh", "max", "ultra" }
+local LEVELS_TO_MAX = { "low", "medium", "high", "xhigh", "max" }
 M.CODEX_MODELS = {
-  { id = "gpt-6.1-sol", label = "GPT-6.1 Sol", context = 500000, reasoning = true },
-  { id = "gpt-6.1-terra", label = "GPT-6.1 Terra", context = 500000, reasoning = true },
-  { id = "gpt-6-astra", label = "GPT-6 Astra", context = 272000, reasoning = true },
-  { id = "gpt-6-sol", label = "GPT-6 Sol", context = 272000, reasoning = true },
-  { id = "gpt-6-luna", label = "GPT-6 Luna", context = 272000, reasoning = true },
-  { id = "gpt-5.6-luna", label = "GPT-5.6 Luna", context = 272000, reasoning = true },
-  { id = "gpt-5.6-sol", label = "GPT-5.6 Sol", context = 272000, reasoning = true },
-  { id = "gpt-5.6-terra", label = "GPT-5.6 Terra", context = 272000, reasoning = true },
+  { id = "gpt-6.1-sol", label = "GPT-6.1 Sol", context = 500000, reasoning = true, supported_reasoning_levels = LEVELS_TO_ULTRA },
+  { id = "gpt-6.1-terra", label = "GPT-6.1 Terra", context = 500000, reasoning = true, supported_reasoning_levels = LEVELS_TO_ULTRA },
+  { id = "gpt-6-astra", label = "GPT-6 Astra", context = 272000, reasoning = true, supported_reasoning_levels = LEVELS_TO_ULTRA },
+  { id = "gpt-6-sol", label = "GPT-6 Sol", context = 272000, reasoning = true, supported_reasoning_levels = LEVELS_TO_ULTRA },
+  { id = "gpt-6-luna", label = "GPT-6 Luna", context = 272000, reasoning = true, supported_reasoning_levels = LEVELS_TO_MAX },
+  { id = "gpt-5.6-luna", label = "GPT-5.6 Luna", context = 272000, reasoning = true, supported_reasoning_levels = LEVELS_TO_MAX },
+  { id = "gpt-5.6-sol", label = "GPT-5.6 Sol", context = 272000, reasoning = true, supported_reasoning_levels = LEVELS_TO_ULTRA },
+  { id = "gpt-5.6-terra", label = "GPT-5.6 Terra", context = 272000, reasoning = true, supported_reasoning_levels = LEVELS_TO_ULTRA },
 }
+M.REASONING_LEVEL_ORDER = { "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" }
 
 M.pending_login = nil
 M.pending_codex_login = nil
@@ -46,6 +49,36 @@ M.pending_codex_login = nil
 function M.now_ms()
   local sec, usec = vim.uv.gettimeofday()
   return sec * 1000 + math.floor(usec / 1000)
+end
+
+function M.flatten_levels(list)
+  if type(list) ~= "table" then return nil end
+  local out = {}
+  for _, item in ipairs(list) do
+    local level = type(item) == "table" and item.effort or item
+    if type(level) == "string" and level ~= "" then out[#out + 1] = level end
+  end
+  return #out > 0 and out or nil
+end
+
+function M.codex_levels(entry)
+  if type(entry) ~= "table" then return nil end
+  local own = M.flatten_levels(entry.supported_reasoning_levels)
+  if own then return own end
+  for _, m in ipairs(M.CODEX_MODELS) do
+    if m.id == entry.id then return M.flatten_levels(m.supported_reasoning_levels) end
+  end
+  return nil
+end
+
+function M.lowest_level(levels)
+  if type(levels) ~= "table" or #levels == 0 then return nil end
+  local present = {}
+  for _, level in ipairs(levels) do present[level] = true end
+  for _, level in ipairs(M.REASONING_LEVEL_ORDER) do
+    if present[level] then return level end
+  end
+  return levels[1]
 end
 
 -- The XDG spec says to ignore a relative $XDG_CONFIG_HOME; a relative

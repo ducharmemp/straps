@@ -63,7 +63,7 @@ case "$*" in
     elif [ "$MODE" = empty ]; then
       printf '{"models":[{"slug":"gpt-hidden","visibility":"hide"}]}\nSTRAPS_HTTP_STATUS:200\n'
     else
-      printf '{"models":[{"slug":"gpt-live","display_name":"GPT Live","context_window":123,"visibility":"list"},{"slug":"gpt-hidden","visibility":"hide"}]}\nSTRAPS_HTTP_STATUS:200\n'
+      printf '{"models":[{"slug":"gpt-live","display_name":"GPT Live","context_window":123,"visibility":"list","supported_reasoning_levels":[{"effort":"medium","description":"m"},{"effort":"low","description":"l"}]},{"slug":"gpt-junk","visibility":"list","supported_reasoning_levels":[{"description":"no effort"},7]},{"slug":"gpt-hidden","visibility":"hide"}]}\nSTRAPS_HTTP_STATUS:200\n'
     fi
     ;;
   *codex/responses*|*v1/responses*)
@@ -367,10 +367,14 @@ it("a Codex callback with an error names Codex; an upper-case localhost URL rout
   clear_all()
 end)
 
-it("the model picker merge keeps a live entry's reasoning flag", function()
-  local merged = require("straps.ui")._merge_models({ { id = "gpt-live", label = "Mine" } },
-    { { id = "gpt-live", label = "GPT Live", reasoning = true } })
+it("the model picker merge keeps a live entry's reasoning flag and takes its reasoning levels", function()
+  local merged = require("straps.ui")._merge_models({ { id = "gpt-live", label = "Mine", supported_reasoning_levels = { "none" } } },
+    { { id = "gpt-live", label = "GPT Live", reasoning = true, supported_reasoning_levels = { "low", "high" } } })
   assert(merged[1].label == "Mine" and merged[1].reasoning == true, vim.inspect(merged))
+  assert(vim.deep_equal(merged[1].supported_reasoning_levels, { "low", "high" }), vim.inspect(merged))
+  merged = require("straps.ui")._merge_models({ { id = "gpt-live", supported_reasoning_levels = { "none" } } },
+    { { id = "gpt-live", reasoning = true } })
+  assert(vim.deep_equal(merged[1].supported_reasoning_levels, { "none" }), "a live entry without levels keeps the stored ones")
 end)
 
 it("health reports the Codex login, a model outside the Codex list, and a bad Codex file", function()
@@ -544,7 +548,7 @@ it("a Codex request goes to chatgpt.com with the Codex headers and body", functi
   assert(body.tool_choice == "auto" and body.parallel_tool_calls == true)
   assert(type(body.prompt_cache_key) == "string" and a:find("session-id: " .. body.prompt_cache_key, 1, true))
   assert(a:find("x-client-request-id: " .. body.prompt_cache_key, 1, true), a)
-  assert(body.reasoning and body.reasoning.effort == "none", vim.inspect(body.reasoning))
+  assert(body.reasoning and body.reasoning.effort == "low" and body.reasoning.summary == nil, vim.inspect(body.reasoning))
   clear_all()
 end)
 
@@ -562,6 +566,48 @@ it("Codex reasoning: a level with summary when effort applies; omitted for a non
   body = last_request()
   assert(body.reasoning == nil, vim.inspect(body.reasoning))
   assert(body.instructions == "You are a helpful assistant.", tostring(body.instructions))
+  clear_all()
+end)
+
+it("Codex effort off sends the entry's lowest reasoning level, or none only when listed, or no reasoning when no levels are known", function()
+  clear_all()
+  registry.call("fn.openai_codex_credential", codex_fixture())
+  local prev = straps.config.effort
+  straps.config.effort = "off"
+  local cases = {
+    { { id = "x", reasoning = true, supported_reasoning_levels = { "medium", "low", "high" } }, "low" },
+    { { id = "x", reasoning = true, supported_reasoning_levels = { "ultra", "max", "xhigh" } }, "xhigh" },
+    { { id = "x", reasoning = true, supported_reasoning_levels = { "low", "none" } }, "none" },
+    { { id = "x", reasoning = true, supported_reasoning_levels = { { effort = "high" }, { effort = "medium" } } }, "medium" },
+    { { id = "x", reasoning = true, supported_reasoning_levels = { "turbo", "slow" } }, "turbo" },
+    { { id = "gpt-6.1-sol", reasoning = true }, "low" },
+    { { id = "gpt-6.1-sol", reasoning = true, supported_reasoning_levels = {} }, "low" },
+    { { id = "gpt-unknown", reasoning = true }, nil },
+    { { id = "gpt-unknown", reasoning = true, supported_reasoning_levels = { { description = "no effort" } } }, nil },
+  }
+  for i, c in ipairs(cases) do
+    provider_call({ model = c[1].id, model_entry = c[1] })
+    local body = last_request()
+    if c[2] then
+      assert(body.reasoning and body.reasoning.effort == c[2] and body.reasoning.summary == nil,
+        "case " .. i .. ": " .. vim.inspect(body.reasoning))
+    else
+      assert(body.reasoning == nil, "case " .. i .. ": " .. vim.inspect(body.reasoning))
+    end
+  end
+  straps.config.effort = prev
+  clear_all()
+end)
+
+it("Codex sends the entry's lowest level when the effort's level is not in the entry's list", function()
+  clear_all()
+  registry.call("fn.openai_codex_credential", codex_fixture())
+  local prev = straps.config.effort
+  straps.config.effort = "high"
+  provider_call({ model = "x", model_entry = { id = "x", reasoning = true, supported_reasoning_levels = { "medium", "low" } } })
+  local body = last_request()
+  assert(body.reasoning and body.reasoning.effort == "low" and body.reasoning.summary == nil, vim.inspect(body.reasoning))
+  straps.config.effort = prev
   clear_all()
 end)
 
@@ -674,10 +720,13 @@ it("fn.list_models with a Codex login reads the Codex catalog and falls back to 
   reset_log()
   local models = registry.call("fn.list_models", "openai")
   local a = last_argv_with("codex/models")
-  assert(a and a:find(oauth.CODEX_BASE_URL .. "/codex/models?client_version=", 1, true)
+  assert(oauth.CODEX_CLIENT_VERSION == "0.159.0", oauth.CODEX_CLIENT_VERSION)
+  assert(a and a:find(oauth.CODEX_BASE_URL .. "/codex/models?client_version=" .. oauth.CODEX_CLIENT_VERSION .. " ", 1, true)
     and a:find("chatgpt-account-id: acct-1", 1, true) and a:find("originator: straps", 1, true), tostring(a))
-  assert(#models == 1 and models[1].id == "gpt-live" and models[1].reasoning == true and models[1].context == 123,
+  assert(#models == 2 and models[1].id == "gpt-live" and models[1].reasoning == true and models[1].context == 123,
     vim.inspect(models))
+  assert(vim.deep_equal(models[1].supported_reasoning_levels, { "medium", "low" }), vim.inspect(models[1]))
+  assert(models[2].id == "gpt-junk" and models[2].supported_reasoning_levels == nil, vim.inspect(models[2]))
   set("models_mode", "fail")
   local msgs = {}
   local orig = vim.notify
@@ -687,6 +736,10 @@ it("fn.list_models with a Codex login reads the Codex catalog and falls back to 
   unset("models_mode")
   assert(#models == #oauth.CODEX_MODELS and models[1].id == oauth.CODEX_MODELS[1].id and models[1].reasoning == true,
     vim.inspect(models))
+  for _, m in ipairs(models) do
+    assert(type(m.supported_reasoning_levels) == "table" and #m.supported_reasoning_levels > 0
+      and not vim.tbl_contains(m.supported_reasoning_levels, "none"), vim.inspect(m))
+  end
   assert(msgs[1] and msgs[1]:find("HTTP 500", 1, true), vim.inspect(msgs))
   set("models_mode", "empty")
   vim.notify = function() end

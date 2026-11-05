@@ -117,6 +117,10 @@ function M.effort_applies(provider, entry, effort_name, efforts)
       return false, "the model entry does not set reasoning"
     end
     if not effort.level then return false, "the effort entry has no level" end
+    local levels = require("straps.oauth").flatten_levels(entry.supported_reasoning_levels)
+    if levels and not vim.tbl_contains(levels, effort.level) then
+      return false, "the model does not list reasoning level " .. tostring(effort.level)
+    end
     return true, effort
   end
   if entry.thinking == "adaptive" then
@@ -129,6 +133,17 @@ function M.effort_applies(provider, entry, effort_name, efforts)
     return true, effort
   end
   return false, "the model entry marks no thinking style (set thinking = \"adaptive\" or \"budget\" in it)"
+end
+
+-- What a request carries when effort_applies returns false for entry, as
+-- the text health and fn.model_note print.
+function M.unapplied_effort_note(provider, entry)
+  if provider == "openai" and type(entry) == "table" and (entry.reasoning == true or entry.reasoning_effort == true) then
+    local lowest = require("straps.oauth").lowest_level(require("straps.oauth").codex_levels(entry))
+    return "an API key sends no reasoning; a Codex login sends "
+      .. (lowest and ("reasoning effort " .. lowest) or "no reasoning")
+  end
+  return "no thinking or reasoning is sent"
 end
 
 -- The provider a request from buffer bufnr uses, and where the name came
@@ -414,7 +429,9 @@ end
 -- OpenAI returns {data:[{id}]} for an API key and {models:[{slug,
 -- display_name, context_window, visibility}]} for a ChatGPT login; hidden
 -- ChatGPT entries are dropped. A Codex login reads the Codex catalog (same
--- shape, every entry reasoning = true) and falls back to oauth.CODEX_MODELS.
+-- shape, every entry reasoning = true, its supported_reasoning_levels
+-- flattened to effort strings) and falls back to oauth.CODEX_MODELS. The
+-- server filters the catalog by oauth.CODEX_CLIENT_VERSION.
 -- llama-server returns {data:[{id, meta?}]};
 -- meta.n_ctx (present only for a loaded model) becomes `context`. The URL is
 -- provider.base_url, the key comes from the slot's key_fn (optional for a
@@ -523,6 +540,7 @@ return function(provider_override)
         thinking = nil,
         context = tonumber(m.context_window),
         reasoning = codex or nil,
+        supported_reasoning_levels = codex and oauth.flatten_levels(m.supported_reasoning_levels) or nil,
       }
     end
   end
@@ -1351,11 +1369,14 @@ return function(req, ctx)
   end
   -- Reasoning effort: the API-key /v1/models catalog does not expose which
   -- models reason (the ChatGPT-login catalog does, but fn.list_models does not
-  -- read it; a Codex login marks every catalog entry reasoning = true), so the
-  -- configured OpenAI model entry must opt in with
-  -- reasoning = true (or reasoning_effort = true). Unlisted models get the
-  -- model's own default. provider.effort_applies decides; it is the rule
-  -- fn.model_note and health report.
+  -- read it; a Codex login marks every catalog entry reasoning = true and
+  -- copies its supported_reasoning_levels), so the configured OpenAI model
+  -- entry must opt in with reasoning = true (or reasoning_effort = true). An
+  -- entry's supported_reasoning_levels refuses levels it does not list.
+  -- Unlisted models get the model's own default; under a Codex login a
+  -- reasoning entry with no applied effort gets its lowest level
+  -- (fn.openai_codex_request). provider.effort_applies decides; it is the
+  -- rule fn.model_note and health report.
   local ctx_entry = ctx and ctx.model_entry
   local model_entry = (type(ctx_entry) == "table" and ctx_entry.id == model_id) and ctx_entry
     or require("straps.provider").model_entry("openai", model_id, config)
@@ -2802,7 +2823,8 @@ return function(body, ctx, account_id)
     body.reasoning.summary = "auto"
   elseif ctx and type(ctx.codex_entry) == "table"
     and (ctx.codex_entry.reasoning == true or ctx.codex_entry.reasoning_effort == true) then
-    body.reasoning = { effort = "none" }
+    local lowest = oauth.lowest_level(oauth.codex_levels(ctx.codex_entry))
+    if lowest then body.reasoning = { effort = lowest } end
   end
   local headers = {
     "-H", "chatgpt-account-id: " .. account_id,
@@ -3881,14 +3903,14 @@ function M.register()
     define({
       name = "fn.openai_codex_request",
       kind = "fn",
-      doc = "(body, ctx, account_id) -> url, header_argv: turn an OpenAI Responses body into a Codex backend request in place (no max_output_tokens; instructions, text, include, tool_choice, parallel_tool_calls, prompt_cache_key; reasoning summary, or effort none for a reasoning entry with effort off) and return https://chatgpt.com/backend-api/codex/responses plus the Codex headers. ctx.codex_entry is the model entry.",
+      doc = "(body, ctx, account_id) -> url, header_argv: turn an OpenAI Responses body into a Codex backend request in place (no max_output_tokens; instructions, text, include, tool_choice, parallel_tool_calls, prompt_cache_key; reasoning summary, or, for a reasoning entry with no applied effort, the lowest level from oauth.codex_levels, or no reasoning when no level list is known) and return https://chatgpt.com/backend-api/codex/responses plus the Codex headers. ctx.codex_entry is the model entry.",
       source = OPENAI_CODEX_REQUEST_SRC,
     })
   end
   define({
     name = "fn.list_models",
     kind = "fn",
-    doc = "GET /v1/models from the effective backend, or an explicit provider argument ('anthropic'/'openai'/'llamacpp'), and return picker entries { id, label, thinking, context?, max_output? } (Anthropic infers the thinking tag from capabilities; OpenAI and llama.cpp have none); (nil, err) on failure.",
+    doc = "GET /v1/models from the effective backend, or an explicit provider argument ('anthropic'/'openai'/'llamacpp'), and return picker entries { id, label, thinking, context?, max_output?, reasoning?, supported_reasoning_levels? } (Anthropic infers the thinking tag from capabilities; OpenAI and llama.cpp have none; a Codex login marks reasoning and flattens the catalog's supported_reasoning_levels to effort strings); (nil, err) on failure.",
     source = LIST_MODELS_SRC,
   })
   define({

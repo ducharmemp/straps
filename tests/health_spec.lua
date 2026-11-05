@@ -329,6 +329,21 @@ it("model section follows the active provider", function()
   local rec_oai_off = collect_with("openai",
     { openai_model = "gpt-5-mini", effort = "off", openai_models = { { id = "gpt-5-mini", reasoning = true } } })
   assert(not find(rec_oai_off, nil, "thinking style: nil"), "openai health printed a thinking style")
+  assert(find(rec_oai_off, "info", "effort: off — an API key sends no reasoning; a Codex login sends no reasoning"),
+    "openai effort off should state what each login sends: " .. vim.inspect(rec_oai_off))
+  local rec_codex_off = collect_with("openai",
+    { openai_model = "gpt-6.1-sol", effort = "off", openai_models = { { id = "gpt-6.1-sol", reasoning = true } } })
+  assert(find(rec_codex_off, "info", "effort: off — an API key sends no reasoning; a Codex login sends reasoning effort low"),
+    "a built-in Codex model's effort off should name its lowest level: " .. vim.inspect(rec_codex_off))
+  local rec_unlisted_level = collect_with("openai", { openai_model = "gpt-x", effort = "high",
+    openai_models = { { id = "gpt-x", reasoning = true, supported_reasoning_levels = { "medium" } } } })
+  assert(find(rec_unlisted_level, "info", "is inert for gpt-x: the model does not list reasoning level"),
+    "an effort level the entry does not list should be inert: " .. vim.inspect(rec_unlisted_level))
+  assert(find(rec_unlisted_level, "info", "; an API key sends no reasoning; a Codex login sends reasoning effort medium"),
+    "the inert line should state what each login sends: " .. vim.inspect(rec_unlisted_level))
+  local rec_plain_off = collect_with("anthropic",
+    { model = "claude-x", effort = "off", models = { { id = "claude-x", thinking = "adaptive" } } })
+  assert(find(rec_plain_off, "info", "effort: off — no thinking or reasoning is sent"), vim.inspect(rec_plain_off))
   assert(not find(rec_reasoning, "ok", "model max 999"), "openai health reported a max_output the backend never sends")
 
   local rec_adaptive = collect_with("anthropic",

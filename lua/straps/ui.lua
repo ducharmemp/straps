@@ -1516,6 +1516,9 @@ end
 --- with no static counterpart brings its API display_name as the label.
 --- server_context = true lets a live `context` replace a stored one (llama.cpp,
 --- whose window is the server's current -c rather than a fixed model fact).
+--- A live supported_reasoning_levels always replaces a stored one, including
+--- one set in setup{}: the Codex catalog is the record of what levels a model
+--- accepts.
 local function merge_models(static_list, live_list, server_context)
   static_list = type(static_list) == "table" and static_list or {}
   local by_id, order = {}, {}
@@ -1543,6 +1546,7 @@ local function merge_models(static_list, live_list, server_context)
         if existing.context == nil or (server_context and m.context ~= nil) then existing.context = m.context end
         if existing.max_output == nil then existing.max_output = m.max_output end
         if existing.reasoning == nil then existing.reasoning = m.reasoning end
+        if m.supported_reasoning_levels ~= nil then existing.supported_reasoning_levels = m.supported_reasoning_levels end
       else
         by_id[m.id] = copy_model(m)
         order[#order + 1] = m.id

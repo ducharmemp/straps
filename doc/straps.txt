@@ -1049,14 +1049,18 @@ fn.openai_codex_logout(cb?)	Cancel a pending Codex login and delete
 fn.openai_codex_request(body, ctx, account_id) -> url, headers
 		Rewrite a Responses body for the Codex backend and return
 		https://chatgpt.com/backend-api/codex/responses and the Codex
-		headers. |fn.provider_openai| calls it when the key source is
-		"codex".
+		headers. With no applied effort, a `reasoning` entry sends its
+		lowest supported level (`oauth.codex_levels`); with no known
+		levels, reasoning is omitted. |fn.provider_openai| calls it
+		when the key source is "codex".
 						*fn.list_models*
 fn.list_models(provider?) -> entries
 			Live GET /v1/models for |:StrapsModel|. Optional provider is
 			"anthropic", "openai" or "llamacpp"; omitted means
 			effective provider. llama.cpp needs no key, and a
-			loaded model's `meta.n_ctx` becomes `context`.
+			loaded model's `meta.n_ctx` becomes `context`. A Codex
+			login reads the Codex catalog, marks entries `reasoning`
+			and copies `supported_reasoning_levels` as effort strings.
 						*fn.build_tools*
 fn.build_tools() -> tools	Map every tool.* entry to an API tool def.
 						*fn.capability*

@@ -98,6 +98,9 @@ it("provider.effort_applies follows the backend rule for every provider, model s
   }
   local adaptive, budget, untagged = { id = "a", thinking = "adaptive" }, { id = "b", thinking = "budget" }, { id = "u" }
   local reasoning, reasoning_effort, plain = { id = "r", reasoning = true }, { id = "re", reasoning_effort = true }, { id = "p" }
+  local listed = { id = "l", reasoning = true, supported_reasoning_levels = { "medium", "high" } }
+  local catalog_shaped = { id = "c", reasoning = true, supported_reasoning_levels = { { effort = "high" } } }
+  local empty_list = { id = "e", reasoning = true, supported_reasoning_levels = {} }
   local cases = {
     { "anthropic", adaptive, "high", true },
     { "anthropic", adaptive, "bud", false },
@@ -117,6 +120,11 @@ it("provider.effort_applies follows the backend rule for every provider, model s
     { "openai", reasoning, "bud", false },
     { "openai", plain, "high", false },
     { "openai", reasoning, "missing", false },
+    { "openai", listed, "high", true },
+    { "openai", listed, "lvl", false },
+    { "openai", catalog_shaped, "high", true },
+    { "openai", catalog_shaped, "lvl", false },
+    { "openai", empty_list, "lvl", true },
     { "llamacpp", budget, "bud", true },
     { "llamacpp", budget, "zero", false },
     { "openai", adaptive, "high", false },
@@ -152,6 +160,20 @@ it("fn.model_note marks an OpenAI effort inert unless the model entry sets reaso
   straps.config.openai_models = saved
   assert(plain_note:find("effort high (inert", 1, true), "a non-reasoning OpenAI model's effort is inert: " .. plain_note)
   assert(not reason_note:find("inert", 1, true), "a reasoning OpenAI model's effort applies: " .. reason_note)
+end)
+
+it("fn.model_note names the level an OpenAI entry does not list and what each login sends instead", function()
+  local saved = straps.config.openai_models
+  straps.config.openai_models = { { id = "gpt-listed", reasoning = true, supported_reasoning_levels = { "medium", "low" } } }
+  local me = state.new_session()
+  vim.b[me].straps_provider = "openai"
+  vim.b[me].straps_openai_model = "gpt-listed"
+  vim.b[me].straps_effort = "high"
+  local note = registry.call("fn.model_note", { bufnr = me })
+  straps.config.openai_models = saved
+  local high = vim.tbl_filter(function(e) return e.name == "high" end, straps.config.efforts)[1].level
+  assert(note:find("effort high (inert: the model does not list reasoning level " .. high
+    .. "; an API key sends no reasoning; a Codex login sends reasoning effort low)", 1, true), note)
 end)
 
 it("fn.model_note marks an effort with no config.efforts entry inert", function()

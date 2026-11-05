@@ -1012,14 +1012,17 @@ return function(ctx)
   local shown = info.model_label ~= info.model
     and ("%s (%s)"):format(info.model_label, info.model) or info.model
   -- An effort is inert when provider.effort_applies says the backend sends no
-  -- thinking or reasoning field for it, the same rule :checkhealth reports.
+  -- field for it, the same rule :checkhealth reports;
+  -- provider.unapplied_effort_note states what the request carries instead.
   local effort = info.effort
   if effort ~= "off" then
     local cfg = require("straps").config or {}
     local providers = require("straps.provider")
     local entry = providers.is_provider(info.provider) and providers.model_entry(info.provider, info.model, cfg) or nil
     local applies, why = providers.effort_applies(info.provider, entry, effort, cfg.efforts)
-    if not applies then effort = effort .. " (inert: " .. why .. "; no thinking or reasoning is sent)" end
+    if not applies then
+      effort = effort .. " (inert: " .. why .. "; " .. providers.unapplied_effort_note(info.provider, entry) .. ")"
+    end
   end
   -- Carried here, not only in the prompt's # Subagents section: that section
   -- is dropped for a subagent at the depth limit, so a nested spawner whose

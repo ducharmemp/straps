@@ -817,7 +817,10 @@ module-table exception: the rule for whether an effort changes a request.
 `output_config` or `reasoning`, and `fn.model_note` and `health.lua`'s
 `check_model` call it to report an inert effort, each with the session's
 provider name. It returns `true` plus the matching `config.efforts` entry, or
-`false` plus a reason. A redefined backend that skips it can send something the
+`false` plus a reason. `M.unapplied_effort_note(provider, entry)` is the text
+the note and health append to an inert or off effort: what the request carries
+instead, naming both OpenAI logins for a reasoning entry. A redefined backend
+that skips it can send something the
 note and health do not report. The plain helpers on the same table are listed
 below. Those that take `config` take it last; `resolve_model` and `model_entry`
 return nil for an unknown provider.
@@ -1037,7 +1040,9 @@ Same `(req, ctx)` contract, OpenAI's wire shape. Selected when
 `/v1/responses` because Chat Completions rejects function tools for models
 that reason by default (gpt-5.6-sol, gpt-6.1-sol) unless `reasoning_effort`
 is `"none"`, while other models reject `"none"`; the Responses API accepts
-function tools together with any reasoning effort.
+function tools together with any reasoning effort. Which values a model
+accepts depends on the backend: the Codex backend rejects `"none"` for
+gpt-6.1-sol.
 
 - POST `{M.base_url("openai", config)}/v1/responses` (default
   `https://api.openai.com`) with `Authorization: Bearer <key>`
@@ -1091,11 +1096,16 @@ function tools together with any reasoning effort.
   subtracted to match Anthropic's meaning.
 - Reasoning: OpenAI models receive `reasoning = { effort = level }` only when
   their configured `config.openai_models` entry has `reasoning = true` or
-  `reasoning_effort = true` and the active `config.efforts` entry has a
-  `level`, with or without tools. Untagged models, `"off"`, and entries with no
-  level send no `reasoning` field, so the model uses its own default; under a
-  Codex login a tagged entry with effort off sends `{ effort = "none" }` (see
-  "Codex login"). Reasoning
+  `reasoning_effort = true`, the active `config.efforts` entry has a
+  `level`, and the entry's `supported_reasoning_levels`, when it names at
+  least one level, lists that level, with or without tools. Untagged models, `"off"`, entries
+  with no level, and levels the entry does not list send no `reasoning`
+  field, so the model uses its own default; under a Codex login a tagged
+  entry sends its lowest supported level instead (see "Codex login").
+  `provider.effort_applies` reads only the entry's own list, since it cannot
+  tell the login; a list stored from the Codex catalog in a pin or model
+  pref stays on the entry after a switch to an API key, or after the catalog
+  changes, until the model is picked again. Reasoning
   items and reasoning/summary events are ignored so provider reasoning never
   enters the durable transcript. With `store=false` no reasoning items are
   passed back between turns.
@@ -1255,8 +1265,17 @@ provider slot is added.
   `text.verbosity=low`, `include=["reasoning.encrypted_content"]`,
   `tool_choice=auto`, `parallel_tool_calls=true` and `prompt_cache_key` (the
   session id). Reasoning: `{ effort = level, summary = "auto" }` when the effort
-  applies; `{ effort = "none" }` for an entry marked `reasoning` with effort off
-  (Pi's rule); otherwise omitted.
+  applies. Otherwise, for an entry marked `reasoning`, `{ effort = lowest }`
+  with no summary, where `lowest` is the first of `oauth.REASONING_LEVEL_ORDER`
+  (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) in the
+  entry's `supported_reasoning_levels`, or, when the entry has none, in the
+  list of the `oauth.CODEX_MODELS` entry with the same id
+  (`oauth.codex_levels`), else the first listed level when the list names
+  none of the known levels. This covers effort off and an effort whose level
+  the entry does not list. With no list from either source, and for an
+  untagged entry, `reasoning` is omitted and the model uses its own default.
+  An entry that lists `none` gets `none`; no model in the measured catalog
+  lists it, and gpt-6.1-sol rejects it with HTTP 400.
 - **Session id.** `state.codex_session_id(bufnr)`: `vim.b
   straps_codex_session_id`, else the `codex_session_id` field of the session's
   `.meta`, else a new UUIDv4 written there, clamped to 64 characters. A resumed
@@ -1270,14 +1289,27 @@ provider slot is added.
   `openai (codex)`.
 - **Models.** With a Codex login, `fn.list_models("openai")` reads
   `https://chatgpt.com/backend-api/codex/models?client_version=<v>` with the
-  Codex headers and marks every entry `reasoning = true`; on any failure it
-  returns `oauth.CODEX_MODELS` (Pi's list) with a warning, including a
-  catalog with no visible models. `openai_model` keeps
-  its default (`gpt-5`), which the Codex backend may reject; the login notice
-  says to pick a model with `:StrapsModel`, and health warns when the model is
-  not in `oauth.CODEX_MODELS`. Unverified against the live backend: the
-  `/codex/models` response shape and `client_version`, the `originator=straps`
-  value, and whether every listed model accepts `effort = "none"`.
+  Codex headers, marks every entry `reasoning = true` and copies its
+  `supported_reasoning_levels`; on any failure it returns `oauth.CODEX_MODELS`
+  with a warning, including a catalog with no visible models. The server
+  filters the catalog by `client_version`: at `0.99.0` it held only the
+  hidden `codex-auto-review`, so every listing fell back. A model's
+  `minimal_client_version` does not predict the cutoff: on 2026-11-04
+  gpt-6.1-sol and gpt-6.1-terra report `0.153.0` but first appear at
+  `0.159.0`, while gpt-6-sol and gpt-6-luna report and appear at `0.155.0`.
+  `oauth.CODEX_CLIENT_VERSION` is `0.159.0`, the lowest version that returned
+  every listed model; a later model gated on a higher version drops out of
+  the list again and appears only if it is in the
+  static list. `oauth.CODEX_MODELS` carries the measured level lists:
+  `low` through `ultra` for the gpt-6.1, gpt-6-astra, gpt-6-sol and
+  gpt-5.6-sol/terra models, `low` through `max` for the luna models. The
+  lists come from the catalog, which does not decide acceptance: the
+  gpt-6.1-sol 400 for `none` named `low` through `max` and omitted the
+  `ultra` the catalog lists. `openai_model` keeps its default (`gpt-5`),
+  which the Codex backend may reject; the login notice says to pick a model
+  with `:StrapsModel`, and health warns when the model is not in
+  `oauth.CODEX_MODELS`. Unverified against the live backend: the
+  `originator=straps` value.
 
 `fn.system_prompt` default source returns the default system prompt (below).
 
@@ -1316,10 +1348,13 @@ provider it lists GPT models, not Claude ones.
   shapes; static `config.openai_models` entries must opt in to
   `reasoning.effort` with `reasoning = true` (or `reasoning_effort = true`).
   With a Codex login the request goes to the Codex catalog instead, with the
-  same `{models:[...]}` shape, every entry marked `reasoning = true`, and
+  same `{models:[...]}` shape, every entry marked `reasoning = true`, its
+  `supported_reasoning_levels` flattened to effort strings by
+  `oauth.flatten_levels` (left off when none remain), and
   `oauth.CODEX_MODELS` returned on failure (see "Codex login"). The model
   picker's merge keeps a live entry's `reasoning` when the static entry has
-  none.
+  none, and a live `supported_reasoning_levels` replaces the stored one,
+  including a list set in `setup{}`.
 - **llama.cpp**: `GET {base_url}/v1/models` with no `?limit` and
   `Authorization: Bearer` only when `fn.llamacpp_api_key` returns a key (no
   key is not an error). The catalog is `{data:[{id, status, meta?}]}`: the id
@@ -2496,7 +2531,11 @@ Sections:
 - model: the ACTIVE provider's model, model list and base URL from its
   `M.PROVIDERS` slot, and the model/effort pairing, the mismatch that 400s a
   request. An effort other than "off" on a model whose list entry marks no
-  thinking style, or for OpenAI no `reasoning` flag, is reported as inert, and
+  thinking style, or for OpenAI no `reasoning` flag or a level its
+  `supported_reasoning_levels` does not list, is reported as inert, and the
+  inert and effort-off lines state what the request carries instead
+  (`provider.unapplied_effort_note`: per login for an OpenAI `reasoning`
+  entry), and
   an unset `llamacpp_model` warns with the `:StrapsModel` remedy.
 - active runs (a warning that quitting cancels in-flight sessions).
 

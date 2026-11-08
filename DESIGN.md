@@ -2364,7 +2364,12 @@ Existing suites must all still pass.
 - `:StrapsAuto [off|cat,...]` (session buffers only, `ui.auto`) — grants
   capability categories to the current session by writing `cap:<category>`
   keys via `registry.grant`: `:StrapsAuto edit,exec` grants those, no
-  arg reports current category grants, `off` clears all cap: keys (leaving
+  arg opens a Snacks multi-select picker when available, or reports current
+  category grants without Snacks. The picker snapshots the grantable categories
+  and preselects current grants. Tab toggles, Enter replaces cap: grants with the
+  selection (empty clears them), and Esc cancels without changes. Confirmation
+  targets the original session buffer and preserves editdir:/tool grants.
+  Picker failures report current grants. `off` clears all cap: keys (leaving
   editdir:/tool grants intact). Completion offers off plus the grantable
   categories from `fn.capability()`.
 - `:StrapsEdit <name>` (completion from `registry.names()`) — opens

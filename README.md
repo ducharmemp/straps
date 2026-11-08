@@ -151,6 +151,7 @@ A personal entries file saved with `registry.dump()` pins the entry sources it h
 | `:Straps[!] [{cats}] [-- {instruction}]` | Open a new session. `{cats}` pre-grants permission categories (`edit,exec`, `all`), `-- {instruction}` seeds the request, `!` sends it. |
 | `:StrapsSend` | Send the current request or steer an active run. |
 | `:StrapsStop` | Stop the active run. |
+| `:StrapsAuto [off\|{cats}]` | With no argument, choose category grants in a Snacks multi-select picker, or report grants without Snacks. Tab toggles; Enter applies the selection; Esc cancels. Explicit categories add grants; `off` clears category grants. |
 | `:StrapsContinue [instruction]` | Continue a stopped run. |
 | `:StrapsResume[!] [session]` | Resume a saved session. `!` opens a picker. |
 | `:StrapsAgents` | Open the agent dashboard: session trees, status, details, and management actions. |

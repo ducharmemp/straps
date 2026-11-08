@@ -2160,13 +2160,6 @@ function M.logout(fargs)
   end)
 end
 
---- :StrapsAuto — grant permission categories to THIS session (auto mode). A
---- grant writes a "cap:<category>" key into the registry's per-session grant
---- set, which the default hook.confirm honors to auto-allow every call
---- fn.capability puts in that category (no prompt). Must run on a session
---- buffer. arg nil/"" reports the current cap: grants; "off" clears them
---- (leaving other keys, e.g. editdir:, intact); otherwise a space/comma list
---- of categories to grant.
 function M.auto(arg)
   local buf = vim.api.nvim_get_current_buf()
   if not vim.b.straps_session then
@@ -2184,9 +2177,80 @@ function M.auto(arg)
     return #cats > 0 and table.concat(cats, ", ") or nil
   end
 
+  local function report()
+    vim.notify("straps: auto grants: " .. (grants_list() or "none"))
+  end
+
   arg = arg or ""
   if arg == "" then
-    return vim.notify("straps: auto grants: " .. (grants_list() or "none"))
+    local ok_picker, pick = pcall(function()
+      local snacks = require("snacks")
+      if type(snacks) == "table" and type(snacks.picker) == "table" then return snacks.picker.pick end
+    end)
+    if not ok_picker or type(pick) ~= "function" then
+      return report()
+    end
+    local items, preselected, allowed = {}, {}, {}
+    local granted = registry.granted(buf)
+    for _, category in ipairs(M.grantable_categories()) do
+      local item = { text = category }
+      items[#items + 1] = item
+      allowed[category] = true
+      if granted["cap:" .. category] then preselected[#preselected + 1] = item end
+    end
+    local finished, confirming = false, false
+    local function fail(picker, err)
+      if finished then return end
+      finished = true
+      if picker and type(picker.close) == "function" then pcall(picker.close, picker) end
+      notify_err("straps: auto picker: " .. tostring(err))
+      report()
+    end
+    local function check_picker(picker)
+      assert(type(picker.selected) == "function" and type(picker.close) == "function"
+        and picker.list and type(picker.list.set_selected) == "function", "multi-select unavailable")
+    end
+    local ok, err = pcall(pick, {
+      source = "straps auto",
+      title = "straps: auto grants (Tab toggles, Enter applies, Esc cancels)",
+      items = items,
+      format = "text",
+      layout = { preset = "select" },
+      on_show = function(picker)
+        if finished then return end
+        local shown, show_err = pcall(function()
+          check_picker(picker)
+          picker.list:set_selected(preselected)
+        end)
+        if not shown then fail(picker, show_err) end
+      end,
+      on_close = function()
+        if not confirming then finished = true end
+      end,
+      confirm = function(picker)
+        if finished or confirming then return end
+        confirming = true
+        local confirmed, confirm_err = pcall(function()
+          check_picker(picker)
+          assert(vim.api.nvim_buf_is_valid(buf) and vim.b[buf].straps_session, "session no longer exists")
+          local selected = picker:selected()
+          local tokens = {}
+          for _, item in ipairs(selected) do
+            assert(allowed[item.text], "unknown auto category " .. tostring(item.text))
+            tokens[#tokens + 1] = item.text
+          end
+          picker:close()
+          for _, category in ipairs(tokens) do registry.grant(buf, "cap:" .. category) end
+          registry.clear_grants(buf, "cap:")
+          for _, category in ipairs(tokens) do registry.grant(buf, "cap:" .. category) end
+          finished = true
+          report()
+        end)
+        if not confirmed then fail(picker, confirm_err) end
+      end,
+    })
+    if not ok then fail(nil, err) end
+    return
   end
 
   if arg == "off" then

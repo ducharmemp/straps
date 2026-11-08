@@ -238,7 +238,11 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			Grant capability categories to the current session so the
 			matching tool calls run without a confirm prompt (session
 			buffers only). `:StrapsAuto edit,exec` grants those
-			categories, no argument reports the current grants, and
+			categories. With Snacks available, no argument opens a
+			multi-select picker with current grants selected. Tab
+			toggles categories; Enter replaces the category grants
+			with the selection (empty clears them); Esc cancels.
+			Without Snacks, no argument reports the current grants.
 			`off` clears every category grant (leaving editdir: and
 			per-tool grants intact). Completion offers `off` and the
 			grantable categories. See |straps-auto| and |fn.capability|.
@@ -1372,7 +1376,7 @@ and `spawn`. The `read` category is always auto-allowed. The `define` and
 
 Grant categories to the current session with |:StrapsAuto|: >vim
 	:StrapsAuto edit,exec   " allow edits and shell commands
-	:StrapsAuto             " report current category grants
+	:StrapsAuto             " choose grants with Snacks, else report grants
 	:StrapsAuto off         " clear all category grants
 <
 A new session can start with grants: `:Straps edit,exec` (or `:Straps all`)

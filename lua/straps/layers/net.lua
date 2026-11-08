@@ -15,10 +15,13 @@ function M.register()
     kind = "tool",
     doc = "Fetch an http(s) URL with curl using a timeout and byte cap. It sends"
       .. " no cookies or credentials. Hostnames are resolved first and internal"
-      .. " addresses are refused. Redirects are checked one hop at a time. Use for"
+      .. " addresses are refused. Use for"
       .. " public docs or small artifacts, not secrets. Parameters: url (required);"
       .. " max_bytes (optional, default 200000, max 1000000); timeout_ms (optional,"
-      .. " default 10000); follow_redirects (optional boolean).",
+      .. " default 10000). Redirects are never followed: follow_redirects=true"
+      .. " returns a refusal; read the Location header and fetch it with a"
+      .. " second call. Failures (bad URL, internal host, DNS, missing curl) raise"
+      .. " an error prefixed 'fetch_url: '.",
     input_schema = {
       type = "object",
       properties = {
@@ -33,7 +36,7 @@ function M.register()
 return function(input, ctx)
   local url = input.url
   if type(url) ~= "string" or not url:match("^https?://") then
-    error("fetch_url: url must start with http:// or https://")
+    error("fetch_url: url must start with http:// or https://", 0)
   end
   local function host_of(u)
     local authority = u:match("^https?://([^/?#]+)") or ""
@@ -61,12 +64,22 @@ return function(input, ctx)
       return nil, "fetch_url: refusing to fetch an internal/loopback/link-local host (" .. host .. ")"
     end
     if not host:match("^%d+%.%d+%.%d+%.%d+$") and not host:find(":", 1, true) then
-      local done, err, addresses = false, nil, nil
-      vim.uv.getaddrinfo(host, nil, { socktype = "stream" }, function(e, a)
-        err, addresses, done = e, a, true
+      if not (ctx and ctx.await) then
+        return nil, "fetch_url: requires a run ctx (ctx.await) to resolve " .. host
+      end
+      local r = ctx.await(function(resolve)
+        local ok_req, req_err = pcall(vim.uv.getaddrinfo, host, nil, { socktype = "stream" }, function(e, a)
+          resolve({ done = true, err = e, addresses = a })
+        end)
+        if not ok_req then
+          resolve({ done = true, err = req_err })
+          return
+        end
+        vim.defer_fn(function() resolve({ done = false }) end, 5000)
+        if ctx.on_cancel then ctx.on_cancel(function() resolve({ done = false }) end) end
       end)
-      vim.wait(5000, function() return done end, 10)
-      if not done then return nil, "fetch_url: DNS lookup timed out for " .. host end
+      local err, addresses = r and r.err, r and r.addresses
+      if not (r and r.done) then return nil, "fetch_url: DNS lookup timed out for " .. host end
       if err or type(addresses) ~= "table" or #addresses == 0 then
         return nil, "fetch_url: could not resolve " .. host .. ": " .. tostring(err)
       end
@@ -79,9 +92,9 @@ return function(input, ctx)
     return true
   end
   local ok_url, url_err = check_url(url)
-  if not ok_url then error(url_err) end
+  if not ok_url then error(url_err, 0) end
   if vim.fn.executable("curl") ~= 1 then
-    return "fetch_url: curl is not executable"
+    error("fetch_url: curl is not executable", 0)
   end
   local max_bytes = math.min(math.max(tonumber(input.max_bytes) or 200000, 1), 1000000)
   local timeout_ms = tonumber(input.timeout_ms) or 10000
@@ -89,12 +102,14 @@ return function(input, ctx)
   -- Curl cannot re-run our DNS policy before each redirect connection. Keep
   -- redirects manual so every destination gets a fresh confirmed, checked call.
   if input.follow_redirects then
-    return "fetch_url: redirects are not followed automatically; inspect the Location header and fetch the destination separately"
+    error("fetch_url: redirects are not followed automatically; inspect the Location header and fetch the destination separately", 0)
   end
   cmd[#cmd + 1] = "--"; cmd[#cmd + 1] = url
   local chunks, n, capped, proc = {}, 0, false, nil
+  local release = require("straps.registry").try_call("fn.subprocess_acquire", ctx,
+    { tool = "fetch_url", bufnr = ctx.bufnr, cmd = url }) or function() end
   local res = ctx.await(function(resolve)
-    proc = vim.system(cmd, {
+    local ok_spawn, spawned = pcall(vim.system, cmd, {
       text = true,
       timeout = timeout_ms,
       stdout = function(_, chunk)
@@ -105,9 +120,25 @@ return function(input, ctx)
         n = n + keep
         if keep < #chunk then capped = true; if proc then pcall(function() proc:kill(9) end) end end
       end,
-    }, function(out) resolve(out) end)
-    if ctx.on_cancel then ctx.on_cancel(function() pcall(function() proc:kill(9) end) end) end
+    }, function(out)
+      release()
+      resolve(out)
+    end)
+    if not ok_spawn then
+      release()
+      resolve({ code = -1, spawn_error = tostring(spawned) })
+      return
+    end
+    proc = spawned
+    if ctx.on_cancel then
+      ctx.on_cancel(function()
+        if proc then pcall(function() proc:kill(9) end) end
+      end)
+    end
   end)
+  if res.spawn_error then
+    error("fetch_url: could not spawn curl: " .. res.spawn_error, 0)
+  end
   local body = table.concat(chunks)
   local lines = { "exit code: " .. tostring(res.code) }
   if capped then lines[#lines + 1] = "body truncated at " .. tostring(max_bytes) .. " bytes" end

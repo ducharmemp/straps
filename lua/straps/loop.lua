@@ -196,9 +196,9 @@ end
 -- The model-origin gate: hook.confirm, then the before_tool fan-out. Passed
 -- to registry.gate_tool as opts.confirm so it runs AFTER the before-guards.
 local function confirm_then_before_tool(name, input, ctx)
-  local allowed, reason = registry.call("hook.confirm", name, input, ctx)
+  local allowed, reason, source = registry.call("hook.confirm", name, input, ctx)
   if not allowed then
-    return false, reason
+    return false, reason, source
   end
   registry.call_hooks("hook.before_tool", name, input, ctx)
   return true
@@ -340,6 +340,26 @@ local function drain_steering(bufnr)
   return true
 end
 
+local function harness_note(bufnr, text)
+  require("straps.state").append(bufnr, "user", nil, "[straps] " .. text)
+end
+
+local function nothing_to_send(bufnr)
+  local state = require("straps.state")
+  local trailing = state.last_user_text(bufnr)
+  if trailing ~= nil and vim.trim(trailing) == "" then
+    return "type your request under the trailing %%[straps:user]%% marker"
+  end
+  local messages = state.parse(bufnr).messages
+  if #messages == 0 then
+    return "type your request under the trailing %%[straps:user]%% marker"
+  end
+  if messages[#messages].role ~= "user" then
+    return "the transcript ends with an assistant message;"
+      .. " type your request under the trailing %%[straps:user]%% marker"
+  end
+end
+
 -- Returns the run's ending reason:
 -- "ok" | "cancelled" | "max_turns" | "stalled" | "blank".
 local function run_turns(bufnr, ctx, run)
@@ -347,7 +367,7 @@ local function run_turns(bufnr, ctx, run)
   local cfg = get_config()
 
   local function cancelled_note()
-    state.append(bufnr, "assistant", nil, "[straps: run cancelled]")
+    harness_note(bufnr, "run cancelled (:StrapsStop)")
     return "cancelled"
   end
 
@@ -410,21 +430,17 @@ local function run_turns(bufnr, ctx, run)
       end
     end
     local parsed = state.parse(bufnr)
-    if #parsed.messages == 0 then
-      error("nothing to send — type your request under the trailing %%[straps:user]%% marker", 0)
-    end
     -- Newer models (including the default) reject a request that ends on an
     -- assistant message — assistant prefill is unsupported — so fail here,
     -- not with an opaque HTTP 400 after a round trip.
-    if parsed.messages[#parsed.messages].role ~= "user" then
+    if #parsed.messages == 0 or parsed.messages[#parsed.messages].role ~= "user" then
       if turn > 1 then
         -- Mid-run an assistant-role tail means the finished turn appended no
         -- user-role content for the model to answer.
         error("the last turn added nothing to respond to — the model claimed"
           .. ' stop_reason "tool_use" but requested no tools, or steering was blank', 0)
       end
-      error("nothing to send — the transcript ends with an assistant message;"
-        .. " type your request under the trailing %%[straps:user]%% marker", 0)
+      error("nothing to send — " .. (nothing_to_send(bufnr) or "empty transcript"), 0)
     end
     log(bufnr, { ev = "turn", turn = turn, messages = #parsed.messages })
     local tools = registry.call("fn.build_tools")
@@ -622,10 +638,10 @@ local function run_turns(bufnr, ctx, run)
       if run.stall >= stall_limit then
         local why = last_error and (" Last error: " .. require("straps.state").utf8_cut((last_error:gsub("%s+", " ")), 200))
           or " (repeated tool calls with no new progress)"
-        state.append(bufnr, "assistant", nil,
-          ("[straps: stopped after %d consecutive turns with no apparent progress"
+        harness_note(bufnr,
+          ("stopped after %d consecutive turns with no apparent progress"
             .. " (config.stall_limit=%d).%s — send a message to steer, or raise"
-            .. " config.stall_limit]"):format(run.stall, stall_limit, why))
+            .. " config.stall_limit"):format(run.stall, stall_limit, why))
         log(bufnr, { ev = "stall", turn = turn, consecutive = run.stall })
         return "stalled"
       end
@@ -656,11 +672,11 @@ local function run_turns(bufnr, ctx, run)
       end
       if n_calls == 0 and not has_text then
         if resp.stop_reason == "max_tokens" then
-          state.append(bufnr, "assistant", nil,
-            "[straps: the model hit max_tokens without producing a visible answer"
+          harness_note(bufnr,
+            "the model hit max_tokens without producing a visible answer"
               .. " — the response budget (likely the thinking budget) was consumed"
               .. " before any text. Set config.max_tokens (a higher explicit cap)"
-              .. " or lower the effort, then send a message to continue.]")
+              .. " or lower the effort, then send a message to continue.")
           log(bufnr, { ev = "blank_end", cause = "max_tokens", turn = turn })
           return "blank"
         end
@@ -673,10 +689,10 @@ local function run_turns(bufnr, ctx, run)
           log(bufnr, { ev = "blank_nudge", turn = turn, attempt = run.blank_nudges })
           -- fall through to the continue below (do NOT return)
         else
-          state.append(bufnr, "assistant", nil,
-            ("[straps: the model returned no text after %d nudge(s) — it keeps"
+          harness_note(bufnr,
+            ("the model returned no text after %d nudge(s) — it keeps"
               .. " ending its turn silently. Send a message to steer, or raise"
-              .. " config.blank_nudge_limit.]"):format(run.blank_nudges))
+              .. " config.blank_nudge_limit."):format(run.blank_nudges))
           log(bufnr, { ev = "blank_end", cause = "end_turn", turn = turn })
           return "blank"
         end
@@ -692,9 +708,8 @@ local function run_turns(bufnr, ctx, run)
   end
 
   -- Exhaustion must be loud: a silent end reads as "the agent died".
-  state.append(bufnr, "assistant", nil,
-    ("[straps: stopped after %d turns (config.max_turns) — send a message to continue]")
-      :format(max_turns))
+  harness_note(bufnr,
+    ("stopped after %d turns (config.max_turns) — send a message to continue"):format(max_turns))
   return "max_turns"
 end
 
@@ -703,6 +718,12 @@ function M.start(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   if runs[bufnr] then
     vim.notify("straps: a run is already active for this buffer", vim.log.levels.WARN)
+    return
+  end
+  local queued = vim.b[bufnr].straps_steering
+  local unsendable = not (type(queued) == "table" and #queued > 0) and nothing_to_send(bufnr)
+  if unsendable then
+    vim.notify("straps: nothing to send — " .. unsendable, vim.log.levels.WARN)
     return
   end
   -- Every session owns its scope (so no peer can create one under itself),
@@ -774,7 +795,7 @@ function M.stop(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local run = runs[bufnr]
   if not run then
-    vim.notify("straps: no active run for this buffer", vim.log.levels.INFO)
+    vim.notify("straps: no active run for this buffer", vim.log.levels.WARN)
     return
   end
   local first_stop = not run.cancelled
@@ -878,7 +899,7 @@ function M.steer(bufnr, text, quiet)
   vim.b[bufnr].straps_steering = queue
   progress(bufnr, run.ctx, { type = "steer_queued" })
   if not quiet then
-    vim.notify("straps: steering queued")
+    vim.notify("straps: steering queued", vim.log.levels.INFO)
   end
   return true
 end

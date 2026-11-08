@@ -153,7 +153,7 @@ return function(input, ctx)
         { "bash", "-lc", cmd },
         {
           text = true,
-          cwd = vim.fn.getcwd(),
+          cwd = vim.fn.getcwd(-1, -1),
           detach = true,
           stdout = function(_, chunk) take(stdout, "out", chunk) end,
           stderr = function(_, chunk) take(stderr, "err", chunk) end,
@@ -234,7 +234,7 @@ end
 return function(input, ctx)
   local cmd = input.command
   if type(cmd) ~= "string" or cmd == "" then
-    error("run_in_terminal: command must be a non-empty string")
+    error("run_in_terminal: command must be a non-empty string", 0)
   end
   local timeout_ms = tonumber(input.timeout_ms) or 300000
   local release = require("straps.registry").try_call("fn.subprocess_acquire", ctx,
@@ -244,7 +244,7 @@ return function(input, ctx)
   local ok_split, split_err = pcall(vim.cmd, "botright 15new")
   if not ok_split then
     release()
-    error("run_in_terminal: could not open the terminal split: " .. tostring(split_err))
+    error("run_in_terminal: could not open the terminal split: " .. tostring(split_err), 0)
   end
   local term_buf = vim.api.nvim_get_current_buf()
 
@@ -259,11 +259,11 @@ return function(input, ctx)
     -- the fresh scratch buffer current, so start BEFORE restoring focus.
     local job = 0
     local okj, j = pcall(vim.fn.jobstart, { "bash", "-lc", cmd },
-      { term = true, on_exit = on_exit })
+      { term = true, cwd = vim.fn.getcwd(-1, -1), on_exit = on_exit })
     if okj and type(j) == "number" and j > 0 then
       job = j
     else
-      local okt, t = pcall(vim.fn.termopen, { "bash", "-lc", cmd }, { on_exit = on_exit })
+      local okt, t = pcall(vim.fn.termopen, { "bash", "-lc", cmd }, { cwd = vim.fn.getcwd(-1, -1), on_exit = on_exit })
       if okt and type(t) == "number" and t > 0 then job = t end
     end
     if job <= 0 then
@@ -302,7 +302,7 @@ return function(input, ctx)
       pcall(vim.api.nvim_buf_delete, term_buf, { force = true })
     end
     pcall(vim.api.nvim_set_current_win, prev_win)
-    error("run_in_terminal: " .. start_err)
+    error("run_in_terminal: " .. start_err, 0)
   end
 
   local out_lines = {}
@@ -344,15 +344,18 @@ end
     kind = "tool",
     doc = "Run a shell command (a build, a test run, a linter, a typecheck) and"
       .. " parse its output into this session's findings list (the session"
-      .. " window's location list when on-screen, else the global quickfix list)"
-      .. " through Vim's native errorformat, then open it — so a failing build"
-      .. " lands as :lnext/:lprev (or :cnext/:cprev when it fell back) navigable"
+      .. " window's location list when on-screen; a windowless session keeps it in"
+      .. " a private session store and never touches the global quickfix list)"
+      .. " through Vim's native errorformat, then open it without moving focus — so a failing build"
+      .. " lands as :lnext/:lprev navigable"
       .. " file:line entries in the user's editor instead of a wall of"
       .. " text in the transcript. Use this instead of bash/run_in_terminal when"
       .. " the command emits compiler/linter-style diagnostics you want the user"
       .. " to step through. The result the agent sees is a compact summary: exit"
       .. " code and the parsed entries as `file:line:col: message` (capped),"
-      .. " which is far smaller than raw output. Parameters: command (required)"
+      .. " which is far smaller than raw output. Each output stream is capped at"
+      .. " 262144 bytes before parsing (a note says when). The command runs in"
+      .. " Neovim's global working directory. Parameters: command (required)"
       .. " — the shell command, run via bash -lc; errorformat (optional) — a Vim"
       .. " 'errorformat' string describing the output (e.g."
       .. " \"%f:%l:%c: %m\" for `file:line:col: message`); when omitted, the"
@@ -374,7 +377,7 @@ end
 return function(input, ctx)
   local cmd = input.command
   if type(cmd) ~= "string" or cmd == "" then
-    error("run_quickfix: command must be a non-empty string")
+    error("run_quickfix: command must be a non-empty string", 0)
   end
   local timeout_ms = tonumber(input.timeout_ms) or 300000
   local release = require("straps.registry").try_call("fn.subprocess_acquire", ctx,
@@ -382,6 +385,18 @@ return function(input, ctx)
 
   local proc
   local finished, timed_out = false, false
+  local stream_cap = 262144
+  local streams, lens, capped = { out = {}, err = {} }, { out = 0, err = 0 }, false
+  local function take(which, chunk)
+    if not chunk or chunk == "" then return end
+    local len = lens[which]
+    if len >= stream_cap then capped = true; return end
+    local keep = math.min(#chunk, stream_cap - len)
+    local dst = streams[which]
+    dst[#dst + 1] = require("straps.state").utf8_cut(chunk, keep)
+    if keep < #chunk then capped = true end
+    lens[which] = len + keep
+  end
   -- Same process-tree defect as tool.bash: proc:kill/opts.timeout only
   -- signal the direct bash child, so a compound command's grandchildren
   -- survive and on_exit never fires. detach=true + vim.uv.kill(-pid, sig)
@@ -394,7 +409,13 @@ return function(input, ctx)
   local res = ctx.await(function(resolve)
     local ok_spawn, spawned = pcall(vim.system,
       { "bash", "-lc", cmd },
-      { text = true, detach = true },
+      {
+        text = true,
+        detach = true,
+        cwd = vim.fn.getcwd(-1, -1),
+        stdout = function(_, chunk) take("out", chunk) end,
+        stderr = function(_, chunk) take("err", chunk) end,
+      },
       function(out)
         finished = true
         release()
@@ -425,7 +446,7 @@ return function(input, ctx)
 
   -- Diagnostics land on either stream (compilers use stderr, many test
   -- runners stdout); feed both, in that order, to the errorformat parser.
-  local raw = (res.stdout or "") .. (res.stderr or "")
+  local raw = table.concat(streams.out) .. table.concat(streams.err)
   local lines = vim.split(raw, "\n", { plain = true })
   while #lines > 0 and lines[#lines] == "" do
     table.remove(lines)
@@ -451,7 +472,7 @@ return function(input, ctx)
   end
 
   -- Replace THIS session's findings list with the valid entries (session
-  -- window's location list when on-screen — isolated from other sessions —
+  -- window's location list when on-screen, its private store when windowless,
   -- else the global quickfix list). A genuine empty result clears it, so a
   -- passing build visibly empties a prior failure's list.
   local open = input.open
@@ -463,13 +484,16 @@ return function(input, ctx)
     end)
     if ok and kind then list_kind = kind end
   end
-  local nav = (list_kind == "loclist") and ":lnext/:lprev" or ":cnext/:cprev"
+  local nav = require("straps.findings").nav_hint(list_kind)
 
   -- Compact summary for the agent: the exit code and the parsed locations,
   -- NOT the raw output (which is what the list is for). Cap the listing.
   local out = { "exit code: " .. tostring(res.code) }
   if timed_out then
     out[#out] = out[#out] .. " (killed: exceeded timeout of " .. timeout_ms .. " ms)"
+  end
+  if capped then
+    out[#out + 1] = "output truncated at " .. stream_cap .. " bytes per stream; entries past the cut were not parsed"
   end
   if #valid == 0 then
     out[#out + 1] = list_kind .. ": no entries parsed (0 diagnostics)"
@@ -478,7 +502,7 @@ return function(input, ctx)
         .. " pass an explicit `errorformat` describing this command's output."
     end
   else
-    out[#out + 1] = ("%s: %d entr%s (%s) — the user can step them with %s")
+    out[#out + 1] = ("%s: %d entr%s (%s) — %s")
       :format(list_kind, #valid, #valid == 1 and "y" or "ies", title, nav)
     local cap = 100
     for i = 1, math.min(#valid, cap) do
@@ -503,7 +527,7 @@ end
 
   -- --------------------------------------------------------- subprocess gate
   --
-  -- A counting semaphore shared by the shell tools and grep bounds how many
+  -- A counting semaphore shared by the shell tools, grep and fetch_url bounds how many
   -- straps-launched processes run at once across every session in this
   -- Neovim. Four redefinable entries: fn.subprocess_in_flight reads the
   -- counter, fn.subprocess_limit is the policy (how many may run), fn.
@@ -516,7 +540,7 @@ end
     name = "fn.subprocess_in_flight",
     kind = "fn",
     doc = "Number of straps-launched subprocesses holding a slot right now"
-      .. " (bash, run_in_terminal, run_quickfix, grep), across every session in"
+      .. " (bash, run_in_terminal, run_quickfix, grep, fetch_url), across every session in"
       .. " this Neovim. A read accessor over registry.subprocess_state(), the"
       .. " counter fn.subprocess_acquire's take/release write; fn.subprocess_threads"
       .. " reads it, and a redefined fn.subprocess_limit can.",
@@ -644,7 +668,7 @@ return function(ctx, info)
     if not admitted or (ctx.cancelled and ctx.cancelled()) then
       drop()
       release()
-      error("subprocess slot wait cancelled" .. (info and info.tool and (" (" .. info.tool .. ")") or ""))
+      error("subprocess slot wait cancelled" .. (info and info.tool and (" (" .. info.tool .. ")") or ""), 0)
     end
   end
   if ctx and ctx.on_cancel then

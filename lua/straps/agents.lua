@@ -231,7 +231,7 @@ function M.render(buf)
     end
   end)
   vim.bo[buf].modifiable = false
-  if not ok then error(err) end
+  if not ok then error(err, 0) end
   st.map, st.folds, st.hls = map, folds, hls
   for _, win in ipairs(vim.fn.win_findbuf(buf)) do restore(buf, win, snapshots[win] or st.views[win], changed or fold_changed or not st.views[win]) end
   if st.detail and st.detail.follow then M.details(buf, st.detail.source) end

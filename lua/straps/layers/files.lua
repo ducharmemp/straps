@@ -36,20 +36,23 @@ function M.register_tools()
 return function(input, ctx)
   local path = input.path
   if type(path) ~= "string" or path == "" then
-    error("read_file: path must be a non-empty string")
+    error("read_file: path must be a non-empty string", 0)
   end
   local full = vim.fn.fnamemodify(path, ":p")
-  local existing = vim.fn.bufnr(full)
+  local existing = -1
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(b) == full then existing = b break end
+  end
   if existing == -1 and vim.fn.filereadable(full) ~= 1 then
-    error("read_file: cannot open " .. tostring(path) .. ": no such file")
+    error("read_file: cannot open " .. tostring(path) .. ": no such file", 0)
   end
   local buf = vim.fn.bufadd(full)
   if not buf or buf == 0 then
-    error("read_file: could not create a buffer for " .. tostring(path))
+    error("read_file: could not create a buffer for " .. tostring(path), 0)
   end
   local ok_load, load_err = pcall(vim.fn.bufload, buf)
   if not ok_load then
-    error("read_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(load_err))
+    error("read_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(load_err), 0)
   end
 
   -- Concurrent-editor checks: reads surface a competing editor as a NOTE,
@@ -127,7 +130,7 @@ return function(input, ctx)
   local registry = require("straps.registry")
   local path = input.path
   if type(path) ~= "string" or path == "" then
-    error("write_file: path must be a non-empty string")
+    error("write_file: path must be a non-empty string", 0)
   end
   local full = vim.fn.fnamemodify(path, ":p")
   local dir = vim.fn.fnamemodify(full, ":h")
@@ -140,11 +143,11 @@ return function(input, ctx)
   -- bufload is a no-op when it is already loaded (unsaved user changes stay).
   local bok, buf = pcall(vim.fn.bufadd, full)
   if not bok or not buf or buf == 0 then
-    error("write_file: could not create a buffer for " .. tostring(path) .. ": " .. tostring(buf))
+    error("write_file: could not create a buffer for " .. tostring(path) .. ": " .. tostring(buf), 0)
   end
   local lok, lerr = pcall(vim.fn.bufload, buf)
   if not lok then
-    error("write_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(lerr))
+    error("write_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(lerr), 0)
   end
 
   -- Concurrent-editor checks: a disk change under the buffer or another
@@ -153,16 +156,16 @@ return function(input, ctx)
   -- read returns; this write never lands on content the caller has not seen.
   local st, rerr = registry.call("fn.reconcile_buf", buf)
   if st == nil then
-    error("write_file: " .. tostring(path) .. " " .. tostring(rerr))
+    error("write_file: " .. tostring(path) .. " " .. tostring(rerr), 0)
   elseif st == "reloaded" then
     error("write_file: " .. tostring(path) .. " changed on disk since its buffer"
       .. " was loaded — another agent or external process is editing this file;"
       .. " the buffer has been reloaded from disk, re-read the file and reapply"
-      .. " your change if it still applies")
+      .. " your change if it still applies", 0)
   end
   local wok, werr = registry.call("fn.check_writer", ctx and ctx.bufnr, buf)
   if wok == nil then
-    error("write_file: " .. tostring(path) .. " " .. tostring(werr))
+    error("write_file: " .. tostring(path) .. " " .. tostring(werr), 0)
   end
 
   -- Split content into buffer lines. A trailing "\n" in the content maps to the
@@ -186,7 +189,7 @@ return function(input, ctx)
       -- replace the whole buffer in one undoable step and persist it.
       vim.cmd("let &l:undolevels = &l:undolevels")
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-      vim.cmd("silent noautocmd write")
+      vim.cmd("silent write")
     end)
   end)
   if not ok then
@@ -196,9 +199,9 @@ return function(input, ctx)
     if tostring(err):find("E13", 1, true) then
       error("write_file: " .. tostring(path) .. " was created on disk by another"
         .. " agent or external process since this buffer was opened — re-read"
-        .. " the file and reapply your change if it still applies")
+        .. " the file and reapply your change if it still applies", 0)
     end
-    error("write_file: failed to write " .. tostring(path) .. ": " .. tostring(err))
+    error("write_file: failed to write " .. tostring(path) .. ": " .. tostring(err), 0)
   end
 
   registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, true)
@@ -256,10 +259,10 @@ return function(input, ctx)
   local path = input.path
   local old, new = input.old_string, input.new_string or ""
   if type(path) ~= "string" or path == "" then
-    error("edit_file: path must be a non-empty string")
+    error("edit_file: path must be a non-empty string", 0)
   end
   if type(old) ~= "string" or old == "" then
-    error("edit_file: old_string must be a non-empty string")
+    error("edit_file: old_string must be a non-empty string", 0)
   end
   local full = vim.fn.fnamemodify(path, ":p")
 
@@ -267,11 +270,11 @@ return function(input, ctx)
   -- haystack, so an already-open buffer's unsaved edits are matched as-is.
   local bok, buf = pcall(vim.fn.bufadd, full)
   if not bok or not buf or buf == 0 then
-    error("edit_file: could not create a buffer for " .. tostring(path) .. ": " .. tostring(buf))
+    error("edit_file: could not create a buffer for " .. tostring(path) .. ": " .. tostring(buf), 0)
   end
   local lok, lerr = pcall(vim.fn.bufload, buf)
   if not lok then
-    error("edit_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(lerr))
+    error("edit_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(lerr), 0)
   end
 
   -- Concurrent-editor checks BEFORE reading the haystack: a disk change or
@@ -279,16 +282,16 @@ return function(input, ctx)
   -- reapply) — never a merge; the edit never matches against stale content.
   local st, rerr = registry.call("fn.reconcile_buf", buf)
   if st == nil then
-    error("edit_file: " .. tostring(path) .. " " .. tostring(rerr))
+    error("edit_file: " .. tostring(path) .. " " .. tostring(rerr), 0)
   elseif st == "reloaded" then
     error("edit_file: " .. tostring(path) .. " changed on disk since its buffer"
       .. " was loaded — another agent or external process is editing this file;"
       .. " the buffer has been reloaded from disk, re-read the file and reapply"
-      .. " your change if it still applies")
+      .. " your change if it still applies", 0)
   end
   local wok, werr = registry.call("fn.check_writer", ctx and ctx.bufnr, buf)
   if wok == nil then
-    error("edit_file: " .. tostring(path) .. " " .. tostring(werr))
+    error("edit_file: " .. tostring(path) .. " " .. tostring(werr), 0)
   end
 
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -303,12 +306,12 @@ return function(input, ctx)
     pos = e + 1
   end
   if count == 0 then
-    error("edit_file: old_string not found in " .. path)
+    error("edit_file: old_string not found in " .. path, 0)
   end
   if count > 1 and not input.replace_all then
     error(string.format(
       "edit_file: old_string matches %d times in %s; add more context to make it unique, or set replace_all=true",
-      count, path))
+      count, path), 0)
   end
 
   -- Map a 0-based byte offset in `text` (lines joined by "\n") to a buffer
@@ -352,11 +355,11 @@ return function(input, ctx)
         local erow, ecol = pos_of(e)
         vim.api.nvim_buf_set_text(buf, srow, scol, erow, ecol, vim.split(new, "\n", { plain = true }))
       end
-      vim.cmd("silent noautocmd write")
+      vim.cmd("silent write")
     end)
   end)
   if not ok then
-    error("edit_file: failed to apply edit to " .. tostring(path) .. ": " .. tostring(err))
+    error("edit_file: failed to apply edit to " .. tostring(path) .. ": " .. tostring(err), 0)
   end
 
   registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, true)
@@ -419,19 +422,19 @@ return function(input, ctx)
   local registry = require("straps.registry")
   local path = input.path
   if type(path) ~= "string" or path == "" then
-    error("patch_file: path must be a non-empty string")
+    error("patch_file: path must be a non-empty string", 0)
   end
   if type(input.hunks) ~= "table" or #input.hunks == 0 then
-    error("patch_file: hunks must be a non-empty array")
+    error("patch_file: hunks must be a non-empty array", 0)
   end
   local full = vim.fn.fnamemodify(path, ":p")
   local bok, buf = pcall(vim.fn.bufadd, full)
   if not bok or not buf or buf == 0 then
-    error("patch_file: could not create a buffer for " .. tostring(path) .. ": " .. tostring(buf))
+    error("patch_file: could not create a buffer for " .. tostring(path) .. ": " .. tostring(buf), 0)
   end
   local lok, lerr = pcall(vim.fn.bufload, buf)
   if not lok then
-    error("patch_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(lerr))
+    error("patch_file: could not load " .. tostring(path) .. " (is it a directory?): " .. tostring(lerr), 0)
   end
 
   -- Concurrent-editor checks BEFORE validating ranges: a disk change or
@@ -439,16 +442,16 @@ return function(input, ctx)
   -- reapply) — never a merge; hunks never apply to stale line numbers.
   local st, rerr = registry.call("fn.reconcile_buf", buf)
   if st == nil then
-    error("patch_file: " .. tostring(path) .. " " .. tostring(rerr))
+    error("patch_file: " .. tostring(path) .. " " .. tostring(rerr), 0)
   elseif st == "reloaded" then
     error("patch_file: " .. tostring(path) .. " changed on disk since its buffer"
       .. " was loaded — another agent or external process is editing this file;"
       .. " the buffer has been reloaded from disk, re-read the file and reapply"
-      .. " your change if it still applies")
+      .. " your change if it still applies", 0)
   end
   local wok, werr = registry.call("fn.check_writer", ctx and ctx.bufnr, buf)
   if wok == nil then
-    error("patch_file: " .. tostring(path) .. " " .. tostring(werr))
+    error("patch_file: " .. tostring(path) .. " " .. tostring(werr), 0)
   end
 
   local line_count = vim.api.nvim_buf_line_count(buf)
@@ -456,7 +459,7 @@ return function(input, ctx)
   for i, h in ipairs(input.hunks) do
     local s, e = tonumber(h.start_line), tonumber(h.end_line)
     local text = h.new_text
-    if not s or not e or type(text) ~= "string" then
+    if not s or not e or s % 1 ~= 0 or e % 1 ~= 0 or type(text) ~= "string" then
       problems[#problems + 1] = ("#%d: needs integer start_line/end_line and string new_text"):format(i)
     elseif s < 1 or e < s - 1 then
       problems[#problems + 1] = ("#%d: invalid range %s-%s"):format(i, tostring(s), tostring(e))
@@ -497,7 +500,7 @@ return function(input, ctx)
     end
   end
   if #problems > 0 then
-    error("patch_file: refused:\n" .. table.concat(problems, "\n"))
+    error("patch_file: refused:\n" .. table.concat(problems, "\n"), 0)
   end
 
   local function split_replacement(text)
@@ -514,11 +517,11 @@ return function(input, ctx)
         local h = hunks[i]
         vim.api.nvim_buf_set_lines(buf, h.s - 1, h.e, false, split_replacement(h.text))
       end
-      vim.cmd("silent noautocmd write")
+      vim.cmd("silent write")
     end)
   end)
   if not ok then
-    error("patch_file: failed to apply patch to " .. tostring(path) .. ": " .. tostring(err))
+    error("patch_file: failed to apply patch to " .. tostring(path) .. ": " .. tostring(err), 0)
   end
   registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, true)
 
@@ -787,7 +790,11 @@ return function(path, ctx)
     end
     if cfg.after_write_diagnostics == false then return nil end
 
-    local buf = vim.fn.bufnr(path)
+    local full = vim.fn.fnamemodify(path, ":p")
+    local buf = -1
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_get_name(b) == full then buf = b break end
+    end
     if buf < 0 or not vim.api.nvim_buf_is_valid(buf)
       or not vim.api.nvim_buf_is_loaded(buf) then
       return nil

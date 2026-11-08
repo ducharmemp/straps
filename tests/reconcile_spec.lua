@@ -236,7 +236,8 @@ it("undo_edit: disk change is an error in all three write modes; history still l
     { path = path, to_seq = 1 },
     { path = path, revert_seq = 2 },
   }) do
-    local res = tool("undo_edit", input, A)
+    local ok, res = pcall(tool, "undo_edit", input, A)
+    assert(not ok, "undo_edit should raise")
     assert(res:find("another agent or external process", 1, true),
       "undo_edit should refuse: " .. res)
     assert(res:find("undo tree does not include", 1, true), "wrong message: " .. res)
@@ -255,7 +256,7 @@ it("sticky conflict: undo_edit's no_reload conflict survives into edit_file, whi
   local path, buf = seed(A, "v1\n")
   tool("edit_file", { path = path, old_string = "v1", new_string = "v2" }, A)
   disk_write(path, "EXTERNAL\n")
-  local res = tool("undo_edit", { path = path, steps = 1 }, A)
+  local _, res = pcall(tool, "undo_edit", { path = path, steps = 1 }, A)
   assert(res:find("another agent or external process", 1, true), "undo_edit should refuse: " .. res)
   -- edit_file next: the remembered conflict resolves via a safe reload and
   -- still errors (the edit was computed against stale content).
@@ -274,7 +275,8 @@ it("undo_edit: sibling session's write errors with the session-specific message"
   local path = seed(A, "v1\n")
   tool("edit_file", { path = path, old_string = "v1", new_string = "v2" }, A)
   tool("edit_file", { path = path, old_string = "v2", new_string = "v3" }, B)
-  local res = tool("undo_edit", { path = path, steps = 1 }, A)
+  local ok, res = pcall(tool, "undo_edit", { path = path, steps = 1 }, A)
+  assert(not ok, "undo_edit should raise")
   assert(res:find("another session", 1, true), "should name a sibling session: " .. res)
   assert(res:find("session " .. B, 1, true), "should name session B: " .. res)
   assert(res:find("states are in the undo tree", 1, true), "wrong message: " .. res)

@@ -1,21 +1,29 @@
--- straps.findings — the session findings-list service: the session window's
--- location list when on-screen, else the global quickfix list. Used by
--- grep/run_quickfix/editor tools; ui.lua delegates here for back-compat.
-
 local M = {}
 
--- Per-session findings lists (quickfix isolation) ---------------------------
--- The quickfix list is GLOBAL to the Neovim instance, so two concurrent
--- sessions populating it would stomp each other — and bulk_replace, which acts
--- on "the current list", could then edit another session's files. Fix: when a
--- session is on-screen, route its findings to that WINDOW's location list
--- (per-window, private); fall back to the global quickfix list only when the
--- session has no window (e.g. a windowless subagent), which is the pre-existing
--- global behavior and no worse than today.
+M.STORE_KIND = "session store"
 
---- The window showing session buffer `bufnr`, or nil. Non-floating, and
---- deterministic (lowest win id) so a grep and the later bulk_replace on the
---- same session resolve to the SAME window's location list.
+local store = {}
+local tracking_ns = vim.api.nvim_create_namespace("straps_findings_tracking")
+
+local function clear_marks(s)
+  for _, m in pairs(s.marks) do
+    pcall(vim.api.nvim_buf_del_extmark, m.buf, tracking_ns, m.id)
+  end
+end
+
+local function current_items(s)
+  for i, m in pairs(s.marks) do
+    local ok, pos = pcall(vim.api.nvim_buf_get_extmark_by_id, m.buf, tracking_ns, m.id, {})
+    if ok and pos[1] then s.items[i].lnum = pos[1] + 1 end
+  end
+  return s.items
+end
+
+local function is_session(bufnr)
+  return type(bufnr) == "number" and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)
+    and vim.b[bufnr].straps_session == true
+end
+
 function M.session_win(bufnr)
   if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
     return nil
@@ -34,73 +42,181 @@ function M.session_win(bufnr)
   return nil
 end
 
---- Set this session's findings list. `what` = { title, items }. Uses the
---- session window's location list when on-screen (isolated per session), else
---- the global quickfix list. `open` opens the matching list window when there
---- are entries. Returns "loclist" or "quickfix" (so callers can name the right
---- :lnext/:cnext navigation).
+local function normalize(items)
+  local out = {}
+  for _, it in ipairs(items) do
+    local e = vim.deepcopy(it)
+    if (type(e.bufnr) ~= "number" or e.bufnr == 0) and type(e.filename) == "string" and e.filename ~= "" then
+      e.bufnr = vim.fn.bufadd(vim.fn.fnamemodify(e.filename, ":p"))
+    end
+    e.lnum = tonumber(e.lnum) or 0
+    e.col = tonumber(e.col) or 0
+    e.text = e.text or ""
+    e.valid = (type(e.bufnr) == "number" and e.bufnr > 0) and 1 or 0
+    out[#out + 1] = e
+  end
+  return out
+end
+
+local function mirror(bufnr, win)
+  local s = store[bufnr]
+  if s and win then
+    pcall(vim.fn.setloclist, win, {}, "r", { title = s.title, items = current_items(s) })
+  end
+end
+
+local function store_set(bufnr, title, items)
+  if not store[bufnr] then
+    local enter = vim.api.nvim_create_autocmd("BufWinEnter", {
+      buffer = bufnr,
+      callback = function() mirror(bufnr, M.session_win(bufnr)) end,
+    })
+    vim.api.nvim_create_autocmd("BufWipeout", {
+      buffer = bufnr,
+      once = true,
+      callback = function()
+        clear_marks(store[bufnr])
+        store[bufnr] = nil
+        pcall(vim.api.nvim_del_autocmd, enter)
+      end,
+    })
+  end
+  if store[bufnr] then clear_marks(store[bufnr]) end
+  local s = { title = title, items = normalize(items), marks = {} }
+  for i, e in ipairs(s.items) do
+    local b = e.bufnr
+    if type(b) == "number" and b > 0 and vim.api.nvim_buf_is_valid(b) and e.lnum > 0 then
+      pcall(vim.fn.bufload, b)
+      if e.lnum <= vim.api.nvim_buf_line_count(b) then
+        s.marks[i] = { buf = b, id = vim.api.nvim_buf_set_extmark(b, tracking_ns, e.lnum - 1, 0,
+          { right_gravity = false, undo_restore = true }) }
+      end
+    end
+  end
+  store[bufnr] = s
+end
+
+function M.stored(bufnr)
+  local s = store[bufnr]
+  if s then current_items(s) end
+  return s
+end
+
+--- How the user steps a list of `kind`, for tool results.
+function M.nav_hint(kind)
+  if kind == "loclist" then return "the user can step them with :lnext/:lprev" end
+  if kind == M.STORE_KIND then
+    return "this session has no window, so they are kept in its private session store"
+      .. " (bulk_replace reads them); the global quickfix list was not touched"
+  end
+  return "the user can step them with :cnext/:cprev"
+end
+
+local function keep_focus(fn)
+  local prev = vim.api.nvim_get_current_win()
+  pcall(fn)
+  if vim.api.nvim_win_is_valid(prev) and vim.api.nvim_get_current_win() ~= prev then
+    pcall(vim.api.nvim_set_current_win, prev)
+  end
+end
+
 function M.set_locations(bufnr, what, open)
   local win = M.session_win(bufnr)
   local title = what.title
   local items = what.items or {}
+  if is_session(bufnr) then
+    store_set(bufnr, title, items)
+    if win then
+      mirror(bufnr, win)
+      if open and #items > 0 then
+        keep_focus(function() vim.fn.win_execute(win, "lopen") end)
+      end
+      return "loclist"
+    end
+    return M.STORE_KIND
+  end
   if win then
     pcall(vim.fn.setloclist, win, {}, " ", { title = title, items = items })
     if open and #items > 0 then
-      pcall(vim.fn.win_execute, win, "lopen")
+      keep_focus(function() vim.fn.win_execute(win, "lopen") end)
     end
     return "loclist"
   end
   pcall(vim.fn.setqflist, {}, " ", { title = title, items = items })
   if open and #items > 0 then
-    pcall(function() vim.cmd("botright copen") end)
+    keep_focus(function() vim.cmd("botright copen") end)
   end
   return "quickfix"
 end
 
 --- Read this session's findings list. Returns items(list), kind, win-or-nil.
 function M.get_locations(bufnr)
-  local win = M.session_win(bufnr)
-  if win then
-    return vim.fn.getloclist(win), "loclist", win
+  if is_session(bufnr) then
+    local win = M.session_win(bufnr)
+    local s = store[bufnr]
+    mirror(bufnr, win)
+    return s and vim.deepcopy(current_items(s)) or {}, win and "loclist" or M.STORE_KIND, win
   end
+  local win = M.session_win(bufnr)
+  if win then return vim.fn.getloclist(win), "loclist", win end
   return vim.fn.getqflist(), "quickfix", nil
 end
 
---- Run an ex substitution across this session's findings list: `:ldo` in its
---- window (private) when on-screen, else `:cdo` globally. `body` is the part
---- after the do-command, e.g. "s#a#b#ge | update". Returns ok, err, kind.
----
---- :ldo/:cdo NAVIGATE the window through every entry (that is how they visit
---- files), so the window ends up showing the last edited file — for the ldo
---- path that window is the SESSION's, and the transcript vanishes from view.
---- Snapshot the window's buffer and view before, restore after (success or
---- failure), so the do-command's edits land but the displacement never shows.
+--- Run an ex command on the line of every entry in this session's findings
+--- list, the way :ldo/:cdo would, without navigating any window: each entry's
+--- buffer is edited through nvim_buf_call, the line is tracked by an extmark
+--- (so earlier substitutions that add or remove lines do not shift later
+--- entries), and the view of any window showing that buffer is restored.
+--- `body` is the command after the range, e.g. "s#a#b#ge | update". Stops at
+--- the first failing entry. Returns ok, err, kind.
 function M.locations_do(bufnr, body)
-  local win = M.session_win(bufnr)
-  local target = win or vim.api.nvim_get_current_win()
-  local prev_buf = vim.api.nvim_win_get_buf(target)
-  local view
-  pcall(function()
-    view = vim.api.nvim_win_call(target, vim.fn.winsaveview)
-  end)
-  local ok, err
-  if win then
-    ok, err = pcall(vim.fn.win_execute, win, "silent ldo " .. body)
-  else
-    ok, err = pcall(vim.cmd, "silent cdo " .. body)
+  local items, kind, win = M.get_locations(bufnr)
+  local ns = vim.api.nvim_create_namespace("straps_findings_do")
+  local marks = {}
+  for _, e in ipairs(items) do
+    local b = e.bufnr
+    if type(b) == "number" and b > 0 and vim.api.nvim_buf_is_valid(b) and (e.lnum or 0) > 0 then
+      pcall(vim.fn.bufload, b)
+      if e.lnum <= vim.api.nvim_buf_line_count(b) then
+        marks[#marks + 1] = { buf = b, item = e, id = vim.api.nvim_buf_set_extmark(b, ns, e.lnum - 1, 0, { right_gravity = false }) }
+      end
+    end
   end
-  pcall(function()
-    if not (vim.api.nvim_win_is_valid(target) and vim.api.nvim_buf_is_valid(prev_buf)) then
-      return
+  local ok, err = true, nil
+  local started = {}
+  for _, m in ipairs(marks) do
+    local pos = vim.api.nvim_buf_get_extmark_by_id(m.buf, ns, m.id, {})
+    if pos and pos[1] then
+      local row = pos[1] + 1
+      ok, err = pcall(vim.api.nvim_buf_call, m.buf, function()
+        local view = vim.fn.winsaveview()
+        if not started[m.buf] then
+          vim.cmd("let &l:undolevels = &l:undolevels")
+          started[m.buf] = true
+        else
+          vim.cmd("silent! undojoin")
+        end
+        local okc, errc = pcall(vim.api.nvim_exec2, "silent keepjumps keeppatterns " .. row .. body, { output = true })
+        vim.fn.winrestview(view)
+        if not okc then error(errc, 0) end
+      end)
+      if not ok then break end
     end
-    if vim.api.nvim_win_get_buf(target) ~= prev_buf then
-      vim.api.nvim_win_set_buf(target, prev_buf)
-    end
-    if type(view) == "table" then
-      vim.api.nvim_win_call(target, function() vim.fn.winrestview(view) end)
-    end
-  end)
-  return ok, err, win and "loclist" or "quickfix"
+  end
+  for _, m in ipairs(marks) do
+    local tracked, pos = pcall(vim.api.nvim_buf_get_extmark_by_id, m.buf, ns, m.id, {})
+    if tracked and pos[1] then m.item.lnum = pos[1] + 1 end
+    pcall(vim.api.nvim_buf_del_extmark, m.buf, ns, m.id)
+  end
+  if is_session(bufnr) and store[bufnr] then
+    store[bufnr].items = items
+    mirror(bufnr, M.session_win(bufnr))
+  elseif kind == "loclist" then
+    vim.fn.setloclist(win, {}, "r", { items = items })
+  else
+    vim.fn.setqflist({}, "r", { items = items })
+  end
+  return ok, err, kind
 end
 
 return M

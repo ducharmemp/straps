@@ -241,7 +241,7 @@ it("rejects non-session buffers without opening a picker", function()
   vim.b[buf].straps_session = nil
   ui.auto()
   expect(opts, nil)
-  expect(notified("not a straps session buffer"), true)
+  expect(notified("not in a straps session"), true)
 end)
 
 it("keeps explicit categories additive and off limited to capability grants", function()

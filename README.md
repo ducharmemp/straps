@@ -95,6 +95,8 @@ Run `:checkhealth straps` after installation.
 
 ## Start a session
 
+Session windows show a model/status winbar. Leaving the buffer or window removes only the Straps expression and restores the prior local value. Returning to the session restores its winbar. Straps preserves the global winbar and user replacements; set `session_winbar = false` to disable the session bar.
+
 1. Run `:Straps`.
 2. Type a request in the session buffer.
 3. Press `<CR>` in normal mode to send it.
@@ -113,7 +115,7 @@ Start Neovim in a working session:
 printf 'context for the task' | nvim - +'Straps! edit,exec -- fix the failing test'
 ```
 
-`edit,exec` grants those permission categories to the session, the same set `:StrapsAuto` accepts (`edit`, `delete`, `exec`, `lua`, `net`, `spawn`; `all` grants every one; `registry_define` and agent-defined tools still prompt). The text after `--` is the request; piped stdin is appended to it. `!` sends the request at once. Each part is optional: `nvim +Straps` opens an empty session in the startup window. A plugin manager that loads straps on first use of the `Straps` command misses the piped text; load it at startup for the stdin form. See `:help :Straps`.
+`edit,exec` grants those permission categories to the session, the same set `:StrapsAuto` accepts (`edit`, `delete`, `exec`, `lua`, `net`, `spawn`, `browser`; `all` grants every one; `registry_define` and agent-defined tools still prompt). The text after `--` is the request; piped stdin is appended to it. `!` sends the request at once. Each part is optional: `nvim +Straps` opens an empty session in the startup window. A plugin manager that loads straps on first use of the `Straps` command misses the piped text; load it at startup for the stdin form. See `:help :Straps`.
 
 ## Malleable tooling
 
@@ -150,18 +152,28 @@ A personal entries file saved with `registry.dump()` pins the entry sources it h
 | --- | --- |
 | `:Straps[!] [{cats}] [-- {instruction}]` | Open a new session. `{cats}` pre-grants permission categories (`edit,exec`, `all`), `-- {instruction}` seeds the request, `!` sends it. |
 | `:StrapsSend` | Send the current request or steer an active run. |
+| `:StrapsSteer {text}` | Queue `{text}` as steering for the active run. With no run, add it to the trailing user block. |
 | `:StrapsStop` | Stop the active run. |
-| `:StrapsAuto [off\|{cats}]` | With no argument, choose category grants in a Snacks multi-select picker, or report grants without Snacks. Tab toggles; Enter applies the selection; Esc cancels. Explicit categories add grants; `off` clears category grants. |
+| `:StrapsAuto [off\|all\|{cats}]` | With no argument, choose category grants in a Snacks multi-select picker, or report grants without Snacks. Tab toggles; Enter applies the selection; Esc cancels. Explicit categories (or `all`) add grants; `off` clears category grants. |
 | `:StrapsContinue [instruction]` | Continue a stopped run. |
+| `:StrapsCompact` | Shrink old tool blocks in the current transcript. |
 | `:StrapsResume[!] [session]` | Resume a saved session. `!` opens a picker. |
+| `:StrapsRename [title]` | Give the current session a durable title for the resume picker. |
+| `:StrapsSearch {pattern}` | Search every saved transcript and load the matches into the quickfix list. |
 | `:StrapsAgents` | Open the agent dashboard: session trees, status, details, and management actions. |
-| `:StrapsProvider` | Choose Anthropic, OpenAI or llama.cpp. In a session buffer, the choice affects that session. Elsewhere, it persists globally and applies to new sessions; a session keeps the provider and model of its first successful request, including after a restart. |
-| `:StrapsModel` | Choose a model for the active provider. In a session buffer, the choice affects that session and is kept after a restart. Elsewhere, it persists per provider and applies to new sessions; a model set in `setup()` wins over it. |
+| `:StrapsProvider` | Choose Anthropic, OpenAI or llama.cpp. In a session buffer or from another buffer with exactly one visible session in the tab, the choice affects that session. Elsewhere, it persists globally and applies to new sessions; a session keeps the provider and model of its first successful request, including after a restart. |
+| `:StrapsModel` | Choose a model for the active provider. In a session buffer or from another buffer with exactly one visible session in the tab, the choice affects that session and is kept after a restart. Elsewhere, it persists per provider and applies to new sessions; a model set in `setup()` wins over it. |
+| `:StrapsEffort` | Choose the extended-thinking effort for the resolved session, or globally when no session resolves. |
 | `:StrapsLogin [provider [key]]` | Store a key for a provider (default: the current one); straps prompts for it. For OpenAI, `:StrapsLogin openai` signs in with ChatGPT, `:StrapsLogin openai codex` signs in the way the Codex CLI does (run `:StrapsLogin openai <url>` with the browser's redirect URL to finish either), and `:StrapsLogin openai key` stores an API key. |
 | `:StrapsLogout [provider]` | Delete a provider's stored key; for OpenAI also the ChatGPT and Codex logins and a pending login. Without a provider it asks first. |
 | `:StrapsRegistry` | List registry entries. |
 | `:StrapsEdit {name}` | Edit and redefine a registry entry. |
+| `:StrapsEval` | Execute the current buffer as Lua. |
 | `:StrapsHelp [tag]` | Open the reference documentation. |
+
+Commands that act on a session (`:StrapsSend`, `:StrapsSteer`, `:StrapsStop`, `:StrapsContinue`, `:StrapsCompact`, `:StrapsRename`, `:StrapsAuto`) also work from another window when exactly one session is visible in the tab. The model, effort and provider pickers use that session too; with no visible session or multiple visible sessions, they change global defaults. `:StrapsResume`, `:StrapsEdit`, `:StrapsRegistry` and `:StrapsAgents` accept window modifiers (`:vertical StrapsRegistry`).
+
+In a session buffer (or any `*.straps` file), `<CR>` sends or steers, `gf` opens the `path:line` reference under the cursor, `]]` and `[[` move between conversation turns, and `gO` lists the turns in the location list.
 
 ## Agent dashboard
 
@@ -181,7 +193,7 @@ Straps is not a sandbox. Approved commands, Lua, file changes, and trusted regis
 
 Every tool call passes a guard chain you install in `stdpath("config")/straps/init.lua` and the agent cannot modify (`:help straps-guards`). No guard ships by default. A guard is a filter and a tripwire, not a boundary: an approved `eval_lua` or `bash` call runs in the same Lua state as the guard.
 
-Subprocesses the tools `bash`, `run_in_terminal`, `run_quickfix` and `grep` start share one semaphore across every session in the Neovim, default 2 × CPU count (`max_subprocesses`), halved while the load average exceeds 2 × CPU count, so N sessions together do not start N times one session's processes. The limit, the counter and the admission mechanism are each a redefinable `fn` (`:help straps-subprocesses`). Outside the gate: the provider's `curl` and `gzip`, `fetch_url`'s `curl`, and whatever a gated command starts on its own (`xargs -P`, `parallel`, `for … & done`).
+Subprocesses the tools `bash`, `run_in_terminal`, `run_quickfix`, `grep` and `fetch_url` start share one semaphore across every session in the Neovim, default 2 × CPU count (`max_subprocesses`), halved while the load average exceeds 2 × CPU count, so N sessions together do not start N times one session's processes. The limit, the counter and the admission mechanism are each a redefinable `fn` (`:help straps-subprocesses`). Outside the gate: the provider's `curl` and `gzip`, and whatever a gated command starts on its own (`xargs -P`, `parallel`, `for … & done`).
 
 Providers receive API credentials and full conversation payloads. Session transcripts persist under Neovim's data directory and can contain prompts, source code, and tool output.
 

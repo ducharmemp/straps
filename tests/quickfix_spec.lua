@@ -6,8 +6,9 @@
 -- staying out of the quickfix list); diagnostics {quickfix=true}
 -- landing seeded diagnostics in the list (and leaving it untouched without the
 -- flag); bulk_replace editing every file in a seeded quickfix list (undoably,
--- with a file count) via :cdo; its dry_run and empty-list paths;
--- locations_do restoring the session window's buffer + view across :ldo.
+-- with a file count); its dry_run and empty-list paths; locations_do
+-- restoring the session window's buffer + view; the windowless-session store;
+-- focus kept when a list opens; c/n flag rejection; grep's open parameter.
 
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(here, ":p"), ":h:h")
@@ -384,17 +385,295 @@ it("bulk_replace preserves the session window's buffer and view across :ldo", fu
   vim.cmd("only")
 end)
 
--- Windowless session (a subagent): falls back to the global quickfix list,
--- which is the pre-existing behavior (no worse than before).
-it("windowless session falls back to the global quickfix list", function()
+it("windowless session keeps its findings in a private store and never touches the global quickfix list", function()
+  local state = require("straps.state")
+  local findings = require("straps.findings")
+  vim.cmd("only")
+  local s = state.new_session()
+  assert(findings.session_win(s) == nil, "expected no window for the hidden session")
+  vim.fn.setqflist({}, " ", { title = "user make", items = { { filename = "/tmp/user", lnum = 1, text = "u" } } })
+  local wins = #vim.api.nvim_list_wins()
+  local kind = findings.set_locations(s, { title = "private",
+    items = { { filename = "/tmp/x", lnum = 1, text = "y" } } }, true)
+  assert.are.equal(findings.STORE_KIND, kind)
+  assert.are.equal("user make", vim.fn.getqflist({ title = 1 }).title)
+  assert.are.equal(wins, #vim.api.nvim_list_wins())
+  local items, gkind = findings.get_locations(s)
+  assert.are.equal(findings.STORE_KIND, gkind)
+  assert.are.equal(1, #items)
+  assert.are.equal("/tmp/x", vim.api.nvim_buf_get_name(items[1].bufnr))
+  assert.are.equal("private", findings.stored(s).title)
+end)
+
+it("grep in a windowless session says the list is private and bulk_replace edits through the store", function()
   local state = require("straps.state")
   vim.cmd("only")
   local s = state.new_session()
-  -- Do NOT show it in any window.
-  local ui = require("straps.ui")
-  assert(ui.session_win(s) == nil, "expected no window for the hidden session")
-  local kind = ui.set_locations(s, { title = "fallback",
-    items = { { filename = "/tmp/x", lnum = 1, text = "y" } } }, false)
-  assert(kind == "quickfix", "windowless session should use the global quickfix list")
-  assert(vim.fn.getqflist({ title = 1 }).title == "fallback", "global list not set")
+  local dir = vim.fn.tempname(); vim.fn.mkdir(dir, "p")
+  write_file(dir .. "/w.txt", "keep\nSTOREHIT\nkeep\n")
+  vim.fn.setqflist({}, " ", { title = "user make", items = {} })
+  local out = drive(function(ctx)
+    ctx.bufnr = s
+    return registry.call("tool.grep", { pattern = "STOREHIT", path = dir }, ctx)
+  end)
+  assert.truthy(out:find("private session store", 1, true))
+  assert.are.equal("user make", vim.fn.getqflist({ title = 1 }).title)
+  local res = registry.call("tool.bulk_replace", { pattern = "STOREHIT", replacement = "DONE" }, { bufnr = s })
+  assert.truthy(res:find("1 file changed", 1, true), res)
+  assert.are.equal("keep\nDONE\nkeep\n", read_file(dir .. "/w.txt"))
+end)
+
+it("opening the findings list never moves focus", function()
+  local state = require("straps.state")
+  local findings = require("straps.findings")
+  vim.cmd("only")
+  local s = state.new_session()
+  vim.api.nvim_set_current_buf(s)
+  local swin = vim.api.nvim_get_current_win()
+  vim.cmd("vsplit")
+  vim.cmd("enew")
+  local user = vim.api.nvim_get_current_win()
+  assert(user ~= swin)
+  findings.set_locations(s, { title = "L", items = { { filename = "/tmp/x", lnum = 1, text = "y" } } }, true)
+  assert.are.equal(user, vim.api.nvim_get_current_win())
+  local loc_open = false
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    if vim.fn.getwininfo(w)[1].loclist == 1 then loc_open = true end
+  end
+  assert.is_true(loc_open)
+  vim.cmd("only")
+  findings.set_locations(nil, { title = "Q", items = { { filename = "/tmp/x", lnum = 1, text = "y" } } }, true)
+  assert.are.equal(user, vim.api.nvim_get_current_win())
+  vim.cmd("cclose")
+  vim.cmd("only")
+end)
+
+it("bulk_replace through the global list leaves the user's window and jumplist alone", function()
+  vim.cmd("only")
+  vim.cmd("enew")
+  local user_win = vim.api.nvim_get_current_win()
+  local user_buf = vim.api.nvim_get_current_buf()
+  local jumps_before = #vim.fn.getjumplist()[1]
+  vim.fn.setreg("/", "usersearch")
+  local f1, f2 = seed_two_files()
+  local out = registry.call("tool.bulk_replace", { pattern = "FOO", replacement = "QUX" }, { bufnr = 0 })
+  assert.truthy(out:find("2 files changed", 1, true), out)
+  assert.truthy(read_file(f1):find("QUX", 1, true))
+  assert.truthy(read_file(f2):find("QUX", 1, true))
+  assert.are.equal(user_win, vim.api.nvim_get_current_win())
+  assert.are.equal(user_buf, vim.api.nvim_win_get_buf(user_win))
+  assert.are.equal(jumps_before, #vim.fn.getjumplist()[1])
+  assert.are.equal("usersearch", vim.fn.getreg("/"))
+end)
+
+it("bulk_replace rejects flags c and n, even in dry_run", function()
+  seed_two_files()
+  for _, f in ipairs({ "gc", "gn" }) do
+    for _, dry in ipairs({ false, true }) do
+      local ok, err = pcall(registry.call, "tool.bulk_replace",
+        { pattern = "FOO", replacement = "BAR", flags = f, dry_run = dry }, { bufnr = 0 })
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("^bulk_replace: flags c %(confirm each match%) and n"), tostring(err))
+    end
+  end
+end)
+
+it("session findings survive visibility changes without reviving stale lists", function()
+  local findings = require("straps.findings")
+  vim.cmd("only")
+  local s = require("straps.state").new_session()
+  local other = vim.api.nvim_create_buf(true, false)
+  local function seed(text)
+    findings.set_locations(s, { title = text, items = { { filename = "/tmp/visibility", lnum = 1, text = text } } }, false)
+  end
+  seed("hidden")
+  vim.api.nvim_set_current_buf(s)
+  local win = vim.api.nvim_get_current_win()
+  assert.are.equal("hidden", vim.fn.getloclist(win)[1] and vim.fn.getloclist(win)[1].text)
+  assert.are.equal("hidden", findings.get_locations(s)[1].text)
+  seed("visible")
+  vim.api.nvim_set_current_buf(other)
+  assert.are.equal("visible", findings.get_locations(s)[1].text)
+  seed("new hidden")
+  vim.api.nvim_set_current_buf(s)
+  assert.are.equal("new hidden", vim.fn.getloclist(win)[1].text)
+  assert.are.equal("new hidden", findings.get_locations(s)[1].text)
+  seed("latest visible")
+  vim.api.nvim_set_current_buf(other)
+  assert.are.equal("latest visible", findings.get_locations(s)[1].text)
+  vim.api.nvim_buf_delete(s, { force = true })
+  assert.is_nil(findings.stored(s))
+end)
+
+it("bulk_replace rejects inherited substitute flags after n and c were seeded", function()
+  for _, inherited in ipairs({ "n", "c" }) do
+    local f1, f2 = seed_two_files()
+    local seed = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(seed, 0, -1, false, { "seed" })
+    vim.api.nvim_buf_call(seed, function() vim.cmd("silent! s/absent/nope/" .. inherited .. "e") end)
+    for _, dry in ipairs({ false, true }) do
+      local ok, err = pcall(registry.call, "tool.bulk_replace",
+        { pattern = "FOO", replacement = "BAR", flags = "&", dry_run = dry }, { bufnr = 0 })
+      assert.is_false(ok)
+      assert.truthy(tostring(err):find("flags contain unsupported characters", 1, true))
+      assert.are.equal("FOO line\nsecond\n", read_file(f1))
+      assert.are.equal("another FOO here\n", read_file(f2))
+    end
+    vim.api.nvim_buf_delete(seed, { force = true })
+  end
+end)
+
+it("bulk_replace tracks later findings through multiline replacements and preserves undo", function()
+  local path = vim.fn.tempname() .. ".txt"
+  write_file(path, "FOO first\nkeep\nFOO last\n")
+  vim.fn.setqflist({}, "r", { items = {
+    { filename = path, lnum = 1 }, { filename = path, lnum = 3 },
+  } })
+  local out = registry.call("tool.bulk_replace", { pattern = "FOO", replacement = "BAR\\rADDED" }, { bufnr = 0 })
+  assert.truthy(out:find("1 file changed", 1, true))
+  assert.are.equal("BAR\nADDED first\nkeep\nBAR\nADDED last\n", read_file(path))
+  local buf = vim.fn.bufadd(path)
+  local function undo_lines()
+    vim.api.nvim_buf_call(buf, function() vim.cmd("silent undo") end)
+    return vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  end
+  assert.are.same({ "FOO first", "keep", "FOO last" }, undo_lines())
+end)
+
+it("bulk_replace gives consecutive timer calls separate per-buffer undo blocks", function()
+  local path = vim.fn.tempname() .. ".txt"
+  write_file(path, "FOO first\nkeep\nFOO last\n")
+  vim.fn.setqflist({}, "r", { items = {
+    { filename = path, lnum = 1 }, { filename = path, lnum = 3 },
+  } })
+  local function replace(pattern, replacement)
+    local finished, failure = false, nil
+    vim.defer_fn(function()
+      local ok, err = pcall(registry.call, "tool.bulk_replace", { pattern = pattern, replacement = replacement }, { bufnr = 0 })
+      if not ok then failure = err end
+      finished = true
+    end, 1)
+    assert.is_true(vim.wait(2000, function() return finished end, 10))
+    assert.is_nil(failure)
+  end
+  replace("FOO", "BAR")
+  replace("BAR", "DONE")
+  local buf = vim.fn.bufadd(path)
+  assert.are.same({ "DONE first", "keep", "DONE last" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+  vim.api.nvim_buf_call(buf, function() vim.cmd("silent undo") end)
+  assert.are.same({ "BAR first", "keep", "BAR last" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+  vim.api.nvim_buf_call(buf, function() vim.cmd("silent undo") end)
+  assert.are.same({ "FOO first", "keep", "FOO last" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+end)
+
+it("bulk_replace persists multiline finding positions for consecutive calls in visible and hidden sessions", function()
+  local findings = require("straps.findings")
+  for _, visible in ipairs({ false, true }) do
+    local s = require("straps.state").new_session()
+    if visible then vim.api.nvim_set_current_buf(s) end
+    local path = vim.fn.tempname() .. ".txt"
+    write_file(path, "FOO first\nkeep\nFOO last\n")
+    findings.set_locations(s, { title = "multiline", items = {
+      { filename = path, lnum = 1 }, { filename = path, lnum = 3 },
+    } }, false)
+    registry.call("tool.bulk_replace", { pattern = "FOO", replacement = "BAR\\rADDED" }, { bufnr = s })
+    local items = findings.get_locations(s)
+    assert.are.equal(1, items[1].lnum)
+    assert.are.equal(4, items[2].lnum)
+    registry.call("tool.bulk_replace", { pattern = "BAR", replacement = "DONE" }, { bufnr = s })
+    assert.are.equal("DONE\nADDED first\nkeep\nDONE\nADDED last\n", read_file(path))
+    vim.api.nvim_buf_delete(s, { force = true })
+  end
+end)
+
+for _, visible in ipairs({ false, true }) do
+  it("bulk_replace restores finding rows after native undo in a " .. (visible and "visible" or "hidden") .. " session", function()
+    local findings = require("straps.findings")
+    local s = require("straps.state").new_session()
+    if visible then vim.api.nvim_set_current_buf(s) end
+    local path = vim.fn.tempname() .. ".txt"
+    write_file(path, "FOO first\nkeep\nFOO last\n")
+    findings.set_locations(s, { title = "undo multiline", items = {
+      { filename = path, lnum = 1 }, { filename = path, lnum = 3 },
+    } }, false)
+    registry.call("tool.bulk_replace", { pattern = "FOO", replacement = "BAR\\rADDED" }, { bufnr = s })
+    local buf = vim.fn.bufadd(path)
+    assert.are.equal(4, findings.get_locations(s)[2].lnum)
+    vim.api.nvim_buf_call(buf, function() vim.cmd("silent undo") end)
+    assert.are.same({ "FOO first", "keep", "FOO last" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+    assert.are.equal(3, findings.get_locations(s)[2].lnum)
+    if visible then assert.are.equal(3, vim.fn.getloclist(findings.session_win(s))[2].lnum) end
+    registry.call("tool.bulk_replace", { pattern = "FOO", replacement = "DONE" }, { bufnr = s })
+    assert.are.equal("DONE first\nkeep\nDONE last\n", read_file(path))
+    vim.api.nvim_buf_delete(s, { force = true })
+  end)
+end
+
+it("session finding tracking marks are removed on reset and wipe", function()
+  local findings = require("straps.findings")
+  local s = require("straps.state").new_session()
+  local path = vim.fn.tempname() .. ".txt"
+  write_file(path, "FOO\n")
+  local ns = vim.api.nvim_create_namespace("straps_findings_tracking")
+  local function seed()
+    findings.set_locations(s, { title = "cleanup", items = { { filename = path, lnum = 1 } } }, false)
+  end
+  seed()
+  local buf = vim.fn.bufadd(path)
+  assert.are.equal(1, #vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, {}))
+  findings.set_locations(s, { title = "empty", items = {} }, false)
+  assert.are.equal(0, #vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, {}))
+  seed()
+  vim.api.nvim_buf_delete(s, { force = true })
+  assert.are.equal(0, #vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, {}))
+  assert.is_nil(findings.stored(s))
+end)
+
+it("locations_do persists moved findings after a partial failure", function()
+  local findings = require("straps.findings")
+  local s = require("straps.state").new_session()
+  local path = vim.fn.tempname() .. ".txt"
+  write_file(path, "FOO first\nkeep\nFOO last\n")
+  findings.set_locations(s, { title = "partial", items = {
+    { filename = path, lnum = 1 }, { filename = path, lnum = 2 }, { filename = path, lnum = 3 },
+  } }, false)
+  local ok = findings.locations_do(s, "s/FOO/BAR\\rADDED/ | update")
+  assert.is_false(ok)
+  local items = findings.get_locations(s)
+  assert.are.equal(1, items[1].lnum)
+  assert.are.equal(3, items[2].lnum)
+  assert.are.equal(4, items[3].lnum)
+  registry.call("tool.bulk_replace", { pattern = "FOO", replacement = "DONE" }, { bufnr = s })
+  assert.are.equal("BAR\nADDED first\nkeep\nDONE last\n", read_file(path))
+  local buf = vim.fn.bufadd(path)
+  vim.api.nvim_buf_call(buf, function() vim.cmd("silent undo") end)
+  vim.api.nvim_buf_call(buf, function() vim.cmd("silent undo") end)
+  assert.are.equal(3, findings.get_locations(s)[3].lnum)
+  registry.call("tool.bulk_replace", { pattern = "FOO", replacement = "FINAL" }, { bufnr = s })
+  assert.are.equal("FINAL first\nkeep\nFINAL last\n", read_file(path))
+  vim.api.nvim_buf_delete(s, { force = true })
+end)
+
+it("grep does not open the findings list by default; open=true opens it without moving focus", function()
+  local state = require("straps.state")
+  vim.cmd("only")
+  local s = state.new_session()
+  vim.api.nvim_set_current_buf(s)
+  local swin = vim.api.nvim_get_current_win()
+  local dir = vim.fn.tempname(); vim.fn.mkdir(dir, "p")
+  write_file(dir .. "/o.txt", "OPENME\n")
+  local function loclist_wins()
+    local n = 0
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.fn.getwininfo(w)[1].loclist == 1 then n = n + 1 end
+    end
+    return n
+  end
+  drive(function(ctx) ctx.bufnr = s; return registry.call("tool.grep", { pattern = "OPENME", path = dir }, ctx) end)
+  assert.are.equal(0, loclist_wins())
+  assert.are.equal(1, #vim.fn.getloclist(swin))
+  drive(function(ctx) ctx.bufnr = s; return registry.call("tool.grep", { pattern = "OPENME", path = dir, open = true }, ctx) end)
+  assert.are.equal(1, loclist_wins())
+  assert.are.equal(swin, vim.api.nvim_get_current_win())
+  vim.cmd("only")
 end)

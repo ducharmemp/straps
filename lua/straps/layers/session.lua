@@ -89,12 +89,12 @@ return function(input, ctx)
     if ok_valid then pcall(function() parent = vim.b[child].straps_parent end) end
     if not (ok_valid and parent == ctx.bufnr) then
       error("transcript_excise: buffer " .. tostring(input.session)
-        .. " is not a subagent of this session")
+        .. " is not a subagent of this session", 0)
     end
     bufnr, is_child = child, true
   end
   if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
-    error("transcript_excise: no valid session buffer to operate on")
+    error("transcript_excise: no valid session buffer to operate on", 0)
   end
 
   local blocks = state.list_blocks(bufnr)
@@ -187,7 +187,7 @@ return function(input, ctx)
     local from = math.floor(tonumber(input.range.from) or 0)
     local to = math.floor(tonumber(input.range.to) or 0)
     if from < 1 or to < from then
-      error("transcript_excise: range must be {from, to} with 1 <= from <= to")
+      error("transcript_excise: range must be {from, to} with 1 <= from <= to", 0)
     end
     -- Clamp before iterating: an unbounded `to` would otherwise build a table
     -- of millions of indices before any of them was checked against #blocks.
@@ -231,7 +231,7 @@ return function(input, ctx)
   local note = input.note
   if type(note) ~= "string" or not note:match("%S") then
     error("transcript_excise: note is required to excise — it is the receipt left"
-      .. " in the transcript in place of what you removed")
+      .. " in the transcript in place of what you removed", 0)
   end
   -- A receipt is exactly one line: flattening the note is what keeps a note
   -- containing a marker-shaped line from splitting the block it lands in.
@@ -272,7 +272,7 @@ return function(input, ctx)
         if not marker:find("^%%%%%[straps:" .. b.kind .. "%]%%%%") then
           error(("transcript_excise: the transcript changed underneath us"
             .. " (block %d is no longer %s) — nothing was excised; list again")
-            :format(i, b.kind))
+            :format(i, b.kind), 0)
         end
         local from_lnum, to_lnum, with_marker = target_region(b)
         local repl = {}

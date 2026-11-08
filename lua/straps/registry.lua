@@ -108,7 +108,7 @@ function M.ensure_scope(bufnr, parent)
     })
   elseif parent ~= nil and s.parent ~= parent then
     error(("straps.registry.ensure_scope: scope %d already has parent %s; parents are fixed at creation")
-      :format(bufnr, tostring(s.parent)))
+      :format(bufnr, tostring(s.parent)), 0)
   end
   return s
 end
@@ -284,32 +284,32 @@ end
 --- hook.guard.* entries are global-only and refused once frozen.
 function M.define(spec, opts)
   if type(spec) ~= "table" then
-    error("straps.registry.define: spec must be a table")
+    error("straps.registry.define: spec must be a table", 0)
   end
   if type(spec.name) ~= "string" or spec.name == "" then
-    error("straps.registry.define: spec.name must be a non-empty string")
+    error("straps.registry.define: spec.name must be a non-empty string", 0)
   end
   if not KINDS[spec.kind] then
     error(("straps.registry.define: %s: kind must be 'tool', 'hook', 'fn' or 'skill' (got %s)")
-      :format(spec.name, tostring(spec.kind)))
+      :format(spec.name, tostring(spec.kind)), 0)
   end
   local suffix = spec.name:match("^" .. spec.kind .. "%.(.+)$")
   if not suffix then
     error(("straps.registry.define: %s: name must start with '%s.'")
-      :format(spec.name, spec.kind))
+      :format(spec.name, spec.kind), 0)
   end
   if spec.kind == "tool" and not suffix:match("^[%w_%-]+$") then
     error(("straps.registry.define: %s: tool API name must match ^[A-Za-z0-9_-]+$")
-      :format(spec.name))
+      :format(spec.name), 0)
   elseif spec.kind ~= "tool" and not suffix:match("^[%w_][%w_%.%-]*$") then
     error(("straps.registry.define: %s: invalid %s name")
-      :format(spec.name, spec.kind))
+      :format(spec.name, spec.kind), 0)
   end
   if type(spec.source) ~= "string" then
-    error(("straps.registry.define: %s: source must be a string"):format(spec.name))
+    error(("straps.registry.define: %s: source must be a string"):format(spec.name), 0)
   end
   if spec.capability ~= nil and type(spec.capability) ~= "string" then
-    error(("straps.registry.define: %s: capability must be a string"):format(spec.name))
+    error(("straps.registry.define: %s: capability must be a string"):format(spec.name), 0)
   end
 
   local scope_opt = opts and opts.scope
@@ -338,16 +338,16 @@ function M.define(spec, opts)
   else
     local chunk, err = load(spec.source, "straps:" .. spec.name)
     if not chunk then
-      error(("straps.registry.define: %s: source does not compile: %s"):format(spec.name, err))
+      error(("straps.registry.define: %s: source does not compile: %s"):format(spec.name, err), 0)
     end
     local ok
     ok, fn = pcall(chunk)
     if not ok then
-      error(("straps.registry.define: %s: source raised on load: %s"):format(spec.name, tostring(fn)))
+      error(("straps.registry.define: %s: source raised on load: %s"):format(spec.name, tostring(fn)), 0)
     end
     if type(fn) ~= "function" then
       error(("straps.registry.define: %s: source chunk must return a function (got %s)")
-        :format(spec.name, type(fn)))
+        :format(spec.name, type(fn)), 0)
     end
   end
 
@@ -429,6 +429,9 @@ end
 --- The gate every tool execution passes: the before-guards, then
 --- opts.confirm(name, input, ctx) if given (the loop supplies hook.confirm
 --- plus the before_tool fan-out; direct callers are never confirmed).
+--- opts.confirm returning false, reason, "hook" marks a hook veto: the
+--- refusal reads "blocked by hook.confirm: <reason>"; any other refusal
+--- reads "user denied: <reason>".
 --- Returns allowed, reason, run. On allowed, `run(ctx) -> ok, raw` executes
 --- the entry resolved HERE exactly once (pcall'd; never raises for a tool
 --- error). On refusal, run is nil.
@@ -448,8 +451,11 @@ function M.gate_tool(name, input, ctx, opts)
     local block = run_guards("before", name, input, ctx)
     if block then return true, block end
     if opts and opts.confirm then
-      local allowed, why = opts.confirm(name, input, ctx)
-      if not allowed then return true, "user denied: " .. (why or "") end
+      local allowed, why, source = opts.confirm(name, input, ctx)
+      if not allowed then
+        local prefix = source == "hook" and "blocked by hook.confirm: " or "user denied: "
+        return true, prefix .. (why or "")
+      end
     end
     return false
   end)
@@ -529,7 +535,7 @@ function M.call(name, ...)
   end
   local entry = resolve(name)
   if not entry then
-    error(("straps.registry: no entry named %q"):format(name))
+    error(("straps.registry: no entry named %q"):format(name), 0)
   end
   return entry.fn(...)
 end
@@ -746,7 +752,7 @@ end
 function M.render(name)
   local e = resolve(name)
   if not e then
-    error(("straps.registry.render: no entry named %q"):format(name))
+    error(("straps.registry.render: no entry named %q"):format(name), 0)
   end
   -- Pick a long-bracket level that cannot collide with the source: bump while
   -- the source contains "]" followed by that many "="s (covers both an inner

@@ -229,3 +229,36 @@ it("hook.after_write still fires and its return is appended to the result", func
     source = [[return function(path, ctx) end]],
   })
 end)
+
+it("write_file, edit_file and patch_file fire BufWritePost (LSP didSave) and keep one undo block each", function()
+  local path = vim.fn.tempname() .. ".txt"
+  local fired = {}
+  local au = vim.api.nvim_create_autocmd("BufWritePost", {
+    callback = function(args) fired[#fired + 1] = args.buf end,
+  })
+  write_file({ path = path, content = "one\ntwo\n" })
+  edit_file({ path = path, old_string = "two", new_string = "TWO" })
+  patch_file({ path = path, hunks = { { start_line = 1, end_line = 1, new_text = "ONE" } } })
+  vim.api.nvim_del_autocmd(au)
+  local buf = bufnr_for(path)
+  assert.are.same({ buf, buf, buf }, fired)
+  vim.api.nvim_buf_call(buf, function() vim.cmd("silent undo") end)
+  assert.are.equal("one\nTWO", buf_text(buf))
+  vim.api.nvim_buf_call(buf, function() vim.cmd("silent undo") end)
+  assert.are.equal("one\ntwo", buf_text(buf))
+end)
+
+it("patch_file rejects non-integer line numbers", function()
+  local path = vim.fn.tempname() .. ".txt"
+  write_file({ path = path, content = "a\nb\nc\n" })
+  local ok, err = pcall(patch_file, { path = path, hunks = { { start_line = 1.5, end_line = 2, new_text = "X" } } })
+  assert.is_false(ok)
+  assert.truthy(tostring(err):find("needs integer start_line/end_line", 1, true))
+  assert.are.equal("a\nb\nc", buf_text(bufnr_for(path)))
+end)
+
+it("tool errors carry no chunk-position prefix", function()
+  local ok, err = pcall(edit_file, { path = vim.fn.tempname(), old_string = "", new_string = "x" })
+  assert.is_false(ok)
+  assert.are.equal("edit_file: old_string must be a non-empty string", err)
+end)

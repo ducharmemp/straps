@@ -71,8 +71,9 @@ variable `llama-server` reads). The llama.cpp key is optional: `llama-server`
 needs one only when it runs with `--api-key`. Anthropic sends the key as
 `x-api-key`, OpenAI and llama.cpp as `Authorization: Bearer`.
 
-The commands work without `setup()` (they `require` lazily), but folding, the
-`gf` mapping and rendering are only fully wired once `setup()` has run.
+The commands work without `setup()`: the first straps command run while the
+registry has no `fn.provider` calls `setup()` with no options. Call `setup()`
+yourself, before any command, to pass options.
 
 ==============================================================================
 3. COMMANDS						*straps-commands*
@@ -114,7 +115,11 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			recent; an argument is a session basename (completed
 			from saved sessions) or a path. This reopens a
 			transcript from disk; it does not restart a run — for
-			that see |:StrapsContinue|.
+			that see |:StrapsContinue|. With no saved sessions,
+			it and |:StrapsResume!| warn and open a new session.
+			A window in the current tab already showing the
+			session gets focus; otherwise |<mods>| place the new
+			window as for |:Straps|.
 :StrapsResume!		Open a picker over all saved sessions. Each row shows
 			the session's durable title (see |:StrapsRename|) or,
 			absent one, its first user prompt, plus a relative age
@@ -133,31 +138,44 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 
 							*:StrapsSearch*
 :StrapsSearch {pattern}	Full-text search across every saved transcript for
-			{pattern} (ripgrep when available, else |:vimgrep|) and
-			load the conversation matches — transcript scaffolding
-			is skipped — into the |quickfix| list, so |:cnext| /
-			|:cprev| step through them and <CR> opens the transcript
-			at the hit. Finds a session by what was said in it.
+			{pattern} (ripgrep in the background when available,
+			else a Vim |regexp| scan) and load the conversation
+			matches — transcript scaffolding is skipped — into a
+			new |quickfix| list, so |:cnext| / |:cprev| step through
+			them and <CR> opens the transcript at the hit. Finds a
+			session by what was said in it. No hits warns and
+			leaves the quickfix list unchanged; an rg failure or an
+			invalid pattern is reported as an error.
 
 							*:StrapsSend*
 :StrapsSend		Send the current session buffer as-is. If a run is
 			already active, prompt for a steering message
 			(|straps-steering|) instead. Also bound to <CR> in a
-			session buffer. Errors if the trailing user block is
-			empty, or if the transcript ends on an assistant
-			message (unsupported prefill) — which is what a
-			stopped run leaves, so use |:StrapsContinue| there.
+			session buffer. Warns "nothing to send" and starts
+			no run if the trailing user block is empty, or if the
+			transcript ends on an assistant message (unsupported
+			prefill).
 
 							*:StrapsSteer*
 :StrapsSteer {text}	Queue {text} as a steering message on the active run
-			(|straps-steering|).
+			(|straps-steering|). With no active run, {text} is
+			added to the trailing user block (a warning says so);
+			send it with |:StrapsSend|.
+
+Commands that act on a session (|:StrapsSend|, |:StrapsSteer|, |:StrapsStop|,
+|:StrapsContinue|, |:StrapsCompact|, |:StrapsRename|, |:StrapsAuto|) act on
+the current buffer when it is a session, else on the session shown in the
+only session window of the current tab. Otherwise they warn and do nothing.
+|:StrapsModel|, |:StrapsEffort| and |:StrapsProvider| use the same session
+resolution, and make a global pick when no session resolves.
 
 							*:StrapsStop*
 :StrapsStop		Request cancellation of the active run. The run
 			notices between turns and between tool calls, kills an
 			in-flight request or `bash` process, and ends with a
-			note appended to the transcript. To pick the work back
-			up, see |:StrapsContinue|.
+			user-role `[straps] run cancelled (:StrapsStop)` note
+			appended to the transcript. To pick the work back up,
+			see |:StrapsContinue|.
 
 							*:StrapsContinue*
 :StrapsContinue [{text}]
@@ -166,8 +184,7 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			state to restore — the buffer IS the state — so this
 			just appends a user block ({text}, or a generic
 			"continue where you left off") and sends: the stopped
-			transcript is already well-formed, it merely ends on an
-			assistant block, which cannot be sent as-is. The
+			transcript is already well-formed. The
 			continued run gets a fresh |straps-config| `max_turns`
 			budget, a fresh stall counter and fresh blank-turn
 			nudges; the conversation itself is unaffected. Errors
@@ -234,18 +251,18 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 			still read. Without {provider} it asks first.
 
 							*:StrapsAuto*
-:StrapsAuto [off|{cats}]
+:StrapsAuto [off|all|{cats}]
 			Grant capability categories to the current session so the
 			matching tool calls run without a confirm prompt (session
 			buffers only). `:StrapsAuto edit,exec` grants those
-			categories. With Snacks available, no argument opens a
+			categories; `all` grants every grantable one. With Snacks available, no argument opens a
 			multi-select picker with current grants selected. Tab
 			toggles categories; Enter replaces the category grants
 			with the selection (empty clears them); Esc cancels.
 			Without Snacks, no argument reports the current grants.
 			`off` clears every category grant (leaving editdir: and
-			per-tool grants intact). Completion offers `off` and the
-			grantable categories. See |straps-auto| and |fn.capability|.
+			per-tool grants intact). Completion offers `off`, `all`
+			and the grantable categories. See |straps-auto| and |fn.capability|.
 
 							*:StrapsCompact*
 :StrapsCompact		Mechanically compact the current transcript — shrink
@@ -255,17 +272,21 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 							*:StrapsEdit*
 :StrapsEdit {name}	Open registry entry {name} (e.g. `fn.render`,
 			`hook.confirm`, `tool.bash`) as an executable Lua
-			buffer. Writing the buffer (|:w|) re-executes it,
-			redefining the entry. Completion lists every entry.
-			See |straps-registry|.
+			buffer in a split (|<mods>| as for |:Straps|; a
+			window already showing it gets focus). Writing the
+			buffer (|:w|) re-executes it, redefining the entry.
+			Completion lists every entry. See |straps-registry|.
 
 							*:StrapsRegistry*
-:StrapsRegistry		Open a scratch listing of every registry entry;
-			<CR> on a line opens that entry with |:StrapsEdit|.
+:StrapsRegistry		Open a scratch listing of every registry entry in a
+			split (|<mods>| as for |:Straps|); <CR> on a line
+			opens that entry in the listing's window.
 
 							*:StrapsHelp*
 :StrapsHelp [tag]	Open |:help| for straps (default tag `straps`, or
 				a supplied straps help tag such as `straps-tools`).
+				Completion lists every tag starting with
+				`straps` in the help tags files.
 
 							*:StrapsEval*
 :StrapsEval		Execute the current buffer as Lua.
@@ -284,8 +305,8 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 
 							*:StrapsProvider*
 :StrapsProvider		Pick the backend: anthropic, openai or llamacpp. On a
-			session buffer it sets b:straps_provider for that
-			session only; elsewhere it sets config `provider` and
+			resolved session it sets b:straps_provider for that
+			session only; with no target it sets config `provider` and
 			persists the choice to ~/.config/straps/provider
 			(|fn.provider_pref|). Run |:StrapsModel| after it to
 			pick that provider's model. A session keeps the
@@ -295,7 +316,8 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 
 							*:StrapsModel*
 :StrapsModel		Pick the provider-specific model for the current session
-			(or global default off a non-session buffer). Does live
+			(or the only visible session in the tab; global default
+			when no session resolves). Does live
 			discovery via |fn.list_models| and merges the
 			provider's catalog over `models`, `openai_models` or
 			`llamacpp_models`. A session pick is saved in the
@@ -306,7 +328,8 @@ The commands work without `setup()` (they `require` lazily), but folding, the
 
 							*:StrapsEffort*
 :StrapsEffort		Pick the extended-thinking effort (off/low/medium/high
-			by default) for the current session or globally.
+			by default) for the resolved session or globally
+			when no session resolves.
 
 ==============================================================================
 4. THE SESSION BUFFER					*straps-session*
@@ -331,10 +354,17 @@ running tool is indistinguishable from an interrupted one, so repairing it
 would report a false failure), and a transcript whose tool blocks were
 hand-edited into an inconsistent state — that still fails loudly when sent.
 
-Buffer-local mappings (normal mode):
+Buffer-local mappings (normal mode), set in session buffers and in any
+hand-opened `*.straps` file:
 	<CR>	Send, or prompt to steer if a run is active (|:StrapsSend|).
-	gf	Open the `path:line[:col]` reference under the cursor. Also
-		active in any hand-opened `*.straps` file.
+	gf	Open the `path:line[:col]` reference under the cursor; any
+		other text falls back to the built-in |gf|, and its error
+		is shown as a warning.
+	]]	Jump to the next conversation turn ([count] turns).
+	[[	Jump to the previous conversation turn ([count] turns).
+	gO	List the turns in the window's |location-list|.
+Changing 'filetype' away from straps removes these mappings and restores the
+fold and conceal options.
 
 Transcript grammar. Blocks are marker lines `%%[straps:KIND]%%` (with compact
 JSON attrs for tool blocks) followed by content; KIND is one of
@@ -359,6 +389,9 @@ Winbar. Session windows get a window-local winbar showing the effective model,
 effort and run status, plus live token usage once the first response arrives —
 the context fill (e.g. 47.0k/200k (24%)) and cache hit rate, from
 `ui.usage_status()`. Disable with |straps-config| `session_winbar = false`.
+Buffer/window leave removes only the Straps expression and restores the prior
+local value. Returning to the session reinstalls the expression. Global values
+and user replacements remain unchanged.
 
 Own components. `ui.session_info(bufnr)` returns the session's RESOLVED state
 (provider, model, model_label, effort, overridden, status, parent, usage,
@@ -445,7 +478,7 @@ max_spawn_depth		(number) 1. How deep subagents nest: 1 lets a
 			nested spawner is under.
 max_subprocesses	(number|nil) nil -> 2 * CPU count. How many
 			straps-launched subprocesses (`bash`, `run_in_terminal`,
-			`run_quickfix`, `grep`) may run at once across every
+			`run_quickfix`, `grep`, `fetch_url`) may run at once across every
 			session in this Neovim. Read by |fn.subprocess_limit| at
 			every admission; a call past the limit parks in
 			ctx.await until a slot frees. See |straps-subprocesses|.
@@ -609,7 +642,8 @@ File & shell:
 	fetch_url, glob, grep, bash, run_in_terminal, run_quickfix,
 	move_file(s), delete_file(s)
 
-Editor-native (tree-sitter / LSP, degrade gracefully with no server):
+Editor-native (tree-sitter / LSP; with no server or parser the call fails
+with "<tool>: no LSP client ..." and the loop marks it an error):
 	diagnostics, diagnostic_at, diagnostic_next, fix_diagnostic,
 	lsp_status,
 	declaration, definition, type_definition, implementation,
@@ -692,15 +726,22 @@ policy: every guard runs and a raising guard BLOCKS. NOT fanned out (single
 entry, called directly): |hook.confirm|, |hook.on_progress|, and
 `hook.on_define`.
 						*hook.confirm*
-hook.confirm(name, input, ctx) -> allowed, reason
-		The permission gate, called for every tool the model requests,
+hook.confirm(name, input, ctx) -> allowed, reason, source
+		A refusal with source `"hook"` is a policy veto and reads
+		`blocked by hook.confirm: <reason>`; any other refusal
+		reads `user denied: <reason>`. The permission gate, called for every tool the model requests,
 		after the before-guards (|hook.guard|). Default:
 		auto-allow the read-only tools; silently allow any call
 		whose |fn.capability| category has been granted (a
 		`cap:<category>` key in the session's grant set, written by
 		|:StrapsAuto| or a subagent `allow`); otherwise prompt
 		(Yes / No / Always this tool / for edits, Always in <dir>
-		/ Always all edits), showing a diff for file edits. Grants
+		/ Always all edits), showing a diff for file edits.
+		"Always all edits" (`editfiles:*`) covers every |fn.capability|
+		`edit` call, including bulk_replace, rename_symbol, format,
+		move_file(s), undo_edit and code_action with an index; those
+		tools also offer it. delete_file/delete_files offer only
+		Yes / No and warn that deletion is not undo-reversible. Grants
 		persist via `registry.grant`; "Always this tool" stores
 		`registry.tool_grant_key(name)` (`<name>@v<version>[@<bufnr>]`), so a
 		redefinition or session shadow of the tool prompts again.
@@ -1058,10 +1099,14 @@ fn.openai_codex_request(body, ctx, account_id) -> url, headers
 		levels, reasoning is omitted. |fn.provider_openai| calls it
 		when the key source is "codex".
 						*fn.list_models*
-fn.list_models(provider?) -> entries
+fn.list_models(provider?, on_done?) -> entries
 			Live GET /v1/models for |:StrapsModel|. Optional provider is
 			"anthropic", "openai" or "llamacpp"; omitted means
-			effective provider. llama.cpp needs no key, and a
+			effective provider. With on_done, credential refresh
+			and curl yield through ctx.await; the call returns nothing, and
+			on_done(entries, err) runs on the main loop;
+			|:StrapsModel| uses this form and never blocks. Without
+			it the call blocks for up to 15 s. llama.cpp needs no key, and a
 			loaded model's `meta.n_ctx` becomes `context`. A Codex
 			login reads the Codex catalog, marks entries `reasoning`
 			and copies `supported_reasoning_levels` as effort strings.
@@ -1074,9 +1119,11 @@ fn.capability(name, input) -> category
 				`lua`, `net`, `define`, `spawn` (spawn, spawn_wait
 				and send_message), or `agent_tool` (an unknown
 				tool, or any tool resolved from a session scope
-				without a trusted `capability` field). Called
+				without a trusted `capability` field), or
+				`browser` (tools a trusted plugin defines with
+				`capability = "browser"`). Called
 				with no arguments it returns the grantable list
-				({edit, delete, exec, lua, net, spawn}); `read`
+				({edit, delete, exec, lua, net, spawn, browser}); `read`
 				needs no grant, and `define`/`agent_tool` are never
 				grantable. |hook.confirm|, |fn.readonly_policy|,
 				|:StrapsAuto|, and subagent `allow` all read it, so
@@ -1148,7 +1195,7 @@ fn.autocmd_bridge(spec)		Bridge a Neovim autocmd back into a session as
 						*straps-subprocesses*
 SUBPROCESS GATE~
 
-A counting semaphore shared by `bash`, `run_in_terminal`, `run_quickfix` and
+A counting semaphore shared by `bash`, `run_in_terminal`, `run_quickfix`, `fetch_url` and
 `grep` bounds how many straps-launched processes run at once across every
 session in this Neovim. Without it, N sessions together start N times the
 processes one session would. Four entries, each redefinable on its own; a
@@ -1450,7 +1497,9 @@ follow your colorscheme; a user `hi link` wins and survives a re-apply.
 	StrapsToolError		DiagnosticError	is_error mark
 	StrapsRule		Comment		turn rules
 	StrapsCardBorder	Comment		expanded-tool box art
-	StrapsWinbar		StatusLine	session-window winbar
+	StrapsWinbar		WinBar		session-window winbar
+	StrapsWinbarNC		WinBarNC	that winbar in a non-current window
+	StrapsProgress		Comment		run-progress text on the last line
 	StrapsFileRef		Underlined	path:line references
 
 The `@straps.marker.*` and `@straps.esc` tree-sitter captures mirror these for

@@ -21,6 +21,22 @@ local function with_ui(body)
   return body(require("straps.ui"))
 end
 
+local function grep_wait(ui, pattern)
+  local n
+  ui.grep_sessions(pattern, function(count) n = count end)
+  assert(vim.wait(5000, function() return n ~= nil end, 10), "grep_sessions never settled")
+  return n
+end
+
+local function capture_notify(fn)
+  local notes, orig = {}, vim.notify
+  vim.notify = function(msg, level) notes[#notes + 1] = { msg = msg, level = level } end
+  local ok, err = pcall(fn)
+  vim.notify = orig
+  if not ok then error(err, 0) end
+  return notes
+end
+
 local straps = require("straps")
 local state = require("straps.state")
 -- Hermetic session dir; register the real provider so new_session uses the
@@ -294,7 +310,7 @@ it("ui.grep_sessions loads content matches into the quickfix list", function()
     local b = state.new_session()
     state.append(b, "user", nil, "please find the needle xyzzy here")
     state.append(b, "assistant", nil, "unrelated content")
-    local n = ui.grep_sessions("xyzzy")
+    local n = grep_wait(ui, "xyzzy")
     local qf = vim.fn.getqflist({ title = 1, items = 1 })
     straps.config.session_dir = savedir
 
@@ -316,11 +332,67 @@ it("ui.grep_sessions skips transcript marker lines", function()
     straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
     local b = state.new_session()
     state.append(b, "user", nil, "some ordinary content")
-    local n = ui.grep_sessions("straps:user")
+    local n = grep_wait(ui, "straps:user")
     straps.config.session_dir = savedir
     assert(n == 0, "grep_sessions matched transcript marker lines (should skip them): " .. n)
   end)
 end)
+
+local function with_search_dir(ui, body)
+  local savedir = straps.config.session_dir
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  straps.config.session_dir = assert(vim.uv.fs_realpath(dir))
+  local b = state.new_session()
+  state.append(b, "user", nil, "search fixture content")
+  local ok, err = pcall(body)
+  straps.config.session_dir = savedir
+  if not ok then error(err, 0) end
+end
+
+for _, engine in ipairs({ "rg", "regex" }) do
+  it("grep_sessions (" .. engine .. "): no hits warns and keeps the quickfix list", function()
+    if engine == "rg" and vim.fn.executable("rg") == 0 then return pending("rg not installed") end
+    with_ui(function(ui)
+      with_search_dir(ui, function()
+        local real_exec = vim.fn.executable
+        if engine == "regex" then
+          vim.fn.executable = function(x) if x == "rg" then return 0 end return real_exec(x) end
+        end
+        vim.fn.setqflist({}, " ", { title = "keep me", items = { { filename = "a", lnum = 1, text = "x" } } })
+        local nr = vim.fn.getqflist({ nr = 0 }).nr
+        local notes = capture_notify(function()
+          assert.are.equal(0, grep_wait(ui, "no-such-needle-qq"))
+        end)
+        vim.fn.executable = real_exec
+        assert.are.equal(nr, vim.fn.getqflist({ nr = 0 }).nr)
+        assert.are.equal("keep me", vim.fn.getqflist({ title = 0 }).title)
+        assert.are.equal(vim.log.levels.WARN, notes[#notes].level)
+      end)
+    end)
+  end)
+
+  it("grep_sessions (" .. engine .. "): an invalid pattern is an ERROR, not 'no matches'", function()
+    if engine == "rg" and vim.fn.executable("rg") == 0 then return pending("rg not installed") end
+    with_ui(function(ui)
+      with_search_dir(ui, function()
+        local real_exec = vim.fn.executable
+        if engine == "regex" then
+          vim.fn.executable = function(x) if x == "rg" then return 0 end return real_exec(x) end
+        end
+        local notes = capture_notify(function()
+          assert.are.equal(0, grep_wait(ui, engine == "rg" and "(" or "\\("))
+        end)
+        vim.fn.executable = real_exec
+        assert(#notes >= 1, "no notify for an invalid pattern")
+        assert.are.equal(vim.log.levels.ERROR, notes[1].level)
+        for _, n in ipairs(notes) do
+          assert(not n.msg:find("no session matches", 1, true), "invalid pattern reported as no matches")
+        end
+      end)
+    end)
+  end)
+end
 
 -- ------------------------------------------- session_summary behavior
 it("session_summary caches and hits on a second call to the same path", function()

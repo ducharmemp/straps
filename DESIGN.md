@@ -424,7 +424,9 @@ lists session basenames (resolve basename → full path); no arg → most recent
 `:Straps` stays "new session". `:StrapsRename [title]` gives the current
 session a durable title (stored in a companion `<transcript>.meta` JSON file,
 not the transcript); `:StrapsSearch {pattern}` greps every transcript's
-conversation content into the quickfix list. Since a transcript's filename is
+conversation content into the quickfix list (rg through a `vim.system`
+callback, else a `vim.regex` scan; zero hits warn and leave the list alone, an
+rg failure or a bad pattern is an ERROR notify). Since a transcript's filename is
 only a timestamp, `state.list_sessions()` carries a `summary` per session (the
 `.meta` title, else the first user prompt via `state.session_summary`, read
 off disk with no buffer load) and the `:StrapsResume!` picker shows it plus a
@@ -525,7 +527,9 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
         Inside the gate: the before-guards (`hook.guard.*`, op `"before"`)
         run first — any `false` blocks with `"blocked by <guard>: <reason>"`
         and confirm is never reached; then confirm — not allowed →
-        `"user denied: " .. (reason or "")`. Either way a refusal becomes a
+        `"user denied: " .. (reason or "")`, or
+        `"blocked by hook.confirm: " .. (reason or "")` when confirm returns
+        `false, reason, "hook"` (a policy veto, not a user answer). Either way a refusal becomes a
         tool_result with `is_error=true`; continue to the next tool_use.
       - `ok, result = run(ctx)` — the entry resolved at gate time, `pcall`'d.
         Result: string, or table (json-encode), or nil → "ok". Truncate
@@ -620,18 +624,23 @@ edit.
   if a run is active, prompt via `vim.ui.input({prompt = "steer: "})` and
   queue; otherwise `loop.start(bufnr)`, which parses the buffer as-is — the
   trailing user block (or whatever the user left there) IS the message. An
-  empty trailing block errors with a clear "nothing to send" message rather
-  than silently doing nothing — both when the conversation is empty and when
-  it would leave the transcript ending on an assistant message (newer models
-  reject a request ending on an assistant message — unsupported prefill).
+  empty trailing block makes `loop.start` warn "nothing to send" through
+  `vim.notify` and return without starting a run or touching the transcript,
+  including after a terminal harness note. It checks `state.last_user_text`
+  before parsing merged messages, so a harness note cannot supply a request
+  for an empty trailing user block. Queued steering counts as content.
+  `:StrapsContinue` supplies an explicit continuation request.
 - Target resolution for `:StrapsSend`/`:StrapsSteer`/`:StrapsStop`/
-  `:StrapsContinue`: current buffer must be a session buffer
-  (`vim.b.straps_session`); else polite error.
+  `:StrapsContinue`/`:StrapsCompact`/`:StrapsRename`/`:StrapsAuto`
+  (`ui.require_session`): the current buffer when it is a session buffer
+  (`vim.b.straps_session`), else the session shown in the only session window
+  of the current tab; otherwise one shared `ui.NOT_A_SESSION` WARN and nothing
+  happens.
 - `:StrapsContinue [text]` continues a stopped or interrupted run. It needs no
   saved run state — invariant 1 again: `loop.stop` already leaves a well-formed
-  transcript (every appended `tool_use` gets a paired result), and the sole
-  obstacle to re-sending it is the assistant-role cancellation note at the tail,
-  which is unsupported prefill. So the command appends a user block (the given
+  transcript (every appended `tool_use` gets a paired result) and ends it with
+  the user-role `[straps] run cancelled (:StrapsStop)` note. The command appends
+  a user block (the given
   text, else a generic continue instruction) and calls `loop.start` on the same
   buffer. Run-scoped bookkeeping — turn budget, stall counter, blank nudges —
   starts over; the conversation does not. Distinct from `:StrapsResume`, which
@@ -664,8 +673,11 @@ edit.
 
 - `run_turns` returns a reason: "ok" | "cancelled" | "max_turns" | "stalled".
   Exhausting `config.max_turns` (the hard backstop, default 128) appends a
-  visible assistant note — `[straps: stopped after N turns (config.max_turns)
-  — send a message to continue]` — never a silent end. The `"stalled"` ending
+  visible user-role harness notice — `[straps] stopped after N turns
+  (config.max_turns) — send a message to continue` — never a silent end.
+  Every loop-authored ending note (cancelled, max_turns, stalled, blank) is a
+  `[straps] ` user notice, so it renders as the harness speaking and the
+  transcript stays sendable (it never ends on an assistant block). The `"stalled"` ending
   is the progress-aware soft stop: after `config.stall_limit` consecutive
   turns that made no apparent progress (all calls errored, or repeated an
   earlier call), it appends a DISTINCT note naming `config.stall_limit` and
@@ -1168,7 +1180,7 @@ second backend.
   `M.check_base_url` (so `https://api.openai.com/v1` is accepted).
   `opts.ctx` waits for a refresh through
   `ctx.await` (cancel returns `nil, "cancelled"`); without ctx it waits with
-  `vim.wait(opts.wait_ms or 50000)` (`fn.list_models` passes 15000);
+  `vim.wait(opts.wait_ms or 50000)` (synchronous `fn.list_models` passes 15000);
   `opts.refresh = false` never refreshes (health).
 - **One stored credential.** OpenAI keeps one of a ChatGPT login, a Codex
   login or a stored API key. The rules below for a ChatGPT login apply to a
@@ -1315,14 +1327,17 @@ provider slot is added.
 
 ### Live model discovery (`fn.list_models`)
 
-`fn.list_models(provider?) -> models | (nil, err)` — a synchronous `curl GET
-/v1/models` against an explicit provider (`"anthropic"`/`"openai"`/`"llamacpp"`) or **the
+`fn.list_models(provider?, on_done?) -> models | (nil, err)` — a `curl GET
+/v1/models` (synchronous, up to 15 s, without `on_done`; with `on_done` it
+runs credential refresh and curl in a coroutine through `ctx.await`, returns nothing, and calls
+`on_done(models, err)` on the main loop — `:StrapsModel` uses that form so
+the editor never blocks) against an explicit provider (`"anthropic"`/`"openai"`/`"llamacpp"`) or **the
 same backend `fn.provider` would use**. It resolves the effective provider exactly as `fn.provider` does (per-session `vim.b straps_provider` on the
 current buffer → `config.provider` → the persisted `fn.provider_pref` file), so discovery never disagrees with the loop: under the OpenAI
 provider it lists GPT models, not Claude ones.
 
 - Every provider's URL is `M.base_url(provider, config)`, its key comes
-  from the slot's `key_fn` with `{ base_url, wait_ms = 15000 }` (a missing
+  from the slot's `key_fn` with `{ base_url, wait_ms = 15000, ctx? }` (a missing
   key is an error only when `key_required`), and `M.auth_headers` builds the
   header.
 - **Anthropic**: `GET {base_url}/v1/models?limit=1000` with
@@ -1574,6 +1589,10 @@ API names (registry names prefixed `tool.`):
 - `path_info {paths}` / `tree {path?, max_depth?, max_entries?, hidden?}` —
   bounded filesystem introspection without shelling out.
 - `fetch_url {url, max_bytes?, timeout_ms?, follow_redirects?}` — bounded curl
+  (`follow_redirects=true` always raises a refusal; it exists so the refusal
+  is explicit). DNS resolution goes through `ctx.await`; curl takes a
+  `fn.subprocess_acquire` slot and a failed spawn raises `fetch_url: could not
+  spawn curl`.
   fetch with config disabled (`curl --disable`), no ambient cookies/credentials,
   timeout and byte cap; not auto-allowed by the default confirm hook. SSRF
   guard: refuses internal host literals and DNS answers (localhost, loopback,
@@ -1636,12 +1655,14 @@ API names (registry names prefixed `tool.`):
   build with the fn removed runs ungated. The counter lives in `registry`
   module state, not a buffer variable, so a redefined limit fn reads the
   same number the default does. Tests in `tests/exec_gate_spec.lua`.
-- `registry_list {kind?}` — names + kind + doc + version, one per line.
+- `registry_list {kind?}` — names + kind + doc + version, one per line; kind is
+  tool, hook, fn or skill.
 - `registry_get {name}` — returns `registry.render(name)` (full definition).
 - `registry_define {name, kind, doc?, input_schema?, source}` — calls
   `registry.define`; `input_schema` arrives as a JSON **string** (schema-of-
   schemas is a tarpit) and is decoded before define. Returns
-  "defined <name> v<version>". This is THE self-extension tool: new tools and
+  "defined <name> v<version>", plus a warning when tool, hook or fn source
+  appears to call a blocking wait. This is THE self-extension tool: new tools and
   redefinitions of any tool/hook/fn, including the provider and confirm hook.
 - `eval_lua {code}` — `load` + pcall, returns `vim.inspect` of results.
   Dangerous by design; gated by `hook.confirm`.
@@ -1829,8 +1850,9 @@ Default hooks registered here:
   `define` (registry_define); `spawn` (spawn, spawn_wait, send_message); `agent_tool` (any
   unknown tool, and any tool resolved from a session scope without a trusted
   `capability` field — a session shadow of `bash` is classified `agent_tool`, not
-  `exec`). Called with NO arguments it returns the
-  GRANTABLE list `{edit, delete, exec, lua, net, spawn}`. `read` needs no
+  `exec`); `browser` (tools a trusted plugin such as straps-buff defines with
+  `capability = "browser"`). Called with NO arguments it returns the
+  GRANTABLE list `{edit, delete, exec, lua, net, spawn, browser}`. `read` needs no
   grant. `define` and `agent_tool` are NEVER grantable — a `define` grant would
   let the agent shadow `hook.confirm` (an everything grant), and agent-defined
   tools cannot be classified by name.
@@ -1854,7 +1876,16 @@ Default hooks registered here:
   this project <root>" stores `editdir:<root>` for the nearest ancestor
   holding a `.git`/`.jj`/`.straps.lua`/`.hg`/`.svn` marker (offered only
   when found and distinct from the parent dir), and "Always all edits"
-  stores `editfiles:*`. Must be called on the main loop (wrap in a
+  stores `editfiles:*`, which allows every `edit`-category call (bulk_replace,
+  rename_symbol, format, move_file(s), undo_edit, code_action/fix_diagnostic
+  with an index, as well as the three path tools). The other edit-category
+  tools prompt Yes / No / Always this tool / Always all edits, with a
+  field-per-line preview of their input; bulk_replace's preview names its
+  pattern, replacement and the findings-list entry and file counts.
+  delete_file/delete_files prompt Yes / No only, with a warning that deletion
+  is not undo-reversible. The diff preview reads the file's loaded buffer, or
+  the file on disk when no buffer is loaded, so a denied prompt leaves no
+  buffer behind. Must be called on the main loop (wrap in a
   scheduled await, since we're inside a coroutine driven from callbacks).
 
 **Tool-call guards (`hook.guard.*`)** — the user-installed policy chain in
@@ -2140,7 +2171,9 @@ schemes clear highlights on load.
 | StrapsToolError | DiagnosticError | `✗` on `is_error` |
 | StrapsRule      | Comment         | the turn rules |
 | StrapsCardBorder| Comment         | the expanded-tool box art |
-| StrapsWinbar    | StatusLine      | session-window winbar |
+| StrapsWinbar    | WinBar          | session-window winbar |
+| StrapsWinbarNC  | WinBarNC        | that winbar in a non-current window |
+| StrapsProgress  | Comment         | run-progress virtual text on the last line |
 | StrapsFileRef   | Underlined      | path:line refs (treesitter engine) |
 | @straps.marker.system      | Title    | marker line, treesitter engine |
 | @straps.marker.user        | Question | marker line, treesitter engine |
@@ -2412,8 +2445,9 @@ Existing suites must all still pass.
   `fn.provider_llamacpp`'s error, before any network call. An unknown provider
   inherited from the parent's `straps_provider` is
   copied as-is and the dispatcher rejects it on the child's first request. `ui.pick_model` /
-  `ui.pick_effort` write `vim.b` when invoked ON a session buffer, else the
-  global config default. `ui.session_info(bufnr)` is the single accessor that
+  `ui.pick_effort` write `vim.b` for `ui.resolve_session()`'s target: the current
+  session buffer or the only visible session in the tab. With no target they
+  change the global default. `ui.session_info(bufnr)` is the single accessor that
   RESOLVES that whole override -> config chain (returning `nil` off a session
   buffer, else provider/model/model_label/effort/overridden/status/parent/
   usage/context_used/context/context_pct/cache_pct, percentages pre-rounded;
@@ -2431,19 +2465,20 @@ Existing suites must all still pass.
   on every redraw — agents buffer → `fn.agents_winbar`, session buffer →
   `session_winbar`, else `""` — so `<CR>` in the agents buffer swapping a
   session into the same window (the `"none"` sentinel) shows the right bar
-  with no reinstallation, and an opt-out (`config.session_winbar = false` /
-  `config.agents_winbar = false`) holds across those swaps and across a
-  split's inherited window-local `winbar` (`show_session` clears an
-  inherited dispatcher on opt-out — only straps' own string, never a user's
-  winbar — since a non-empty option holds the bar row open even when it
-  evaluates to `""`). Exposing resolved state rather than only the raw
+  through the buffer/window enter lifecycle. Buffer/window leave removes only
+  the Straps expression and restores the previous local value. Returning to a
+  session reinstalls the expression unless the user replaced the winbar.
+  The lifecycle preserves the global value and source-buffer local values.
+  An opt-out (`config.session_winbar = false` / `config.agents_winbar = false`)
+  also clears an inherited Straps expression, since a non-empty option holds
+  the bar row open even when it evaluates to `""`. Exposing resolved state rather than only the raw
   buffer vars is what
   lets a user's own statusline/lualine component avoid reimplementing the
   fallback chain. `ui.redraw_status([all])` pairs `:redrawstatus` with
   `:redrawtabline` — the former does not cover the tabline — and every status
   redraw in `loop.lua`/`ui.lua` goes through it.
 - `:StrapsProvider` (`ui.pick_provider`) — picks the API backend
-  (anthropic/openai/llamacpp). ON a session buffer it sets `vim.b straps_provider`
+  (anthropic/openai/llamacpp). For `ui.resolve_session()`'s target it sets `vim.b straps_provider`
   and saves it to the transcript's `.meta` file (`state.set_session_pin`);
   otherwise it writes the choice to `$XDG_CONFIG_HOME/straps/provider` via
   `fn.provider_pref`, which every Neovim reads on its next request, so it
@@ -2636,8 +2671,12 @@ Make the harness use the editor it lives in. Three workstreams, built in order.
 
 New tools in a dedicated module (register() called from init.setup, mirroring
 tools/provider). LSP calls are async through ctx.await; tree-sitter tools are
-synchronous and need no server, so they are the reliable core. Every tool
-degrades gracefully (no client / no parser → a clear message, never an error).
+synchronous and need no server, so they are the reliable core. A genuine
+failure (no such file, no LSP client for the filetype, no parser, invalid
+input, a refused or failed write) raises `error("<tool>: ...", 0)` so the loop
+marks the result is_error; an empty-but-valid result ("no diagnostics", "no
+references found") is a returned string. Outgoing positions convert the byte
+column to each client's `offset_encoding` with `vim.str_utfindex`.
 Positions: read_file emits 1-based lines and BYTE columns; LSP is 0-based and
 its `character` is a UTF-16 code-unit offset (per the client's
 `offset_encoding`). Convert at the seam: `line + 1` for the row, and map the
@@ -2663,19 +2702,21 @@ workspace_symbols.
   `{path, line, col, quickfix?}` — load buffer, wait briefly for an LSP client
   (LspAttach is async), issue the matching textDocument request, resolve with
   location(s) as `file:line:col`, optionally feeding the findings list. No
-  client → clear message; definition/references also try tags where useful.
+  client → `<tool>: no LSP client` error; definition/references first try
+  tags and return their hits as `file:line:col` through the same output path.
 - `references {path, line, col, quickfix?}` — textDocument/references, same
   location shape; can feed the findings list.
 - `symbols {path}` — document outline. Prefer tree-sitter (a locals/@function
   query via `vim.treesitter`) so it works with no LSP; fall back to LSP
-  documentSymbol. Returns `name  kind  L<start>-<end>` per symbol.
+  documentSymbol. Returns `name  kind  L<start>-<end>` per symbol, nested
+  symbols included.
 - `tree_sitter_status {path}` / `node_at {path, line, col, max_text_bytes?}` /
   `read_node {path, line, col, ancestor?, max_lines?}` — parser readiness,
   node/parent-chain inspection, and enclosing-source reads for syntax-structure
   investigations without requiring a language server.
 - `read_symbol {path, name}` — tree-sitter: find the named function/class node,
-  return its source text (targeted read instead of the whole file). Ambiguous
-  name → list the matches.
+  return its source text (targeted read instead of the whole file), capped at
+  1000 lines with a truncation note. Ambiguous name → list the matches.
 
 All are read-only except none; `hook.confirm` auto-allows the read-only set
 via `fn.readonly_policy` (see below). Async LSP tools use ctx.await + a timeout
@@ -2692,8 +2733,13 @@ unified-diff renderer that the confirm-dialog edit preview also uses.
   filetype?, left_label?, right_label?}` (two texts) — a native `:diffthis`
   split (new_split_win for the left so the user's buffer is never replaced,
   rightbelow vsplit for the right), winbar labels, hunk count in the result.
+  Its windows carry `w:straps_view = "diff"`; a later call reuses them.
 - `show_buffer {content, filetype?, title?, split?}` — a filetype'd scratch
-  split (`straps://buffer/<title>`) for generated/extracted content.
+  split (`straps://buffer/<title>`) for generated/extracted content. Its window
+  carries `w:straps_view = "buffer"`; a later call replaces that window's buffer.
+- `show_user {path, line?, col?}` — moves the cursor in a window already
+  showing the file, else in a new split; keyboard focus returns to the window
+  the user was in.
 - `set_findings {items=[{path,line?,col?,text?}], title?, open?}` — load
   agent-assembled locations into the session's findings list and open it. For
   findings the agent built itself; grep and run_quickfix already fill the list
@@ -2707,8 +2753,11 @@ Apply agent edits THROUGH the file's buffer so they enter its native undo tree
 - Load the target into a buffer (`vim.fn.bufadd(path)` + `bufload`), or reuse
   the already-open buffer. Apply the change with `nvim_buf_set_text` /
   `nvim_buf_set_lines` (one undoable edit), then persist by writing THAT buffer
-  (`nvim_buf_call(buf, () -> silent noautocmd write)`), leaving modified=false
-  and the undo history intact.
+  (`nvim_buf_call(buf, () -> silent write)`), leaving modified=false
+  and the undo history intact. The write runs autocmds, so BufWritePost
+  fires and attached LSP clients receive textDocument/didSave (Neovim sends
+  didSave from a BufWritePost autocmd); `tests/edit_undo_spec.lua` checks one
+  BufWritePost and one undo block per write.
 - edit_file: exact-match on the buffer's current lines (not a fresh disk read),
   replace via set_text, write. Same 0/1/replace_all error semantics as today.
 - write_file: mkdir parents, set all lines (undoable single step), write.
@@ -2762,8 +2811,16 @@ overwrite. Two topologies, no new files on disk:
   hand-edit after a sibling's write masks that write (the tick moves past the
   stamp); cross-instance attribution is just "another agent or external
   process" (naming it would need a rendezvous file on disk — deliberately not
-  done). WorkspaceEdit save paths, bulk_replace, and state.persist are not
-  covered.
+  done). bulk_replace and state.persist are not covered.
+- WorkspaceEdit paths in rename_symbol, move_file(s), delete_file(s),
+  code_action, and fix_diagnostic reconcile disk changes and check sibling
+  writers before applying edits. They capture loaded-buffer changedticks
+  before requesting edits and reject returned targets changed while requests
+  or code-action resolution were pending. Refused edits preserve user changes
+  without saving them. WorkspaceEdit create/rename/delete resource operations
+  are rejected; these tools accept text edits within cwd only. Batch move_files
+  and delete_files reject responses whose WorkspaceEdits share a target buffer
+  before applying any edits or moving/deleting files, even if their ranges differ.
 - Tests: `tests/reconcile_spec.lua`.
 
 Multiplayer AWARENESS (fn.peer_agents, tool.agents, hook.on_run_start,
@@ -2919,11 +2976,13 @@ parent's (tools.lua) — a real decision the agent had no inputs for.
   become `:cnext`/`:cprev` navigable; `hook.on_progress`-independent.
 - `diagnostics`: add `{ quickfix = true }` → also `vim.diagnostic.setqflist`.
 - `bulk_replace {pattern, replacement, flags?}` — write tool. Runs a guarded
-  `:cdo`/`:ldo` substitute across the CURRENT findings list (the set grep just
-  made), so it's a native multi-file edit that goes through buffers → undoable
-  (ties into ws2). Empty list → error ("run grep first"). Reject newline/`|` in
-  pattern/replacement, escape the delimiter, and whitelist substitute flags so
-  user input cannot append another Ex command. Return the count of files changed.
+  substitute on the line of every entry in the CURRENT findings list (the set
+  grep just made) through `findings.locations_do`, so it's a native multi-file
+  edit that goes through buffers → undoable (ties into ws2). Empty list →
+  message ("run grep first"). Reject newline/`|` in pattern/replacement,
+  escape the delimiter, and whitelist substitute flags so user input cannot
+  append another Ex command; flags `c` (prompts per match) and `n` (counts
+  without substituting) are rejected. Return the count of files changed.
   Gated by hook.confirm (it writes). Optional `{ dry_run = true }` → report
   targets without editing.
 - Tests: grep populates a non-empty quickfix list with correct file/lnum;
@@ -2951,21 +3010,37 @@ per-window), so if every session wrote its findings there, two concurrent
 sessions would stomp each other — and `bulk_replace`, which acts on the CURRENT
 list, could read another session's set and edit the wrong files (worse for the
 confirm-gated human-paced gap between a grep and its bulk_replace). Fix: route
-each session's findings to ITS window's LOCATION list when the session is
-on-screen (private per window), and fall back to the global quickfix list only
-when the session has no window (a windowless subagent — no worse than the
-pre-existing global behavior). Shared helpers live in `ui.lua`:
-`session_win(bufnr)` (the session's non-floating window, lowest win id so grep
-and the later bulk_replace resolve to the SAME list), `set_locations` /
-`get_locations` (setloclist/getloclist on that window, else set/getqflist),
-and `locations_do(bufnr, body)` (`:ldo <body>` via `win_execute` in the window,
-else global `:cdo <body>`). `grep`, `diagnostics{quickfix}`, `run_quickfix`,
+each session's findings to an authoritative per-session store in
+`straps.findings` (`STORE_KIND`, `stored(bufnr)`). The service mirrors the
+stored list to the session window's location list on set, get, and
+`BufWinEnter`. Showing or hiding the session preserves its findings;
+window-local lists never replace the stored findings. Callers without a
+session use the global quickfix list, except a supplied displayed non-session
+buffer retains its window-local list for compatibility.
+Opening a list window (`lopen`/`copen`) restores the previously current
+window. `locations_do` no longer runs `:ldo`/`:cdo`: it marks each entry's
+line with an extmark and runs `<line><body>` inside `nvim_buf_call` with
+`keepjumps keeppatterns`, restoring each window view, so no window changes
+buffer and the jumplist and search register stay unchanged. Shared helpers
+live in `straps.findings` (`ui.lua` delegates):
+`session_win(bufnr)` selects the session's non-floating window with the
+lowest window id. `set_locations` / `get_locations` write and read the private
+session store and mirror it to that window when visible. With no session,
+they use `setqflist` / `getqflist`. `locations_do(bufnr, body)` edits each
+entry through `nvim_buf_call`, with extmarks tracking line movements. Each invocation starts a separate undo block per buffer and joins that invocation's entries into the block. Before removing its marks, it saves adjusted entry lines to the authoritative store or native list, including when an entry fails, so later calls use the moved targets. Marks stay at the start of replaced lines when substitutions insert newlines. `grep`, `diagnostics{quickfix}`, `run_quickfix`,
 `set_findings` write through `set_locations`; `bulk_replace` reads through
 `get_locations` and edits through `locations_do`, and its result names whichever
 list ("loclist"/"quickfix"). Tools' user-facing summaries say `:lnext/:cnext`
 accordingly. Tested in `quickfix_spec.lua`: two on-screen sessions get isolated
 per-window lists (and the global qf list stays untouched), bulk_replace on
-session A edits only A's file, and a windowless session falls back to global.
+session A edits only A's file, a windowless session uses its private store,
+opening a list keeps focus, and bulk_replace leaves the user's window,
+jumplist and search register alone. Visibility-transition tests cover stored
+findings becoming visible, visible findings becoming hidden, and stale list
+replacement. Multiline substitution tests exercise later extmarks moving and
+undo restoring both replacements in one buffer. `bulk_replace` rejects `c`,
+`n`, and `&` flags, including after an earlier substitute seeded inherited
+flags. `grep` takes `open` (default false).
 
 ## Style
 

@@ -915,6 +915,23 @@ function M.seed_user(bufnr, text)
   M.persist(bufnr)
 end
 
+--- Add text to the trailing user block (creating one when the transcript ends
+--- elsewhere), after a blank line when the block already has content. Lines
+--- are escaped like seed_user's.
+function M.add_to_trailing_user(bufnr, text)
+  if M.last_user_text(bufnr) == nil then
+    M.append(bufnr, "user", nil, "")
+  end
+  local lines = (M.last_user_text(bufnr) or "") ~= "" and { "" } or {}
+  for _, l in ipairs(vim.split(text, "\n", { plain = true })) do
+    lines[#lines + 1] = escape_line(l)
+  end
+  with_pin(bufnr, function()
+    vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, lines)
+  end)
+  M.persist(bufnr)
+end
+
 --- Repair a transcript that was interrupted mid-tool (Neovim killed, or the
 --- process died, while a tool was in flight): persist() runs at block
 --- boundaries, so the file can hold a tool_use whose tool_result was never

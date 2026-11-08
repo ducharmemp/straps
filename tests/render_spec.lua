@@ -92,6 +92,9 @@ it("highlight groups resolve to their default link targets", function()
     StrapsToolError = "DiagnosticError",
     StrapsRule = "Comment",
     StrapsCardBorder = "Comment",
+    StrapsWinbar = "WinBar",
+    StrapsWinbarNC = "WinBarNC",
+    StrapsProgress = "Comment",
   }
   for name, target in pairs(want) do
     local hl = vim.api.nvim_get_hl(0, { name = name, link = true })

@@ -75,6 +75,19 @@ it("client + ERROR/WARN diagnostics -> formatted summary", function()
   assert(out:find("ERROR", 1, true) < out:find("WARN", 1, true), "not sorted by position")
 end)
 
+it("matches the written file's buffer by exact path, not a similarly named one", function()
+  local path = tmp .. "/exact.lua"
+  local decoy = make_buf(tmp .. "/exact.lua.orig", { "x" })
+  vim.diagnostic.set(ns, decoy, {
+    { lnum = 0, col = 0, severity = vim.diagnostic.severity.ERROR, message = "decoy", source = "s" },
+  })
+  local out
+  with_fake_client(function()
+    out = registry.call("hook.after_write", path, ctx_for(decoy))
+  end)
+  assert(out == nil, "the decoy buffer's diagnostics were reported for " .. path .. ": " .. tostring(out))
+end)
+
 it("HINT/INFO only -> nil (below WARN threshold)", function()
   local path = tmp .. "/c.lua"
   local buf = make_buf(path, { "x" })

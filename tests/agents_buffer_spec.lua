@@ -572,6 +572,9 @@ it("loaded row shows context fill when usage is present", function()
   local straps = require("straps")
   local old_ctx = straps.config.context_window
   straps.config.context_window = 200000 -- make context% computable from usage
+  local old_provider, old_model = vim.b[loaded_buf].straps_provider, vim.b[loaded_buf].straps_model
+  vim.b[loaded_buf].straps_provider, vim.b[loaded_buf].straps_model = "anthropic", "test-context-model"
+  assert.are.equal(200000, ui.session_info(loaded_buf).context)
   vim.b[loaded_buf].straps_usage = { input_billed = 50000, cache_read = 0 }
   -- Render windowless so width fallback (76) guarantees metadata placement
   local existing
@@ -592,7 +595,7 @@ it("loaded row shows context fill when usage is present", function()
     end
   end
   assert(row, "no loaded row for loaded_buf")
-  assert(row:find("ctx ", 1, true), "loaded row missing ctx fill: " .. row)
+  assert(row:find("ctx 25%", 1, true), "loaded row missing ctx fill: " .. row)
   -- Counterfactual dimension: clear the usage and the field disappears.
   vim.b[loaded_buf].straps_usage = nil
   require("straps.agents").render(buf)
@@ -606,6 +609,7 @@ it("loaded row shows context fill when usage is present", function()
   end
   assert(not row:find("ctx ", 1, true), "ctx field should vanish without usage: " .. row)
   straps.config.context_window = old_ctx
+  vim.b[loaded_buf].straps_provider, vim.b[loaded_buf].straps_model = old_provider, old_model
 end)
 
 it("agents_winbar = false puts the legend on the first line, no winbar", function()
@@ -672,9 +676,8 @@ it("show_session clears an inherited dispatcher when session_winbar = false", fu
   assert(ok, tostring(err))
   -- Counterfactual dimension: with the opt-out lifted the same swap installs.
   ui.open_agents("")
-  local win2 = vim.api.nvim_get_current_win()
   ui.show_session(sess, "none")
-  assert(vim.wo[win2].winbar ~= "", "default swap should install the dispatcher")
+  assert(vim.wo.winbar ~= "", "default swap should install the dispatcher")
 end)
 
 it("a throwing fn.agents_winbar degrades to an empty winbar", function()

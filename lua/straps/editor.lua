@@ -1,8 +1,11 @@
 -- straps/editor.lua — editor-native tools (diagnostics, definition, references,
 -- symbols, read_symbol). Tree-sitter tools are synchronous and need no server;
 -- LSP tools run async through ctx.await with a bounded timeout so a wedged
--- server can never hang the run. Every tool degrades to a clear string, never
--- a Lua error. register() uses registry.define_default (no clobbering).
+-- server can never hang the run. A genuine failure (no such file, refusal, no
+-- LSP client, invalid input) raises error("<tool>: ...", 0) so the loop marks
+-- the result is_error; an empty-but-valid result ("no diagnostics", "no
+-- references found") is a returned string. register() uses
+-- registry.define_default (no clobbering).
 
 local M = {}
 
@@ -16,7 +19,12 @@ local uv = vim.uv or vim.loop
 
 -- Load `path` into a buffer and resolve its filetype (so a linter/LSP can
 -- attach and tree-sitter can pick a language). Returns bufnr, filetype.
-local function load_buf(path)
+local function load_buf(path, tool)
+  tool = tool or "load_buf"
+  if type(path) ~= "string" or path == "" then error(tool .. ": path is required", 0) end
+  if vim.fn.filereadable(vim.fn.fnamemodify(path, ":p")) ~= 1 then
+    error(tool .. ": no such file: " .. path, 0)
+  end
   local buf = vim.fn.bufadd(path)
   vim.fn.bufload(buf)
   local name = vim.api.nvim_buf_get_name(buf)
@@ -289,6 +297,9 @@ local function workspace_edit_uris(edit)
 end
 
 local function guard_workspace_edit(edit)
+  for _, dc in ipairs(edit.documentChanges or {}) do
+    if dc.kind then return nil, "WorkspaceEdit resource operations are not supported: " .. tostring(dc.kind) end
+  end
   local root = workspace_root()
   for _, uri in ipairs(workspace_edit_uris(edit)) do
     local path, err = uri_path(uri)
@@ -300,53 +311,209 @@ local function guard_workspace_edit(edit)
   return true
 end
 
-local function save_workspace_files(uris)
-  local files, seen = {}, {}
-  for _, uri in ipairs(uris) do
+local function find_buf(full)
+  local real = vim.uv.fs_realpath(full) or full
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    local name = vim.api.nvim_buf_get_name(b)
+    if name ~= "" and (name == full or name == real or vim.uv.fs_realpath(name) == real) then
+      return b
+    end
+  end
+  return nil
+end
+
+local function wipe_buf_keep_windows(buf)
+  if not vim.api.nvim_buf_is_valid(buf) then return end
+  for _, w in ipairs(vim.fn.win_findbuf(buf)) do
+    local alt = vim.api.nvim_win_call(w, function() return vim.fn.bufnr("#") end)
+    if alt > 0 and alt ~= buf and vim.api.nvim_buf_is_valid(alt) and vim.bo[alt].buflisted then
+      pcall(vim.api.nvim_win_set_buf, w, alt)
+    else
+      pcall(vim.api.nvim_win_set_buf, w, vim.api.nvim_create_buf(true, false))
+    end
+  end
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+end
+
+local function byte_to_lsp_char(buf, line0, col0, enc)
+  local text = vim.api.nvim_buf_get_lines(buf, line0, line0 + 1, false)[1] or ""
+  local idx = math.min(col0, #text)
+  local ok, c = pcall(vim.str_utfindex, text, enc or "utf-16", idx, false)
+  if ok and type(c) == "number" then return c end
+  return col0
+end
+
+local function position_params(buf, line0, col0, extra)
+  return function(client)
+    local p = {
+      textDocument = { uri = vim.uri_from_bufnr(buf) },
+      position = { line = line0, character = byte_to_lsp_char(buf, line0, col0, client and client.offset_encoding) },
+    }
+    for k, v in pairs(extra or {}) do p[k] = v end
+    return p
+  end
+end
+
+local function check_target_buf(ctx, tool, buf)
+  local registry = require("straps.registry")
+  local label = relname(vim.api.nvim_buf_get_name(buf), buf)
+  local st, rerr = registry.call("fn.reconcile_buf", buf)
+  if st == nil then
+    error(tool .. ": " .. label .. " " .. tostring(rerr), 0)
+  elseif st == "reloaded" then
+    error(tool .. ": " .. label .. " changed on disk since its buffer was loaded — another"
+      .. " agent or external process is editing this file; the buffer has been reloaded"
+      .. " from disk, re-read the file and retry", 0)
+  end
+  local wok, werr = registry.call("fn.check_writer", ctx and ctx.bufnr, buf)
+  if wok == nil then error(tool .. ": " .. label .. " " .. tostring(werr), 0) end
+end
+
+local function buffer_versions()
+  local versions = {}
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf) then versions[buf] = vim.api.nvim_buf_get_changedtick(buf) end
+  end
+  return versions
+end
+
+local function validate_workspace_edits(ctx, tool, pending, versions)
+  local targets = {}
+  for _, p in ipairs(pending) do
+    local ok, err = guard_workspace_edit(p.edit)
+    if not ok then error(tool .. ": " .. tostring(err), 0) end
+    for _, uri in ipairs(workspace_edit_uris(p.edit)) do
+      local path = uri_path(uri)
+      if targets[path] and targets[path] ~= p then
+        error(tool .. ": refusing batch — multiple WorkspaceEdits target the same buffer: " .. relname(path), 0)
+      end
+      targets[path] = p
+    end
+  end
+  for _, p in ipairs(pending) do
+    for _, uri in ipairs(workspace_edit_uris(p.edit)) do
+      local buf = vim.uri_to_bufnr(uri)
+      if vim.api.nvim_buf_is_loaded(buf) and vim.api.nvim_buf_get_changedtick(buf) ~= versions[buf] then
+        error(tool .. ": reference buffer changed while awaiting server responses — retry", 0)
+      end
+      vim.fn.bufload(buf)
+      check_target_buf(ctx, tool, buf)
+      versions[buf] = vim.api.nvim_buf_get_changedtick(buf)
+    end
+  end
+end
+
+local function validate_delete_targets(ctx, tool, entries)
+  for _, e in ipairs(entries) do
+    check_target_buf(ctx, tool, e.buf)
+    if vim.bo[e.buf].modified or vim.api.nvim_buf_get_changedtick(e.buf) ~= e.tick then
+      error(tool .. ": refusing — " .. relname(e.path) .. " changed while awaiting deletion — retry", 0)
+    end
+  end
+end
+
+local function after_writes(ctx, bufs)
+  local registry = require("straps.registry")
+  local extras = {}
+  for _, buf in ipairs(bufs) do
+    if vim.api.nvim_buf_is_loaded(buf) then
+      registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, true)
+      local results, errors = registry.call_hooks("hook.after_write", vim.api.nvim_buf_get_name(buf), ctx)
+      for _, r in ipairs(results) do
+        if type(r) == "string" and r ~= "" then extras[#extras + 1] = r end
+      end
+      for _, e in ipairs(errors) do
+        extras[#extras + 1] = "[hook " .. e.name .. " error: " .. e.err .. "]"
+      end
+    end
+  end
+  return extras
+end
+
+local function undo_seq(buf)
+  local s = 0
+  vim.api.nvim_buf_call(buf, function() s = vim.fn.undotree().seq_cur end)
+  return s
+end
+
+local function rollback_workspace_edit(applied)
+  local stuck = {}
+  for _, s in ipairs(applied and applied.snaps or {}) do
+    if vim.api.nvim_buf_is_loaded(s.buf) then
+      local ok = pcall(function()
+        vim.api.nvim_buf_call(s.buf, function() vim.cmd("silent undo " .. s.seq) end)
+      end)
+      if ok and undo_seq(s.buf) == s.seq then
+        if not s.modified then vim.bo[s.buf].modified = false end
+      else
+        stuck[#stuck + 1] = relname(vim.api.nvim_buf_get_name(s.buf), s.buf)
+      end
+    end
+  end
+  return stuck
+end
+
+-- Apply a WorkspaceEdit through buffers (native undo, like write_file /
+-- edit_file: each touched buffer gets its own undo break first) WITHOUT
+-- saving. Every touched buffer passes check_target_buf first; a failed apply
+-- is rolled back. Returns { bufs, snaps } for save_workspace_edit or
+-- rollback_workspace_edit. Raises "<tool>: ...".
+local function apply_workspace_edit(ctx, tool, edit, enc)
+  local ok_guard, guard_err = guard_workspace_edit(edit)
+  if not ok_guard then error(tool .. ": " .. tostring(guard_err), 0) end
+  local bufs, seen = {}, {}
+  for _, uri in ipairs(workspace_edit_uris(edit)) do
     local buf = vim.uri_to_bufnr(uri)
     if not seen[buf] then
       seen[buf] = true
-      pcall(function()
-        vim.api.nvim_buf_call(buf, function() vim.cmd("silent noautocmd update") end)
-      end)
-      files[#files + 1] = relname(vim.api.nvim_buf_get_name(buf), buf)
+      pcall(vim.fn.bufload, buf)
+      bufs[#bufs + 1] = buf
     end
+  end
+  for _, buf in ipairs(bufs) do check_target_buf(ctx, tool, buf) end
+  local applied = { bufs = bufs, snaps = {} }
+  for _, buf in ipairs(bufs) do
+    pcall(function()
+      vim.api.nvim_buf_call(buf, function() vim.cmd("let &l:undolevels = &l:undolevels") end)
+    end)
+    applied.snaps[#applied.snaps + 1] = { buf = buf, seq = undo_seq(buf), modified = vim.bo[buf].modified }
+  end
+  local ok, err = pcall(vim.lsp.util.apply_workspace_edit, edit, enc or "utf-16")
+  if not ok then
+    local stuck = rollback_workspace_edit(applied)
+    error(tool .. ": failed to apply edit: " .. tostring(err)
+      .. (#stuck > 0 and ("; could not roll back, left modified: " .. table.concat(stuck, ", ")) or ""), 0)
+  end
+  return applied
+end
+
+local function save_workspace_edit(ctx, applied)
+  local files, extras = {}, {}
+  for _, buf in ipairs(applied.bufs) do
+    local ok, err = pcall(function()
+      vim.api.nvim_buf_call(buf, function() vim.cmd("silent noautocmd update") end)
+    end)
+    local label = relname(vim.api.nvim_buf_get_name(buf), buf)
+    files[#files + 1] = label
+    if not ok then extras[#extras + 1] = "failed to save " .. label .. ": " .. tostring(err) end
+  end
+  table.sort(files)
+  vim.list_extend(extras, after_writes(ctx, applied.bufs))
+  return files, extras
+end
+
+local function file_labels(applied)
+  local files = {}
+  for _, buf in ipairs(applied and applied.bufs or {}) do
+    files[#files + 1] = relname(vim.api.nvim_buf_get_name(buf), buf)
   end
   table.sort(files)
   return files
 end
 
--- Apply a WorkspaceEdit through buffers (native undo, like write_file /
--- edit_file: each touched buffer gets its own undo break first). By default it
--- :update's every touched file; opts.save=false leaves them modified so callers
--- can do a filesystem operation first and save only after that succeeds.
-local function apply_workspace_edit_and_save(edit, enc, opts)
-  local ok_guard, guard_err = guard_workspace_edit(edit)
-  if not ok_guard then error(guard_err) end
-  local uris = workspace_edit_uris(edit)
-  for _, uri in ipairs(uris) do
-    local buf = vim.uri_to_bufnr(uri)
-    pcall(vim.fn.bufload, buf)
-    pcall(function()
-      vim.api.nvim_buf_call(buf, function()
-        vim.cmd("let &l:undolevels = &l:undolevels")
-      end)
-    end)
-  end
-  vim.lsp.util.apply_workspace_edit(edit, enc or "utf-16")
-  if opts and opts.save == false then
-    local files, seen = {}, {}
-    for _, uri in ipairs(uris) do
-      local buf = vim.uri_to_bufnr(uri)
-      if not seen[buf] then
-        seen[buf] = true
-        files[#files + 1] = relname(vim.api.nvim_buf_get_name(buf), buf)
-      end
-    end
-    table.sort(files)
-    return files, uris
-  end
-  return save_workspace_files(uris), uris
+local function with_extras(text, extras)
+  if extras and #extras > 0 then return text .. "\n" .. table.concat(extras, "\n") end
+  return text
 end
 
 -- Node types treated as outline entries, mapped to a kind label. Kept small
@@ -450,23 +617,70 @@ local function unified_diff(old, new, ctxlen)
   return type(d) == "string" and d or ""
 end
 
+local function tag_location(t, sym)
+  local file = t.filename
+  if type(file) ~= "string" or file == "" then return nil end
+  local full = vim.fn.fnamemodify(file, ":p")
+  local okr, lines = pcall(vim.fn.readfile, full)
+  if not okr then return nil end
+  local cmd = tostring(t.cmd or "")
+  local lnum = tonumber(cmd:match("^%s*(%d+)"))
+  if not lnum then
+    local pat = cmd:match("^/(.*)/;?\"?$") or cmd:match("^%?(.*)%?;?\"?$") or ""
+    local anchored_start = pat:sub(1, 1) == "^"
+    local anchored_end = pat:sub(-1) == "$" and pat:sub(-2, -2) ~= "\\"
+    if anchored_start then pat = pat:sub(2) end
+    if anchored_end then pat = pat:sub(1, -2) end
+    pat = pat:gsub("\\([/?\\])", "%1")
+    for i, l in ipairs(lines) do
+      local hit
+      if anchored_start and anchored_end then hit = l == pat
+      elseif anchored_start then hit = l:sub(1, #pat) == pat
+      elseif anchored_end then hit = l:sub(-#pat) == pat
+      else hit = l:find(pat, 1, true) ~= nil end
+      if hit then lnum = i; break end
+    end
+  end
+  if not lnum then return nil end
+  local col = ((lines[lnum] or ""):find(sym, 1, true)) or 1
+  return string.format("%s:%d:%d", relname(full), lnum, col)
+end
+
 -- No-LSP-client fallback for a position-based navigation tool: look the symbol
--- under the cursor up in the tags files. Returns a formatted tag list, or the
--- standard "no LSP client … (and no tags)" message. Shared by definition and
--- references, which degrade identically.
-local function tags_fallback(buf, ft, line0, col0)
+-- under the cursor up in the tags files and return its locations through
+-- location_output (file:line:col, quickfix honored). With no tags, raises the
+-- standard "<tool>: no LSP client ... (and no tags)" error. Shared by
+-- definition and references, which degrade identically.
+local function tags_fallback(ctx, input, tool, buf, ft, line0, col0)
   local sym = symbol_at(buf, line0, col0)
   if sym and sym ~= "" then
     local okt, tags = pcall(vim.fn.taglist, "^" .. sym .. "$")
     if okt and type(tags) == "table" and #tags > 0 then
-      local out = {}
+      local locs = {}
       for _, t in ipairs(tags) do
-        out[#out + 1] = string.format("%s\t%s", t.filename or "?", t.name or sym)
+        local loc = tag_location(t, sym)
+        if loc then locs[#locs + 1] = loc end
       end
-      return "tags for " .. sym .. ":\n" .. table.concat(out, "\n")
+      if #locs > 0 then
+        return "no LSP client; tags for " .. sym .. ":\n"
+          .. location_output(ctx, input, "straps: " .. tool .. " (tags)", locs, "")
+      end
     end
   end
-  return "no LSP client for filetype " .. (ft ~= "" and ft or "?") .. " (and no tags)"
+  error(tool .. ": no LSP client for filetype " .. (ft ~= "" and ft or "?") .. " (and no tags)", 0)
+end
+
+local function diag_covers(d, line0, col0)
+  local dl0, dc0 = d.lnum or 0, d.col or 0
+  local de0 = d.end_lnum or dl0
+  local dec0 = d.end_col or (dc0 + 1)
+  if de0 == dl0 and dec0 <= dc0 then return line0 == dl0 and col0 == dc0 end
+  return (line0 > dl0 or (line0 == dl0 and col0 >= dc0))
+    and (line0 < de0 or (line0 == de0 and col0 < dec0))
+end
+
+local function no_client(tool, ft, extra)
+  error(tool .. ": no LSP client for filetype " .. (ft ~= "" and ft or "?") .. (extra or ""), 0)
 end
 
 -- True if buffer b is a straps session transcript (marked with b:straps_session).
@@ -522,9 +736,7 @@ return function(input, ctx)
     }
     local bufs = {}
     if input and type(input.path) == "string" and input.path ~= "" then
-      local okl, buf = pcall(load_buf, input.path)
-      if not okl then return "diagnostics: cannot load " .. tostring(input.path) end
-      bufs = { buf }
+      bufs = { (load_buf(input.path, "diagnostics")) }
     else
       for _, b in ipairs(vim.api.nvim_list_bufs()) do
         if vim.api.nvim_buf_is_loaded(b)
@@ -570,7 +782,10 @@ return function(input, ctx)
     if #lines == 0 then return "no diagnostics" end
     return table.concat(lines, "\n")
   end)
-  if not ok then return "diagnostics: " .. tostring(out) end
+  if not ok then
+    local msg = tostring(out)
+    error(msg:sub(1, 13) == "diagnostics: " and msg or ("diagnostics: " .. msg), 0)
+  end
   return out
 end
 ]==]),
@@ -596,7 +811,7 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf = load_buf(input.path)
+  local buf = load_buf(input.path, "diagnostic_at")
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
   local sev = vim.diagnostic.severity
@@ -605,11 +820,7 @@ return function(input, ctx)
   local out = {}
   for _, d in ipairs(vim.diagnostic.get(buf) or {}) do
     local dl0, dc0 = d.lnum or 0, d.col or 0
-    local de0 = d.end_lnum or dl0
-    local dec0 = d.end_col or (dc0 + 1)
-    local covers = (line0 > dl0 or (line0 == dl0 and col0 >= dc0))
-      and (line0 < de0 or (line0 == de0 and col0 <= dec0))
-    if covers then
+    if diag_covers(d, line0, col0) then
       local source = (d.source and d.source ~= "") and (" [" .. d.source .. "]") or ""
       out[#out + 1] = string.format("%s:%d:%d: %s %s%s",
         relname(name, buf), dl0 + 1, dc0 + 1, names[d.severity] or "UNKNOWN", tostring(d.message or ""), source)
@@ -644,7 +855,7 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf = load_buf(input.path)
+  local buf = load_buf(input.path, "diagnostic_next")
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
   local sev = vim.diagnostic.severity
@@ -687,7 +898,8 @@ end
     doc = "List or apply code actions for the diagnostic at a file position."
       .. " Without index, it lists fixes for diagnostics covering the position"
       .. " (read-only). With index=N, applies the Nth action via the same LSP"
-      .. " WorkspaceEdit path as code_action (write, confirm-gated). Parameters:"
+      .. " WorkspaceEdit path as code_action (write, confirm-gated). Rejects WorkspaceEdit"
+      .. " create/rename/delete resource operations and edits to buffers changed during requests. Parameters:"
       .. " path, line, col, index?",
     input_schema = {
       type = "object",
@@ -701,20 +913,18 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "fix_diagnostic")
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
   local covering = {}
   for _, d in ipairs(vim.diagnostic.get(buf) or {}) do
-    local dl0, dc0 = d.lnum or 0, d.col or 0
-    local de0 = d.end_lnum or dl0
-    local dec0 = d.end_col or (dc0 + 1)
-    local covers = (line0 > dl0 or (line0 == dl0 and col0 >= dc0))
-      and (line0 < de0 or (line0 == de0 and col0 <= dec0))
-    if covers then
-      local lsp = d.user_data and d.user_data.lsp
-      covering[#covering + 1] = lsp or {
+    if diag_covers(d, line0, col0) then
+      local dl0, dc0 = d.lnum or 0, d.col or 0
+      local de0 = d.end_lnum or dl0
+      local dec0 = d.end_col or (dc0 + 1)
+      covering[#covering + 1] = (d.user_data and d.user_data.lsp) or {
         range = { start = { line = dl0, character = dc0 }, ["end"] = { line = de0, character = dec0 } },
+        bytes = true,
         severity = d.severity,
         source = d.source,
         message = d.message,
@@ -722,17 +932,34 @@ return function(input, ctx)
     end
   end
   if #covering == 0 then return "fix_diagnostic: no diagnostic at that position" end
-  local params = {
-    textDocument = { uri = vim.uri_from_bufnr(buf) },
-    range = covering[1].range or {
-      start = { line = line0, character = col0 }, ["end"] = { line = line0, character = col0 },
-    },
-    context = { diagnostics = covering, only = { "quickfix" } },
-  }
+  local params = function(client)
+    local enc = client and client.offset_encoding
+    local diags = {}
+    for i, c in ipairs(covering) do
+      if c.bytes then
+        local s, e = c.range.start, c.range["end"]
+        diags[i] = {
+          range = {
+            start = { line = s.line, character = byte_to_lsp_char(buf, s.line, s.character, enc) },
+            ["end"] = { line = e.line, character = byte_to_lsp_char(buf, e.line, e.character, enc) },
+          },
+          severity = c.severity, source = c.source, message = c.message,
+        }
+      else
+        diags[i] = c
+      end
+    end
+    return {
+      textDocument = { uri = vim.uri_from_bufnr(buf) },
+      range = diags[1].range,
+      context = { diagnostics = diags, only = { "quickfix" } },
+    }
+  end
+  local versions = buffer_versions()
   local ok, res, err = pcall(lsp_request, ctx, buf, "textDocument/codeAction", params, 5000)
-  if not ok then return "fix_diagnostic: " .. tostring(res) end
-  if err == "noclient" then return "no LSP client for filetype " .. (ft ~= "" and ft or "?") end
-  if err == "timeout" then return "fix_diagnostic: LSP request timed out" end
+  if not ok then error("fix_diagnostic: " .. tostring(res), 0) end
+  if err == "noclient" then no_client("fix_diagnostic", ft) end
+  if err == "timeout" then error("fix_diagnostic: LSP request timed out", 0) end
   local cids = {}
   for cid in pairs(res or {}) do cids[#cids + 1] = cid end
   table.sort(cids)
@@ -756,17 +983,19 @@ return function(input, ctx)
     return table.concat(lines, "\n")
   end
   local entry = actions[index]
-  if not entry then return string.format("fix_diagnostic: index %d out of range (1-%d)", index, #actions) end
+  if not entry then error(string.format("fix_diagnostic: index %d out of range (1-%d)", index, #actions), 0) end
   local action = entry.action
   local client = vim.lsp.get_client_by_id(entry.client_id)
   if client and not action.edit and not action.command then
     local resolved = client_request(ctx, client, "codeAction/resolve", action, buf, 5000)
     if type(resolved) == "table" then action = resolved end
   end
-  local did = {}
+  local did, extras = {}, {}
   if type(action.edit) == "table" then
-    local okap, files = pcall(apply_workspace_edit_and_save, action.edit, client and client.offset_encoding)
-    if not okap then return "fix_diagnostic: failed to apply edit: " .. tostring(files) end
+    validate_workspace_edits(ctx, "fix_diagnostic", { { edit = action.edit } }, versions)
+    local applied = apply_workspace_edit(ctx, "fix_diagnostic", action.edit, client and client.offset_encoding)
+    local files
+    files, extras = save_workspace_edit(ctx, applied)
     did[#did + 1] = "edited " .. table.concat(files, ", ")
   end
   local cmd = action.command
@@ -776,8 +1005,9 @@ return function(input, ctx)
       { command = cmd.command, arguments = cmd.arguments }, buf, 5000)
     did[#did + 1] = cerr and ("command " .. cmd.command .. " failed: " .. cerr) or ("ran command " .. cmd.command)
   end
-  if #did == 0 then return "fix_diagnostic: action had no edit or command to apply" end
-  return string.format("applied %q: %s — undo with u in each edited buffer", action.title or "?", table.concat(did, "; "))
+  if #did == 0 then error("fix_diagnostic: action had no edit or command to apply", 0) end
+  return with_extras(string.format("applied %q: %s — undo with u in each edited buffer",
+    action.title or "?", table.concat(did, "; ")), extras)
 end
 ]==]),
   })
@@ -805,24 +1035,22 @@ end
         required = { "path", "line", "col" },
       },
       source = src(([[
+local TOOL = %q
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, TOOL)
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
-  local params = {
-    textDocument = { uri = vim.uri_from_bufnr(buf) },
-    position = { line = line0, character = col0 },
-  }
+  local params = position_params(buf, line0, col0)
   local ok, res, err = pcall(lsp_request, ctx, buf, %q, params, 5000)
-  if not ok then return %q .. ": " .. tostring(res) end
-  if err == "noclient" then return "no LSP client for filetype " .. (ft ~= "" and ft or "?") end
-  if err == "timeout" then return %q .. ": LSP request timed out" end
+  if not ok then error(TOOL .. ": " .. tostring(res), 0) end
+  if err == "noclient" then no_client(TOOL, ft) end
+  if err == "timeout" then error(TOOL .. ": LSP request timed out", 0) end
   local locs = {}
   local enc = buf_offset_encoding(buf)
   each_result(res, function(result) collect_locations(result, locs, enc) end)
-  return location_output(ctx, input, "straps: %s", locs, "no %s found")
+  return location_output(ctx, input, "straps: " .. TOOL, locs, "no %s found")
 end
-]]):format(method, api_name, api_name, api_name, api_name:gsub("_", " "))),
+]]):format(api_name, method, (api_name:gsub("_", " ")))),
     })
   end
 
@@ -848,7 +1076,7 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "lsp_status")
   local clients = wait_clients(ctx, buf)
   if not clients or #clients == 0 then
     return "no LSP client attached for " .. relname(vim.api.nvim_buf_get_name(buf), buf)
@@ -885,8 +1113,8 @@ end
     doc = "Go to the definition of the symbol at a position, using the attached"
       .. " LSP client (textDocument/definition). Returns the target location(s)"
       .. " as 'file:line:col'. If no LSP client is attached, falls back to a tags"
-      .. " lookup of the symbol under the position; if that finds nothing,"
-      .. " returns a clear 'no LSP client' message. With quickfix=true it also"
+      .. " lookup of the symbol under the position (same 'file:line:col' shape);"
+      .. " if that finds nothing, fails with 'no LSP client'. With quickfix=true it also"
       .. " loads locations into this session's findings list. Parameters: path"
       .. " (required); line (required, 1-based); col (required, 1-based);"
       .. " quickfix/open (optional).",
@@ -903,18 +1131,15 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "definition")
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
 
-  local params = {
-    textDocument = { uri = vim.uri_from_bufnr(buf) },
-    position = { line = line0, character = col0 },
-  }
+  local params = position_params(buf, line0, col0)
   local ok, res, err = pcall(lsp_request, ctx, buf, "textDocument/definition", params, 5000)
-  if not ok then return "definition: " .. tostring(res) end
-  if err == "noclient" then return tags_fallback(buf, ft, line0, col0) end
-  if err == "timeout" then return "definition: LSP request timed out" end
+  if not ok then error("definition: " .. tostring(res), 0) end
+  if err == "noclient" then return tags_fallback(ctx, input, "definition", buf, ft, line0, col0) end
+  if err == "timeout" then error("definition: LSP request timed out", 0) end
 
   local locs = {}
   local enc = buf_offset_encoding(buf)
@@ -932,8 +1157,8 @@ end
     doc = "Find all references to the symbol at a position via the attached LSP"
       .. " client (textDocument/references, including the declaration). Returns a"
       .. " deduped, sorted list of 'file:line:col'. If no LSP client is attached,"
-      .. " falls back to a tags lookup of the symbol, and otherwise returns a"
-      .. " clear 'no LSP client' message. With quickfix=true it also loads locations"
+      .. " falls back to a tags lookup of the symbol (same 'file:line:col' shape),"
+      .. " and otherwise fails with 'no LSP client'. With quickfix=true it also loads locations"
       .. " into this session's findings list. Parameters: path (required); line"
       .. " (required, 1-based); col (required, 1-based); quickfix/open (optional).",
     input_schema = {
@@ -949,19 +1174,15 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "references")
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
 
-  local params = {
-    textDocument = { uri = vim.uri_from_bufnr(buf) },
-    position = { line = line0, character = col0 },
-    context = { includeDeclaration = true },
-  }
+  local params = position_params(buf, line0, col0, { context = { includeDeclaration = true } })
   local ok, res, err = pcall(lsp_request, ctx, buf, "textDocument/references", params, 5000)
-  if not ok then return "references: " .. tostring(res) end
-  if err == "noclient" then return tags_fallback(buf, ft, line0, col0) end
-  if err == "timeout" then return "references: LSP request timed out" end
+  if not ok then error("references: " .. tostring(res), 0) end
+  if err == "noclient" then return tags_fallback(ctx, input, "references", buf, ft, line0, col0) end
+  if err == "timeout" then error("references: LSP request timed out", 0) end
 
   local locs = {}
   local enc = buf_offset_encoding(buf)
@@ -986,7 +1207,7 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "tree_sitter_status")
   local lang = ft
   local ok_l, mapped = pcall(vim.treesitter.language.get_lang, ft)
   if ok_l and mapped then lang = mapped end
@@ -996,7 +1217,7 @@ return function(input, ctx)
       .. " (filetype " .. (ft ~= "" and ft or "?") .. ", language " .. (lang ~= "" and lang or "?") .. ")"
   end
   local ok, trees = pcall(function() return parser:parse() end)
-  if not ok or not trees or not trees[1] then return "tree-sitter parser exists but parse failed" end
+  if not ok or not trees or not trees[1] then error("tree_sitter_status: tree-sitter parser exists but parse failed", 0) end
   local root = trees[1]:root()
   local children = 0
   for _ in root:iter_children() do children = children + 1 end
@@ -1013,29 +1234,29 @@ end
     kind = "tool",
     doc = "Inspect the tree-sitter node at a file position. Returns the smallest"
       .. " named node, its range, parent chain, and capped source text. Read-only."
-      .. " Parameters: path, line, col; max_text_bytes optional (default 500).",
+      .. " Parameters: path, line, col; max_text_bytes optional (default 500, max 5000).",
     input_schema = {
       type = "object",
       properties = {
         path = { type = "string", description = "File to inspect." },
         line = { type = "integer", description = "1-based line." },
         col = { type = "integer", description = "1-based column." },
-        max_text_bytes = { type = "integer", description = "Maximum node text bytes (default 500)." },
+        max_text_bytes = { type = "integer", description = "Maximum node text bytes (default 500, max 5000)." },
       },
       required = { "path", "line", "col" },
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "node_at")
   local parser = get_parser(buf, ft)
-  if not parser then return "node_at: no tree-sitter parser for " .. (ft ~= "" and ft or "?") end
+  if not parser then error("node_at: no tree-sitter parser for " .. (ft ~= "" and ft or "?"), 0) end
   local ok, trees = pcall(function() return parser:parse() end)
-  if not ok or not trees or not trees[1] then return "node_at: parse failed" end
+  if not ok or not trees or not trees[1] then error("node_at: parse failed", 0) end
   local root = trees[1]:root()
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
   local node = root:named_descendant_for_range(line0, col0, line0, col0)
-  if not node then return "node_at: no named node at that position" end
+  if not node then error("node_at: no named node at that position", 0) end
   local sr, sc, er, ec = node:range()
   local chain, cur = {}, node
   while cur do
@@ -1073,20 +1294,20 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "read_node")
   local parser = get_parser(buf, ft)
-  if not parser then return "read_node: no tree-sitter parser for " .. (ft ~= "" and ft or "?") end
+  if not parser then error("read_node: no tree-sitter parser for " .. (ft ~= "" and ft or "?"), 0) end
   local ok, trees = pcall(function() return parser:parse() end)
-  if not ok or not trees or not trees[1] then return "read_node: parse failed" end
+  if not ok or not trees or not trees[1] then error("read_node: parse failed", 0) end
   local root = trees[1]:root()
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
   local node = root:named_descendant_for_range(line0, col0, line0, col0)
-  if not node then return "read_node: no named node at that position" end
+  if not node then error("read_node: no named node at that position", 0) end
   if type(input.ancestor) == "string" and input.ancestor ~= "" then
     local want, cur = input.ancestor, node
     while cur and cur:type() ~= want do cur = cur:parent() end
-    if not cur then return "read_node: no ancestor of type " .. want .. " from node " .. node:type() end
+    if not cur then error("read_node: no ancestor of type " .. want .. " from node " .. node:type(), 0) end
     node = cur
   end
   local sr, _, er, _ = node:range()
@@ -1107,7 +1328,8 @@ end
     name = "tool.symbols",
     kind = "tool",
     doc = "Produce a document outline for a file: its functions, methods,"
-      .. " classes and similar top-level constructs. Prefers tree-sitter, so it"
+      .. " classes and similar constructs at every nesting depth (nested"
+      .. " functions and methods included). Prefers tree-sitter, so it"
       .. " works without any LSP server; falls back to LSP documentSymbol if no"
       .. " tree-sitter parser is available. Each symbol is one line:"
       .. " 'name  kind  L<start>-<end>' (1-based line range). Parameters: path"
@@ -1121,7 +1343,7 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "symbols")
 
   -- Prefer tree-sitter (no server needed).
   local parser = get_parser(buf, ft)
@@ -1162,7 +1384,7 @@ return function(input, ctx)
     walk(res and (function() local m = {}; each_result(res, function(r) for _, x in ipairs(r or {}) do m[#m+1]=x end end); return m end)() or {})
     if #lines > 0 then return table.concat(lines, "\n") end
   end
-  return "no tree-sitter parser or LSP for " .. (ft ~= "" and ft or "?")
+  error("symbols: no tree-sitter parser or LSP for " .. (ft ~= "" and ft or "?"), 0)
 end
 ]==]),
   })
@@ -1175,7 +1397,8 @@ end
     doc = "Read the source text of a named symbol (function, method, class, ...)"
       .. " from a file using tree-sitter — a targeted read instead of the whole"
       .. " file. Returns the symbol's lines with 1-based line numbers, like"
-      .. " read_file. If several symbols share the name, lists the matches"
+      .. " read_file, capped at 1000 lines with a truncation note. If several"
+      .. " symbols share the name, lists the matches"
       .. " ('name  L<start>-<end>') so you can pick; if none match, says so."
       .. " Parameters: path (required); name (required) — the symbol name.",
     input_schema = {
@@ -1188,19 +1411,19 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
   local want = input.name
   if type(want) ~= "string" or want == "" then
-    return "read_symbol: name is required"
+    error("read_symbol: name is required", 0)
   end
+  local buf, ft = load_buf(input.path, "read_symbol")
   local parser = get_parser(buf, ft)
   if not parser then
-    return "read_symbol: no tree-sitter parser for " .. (ft ~= "" and ft or "?")
+    error("read_symbol: no tree-sitter parser for " .. (ft ~= "" and ft or "?"), 0)
   end
   local ok, out = pcall(function()
     local trees = parser:parse()
     if not trees or not trees[1] then
-      return "read_symbol: could not parse " .. tostring(input.path)
+      error("read_symbol: could not parse " .. tostring(input.path), 0)
     end
     local syms = {}
     walk_symbols(trees[1]:root(), buf, syms)
@@ -1219,14 +1442,22 @@ return function(input, ctx)
       return table.concat(lines, "\n")
     end
     local s = matches[1]
-    local body = vim.api.nvim_buf_get_lines(buf, s.sr - 1, s.er, false)
+    local last = math.min(s.er, s.sr - 1 + 1000)
+    local body = vim.api.nvim_buf_get_lines(buf, s.sr - 1, last, false)
     local lines = {}
     for i, l in ipairs(body) do
       lines[#lines + 1] = string.format("  %d\t%s", s.sr + i - 1, l)
     end
+    if s.er > last then
+      lines[#lines + 1] = string.format("[truncated: showing 1000 of %d lines; read_file offset=%d for the rest]",
+        s.er - s.sr + 1, last + 1)
+    end
     return table.concat(lines, "\n")
   end)
-  if not ok then return "read_symbol: " .. tostring(out) end
+  if not ok then
+    local msg = tostring(out)
+    error(msg:sub(1, 13) == "read_symbol: " and msg or ("read_symbol: " .. msg), 0)
+  end
   return out
 end
 ]==]),
@@ -1254,17 +1485,14 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "hover")
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
-  local params = {
-    textDocument = { uri = vim.uri_from_bufnr(buf) },
-    position = { line = line0, character = col0 },
-  }
+  local params = position_params(buf, line0, col0)
   local ok, res, err = pcall(lsp_request, ctx, buf, "textDocument/hover", params, 5000)
-  if not ok then return "hover: " .. tostring(res) end
-  if err == "noclient" then return "no LSP client for filetype " .. (ft ~= "" and ft or "?") end
-  if err == "timeout" then return "hover: LSP request timed out" end
+  if not ok then error("hover: " .. tostring(res), 0) end
+  if err == "noclient" then no_client("hover", ft) end
+  if err == "timeout" then error("hover: LSP request timed out", 0) end
   local out = {}
   each_result(res, function(result)
     if type(result) == "table" and result.contents then
@@ -1309,10 +1537,10 @@ end
     source = src([==[
 return function(input, ctx)
   local query = input.query
-  if type(query) ~= "string" then return "workspace_symbols: query is required" end
+  if type(query) ~= "string" then error("workspace_symbols: query is required", 0) end
   local buf, ft
   if type(input.path) == "string" and input.path ~= "" then
-    buf, ft = load_buf(input.path)
+    buf, ft = load_buf(input.path, "workspace_symbols")
   else
     for _, b in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_is_loaded(b) and #vim.lsp.get_clients({ bufnr = b }) > 0 then
@@ -1321,13 +1549,13 @@ return function(input, ctx)
       end
     end
     if not buf then
-      return "workspace_symbols: no LSP client running — pass path to a file of the target language"
+      error("workspace_symbols: no LSP client running — pass path to a file of the target language", 0)
     end
   end
   local ok, res, err = pcall(lsp_request, ctx, buf, "workspace/symbol", { query = query }, 5000)
-  if not ok then return "workspace_symbols: " .. tostring(res) end
-  if err == "noclient" then return "no LSP client for filetype " .. (ft ~= "" and ft or "?") end
-  if err == "timeout" then return "workspace_symbols: LSP request timed out" end
+  if not ok then error("workspace_symbols: " .. tostring(res), 0) end
+  if err == "noclient" then no_client("workspace_symbols", ft) end
+  if err == "timeout" then error("workspace_symbols: LSP request timed out", 0) end
   local kinds = vim.lsp.protocol.SymbolKind or {}
   local seen, out, locs = {}, {}, {}
   local enc = buf_offset_encoding(buf)
@@ -1383,7 +1611,8 @@ end
       .. " renames the SYMBOL, not the text, so same-named identifiers of other"
       .. " things are untouched. The returned WorkspaceEdit is applied through"
       .. " each file's buffer (native undo: `u` in each touched buffer) and"
-      .. " every touched file is saved. This is a WRITE tool and prompts for"
+      .. " every touched file is saved. Rejects WorkspaceEdit create/rename/delete"
+      .. " resource operations and edits to buffers changed during requests. This is a WRITE tool and prompts for"
       .. " confirmation. Parameters: path (required); line (required, 1-based);"
       .. " col (required, 1-based) — position of the symbol; new_name"
       .. " (required).",
@@ -1401,23 +1630,19 @@ end
 return function(input, ctx)
   local new_name = input.new_name
   if type(new_name) ~= "string" or new_name == "" then
-    return "rename_symbol: new_name is required"
+    error("rename_symbol: new_name is required", 0)
   end
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "rename_symbol")
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
-  local params = {
-    textDocument = { uri = vim.uri_from_bufnr(buf) },
-    position = { line = line0, character = col0 },
-    newName = new_name,
-  }
+  local params = position_params(buf, line0, col0, { newName = new_name })
+  local versions = buffer_versions()
   local ok, res, err = pcall(lsp_request, ctx, buf, "textDocument/rename", params, 10000)
-  if not ok then return "rename_symbol: " .. tostring(res) end
+  if not ok then error("rename_symbol: " .. tostring(res), 0) end
   if err == "noclient" then
-    return "no LSP client for filetype " .. (ft ~= "" and ft or "?")
-      .. " — rename needs a language server (grep + bulk_replace is the textual fallback)"
+    no_client("rename_symbol", ft, " — rename needs a language server (grep + bulk_replace is the textual fallback)")
   end
-  if err == "timeout" then return "rename_symbol: LSP request timed out" end
+  if err == "timeout" then error("rename_symbol: LSP request timed out", 0) end
   local edit, enc
   for cid, r in pairs(res or {}) do
     local result = result_of(r)
@@ -1429,12 +1654,13 @@ return function(input, ctx)
     end
   end
   if not edit then
-    return "rename_symbol: server returned no edit — is the position on a renameable symbol?"
+    error("rename_symbol: server returned no edit — is the position on a renameable symbol?", 0)
   end
-  local okap, files = pcall(apply_workspace_edit_and_save, edit, enc)
-  if not okap then return "rename_symbol: failed to apply edit: " .. tostring(files) end
-  return string.format("renamed to %s across %d file%s:\n%s\n— undo with u in each buffer",
-    new_name, #files, #files == 1 and "" or "s", table.concat(files, "\n"))
+  validate_workspace_edits(ctx, "rename_symbol", { { edit = edit } }, versions)
+  local applied = apply_workspace_edit(ctx, "rename_symbol", edit, enc)
+  local files, extras = save_workspace_edit(ctx, applied)
+  return with_extras(string.format("renamed to %s across %d file%s:\n%s\n— undo with u in each buffer",
+    new_name, #files, #files == 1 and "" or "s", table.concat(files, "\n")), extras)
 end
 ]==]),
   })
@@ -1452,10 +1678,12 @@ end
       .. " vim.lsp.util.rename (renames any open buffer in place, keeping its"
       .. " undo history, and moves its undofile) so open buffers never go"
       .. " stale, and workspace/didRenameFiles notifies the server afterward."
-      .. " No attached/capable server: a plain filesystem move — never an"
-      .. " error, since not every filetype has one. This is a WRITE tool and"
+      .. " No attached/capable server: a plain filesystem move, since not"
+      .. " every filetype has one. If the move fails, the server's reference"
+      .. " edits are undone in their buffers and nothing is saved. This is a WRITE tool and"
       .. " prompts for confirmation. Parameters: from (required, existing"
       .. " path); to (required, destination path; parent dirs are created)."
+      .. " Rejects WorkspaceEdit create/rename/delete resource operations and edits to buffers changed during requests."
       .. " For renaming a SYMBOL rather than a file, use rename_symbol.",
     input_schema = {
       type = "object",
@@ -1468,21 +1696,21 @@ end
     source = src([==[
 return function(input, ctx)
   local from, to = input.from, input.to
-  if type(from) ~= "string" or from == "" then return "move_file: from is required" end
-  if type(to) ~= "string" or to == "" then return "move_file: to is required" end
+  if type(from) ~= "string" or from == "" then error("move_file: from is required", 0) end
+  if type(to) ~= "string" or to == "" then error("move_file: to is required", 0) end
 
   local from_full = vim.fn.fnamemodify(from, ":p")
   if vim.fn.filereadable(from_full) ~= 1 then
-    return "move_file: no such file: " .. relname(from_full)
+    error("move_file: no such file: " .. relname(from_full), 0)
   end
   local to_full = vim.fn.fnamemodify(to, ":p")
   if vim.fn.filereadable(to_full) == 1 then
-    return "move_file: destination already exists: " .. relname(to_full)
+    error("move_file: destination already exists: " .. relname(to_full), 0)
   end
 
-  local buf = load_buf(from_full) -- load first: LSP needs an attached buffer to ask
+  local buf = load_buf(from_full, "move_file")
   local clients = wait_clients(ctx, buf)
-  local mover -- the one client (if any) that supports will/didRenameFiles
+  local mover
   for _, c in ipairs(clients or {}) do
     local ok_s, supports = pcall(function()
       return c:supports_method("workspace/willRenameFiles")
@@ -1491,31 +1719,42 @@ return function(input, ctx)
   end
 
   local edit_note = ""
-  local pending_uris
+  local applied
   if mover then
     local params = {
       files = { { oldUri = vim.uri_from_fname(from_full), newUri = vim.uri_from_fname(to_full) } },
     }
+    local versions = buffer_versions()
     local result, err = client_request(ctx, mover, "workspace/willRenameFiles", params, buf, 8000)
     if result and type(result) == "table" and (result.changes or result.documentChanges) then
-      local okap, files, uris = pcall(apply_workspace_edit_and_save, result, mover.offset_encoding, { save = false })
-      if okap then
-        pending_uris = uris
-        edit_note = string.format("; server updated %d reference file%s:\n%s",
-          #files, #files == 1 and "" or "s", table.concat(files, "\n"))
-      else
-        edit_note = "; server returned an edit but it failed to apply: " .. tostring(files)
-      end
+      validate_workspace_edits(ctx, "move_file", { { edit = result } }, versions)
+      applied = apply_workspace_edit(ctx, "move_file", result, mover.offset_encoding)
     elseif err then
       edit_note = "; willRenameFiles request " .. tostring(err) .. " (moved anyway)"
     end
   end
 
   local ok_rn, rn_err = pcall(vim.lsp.util.rename, from_full, to_full, {})
-  if not ok_rn then
-    return "move_file: rename failed: " .. tostring(rn_err)
+  if ok_rn and (vim.fn.filereadable(to_full) ~= 1 or vim.fn.filereadable(from_full) == 1) then
+    ok_rn, rn_err = false, "file was not moved"
   end
-  if pending_uris then save_workspace_files(pending_uris) end
+  if not ok_rn then
+    local msg = "move_file: rename failed: " .. tostring(rn_err)
+    if applied then
+      local stuck = rollback_workspace_edit(applied)
+      msg = msg .. (#stuck > 0
+        and ("; reference edits could not be rolled back, left modified and unsaved: " .. table.concat(stuck, ", "))
+        or "; reference edits rolled back")
+    end
+    error(msg, 0)
+  end
+  local extras = {}
+  if applied then
+    local files
+    files, extras = save_workspace_edit(ctx, applied)
+    edit_note = string.format("; server updated %d reference file%s:\n%s",
+      #files, #files == 1 and "" or "s", table.concat(files, "\n"))
+  end
 
   if mover then
     local ok_s2, supports_did = pcall(function()
@@ -1530,7 +1769,7 @@ return function(input, ctx)
     end
   end
 
-  return string.format("moved %s -> %s%s", relname(from_full), relname(to_full), edit_note)
+  return with_extras(string.format("moved %s -> %s%s", relname(from_full), relname(to_full), edit_note), extras)
 end
 ]==]),
   })
@@ -1551,9 +1790,13 @@ end
       .. " path fixups — are applied through buffers (native undo) before"
       .. " any file moves; workspace/didRenameFiles then notifies each"
       .. " client, batched the same way. Files with no capable client just"
-      .. " move plainly, same as move_file. This is a WRITE tool and prompts"
+      .. " move plainly, same as move_file. If any move fails, every server"
+      .. " reference edit is undone in its buffer, nothing is saved, and the"
+      .. " call fails listing what moved and what did not. This is a WRITE tool and prompts"
       .. " for confirmation. Parameters: moves (required) — array of"
-      .. " {from, to} objects.",
+      .. " {from, to} objects. Rejects WorkspaceEdit create/rename/delete resource"
+      .. " operations, edits to buffers changed during requests, and batches whose"
+      .. " returned WorkspaceEdits share a target buffer, even if their ranges differ.",
     input_schema = {
       type = "object",
       properties = {
@@ -1576,7 +1819,7 @@ end
 return function(input, ctx)
   local moves = input.moves
   if type(moves) ~= "table" or #moves == 0 then
-    return "move_files: moves must be a non-empty array of {from, to}"
+    error("move_files: moves must be a non-empty array of {from, to}", 0)
   end
 
   -- Validate the WHOLE batch before touching disk: collect every problem
@@ -1607,8 +1850,8 @@ return function(input, ctx)
     end
   end
   if #problems > 0 then
-    return "move_files: refusing the whole batch — fix these and retry:\n"
-      .. table.concat(problems, "\n")
+    error("move_files: refusing the whole batch — fix these and retry:\n"
+      .. table.concat(problems, "\n"), 0)
   end
 
   -- Bucket entries by the one client (per filetype, cached — files sharing a
@@ -1618,7 +1861,7 @@ return function(input, ctx)
   local ft_clients = {}
   local buckets, bucket_order = {}, {}
   for _, e in ipairs(entries) do
-    e.buf = load_buf(e.from)
+    e.buf = load_buf(e.from, "move_files")
     local ft = vim.bo[e.buf].filetype or ""
     if ft_clients[ft] == nil then
       ft_clients[ft] = wait_clients(ctx, e.buf) or false
@@ -1637,14 +1880,15 @@ return function(input, ctx)
     end
   end
 
-  local server_files, seen_file = {}, {}
-  local function note_files(files)
-    for _, f in ipairs(files) do
-      if not seen_file[f] then seen_file[f] = true; server_files[#server_files + 1] = f end
-    end
-  end
+  local versions = buffer_versions()
+  local pending = {}
   local notes = {}
-  local pending_uris = {}
+  local applied_all = {}
+  local function rollback_all()
+    local stuck = {}
+    for i = #applied_all, 1, -1 do vim.list_extend(stuck, rollback_workspace_edit(applied_all[i])) end
+    return stuck
+  end
 
   for _, id in ipairs(bucket_order) do
     local bucket = buckets[id]
@@ -1656,31 +1900,34 @@ return function(input, ctx)
     local result, err = client_request(ctx, bucket.client, "workspace/willRenameFiles",
       { files = files_param }, bucket.entries[1].buf, 8000)
     if result and type(result) == "table" and (result.changes or result.documentChanges) then
-      local okap, files, uris = pcall(apply_workspace_edit_and_save, result, bucket.client.offset_encoding, { save = false })
-      if okap then
-        note_files(files)
-        for _, uri in ipairs(uris or {}) do pending_uris[#pending_uris + 1] = uri end
-      else
-        notes[#notes + 1] = bucket.client.name .. ": edit returned but failed to apply: " .. tostring(files)
-      end
+      pending[#pending + 1] = { edit = result, encoding = bucket.client.offset_encoding }
     elseif err then
       notes[#notes + 1] = bucket.client.name .. ": willRenameFiles " .. tostring(err) .. " (moved anyway)"
     end
   end
 
-  -- Validation already guaranteed every source exists and every destination
-  -- is free, so each move is expected to succeed; a failure here still lets
-  -- the loop finish the rest rather than losing track of remaining files.
+  validate_workspace_edits(ctx, "move_files", pending, versions)
+  for _, p in ipairs(pending) do
+    local okap, applied = pcall(apply_workspace_edit, ctx, "move_files", p.edit, p.encoding)
+    if not okap then
+      local stuck = rollback_all()
+      error(tostring(applied) .. (#stuck > 0 and ("; rollback failed: " .. table.concat(stuck, ", ")) or ""), 0)
+    end
+    applied_all[#applied_all + 1] = applied
+  end
+
   local moved, failed = {}, {}
   for _, e in ipairs(entries) do
     local ok_rn, rn_err = pcall(vim.lsp.util.rename, e.from, e.to, {})
+    if ok_rn and (vim.fn.filereadable(e.to) ~= 1 or vim.fn.filereadable(e.from) == 1) then
+      ok_rn, rn_err = false, "file was not moved"
+    end
     if ok_rn then
       moved[#moved + 1] = string.format("%s -> %s", relname(e.from), relname(e.to))
     else
       failed[#failed + 1] = string.format("%s -> %s: %s", relname(e.from), relname(e.to), tostring(rn_err))
     end
   end
-  if #failed == 0 and #pending_uris > 0 then save_workspace_files(pending_uris) end
 
   for _, id in ipairs(bucket_order) do
     local bucket = buckets[id]
@@ -1688,10 +1935,14 @@ return function(input, ctx)
     if ok_s and supports_did then
       local files_param = {}
       for _, e in ipairs(bucket.entries) do
-        files_param[#files_param + 1] =
-          { oldUri = vim.uri_from_fname(e.from), newUri = vim.uri_from_fname(e.to) }
+        if vim.fn.filereadable(e.to) == 1 then
+          files_param[#files_param + 1] =
+            { oldUri = vim.uri_from_fname(e.from), newUri = vim.uri_from_fname(e.to) }
+        end
       end
-      pcall(function() bucket.client:notify("workspace/didRenameFiles", { files = files_param }) end)
+      if #files_param > 0 then
+        pcall(function() bucket.client:notify("workspace/didRenameFiles", { files = files_param }) end)
+      end
     end
   end
 
@@ -1700,13 +1951,29 @@ return function(input, ctx)
   if #failed > 0 then
     out[#out + 1] = string.format("%d move%s FAILED:", #failed, #failed == 1 and "" or "s")
     vim.list_extend(out, failed)
+    if #applied_all > 0 then
+      local stuck = rollback_all()
+      out[#out + 1] = #stuck > 0
+        and ("server reference edits could not be rolled back, left modified and unsaved: " .. table.concat(stuck, ", "))
+        or "server reference edits rolled back (none saved); fix references for the moved files by hand"
+    end
+    vim.list_extend(out, notes)
+    error("move_files: " .. table.concat(out, "\n"), 0)
+  end
+  local server_files, seen_file, extras = {}, {}, {}
+  for _, a in ipairs(applied_all) do
+    local files, ex = save_workspace_edit(ctx, a)
+    for _, f in ipairs(files) do
+      if not seen_file[f] then seen_file[f] = true; server_files[#server_files + 1] = f end
+    end
+    vim.list_extend(extras, ex)
   end
   if #server_files > 0 then
     out[#out + 1] = string.format("server updated %d reference file%s:", #server_files, #server_files == 1 and "" or "s")
     vim.list_extend(out, server_files)
   end
   vim.list_extend(out, notes)
-  return table.concat(out, "\n")
+  return with_extras(table.concat(out, "\n"), extras)
 end
 ]==]),
   })
@@ -1726,10 +1993,14 @@ end
       .. " WorkspaceEdit (e.g. removing now-dangling imports elsewhere) —"
       .. " applied through buffers (native undo) before the file itself is"
       .. " removed; workspace/didDeleteFiles notifies the server afterward."
-      .. " No attached/capable server: a plain filesystem delete, never an"
-      .. " error. Any loaded buffer on the file is wiped after deletion."
+      .. " No attached/capable server: a plain filesystem delete. If the"
+      .. " delete fails, the server's reference edits are undone in their"
+      .. " buffers and nothing is saved. Any loaded buffer on the file is wiped"
+      .. " after deletion; windows showing it switch to the alternate buffer"
+      .. " (or an empty one) instead of closing."
       .. " This is a WRITE tool and prompts for confirmation. Parameters:"
-      .. " path (required, existing file).",
+      .. " path (required, existing file). Rejects WorkspaceEdit create/rename/delete"
+      .. " resource operations and edits to buffers changed during requests.",
     input_schema = {
       type = "object",
       properties = {
@@ -1740,21 +2011,22 @@ end
     source = src([==[
 return function(input, ctx)
   local path = input.path
-  if type(path) ~= "string" or path == "" then return "delete_file: path is required" end
+  if type(path) ~= "string" or path == "" then error("delete_file: path is required", 0) end
 
   local full = vim.fn.fnamemodify(path, ":p")
   if vim.fn.filereadable(full) ~= 1 then
-    return "delete_file: no such file: " .. relname(full)
+    error("delete_file: no such file: " .. relname(full), 0)
   end
 
-  local existing_buf = vim.fn.bufnr(full)
-  if existing_buf ~= -1 and vim.api.nvim_buf_is_loaded(existing_buf)
+  local existing_buf = find_buf(full)
+  if existing_buf and vim.api.nvim_buf_is_loaded(existing_buf)
     and vim.bo[existing_buf].modified then
-    return "delete_file: refusing — " .. relname(full)
-      .. " has unsaved buffer changes (write or discard them first)"
+    error("delete_file: refusing — " .. relname(full)
+      .. " has unsaved buffer changes (write or discard them first)", 0)
   end
 
-  local buf = load_buf(full)
+  local buf = load_buf(full, "delete_file")
+  local targets = { { path = full, buf = buf, tick = vim.api.nvim_buf_get_changedtick(buf) } }
   local clients = wait_clients(ctx, buf)
   local deleter
   for _, c in ipairs(clients or {}) do
@@ -1763,33 +2035,44 @@ return function(input, ctx)
   end
 
   local edit_note = ""
-  local pending_uris
+  local applied
   if deleter then
     local params = { files = { { uri = vim.uri_from_fname(full) } } }
+    local versions = buffer_versions()
     local result, err = client_request(ctx, deleter, "workspace/willDeleteFiles", params, buf, 8000)
     if result and type(result) == "table" and (result.changes or result.documentChanges) then
-      local okap, files, uris = pcall(apply_workspace_edit_and_save, result, deleter.offset_encoding, { save = false })
-      if okap then
-        pending_uris = uris
-        edit_note = string.format("; server updated %d reference file%s:\n%s",
-          #files, #files == 1 and "" or "s", table.concat(files, "\n"))
-      else
-        edit_note = "; server returned an edit but it failed to apply: " .. tostring(files)
-      end
+      validate_workspace_edits(ctx, "delete_file", { { edit = result } }, versions)
+      applied = apply_workspace_edit(ctx, "delete_file", result, deleter.offset_encoding)
     elseif err then
       edit_note = "; willDeleteFiles request " .. tostring(err) .. " (deleted anyway)"
     end
   end
 
+  local valid, validation_err = pcall(validate_delete_targets, ctx, "delete_file", targets)
+  if not valid then
+    local stuck = applied and rollback_workspace_edit(applied) or {}
+    error(tostring(validation_err) .. (#stuck > 0 and ("; rollback failed: " .. table.concat(stuck, ", ")) or ""), 0)
+  end
   local ok_rm, succ, rm_err = pcall(os.remove, full)
   if not ok_rm or succ ~= true then
-    return "delete_file: failed to delete: " .. tostring((not ok_rm and succ) or rm_err or "unknown error")
+    local msg = "delete_file: failed to delete: " .. tostring((not ok_rm and succ) or rm_err or "unknown error")
+    if applied then
+      local stuck = rollback_workspace_edit(applied)
+      msg = msg .. (#stuck > 0
+        and ("; reference edits could not be rolled back, left modified and unsaved: " .. table.concat(stuck, ", "))
+        or "; reference edits rolled back")
+    end
+    error(msg, 0)
   end
-  if pending_uris then save_workspace_files(pending_uris) end
+  local extras = {}
+  if applied then
+    local files
+    files, extras = save_workspace_edit(ctx, applied)
+    edit_note = string.format("; server updated %d reference file%s:\n%s",
+      #files, #files == 1 and "" or "s", table.concat(files, "\n"))
+  end
 
-  pcall(function()
-    if vim.api.nvim_buf_is_loaded(buf) then vim.cmd("bwipeout! " .. buf) end
-  end)
+  wipe_buf_keep_windows(buf)
 
   if deleter then
     local ok_s2, supports_did = pcall(function() return deleter:supports_method("workspace/didDeleteFiles") end)
@@ -1800,7 +2083,7 @@ return function(input, ctx)
     end
   end
 
-  return string.format("deleted %s (not undo-tree reversible)%s", relname(full), edit_note)
+  return with_extras(string.format("deleted %s (not undo-tree reversible)%s", relname(full), edit_note), extras)
 end
 ]==]),
   })
@@ -1820,8 +2103,14 @@ end
       .. " per file) and the returned WorkspaceEdit(s) are applied through"
       .. " buffers (native undo) before any file is removed;"
       .. " workspace/didDeleteFiles then notifies each client, also batched."
+      .. " If any delete fails, every server reference edit is undone in its"
+      .. " buffer, nothing is saved, and the call fails listing what was and"
+      .. " was not deleted. Windows showing a deleted file switch to the"
+      .. " alternate buffer (or an empty one) instead of closing."
       .. " This is a WRITE tool and prompts for confirmation. Parameters:"
-      .. " paths (required) — array of existing file paths.",
+      .. " paths (required) — array of existing file paths. Rejects WorkspaceEdit"
+      .. " create/rename/delete resource operations, edits to buffers changed during requests,"
+      .. " and batches whose returned WorkspaceEdits share a target buffer, even if their ranges differ.",
     input_schema = {
       type = "object",
       properties = {
@@ -1837,7 +2126,7 @@ end
 return function(input, ctx)
   local paths = input.paths
   if type(paths) ~= "table" or #paths == 0 then
-    return "delete_files: paths must be a non-empty array of file paths"
+    error("delete_files: paths must be a non-empty array of file paths", 0)
   end
 
   -- Validate the WHOLE batch before touching disk, collecting every problem.
@@ -1852,8 +2141,8 @@ return function(input, ctx)
       elseif vim.fn.filereadable(full) ~= 1 then
         problems[#problems + 1] = ("#%d: no such file: %s"):format(i, relname(full))
       else
-        local existing_buf = vim.fn.bufnr(full)
-        if existing_buf ~= -1 and vim.api.nvim_buf_is_loaded(existing_buf)
+        local existing_buf = find_buf(full)
+        if existing_buf and vim.api.nvim_buf_is_loaded(existing_buf)
           and vim.bo[existing_buf].modified then
           problems[#problems + 1] = ("#%d: %s has unsaved buffer changes"):format(i, relname(full))
         else
@@ -1864,8 +2153,8 @@ return function(input, ctx)
     end
   end
   if #problems > 0 then
-    return "delete_files: refusing the whole batch — fix these and retry:\n"
-      .. table.concat(problems, "\n")
+    error("delete_files: refusing the whole batch — fix these and retry:\n"
+      .. table.concat(problems, "\n"), 0)
   end
 
   -- Bucket by the one client (per filetype) that supports willDeleteFiles,
@@ -1873,7 +2162,8 @@ return function(input, ctx)
   local ft_clients = {}
   local buckets, bucket_order = {}, {}
   for _, e in ipairs(entries) do
-    e.buf = load_buf(e.path)
+    e.buf = load_buf(e.path, "delete_files")
+    e.tick = vim.api.nvim_buf_get_changedtick(e.buf)
     local ft = vim.bo[e.buf].filetype or ""
     if ft_clients[ft] == nil then
       ft_clients[ft] = wait_clients(ctx, e.buf) or false
@@ -1892,14 +2182,15 @@ return function(input, ctx)
     end
   end
 
-  local server_files, seen_file = {}, {}
-  local function note_files(files)
-    for _, f in ipairs(files) do
-      if not seen_file[f] then seen_file[f] = true; server_files[#server_files + 1] = f end
-    end
-  end
+  local versions = buffer_versions()
+  local pending = {}
   local notes = {}
-  local pending_uris = {}
+  local applied_all = {}
+  local function rollback_all()
+    local stuck = {}
+    for i = #applied_all, 1, -1 do vim.list_extend(stuck, rollback_workspace_edit(applied_all[i])) end
+    return stuck
+  end
 
   for _, id in ipairs(bucket_order) do
     local bucket = buckets[id]
@@ -1910,34 +2201,39 @@ return function(input, ctx)
     local result, err = client_request(ctx, bucket.client, "workspace/willDeleteFiles",
       { files = files_param }, bucket.entries[1].buf, 8000)
     if result and type(result) == "table" and (result.changes or result.documentChanges) then
-      local okap, files, uris = pcall(apply_workspace_edit_and_save, result, bucket.client.offset_encoding, { save = false })
-      if okap then
-        note_files(files)
-        for _, uri in ipairs(uris or {}) do pending_uris[#pending_uris + 1] = uri end
-      else
-        notes[#notes + 1] = bucket.client.name .. ": edit returned but failed to apply: " .. tostring(files)
-      end
+      pending[#pending + 1] = { edit = result, encoding = bucket.client.offset_encoding }
     elseif err then
       notes[#notes + 1] = bucket.client.name .. ": willDeleteFiles " .. tostring(err) .. " (deleted anyway)"
     end
   end
 
-  -- Validation already confirmed every path exists; a failure here still
-  -- lets the loop finish the rest rather than losing track of the remainder.
+  validate_workspace_edits(ctx, "delete_files", pending, versions)
+  validate_delete_targets(ctx, "delete_files", entries)
+  for _, p in ipairs(pending) do
+    local okap, applied = pcall(apply_workspace_edit, ctx, "delete_files", p.edit, p.encoding)
+    if not okap then
+      local stuck = rollback_all()
+      error(tostring(applied) .. (#stuck > 0 and ("; rollback failed: " .. table.concat(stuck, ", ")) or ""), 0)
+    end
+    applied_all[#applied_all + 1] = applied
+  end
+  local valid, validation_err = pcall(validate_delete_targets, ctx, "delete_files", entries)
+  if not valid then
+    local stuck = rollback_all()
+    error(tostring(validation_err) .. (#stuck > 0 and ("; rollback failed: " .. table.concat(stuck, ", ")) or ""), 0)
+  end
+
   local deleted, failed = {}, {}
   for _, e in ipairs(entries) do
     local ok_rm, succ, rm_err = pcall(os.remove, e.path)
     if ok_rm and succ == true then
       deleted[#deleted + 1] = relname(e.path)
-      pcall(function()
-        if vim.api.nvim_buf_is_loaded(e.buf) then vim.cmd("bwipeout! " .. e.buf) end
-      end)
+      wipe_buf_keep_windows(e.buf)
     else
       failed[#failed + 1] = relname(e.path) .. ": "
         .. tostring((not ok_rm and succ) or rm_err or "unknown error")
     end
   end
-  if #failed == 0 and #pending_uris > 0 then save_workspace_files(pending_uris) end
 
   for _, id in ipairs(bucket_order) do
     local bucket = buckets[id]
@@ -1945,9 +2241,13 @@ return function(input, ctx)
     if ok_s and supports_did then
       local files_param = {}
       for _, e in ipairs(bucket.entries) do
-        files_param[#files_param + 1] = { uri = vim.uri_from_fname(e.path) }
+        if vim.fn.filereadable(e.path) ~= 1 then
+          files_param[#files_param + 1] = { uri = vim.uri_from_fname(e.path) }
+        end
       end
-      pcall(function() bucket.client:notify("workspace/didDeleteFiles", { files = files_param }) end)
+      if #files_param > 0 then
+        pcall(function() bucket.client:notify("workspace/didDeleteFiles", { files = files_param }) end)
+      end
     end
   end
 
@@ -1957,13 +2257,29 @@ return function(input, ctx)
   if #failed > 0 then
     out[#out + 1] = string.format("%d delete%s FAILED:", #failed, #failed == 1 and "" or "s")
     vim.list_extend(out, failed)
+    if #applied_all > 0 then
+      local stuck = rollback_all()
+      out[#out + 1] = #stuck > 0
+        and ("server reference edits could not be rolled back, left modified and unsaved: " .. table.concat(stuck, ", "))
+        or "server reference edits rolled back (none saved); fix references to the deleted files by hand"
+    end
+    vim.list_extend(out, notes)
+    error("delete_files: " .. table.concat(out, "\n"), 0)
+  end
+  local server_files, seen_file, extras = {}, {}, {}
+  for _, a in ipairs(applied_all) do
+    local files, ex = save_workspace_edit(ctx, a)
+    for _, f in ipairs(files) do
+      if not seen_file[f] then seen_file[f] = true; server_files[#server_files + 1] = f end
+    end
+    vim.list_extend(extras, ex)
   end
   if #server_files > 0 then
     out[#out + 1] = string.format("server updated %d reference file%s:", #server_files, #server_files == 1 and "" or "s")
     vim.list_extend(out, server_files)
   end
   vim.list_extend(out, notes)
-  return table.concat(out, "\n")
+  return with_extras(table.concat(out, "\n"), extras)
 end
 ]==]),
   })
@@ -1981,7 +2297,9 @@ end
       .. " buffer's native undo history, and touched files are saved. Pairs"
       .. " with the diagnostics tool: read the diagnostic, apply its suggested"
       .. " fix. Parameters: path (required); line (required, 1-based); col"
-      .. " (required, 1-based); index (optional) — apply the Nth listed action.",
+      .. " (required, 1-based); index (optional) — apply the Nth listed action."
+      .. " Rejects WorkspaceEdit create/rename/delete resource operations and edits"
+      .. " to buffers changed during requests or resolution.",
     input_schema = {
       type = "object",
       properties = {
@@ -1994,11 +2312,9 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local buf, ft = load_buf(input.path, "code_action")
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
-  -- Diagnostics overlapping the line, in original LSP shape when available —
-  -- servers key their quick-fixes off this context.
   local diags = {}
   pcall(function()
     for _, d in ipairs(vim.diagnostic.get(buf, { lnum = line0 })) do
@@ -2006,16 +2322,19 @@ return function(input, ctx)
       if lsp then diags[#diags + 1] = lsp end
     end
   end)
-  local pos = { line = line0, character = col0 }
-  local params = {
-    textDocument = { uri = vim.uri_from_bufnr(buf) },
-    range = { start = pos, ["end"] = pos },
-    context = { diagnostics = diags },
-  }
+  local params = function(client)
+    local pos = { line = line0, character = byte_to_lsp_char(buf, line0, col0, client and client.offset_encoding) }
+    return {
+      textDocument = { uri = vim.uri_from_bufnr(buf) },
+      range = { start = pos, ["end"] = pos },
+      context = { diagnostics = diags },
+    }
+  end
+  local versions = buffer_versions()
   local ok, res, err = pcall(lsp_request, ctx, buf, "textDocument/codeAction", params, 5000)
-  if not ok then return "code_action: " .. tostring(res) end
-  if err == "noclient" then return "no LSP client for filetype " .. (ft ~= "" and ft or "?") end
-  if err == "timeout" then return "code_action: LSP request timed out" end
+  if not ok then error("code_action: " .. tostring(res), 0) end
+  if err == "noclient" then no_client("code_action", ft) end
+  if err == "timeout" then error("code_action: LSP request timed out", 0) end
 
   -- Flatten per-client results, keeping the owning client for apply/resolve.
   -- Stable order: sort client ids so index=N means the same action across the
@@ -2046,7 +2365,7 @@ return function(input, ctx)
 
   local entry = actions[index]
   if not entry then
-    return string.format("code_action: index %d out of range (1-%d)", index, #actions)
+    error(string.format("code_action: index %d out of range (1-%d)", index, #actions), 0)
   end
   local action = entry.action
   local client = vim.lsp.get_client_by_id(entry.client_id)
@@ -2055,11 +2374,12 @@ return function(input, ctx)
     if type(resolved) == "table" then action = resolved end
   end
 
-  local did = {}
+  local did, extras = {}, {}
   if type(action.edit) == "table" then
-    local okap, files = pcall(apply_workspace_edit_and_save, action.edit,
-      client and client.offset_encoding)
-    if not okap then return "code_action: failed to apply edit: " .. tostring(files) end
+    validate_workspace_edits(ctx, "code_action", { { edit = action.edit } }, versions)
+    local applied = apply_workspace_edit(ctx, "code_action", action.edit, client and client.offset_encoding)
+    local files
+    files, extras = save_workspace_edit(ctx, applied)
     did[#did + 1] = "edited " .. table.concat(files, ", ")
   end
   local cmd = action.command
@@ -2071,9 +2391,9 @@ return function(input, ctx)
       and ("command " .. cmd.command .. " failed: " .. cerr)
       or ("ran command " .. cmd.command)
   end
-  if #did == 0 then return "code_action: action had no edit or command to apply" end
-  return string.format("applied %q: %s — undo with u in each edited buffer",
-    action.title or "?", table.concat(did, "; "))
+  if #did == 0 then error("code_action: action had no edit or command to apply", 0) end
+  return with_extras(string.format("applied %q: %s — undo with u in each edited buffer",
+    action.title or "?", table.concat(did, "; ")), extras)
 end
 ]==]),
   })
@@ -2084,11 +2404,14 @@ end
     name = "tool.format",
     kind = "tool",
     doc = "Format a file (or a line range of it) with the attached LSP"
-      .. " server's formatter, through the file's buffer — the result lands in"
-      .. " native undo history (`u` reverts) and the file is saved. This is a"
+      .. " server's formatter (textDocument/formatting or rangeFormatting,"
+      .. " async), through the file's buffer — the result lands in"
+      .. " native undo history (`u` reverts) and the file is saved. Fails when"
+      .. " the file changed under this session (another agent or external"
+      .. " process). hook.after_write fires. This is a"
       .. " WRITE tool and prompts for confirmation. Parameters: path"
       .. " (required); start_line / end_line (optional, 1-based, both or"
-      .. " neither) — format only this range.",
+      .. " neither; one without the other is an error) — format only this range.",
     input_schema = {
       type = "object",
       properties = {
@@ -2100,31 +2423,70 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf, ft = load_buf(input.path)
+  local sl, el = tonumber(input.start_line), tonumber(input.end_line)
+  if (sl == nil) ~= (el == nil) then
+    error("format: pass both start_line and end_line, or neither", 0)
+  end
+  local buf, ft = load_buf(input.path, "format")
+  if sl then
+    local n = vim.api.nvim_buf_line_count(buf)
+    if sl < 1 or el < sl or el > n then
+      error(string.format("format: invalid range L%d-%d (file has %d lines)", sl, el, n), 0)
+    end
+  end
+  local method = sl and "textDocument/rangeFormatting" or "textDocument/formatting"
   local clients = wait_clients(ctx, buf)
   if not clients or #clients == 0 then
-    return "no LSP client for filetype " .. (ft ~= "" and ft or "?") .. " — nothing to format with"
+    no_client("format", ft, " — nothing to format with")
   end
-  local range = nil
-  local sl, el = tonumber(input.start_line), tonumber(input.end_line)
-  if sl and el then
-    range = { start = { sl, 0 }, ["end"] = { el, 2147483647 } }
+  local client
+  for _, c in ipairs(clients) do
+    local oks, yes = pcall(function() return c:supports_method(method, buf) end)
+    if oks and yes then client = c; break end
+  end
+  if not client then
+    error("format: no attached LSP client supports " .. method, 0)
+  end
+  check_target_buf(ctx, "format", buf)
+  local enc = client.offset_encoding or "utf-16"
+  local params = {
+    textDocument = { uri = vim.uri_from_bufnr(buf) },
+    options = { tabSize = vim.bo[buf].shiftwidth > 0 and vim.bo[buf].shiftwidth or vim.bo[buf].tabstop,
+      insertSpaces = vim.bo[buf].expandtab },
+  }
+  if sl then
+    local last = vim.api.nvim_buf_get_lines(buf, el - 1, el, false)[1] or ""
+    params.range = {
+      start = { line = sl - 1, character = 0 },
+      ["end"] = { line = el - 1, character = byte_to_lsp_char(buf, el - 1, #last, enc) },
+    }
   end
   local tick = vim.api.nvim_buf_get_changedtick(buf)
+  local edits, rerr = client_request(ctx, client, method, params, buf, 5000)
+  if rerr then error("format: " .. method .. " " .. tostring(rerr), 0) end
+  if type(edits) ~= "table" or #edits == 0 then
+    return "already formatted (no changes)"
+  end
+  check_target_buf(ctx, "format", buf)
+  if vim.api.nvim_buf_get_changedtick(buf) ~= tick then
+    error("format: " .. relname(vim.api.nvim_buf_get_name(buf), buf)
+      .. " changed while the formatter ran — retry", 0)
+  end
   local ok, err = pcall(function()
     vim.api.nvim_buf_call(buf, function()
       vim.cmd("let &l:undolevels = &l:undolevels")
     end)
-    vim.lsp.buf.format({ bufnr = buf, async = false, timeout_ms = 5000, range = range })
+    vim.lsp.util.apply_text_edits(edits, buf, enc)
     vim.api.nvim_buf_call(buf, function() vim.cmd("silent noautocmd update") end)
   end)
-  if not ok then return "format: " .. tostring(err) end
+  if not ok then error("format: " .. tostring(err), 0) end
   if vim.api.nvim_buf_get_changedtick(buf) == tick then
     return "already formatted (no changes)"
   end
-  return "formatted " .. relname(vim.api.nvim_buf_get_name(buf), buf)
-    .. (range and string.format(" (L%d-%d)", sl, el) or "")
-    .. " — undo with u in the buffer"
+  local extras = after_writes(ctx, { buf })
+  return with_extras("formatted " .. relname(vim.api.nvim_buf_get_name(buf), buf)
+    .. (sl and string.format(" (L%d-%d)", sl, el) or "")
+    .. " — undo with u in the buffer", extras)
 end
 ]==]),
   })
@@ -2210,12 +2572,14 @@ end
   define({
     name = "tool.show_user",
     kind = "tool",
-    doc = "Point the user's editor at a location: open the file in a"
-      .. " non-session window (reusing one that already shows it, else the"
-      .. " first available, else a new split), move the cursor there, center"
-      .. " the view, and flash a brief highlight on the line. Use it to land"
-      .. " the user on the change or finding you want them to see; they can"
-      .. " jump back with ctrl-o. Parameters: path (required); line (optional,"
+    doc = "Point the user's editor at a location: show the file in a"
+      .. " non-session window (reusing one that already shows it, else a new"
+      .. " split), move that window's cursor there (setting a jumplist entry),"
+      .. " center the view, and flash a brief highlight on the line. Keyboard"
+      .. " focus stays in the window the user is in, so typing is never"
+      .. " redirected. Use it to land"
+      .. " the user on the change or finding you want them to see; in that"
+      .. " window ctrl-o jumps back. Parameters: path (required); line (optional,"
       .. " 1-based); col (optional, 1-based).",
     input_schema = {
       type = "object",
@@ -2230,38 +2594,48 @@ end
 return function(input, ctx)
   local path = input.path
   if type(path) ~= "string" or path == "" then
-    return "show_user: path is required"
+    error("show_user: path is required", 0)
   end
   local full = vim.fn.fnamemodify(path, ":p")
   if vim.fn.filereadable(full) == 0 then
-    return "show_user: no such file: " .. path
+    error("show_user: no such file: " .. path, 0)
   end
   local buf = vim.fn.bufadd(full)
   if not pcall(vim.fn.bufload, buf) then
-    return "show_user: could not load " .. path
+    error("show_user: could not load " .. path, 0)
   end
+  local user_win = vim.api.nvim_get_current_win()
   local target
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_get_buf(win) == buf then target = win break end
-  end
+  if vim.api.nvim_win_get_buf(user_win) == buf then target = user_win end
   if not target then
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
-      if not is_session(vim.api.nvim_win_get_buf(win)) then target = win break end
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if vim.api.nvim_win_get_buf(win) == buf then target = win break end
     end
   end
   local ok, err = pcall(function()
-    if target then
-      vim.api.nvim_win_set_buf(target, buf)
-    else
-      vim.cmd("botright vsplit")
+    if not target then
+      local anchor = user_win
+      if is_session(vim.api.nvim_win_get_buf(user_win)) then
+        for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+          if not is_session(vim.api.nvim_win_get_buf(win))
+            and vim.api.nvim_win_get_config(win).relative == "" then
+            anchor = win
+            break
+          end
+        end
+      end
+      vim.api.nvim_set_current_win(anchor)
+      vim.cmd(anchor == user_win and "botright vsplit" or "aboveleft split")
       target = vim.api.nvim_get_current_win()
       vim.api.nvim_win_set_buf(target, buf)
     end
-    vim.api.nvim_set_current_win(target)
     local line = math.max(1, math.min(tonumber(input.line) or 1, vim.api.nvim_buf_line_count(buf)))
     local col = math.max(0, (tonumber(input.col) or 1) - 1)
-    vim.api.nvim_win_set_cursor(target, { line, col })
-    vim.cmd("normal! zz")
+    vim.api.nvim_win_call(target, function()
+      vim.cmd("normal! m'")
+      vim.api.nvim_win_set_cursor(target, { line, col })
+      vim.cmd("normal! zz")
+    end)
     local ns = vim.api.nvim_create_namespace("straps_show_user")
     vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
     vim.api.nvim_buf_set_extmark(buf, ns, line - 1, 0, {
@@ -2271,7 +2645,8 @@ return function(input, ctx)
       pcall(vim.api.nvim_buf_clear_namespace, buf, ns, 0, -1)
     end, 1500)
   end)
-  if not ok then return "show_user: " .. tostring(err) end
+  if vim.api.nvim_win_is_valid(user_win) then pcall(vim.api.nvim_set_current_win, user_win) end
+  if not ok then error("show_user: " .. tostring(err), 0) end
   return string.format("showing %s:%d to the user",
     vim.fn.fnamemodify(full, ":~:."), tonumber(input.line) or 1)
 end
@@ -2300,7 +2675,7 @@ end
 return function(input, ctx)
   local query = input.query
   if type(query) ~= "string" or query == "" then
-    return "help_search: query is required"
+    error("help_search: query is required", 0)
   end
   local lq = query:lower()
   local matches = {} -- { tag, file (absolute), }
@@ -2424,7 +2799,7 @@ end
 return function(input, ctx)
   local question = input.question
   if type(question) ~= "string" or question == "" then
-    return "ask_user: question is required"
+    error("ask_user: question is required", 0)
   end
 
   local options, previews = {}, {}
@@ -2473,7 +2848,7 @@ return function(input, ctx)
     bufnr = vim.api.nvim_get_current_buf()
   end
   if not vim.api.nvim_buf_is_valid(bufnr) or not vim.b[bufnr].straps_session then
-    return "ask_user: no session buffer"
+    error("ask_user: no session buffer", 0)
   end
   local user_win = vim.api.nvim_get_current_win()
 
@@ -2715,8 +3090,8 @@ end
       .. " reported; revert_seq=N surgically reverses JUST edit N while"
       .. " keeping every later edit applied (git-revert semantics on an undo"
       .. " block: strict patch, refuses with a conflict message if later"
-      .. " changes overlap it, and refuses if the buffer has unsaved user"
-      .. " changes). Write modes refuse when the file changed on disk or a"
+      .. " changes overlap it). Write modes (steps, to_seq, revert_seq) refuse"
+      .. " when the buffer has unsaved user changes, when the file changed on disk or a"
       .. " sibling session edited the buffer — re-inspect history before"
       .. " rewinding. After any change the buffer is saved to disk."
       .. " Parameters: path (required); history (optional boolean); steps"
@@ -2734,7 +3109,7 @@ end
     },
     source = src([==[
 return function(input, ctx)
-  local buf = load_buf(input.path)
+  local buf = load_buf(input.path, "undo_edit")
   local name = relname(vim.api.nvim_buf_get_name(buf), buf)
 
   local function tree()
@@ -2773,12 +3148,12 @@ return function(input, ctx)
   -- Concurrent-editor checks (write modes only — listing history above stays
   -- read-only under a conflict). no_reload always: a reload would mutate the
   -- very undo tree this tool navigates, and error-first semantics mean there
-  -- is nothing to reload for. Errors are returned strings, per convention.
+  -- is nothing to reload for.
   local registry = require("straps.registry")
   local st, rerr = registry.call("fn.reconcile_buf", buf, { no_reload = true })
   if st == nil then
-    return name .. " " .. tostring(rerr) .. " — another agent or external"
-      .. " process is editing this file; its undo tree does not include that change"
+    error("undo_edit: " .. name .. " " .. tostring(rerr) .. " — another agent or external"
+      .. " process is editing this file; its undo tree does not include that change", 0)
   end
   local wok, werr = registry.call("fn.check_writer", ctx and ctx.bufnr, buf)
   if wok == nil then
@@ -2787,9 +3162,14 @@ return function(input, ctx)
     if type(stamp) == "table" and type(stamp.task) == "string" and stamp.task ~= "" then
       who = who .. ', task: "' .. stamp.task .. '"'
     end
-    return name .. ": another session (" .. who .. ") has edited this buffer"
+    error("undo_edit: " .. name .. ": another session (" .. who .. ") has edited this buffer"
       .. " since this session last read it — its states are in the undo tree;"
-      .. " re-read the file and re-inspect history=true before rewinding"
+      .. " re-read the file and re-inspect history=true before rewinding", 0)
+  end
+
+  if vim.bo[buf].modified then
+    error("undo_edit: " .. name .. ": buffer has unsaved changes — undoing would"
+      .. " discard or interleave with them and then save; save or discard them first", 0)
   end
 
   -- revert_seq: surgically reverse ONE undo block, keeping later edits.
@@ -2800,18 +3180,9 @@ return function(input, ctx)
   if input.revert_seq ~= nil then
     local seq = tonumber(input.revert_seq)
     if not seq or seq < 1 then
-      return "undo_edit: revert_seq must be a positive undo sequence number"
+      error("undo_edit: revert_seq must be a positive undo sequence number", 0)
     end
     seq = math.floor(seq)
-
-    -- Guard: the capture round-trip moves the buffer through undo states.
-    -- With unsaved user changes in the buffer, refuse rather than risk
-    -- interleaving with live typing.
-    if vim.bo[buf].modified then
-      return name .. ": buffer has unsaved changes — revert_seq transiently"
-        .. " moves the buffer through undo states, so save or discard them first"
-    end
-
     local t = tree()
     local cur_seq = t.seq_cur
     local found = false
@@ -2823,7 +3194,7 @@ return function(input, ctx)
     end
     find(t.entries)
     if not found then
-      return string.format("%s: no undo state with seq %d (history=true lists them)", name, seq)
+      error(string.format("undo_edit: %s: no undo state with seq %d (history=true lists them)", name, seq), 0)
     end
 
     -- Snapshot: current text, text after edit N, text before edit N (its
@@ -2844,12 +3215,12 @@ return function(input, ctx)
     end)
     local restored = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
     if restored ~= text_cur then
-      return string.format(
-        "%s: internal error capturing undo states — restore the buffer with to_seq=%d",
-        name, cur_seq)
+      error(string.format(
+        "undo_edit: %s: internal error capturing undo states — restore the buffer with to_seq=%d",
+        name, cur_seq), 0)
     end
     if not okc then
-      return "undo_edit: could not capture undo states: " .. tostring(cerr)
+      error("undo_edit: could not capture undo states: " .. tostring(cerr), 0)
     end
 
     local after_lines = vim.split(text_after, "\n", { plain = true })
@@ -2912,10 +3283,10 @@ return function(input, ctx)
       local sa, ca, sb, cb = h[1], h[2], h[3], h[4]
       local start, why = locate(sa, ca)
       if not start then
-        return string.format(
-          "%s: cannot surgically revert seq %d — %s for the hunk near line %d"
+        error(string.format(
+          "undo_edit: %s: cannot surgically revert seq %d — %s for the hunk near line %d"
             .. " (later changes overlap it). Fall back to to_seq time travel or edit_file.",
-          name, seq, why, math.max(1, sa))
+          name, seq, why, math.max(1, sa)), 0)
       end
       local insert = {}
       for i = sb, sb + cb - 1 do insert[#insert + 1] = before_lines[i] end
@@ -2924,10 +3295,10 @@ return function(input, ctx)
     table.sort(reps, function(a, b) return a.start < b.start end)
     for i = 2, #reps do
       if reps[i].start < reps[i - 1].start + reps[i - 1].remove then
-        return string.format(
-          "%s: cannot surgically revert seq %d — its hunks map to overlapping"
+        error(string.format(
+          "undo_edit: %s: cannot surgically revert seq %d — its hunks map to overlapping"
             .. " regions of the current text. Fall back to to_seq time travel.",
-          name, seq)
+          name, seq), 0)
       end
     end
 
@@ -2945,7 +3316,7 @@ return function(input, ctx)
         vim.cmd("silent noautocmd update")
       end)
     end)
-    if not oka then return "undo_edit: failed to apply the revert: " .. tostring(aerr) end
+    if not oka then error("undo_edit: failed to apply the revert: " .. tostring(aerr), 0) end
     registry.call("fn.mark_seen", ctx and ctx.bufnr, buf, true)
     return string.format(
       "%s: surgically reverted seq %d (%d hunk%s), later edits kept, saved —"
@@ -2958,7 +3329,7 @@ return function(input, ctx)
   if input.to_seq ~= nil then
     local seq = tonumber(input.to_seq)
     if not seq or seq < 0 then
-      return "undo_edit: to_seq must be a non-negative undo sequence number"
+      error("undo_edit: to_seq must be a non-negative undo sequence number", 0)
     end
     cmd = "undo " .. math.floor(seq)
   else
@@ -2971,7 +3342,7 @@ return function(input, ctx)
       vim.cmd("silent noautocmd update")
     end)
   end)
-  if not ok then return "undo_edit: " .. tostring(err) end
+  if not ok then error("undo_edit: " .. tostring(err), 0) end
   local after = tree().seq_cur
   if after == before then
     return string.format(
@@ -2998,7 +3369,9 @@ end
       .. " against the file's CURRENT contents on disk/buffer (e.g. preview an"
       .. " edit before making it); (2) arbitrary texts: pass {left, right,"
       .. " filetype?, left_label?, right_label?} to diff two strings. Opens in"
-      .. " non-session windows without stealing the user's focus. Read-only"
+      .. " non-session windows without stealing the user's focus; a later call"
+      .. " reuses the diff windows a previous call opened (tagged"
+      .. " w:straps_view='diff') instead of adding splits. Read-only"
       .. " (shows a view; changes no files). Returns a one-line confirmation"
       .. " with the hunk count. Parameters: path + content, OR left + right"
       .. " (with optional filetype and labels).",
@@ -3040,31 +3413,53 @@ return function(input, ctx)
     lname = input.left_label or "left"
     rname = input.right_label or "right"
   else
-    return "show_diff: pass {path, content} or {left, right}"
+    error("show_diff: pass {path, content} or {left, right}", 0)
   end
 
   local hunks = 0
   local ok, err = pcall(function()
-    local lb = scratch_buf(vim.split(left, "\n", { plain = true }), ft, "straps://diff/" .. lname)
-    local rb = scratch_buf(vim.split(right, "\n", { plain = true }), ft, "straps://diff/" .. rname)
-    -- New content gets its own split so the user's current buffer is never
-    -- replaced; the right side splits beside it.
-    local lw = new_split_win()
-    vim.api.nvim_win_set_buf(lw, lb)
+    local lb = scratch_buf(vim.split(left, "\n", { plain = true }), ft)
+    local rb = scratch_buf(vim.split(right, "\n", { plain = true }), ft)
+    vim.b[lb].straps_view = "diff"
+    vim.b[rb].straps_view = "diff"
     local cur = vim.api.nvim_get_current_win()
+    local views = {}
+    for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if vim.w[w].straps_view == "diff" and vim.b[vim.api.nvim_win_get_buf(w)].straps_view == "diff" then
+        views[#views + 1] = w
+      end
+    end
+    table.sort(views, function(a, b)
+      local pa, pb = vim.api.nvim_win_get_position(a), vim.api.nvim_win_get_position(b)
+      if pa[2] ~= pb[2] then return pa[2] < pb[2] end
+      return pa[1] < pb[1]
+    end)
+    local lw, rw = views[1], views[2]
+    for i = 3, #views do pcall(vim.api.nvim_win_close, views[i], true) end
+    if not lw then
+      lw = new_split_win()
+    end
+    vim.api.nvim_win_set_buf(lw, lb)
     pcall(function()
       vim.api.nvim_set_current_win(lw)
-      vim.cmd("diffthis")
-      vim.cmd("rightbelow vsplit")
-      local rw = vim.api.nvim_get_current_win()
+      if not rw then
+        vim.cmd("rightbelow vsplit")
+        rw = vim.api.nvim_get_current_win()
+      end
       vim.api.nvim_win_set_buf(rw, rb)
-      vim.cmd("diffthis")
-      pcall(function() vim.wo[lw].winbar = lname end)
-      pcall(function() vim.wo[rw].winbar = rname end)
+      vim.w[lw].straps_view = "diff"
+      vim.w[rw].straps_view = "diff"
+      for _, w in ipairs({ lw, rw }) do
+        vim.api.nvim_win_call(w, function() vim.cmd("diffthis") end)
+      end
+      pcall(vim.api.nvim_buf_set_name, lb, "straps://diff/" .. lname)
+      pcall(vim.api.nvim_buf_set_name, rb, "straps://diff/" .. rname)
+      pcall(function() vim.wo[lw].winbar = (lname:gsub("%%", "%%%%")) end)
+      pcall(function() vim.wo[rw].winbar = (rname:gsub("%%", "%%%%")) end)
     end)
     pcall(vim.api.nvim_set_current_win, cur)
   end)
-  if not ok then return "show_diff: " .. tostring(err) end
+  if not ok then error("show_diff: " .. tostring(err), 0) end
 
   if left == right then
     return "show_diff: the two versions are identical (no differences)"
@@ -3088,7 +3483,9 @@ end
       .. " split — a report, a table, a data extract, sample code — so it"
       .. " arrives syntax-highlighted and searchable in their editor instead of"
       .. " scrolling past in the transcript. Opens in a non-session window"
-      .. " without stealing focus. Read-only (creates a scratch buffer; touches"
+      .. " without stealing focus; a later call replaces the buffer in the"
+      .. " window a previous call opened (tagged w:straps_view='buffer')"
+      .. " instead of adding a split. Read-only (creates a scratch buffer; touches"
       .. " no files). Returns a one-line confirmation. Parameters: content"
       .. " (required) — the text to display; filetype (optional) — for"
       .. " highlighting, e.g. 'markdown', 'lua', 'json'; title (optional) — a"
@@ -3108,7 +3505,7 @@ end
 return function(input, ctx)
   input = input or {}
   if type(input.content) ~= "string" then
-    return "show_buffer: content is required"
+    error("show_buffer: content is required", 0)
   end
   local ft = type(input.filetype) == "string" and input.filetype or ""
   local title = type(input.title) == "string" and input.title ~= "" and input.title or nil
@@ -3117,13 +3514,24 @@ return function(input, ctx)
   local ok, err = pcall(function()
     local lines = vim.split(input.content, "\n", { plain = true })
     nlines = #lines
-    local b = scratch_buf(lines, ft, name)
-    local cmd = (input.split == "horizontal") and "botright split" or "botright vsplit"
-    local win = new_split_win(cmd)
+    local b = scratch_buf(lines, ft)
+    vim.b[b].straps_view = "buffer"
+    local win
+    for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if vim.w[w].straps_view == "buffer" and vim.b[vim.api.nvim_win_get_buf(w)].straps_view == "buffer" then
+        win = w; break
+      end
+    end
+    if not win then
+      local cmd = (input.split == "horizontal") and "botright split" or "botright vsplit"
+      win = new_split_win(cmd)
+      vim.w[win].straps_view = "buffer"
+    end
     vim.api.nvim_win_set_buf(win, b)
-    if title then pcall(function() vim.wo[win].winbar = title end) end
+    pcall(vim.api.nvim_buf_set_name, b, name)
+    pcall(function() vim.wo[win].winbar = title and (title:gsub("%%", "%%%%")) or "" end)
   end)
-  if not ok then return "show_buffer: " .. tostring(err) end
+  if not ok then error("show_buffer: " .. tostring(err), 0) end
   return ("show_buffer: opened %d line%s%s%s")
     :format(nlines, nlines == 1 and "" or "s",
       ft ~= "" and (" (" .. ft .. ")") or "",
@@ -3174,7 +3582,7 @@ end
 return function(input, ctx)
   input = input or {}
   if type(input.items) ~= "table" then
-    return "set_findings: items must be an array of {path, line?, col?, text?}"
+    error("set_findings: items must be an array of {path, line?, col?, text?}", 0)
   end
   local qf = {}
   for _, it in ipairs(input.items) do
@@ -3188,7 +3596,7 @@ return function(input, ctx)
     end
   end
   if #qf == 0 then
-    return "set_findings: no valid items (each needs a `path`)"
+    error("set_findings: no valid items (each needs a `path`)", 0)
   end
   local title = type(input.title) == "string" and input.title ~= "" and input.title
     or "straps: findings"

@@ -5,7 +5,9 @@
 -- commands must be refused with a pointer to the vim-native tool, also behind
 -- a leading `cd X &&` and when piped only into pure filters; anything with
 -- other shell logic, and unrelated commands, must run. Also covers the cwd
--- the command runs in and the repeat-command nudge.
+-- the command runs in, the repeat-command nudge, fetch_url failure paths,
+-- glob pattern errors, run_quickfix cwd and stream cap, exact-path buffer
+-- lookup in read_file/path_info, and registry_list kind=skill.
 
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(here, ":p"), ":h:h")
@@ -205,13 +207,235 @@ it("fetch_url refuses internal/loopback/link-local hosts (SSRF guard)", function
 end)
 
 it("fetch_url refuses automatic redirects", function()
-  local out = registry.call("tool.fetch_url",
+  local ok, err = pcall(registry.call, "tool.fetch_url",
     { url = "http://93.184.216.34/x", follow_redirects = true }, ctx)
-  assert(out:find("not followed automatically", 1, true), "redirect refusal missing: " .. out)
+  assert.is_false(ok)
+  assert.are.equal("fetch_url: ", err:sub(1, 11))
+  assert(err:find("not followed automatically", 1, true), "redirect refusal missing: " .. err)
+end)
+
+it("fetch_url resolves hostnames through ctx.await, not a blocking wait", function()
+  local awaited = 0
+  local counting = { await = function(fn) awaited = awaited + 1; return ctx.await(fn) end }
+  local ok, err = pcall(registry.call, "tool.fetch_url", { url = "http://straps-test.invalid/x" }, counting)
+  assert.is_false(ok)
+  assert.are.equal(1, awaited)
+  assert.truthy(err:find("^fetch_url: could not resolve straps%-test%.invalid"))
+end)
+
+it("fetch_url raises when curl is missing", function()
+  local path = vim.env.PATH
+  vim.env.PATH = ""
+  local ok, err = pcall(registry.call, "tool.fetch_url", { url = "http://93.184.216.34/x" }, ctx)
+  vim.env.PATH = path
+  assert.is_false(ok)
+  assert.are.equal("fetch_url: curl is not executable", err)
+end)
+
+it("fetch_url takes and releases a subprocess slot", function()
+  local saved = registry.render("fn.subprocess_acquire")
+  local taken, released = 0, 0
+  registry.define({ name = "fn.subprocess_acquire", kind = "fn", source = [[
+    return function(ctx, info)
+      _G.straps_test_slot = (_G.straps_test_slot or 0) + 1
+      _G.straps_test_tool = info.tool
+      return function() _G.straps_test_released = (_G.straps_test_released or 0) + 1 end
+    end
+  ]] })
+  pcall(registry.call, "tool.fetch_url", { url = "http://93.184.216.34/x", timeout_ms = 1 }, ctx)
+  taken, released = _G.straps_test_slot, _G.straps_test_released
+  assert(load(saved))()
+  assert.are.equal(1, taken)
+  assert.are.equal("fetch_url", _G.straps_test_tool)
+  assert.are.equal(1, released)
 end)
 
 it("huge output is capped before returning to the loop", function()
   local out = bash("yes x | head -c 400000")
   assert(out:find("output truncated", 1, true), "missing truncation note: " .. out:sub(1, 200))
   assert(#out < 300000, "bash returned too much output: " .. #out)
+end)
+
+it("fetch_url's cancel handler is safe when curl failed to spawn", function()
+  local saved_system = vim.system
+  local cancel_fns = {}
+  vim.system = function() error("spawn boom") end
+  local cctx = { await = ctx.await, on_cancel = function(f) cancel_fns[#cancel_fns + 1] = f end }
+  local ok, err = pcall(registry.call, "tool.fetch_url", { url = "http://93.184.216.34/x" }, cctx)
+  vim.system = saved_system
+  assert.is_false(ok)
+  assert.truthy(err:find("^fetch_url: could not spawn curl: .*spawn boom"))
+  for _, f in ipairs(cancel_fns) do assert.is_true(pcall(f)) end
+end)
+
+local function cancellation_probe(check)
+  local saved = { system = vim.system, schedule = vim.schedule, defer = vim.defer_fn,
+    dns = vim.uv.getaddrinfo, executable = vim.fn.executable }
+  local queue, timers, run = {}, {}, { cancelled = false, done = false, await_seq = 0, cancel_fns = {} }
+  local new_ctx
+  for i = 1, 100 do
+    local name, value = debug.getupvalue(require("straps.loop").start, i)
+    if not name then break end
+    if name == "new_ctx" then new_ctx = value; break end
+  end
+  assert(new_ctx, "loop.start must retain the installed new_ctx")
+  local probe = { resumes = 0, completed = 0, spawned = 0, killed = 0 }
+  local cctx = new_ctx(0, run)
+  vim.schedule = function(fn) queue[#queue + 1] = fn end
+  vim.defer_fn = function(fn) timers[#timers + 1] = fn end
+  vim.fn.executable = function() return 1 end
+  vim.uv.getaddrinfo = function(_, _, _, callback) probe.dns = callback; return {} end
+  vim.system = function(_, opts, callback)
+    probe.spawned = probe.spawned + 1
+    probe.exit = callback
+    return { kill = function(_, signal) probe.killed = probe.killed + 1; assert.are.equal(9, signal) end }
+  end
+  function probe.start(url)
+    probe.co = coroutine.create(function()
+      probe.ok, probe.result = pcall(registry.call, "tool.fetch_url", { url = url }, cctx)
+      probe.completed = probe.completed + 1
+    end)
+    assert(coroutine.resume(probe.co))
+    assert.are.equal("suspended", coroutine.status(probe.co))
+  end
+  function probe.cancel()
+    run.cancelled = true
+    local handlers = run.cancel_fns
+    run.cancel_fns = {}
+    for _, fn in ipairs(handlers) do fn() end
+  end
+  function probe.flush()
+    while #queue > 0 do
+      probe.resumes = probe.resumes + 1
+      table.remove(queue, 1)()
+    end
+  end
+  probe.timers = timers
+  local ok, err = xpcall(function() check(probe) end, debug.traceback)
+  vim.system, vim.schedule, vim.defer_fn = saved.system, saved.schedule, saved.defer
+  vim.uv.getaddrinfo, vim.fn.executable = saved.dns, saved.executable
+  assert(ok, err)
+end
+
+it("fetch_url cancellation during active DNS resolves once without spawning curl", function()
+  cancellation_probe(function(p)
+    local slots = registry.subprocess_state().in_flight
+    p.start("http://pending.example/x")
+    assert.is_function(p.dns)
+    assert.are.equal(0, p.spawned)
+    p.cancel()
+    p.flush()
+    assert.is_false(p.ok)
+    assert.truthy(p.result:find("fetch_url: DNS lookup timed out", 1, true), p.result)
+    assert.are.equal(1, p.completed)
+    assert.are.equal(1, p.resumes)
+    p.dns(nil, { { addr = "93.184.216.34" } })
+    p.timers[1]()
+    p.flush()
+    assert.are.equal(1, p.resumes)
+    assert.are.equal(1, p.completed)
+    assert.are.equal(0, p.spawned)
+    assert.are.equal(slots, registry.subprocess_state().in_flight)
+  end)
+end)
+
+it("fetch_url cancellation kills active curl and releases its slot before late duplicate exits", function()
+  cancellation_probe(function(p)
+    local slots = registry.subprocess_state().in_flight
+    p.start("http://93.184.216.34/x")
+    assert.are.equal(1, p.spawned)
+    assert.are.equal(slots + 1, registry.subprocess_state().in_flight)
+    p.cancel()
+    assert.are.equal(1, p.killed)
+    assert.are.equal(slots, registry.subprocess_state().in_flight)
+    assert.are.equal(0, p.completed)
+    p.exit({ code = 137, stderr = "" })
+    p.exit({ code = 0, stderr = "duplicate" })
+    p.flush()
+    assert.is_true(p.ok)
+    assert.are.equal("exit code: 137\n", p.result)
+    assert.are.equal(1, p.completed)
+    assert.are.equal(1, p.resumes)
+    assert.are.equal(slots, registry.subprocess_state().in_flight)
+  end)
+end)
+
+it("glob raises a prefixed error for an unbalanced brace and supports {a,b}", function()
+  local ok, err = pcall(call_tool, "glob", { pattern = root .. "/lua/straps/{loop" })
+  assert.is_false(ok)
+  assert.truthy(err:find("^glob: invalid pattern .*E220"), err)
+  local out = call_tool("glob", { pattern = root .. "/lua/straps/{loop,state}.lua" })
+  assert.truthy(out:find("loop.lua", 1, true) and out:find("state.lua", 1, true), out)
+end)
+
+it("run_in_terminal and run_quickfix run in Neovim's global working directory", function()
+  local dir = vim.uv.fs_realpath(vim.fn.tempname():match("^(.*)/"))
+  local saved = vim.fn.getcwd
+  local seen = {}
+  vim.fn.getcwd = function(...) seen[#seen + 1] = select("#", ...); return dir end
+  local out = call_tool("run_quickfix", { command = "pwd -P | sed 's|$|:1:1: here|'", errorformat = "%f:%l:%c: %m" })
+  vim.fn.getcwd = saved
+  assert.truthy(out:find(vim.fn.fnamemodify(dir, ":.") .. ":1:1: here", 1, true), out)
+  assert.are.same({ 2 }, seen)
+end)
+
+for _, stream in ipairs({ "stdout", "stderr" }) do
+  it("run_quickfix caps " .. stream .. " at 262144 bytes before parsing", function()
+    local saved_system, saved_getqflist, saved_defer = vim.system, vim.fn.getqflist, vim.defer_fn
+    local parsed_raw
+    vim.system = function(_, opts, done)
+      opts[stream](nil, string.rep("x", 262140))
+      opts[stream](nil, "123456789")
+      opts[stream](nil, "ignored")
+      done({ code = 0 })
+      return { pid = 123 }
+    end
+    vim.defer_fn = function() end
+    vim.fn.getqflist = function(opts)
+      if opts and opts.lines then parsed_raw = table.concat(opts.lines, "\n"); return { items = {} } end
+      return saved_getqflist(opts)
+    end
+    local ok, out = pcall(call_tool, "run_quickfix", { command = "stubbed", errorformat = "%f:%l:%c: %m", open = false })
+    vim.system, vim.fn.getqflist, vim.defer_fn = saved_system, saved_getqflist, saved_defer
+    assert(ok, out)
+    assert.truthy(out:find("output truncated at 262144 bytes per stream", 1, true), out)
+    assert.are.equal(262144, #parsed_raw)
+    assert.are.equal("xxxx1234", parsed_raw:sub(-8))
+  end)
+end
+
+it("run_quickfix does not claim truncation below the stream cap", function()
+  local out = call_tool("run_quickfix", { command = "head -c 1000 /dev/zero | tr '\\0' x", errorformat = "%f:%l:%c: %m", open = false })
+  assert.falsy(out:find("output truncated", 1, true), out)
+end)
+
+it("read_file and path_info match a buffer by exact full path, not a bufname pattern", function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, "p")
+  local real = dir .. "/target.txt"
+  local f = assert(io.open(real, "w")); f:write("disk\n"); f:close()
+  local decoy = vim.fn.bufadd(dir .. "/target.txt.bak")
+  vim.fn.bufload(decoy)
+  vim.api.nvim_buf_set_lines(decoy, 0, -1, false, { "DECOY" })
+  vim.bo[decoy].modified = true
+  local info = call_tool("path_info", { paths = { real } })
+  assert.falsy(info:find("loaded", 1, true), info)
+  local out = call_tool("read_file", { path = real })
+  assert.truthy(out:find("disk", 1, true), out)
+  assert.falsy(out:find("DECOY", 1, true), out)
+  local only = dir .. "/only.txt"
+  local g = assert(io.open(only, "w")); g:write("only\n"); g:close()
+  call_tool("read_file", { path = only })
+  local ok, err = pcall(call_tool, "read_file", { path = dir .. "/only" })
+  assert.is_false(ok)
+  assert.are.equal("read_file: cannot open " .. dir .. "/only: no such file", err)
+end)
+
+it("registry_list accepts kind=skill", function()
+  local schema = registry.get("tool.registry_list").input_schema
+  assert.truthy(vim.tbl_contains(schema.properties.kind.enum, "skill"))
+  registry.define({ name = "skill.bg_skill", kind = "skill", doc = "a test skill", source = "prose" })
+  local out = call_tool("registry_list", { kind = "skill" })
+  assert.truthy(out:find("skill.bg_skill", 1, true), out)
+  assert.falsy(out:find("tool.", 1, true), out)
 end)

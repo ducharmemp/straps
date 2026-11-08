@@ -417,27 +417,8 @@ return function()
 end
 ]==]
 
--- Live model discovery: GET /v1/models and map each model to a picker entry
--- { id, label, thinking }. Synchronous curl (the picker is a one-off UI action,
--- not the hot path). The `thinking` tag is inferred from the API's own
--- capabilities.thinking.types — the single source of truth for which of the
--- two mutually incompatible thinking mechanisms a model speaks
--- (fn.anthropic_messages reads the same tag): adaptive.supported ->
--- "adaptive", else enabled.supported -> "budget", else nil (send no thinking
--- block). Returns a list on success, or
--- (nil, errmsg) on any failure so callers can fall back to the static list.
--- OpenAI returns {data:[{id}]} for an API key and {models:[{slug,
--- display_name, context_window, visibility}]} for a ChatGPT login; hidden
--- ChatGPT entries are dropped. A Codex login reads the Codex catalog (same
--- shape, every entry reasoning = true, its supported_reasoning_levels
--- flattened to effort strings) and falls back to oauth.CODEX_MODELS. The
--- server filters the catalog by oauth.CODEX_CLIENT_VERSION.
--- llama-server returns {data:[{id, meta?}]};
--- meta.n_ctx (present only for a loaded model) becomes `context`. The URL is
--- provider.base_url, the key comes from the slot's key_fn (optional for a
--- slot with key_required = false), and provider.auth_headers builds the header.
 local LIST_MODELS_SRC = [==[
-return function(provider_override)
+local function discover(provider_override, ctx)
   local registry = require("straps.registry")
   local providers = require("straps.provider")
   local ok_straps, straps = pcall(require, "straps")
@@ -468,7 +449,7 @@ return function(provider_override)
     return nil, "openai layer disabled (setup{ layers = { openai = false } })"
   end
 
-  local ok_key, api_key, key_source, account_id = pcall(registry.call, key_fn, { base_url = base_url, wait_ms = 15000 })
+  local ok_key, api_key, key_source, account_id = pcall(registry.call, key_fn, { base_url = base_url, wait_ms = 15000, ctx = ctx })
   if not ok_key then
     return nil, key_fn .. " failed (" .. tostring(api_key):gsub("^straps: ", "") .. ")"
   end
@@ -493,8 +474,6 @@ return function(provider_override)
     return list
   end
 
-  -- Synchronous: the picker blocks briefly on this, which is fine for a
-  -- deliberate UI action and avoids threading the loop's async ctx through.
   -- Anthropic caps the page with ?limit; OpenAI's and llama-server's
   -- /v1/models have no such param, so only send it for Anthropic.
   local url = base_url .. "/v1/models" .. ((openai or llamacpp) and "" or "?limit=1000")
@@ -504,81 +483,129 @@ return function(provider_override)
   local argv = { "curl", "-sS", "-g", url }
   vim.list_extend(argv, headers)
   vim.list_extend(argv, { "-w", "\nSTRAPS_HTTP_STATUS:%{http_code}\n" })
-  local res = vim.system(argv, { text = true }):wait(15000)
 
   local function fail(msg)
     if codex then return codex_fallback(msg) end
     return nil, msg
   end
-  if not res then
-    return fail("model list request timed out")
-  end
-  local out = res.stdout or ""
-  local status = tonumber(out:match("STRAPS_HTTP_STATUS:(%d+)"))
-  out = out:gsub("%s*STRAPS_HTTP_STATUS:%d+%s*$", "")
-  if res.code ~= 0 then
-    return fail("curl exited " .. res.code .. ": " .. (res.stderr or ""))
-  end
-  if status and status >= 400 then
-    return fail("HTTP " .. status .. ": " .. out:sub(1, 300))
-  end
-  local ok_json, body = pcall(vim.json.decode, out)
-  if not ok_json or type(body) ~= "table" then
-    return fail("could not parse /v1/models response")
-  end
-
-  local models = {}
-  local chatgpt_catalog = openai and type(body.data) ~= "table" and type(body.models) == "table"
-  if not chatgpt_catalog and type(body.data) ~= "table" then
-    return fail("could not parse /v1/models response")
-  end
-  for _, m in ipairs(chatgpt_catalog and body.models or {}) do
-    if type(m) == "table" and type(m.slug) == "string" and m.visibility ~= "hide" then
-      models[#models + 1] = {
-        id = m.slug,
-        label = type(m.display_name) == "string" and m.display_name or m.slug,
-        thinking = nil,
-        context = tonumber(m.context_window),
-        reasoning = codex or nil,
-        supported_reasoning_levels = codex and oauth.flatten_levels(m.supported_reasoning_levels) or nil,
-      }
+  local function parse(res)
+    if not res or res.code == 124 then
+      return fail("model list request timed out")
     end
-  end
-  for _, m in ipairs(chatgpt_catalog and {} or body.data) do
-    if type(m) == "table" and type(m.id) == "string" then
-      if openai then
-        -- OpenAI API-key catalog entries carry no display name or thinking /
-        -- reasoning-effort capabilities, so the id doubles as the label and
-        -- static config must opt a model into reasoning.effort explicitly.
-        models[#models + 1] = { id = m.id, label = m.id, thinking = nil }
-      elseif llamacpp then
-        local meta = type(m.meta) == "table" and m.meta or {}
-        models[#models + 1] = { id = m.id, label = m.id, thinking = nil, context = tonumber(meta.n_ctx) }
-      else
-        local types = (((m.capabilities or {}).thinking or {}).types) or {}
-        local thinking = nil
-        if ((types.adaptive or {}).supported) == true then
-          thinking = "adaptive"
-        elseif ((types.enabled or {}).supported) == true then
-          thinking = "budget"
-        end
-        -- max_tokens is the model's max response tokens; fn.anthropic_messages
-        -- uses it as the default max_tokens (as `max_output`). context
-        -- (max_input_tokens) drives the winbar fill.
+    local out = res.stdout or ""
+    local status = tonumber(out:match("STRAPS_HTTP_STATUS:(%d+)"))
+    out = out:gsub("%s*STRAPS_HTTP_STATUS:%d+%s*$", "")
+    if res.code ~= 0 then
+      return fail("curl exited " .. res.code .. ": " .. (res.stderr or ""))
+    end
+    if status and status >= 400 then
+      return fail("HTTP " .. status .. ": " .. out:sub(1, 300))
+    end
+    local ok_json, body = pcall(vim.json.decode, out)
+    if not ok_json or type(body) ~= "table" then
+      return fail("could not parse /v1/models response")
+    end
+
+    local models = {}
+    local chatgpt_catalog = openai and type(body.data) ~= "table" and type(body.models) == "table"
+    if not chatgpt_catalog and type(body.data) ~= "table" then
+      return fail("could not parse /v1/models response")
+    end
+    for _, m in ipairs(chatgpt_catalog and body.models or {}) do
+      if type(m) == "table" and type(m.slug) == "string" and m.visibility ~= "hide" then
         models[#models + 1] = {
-          id = m.id,
-          label = m.display_name or m.id,
-          thinking = thinking,
-          max_output = tonumber(m.max_tokens),
-          context = tonumber(m.max_input_tokens),
+          id = m.slug,
+          label = type(m.display_name) == "string" and m.display_name or m.slug,
+          thinking = nil,
+          context = tonumber(m.context_window),
+          reasoning = codex or nil,
+          supported_reasoning_levels = codex and oauth.flatten_levels(m.supported_reasoning_levels) or nil,
         }
       end
     end
+    for _, m in ipairs(chatgpt_catalog and {} or body.data) do
+      if type(m) == "table" and type(m.id) == "string" then
+        if openai then
+          -- OpenAI API-key catalog entries carry no display name or thinking /
+          -- reasoning-effort capabilities, so the id doubles as the label and
+          -- static config must opt a model into reasoning.effort explicitly.
+          models[#models + 1] = { id = m.id, label = m.id, thinking = nil }
+        elseif llamacpp then
+          local meta = type(m.meta) == "table" and m.meta or {}
+          models[#models + 1] = { id = m.id, label = m.id, thinking = nil, context = tonumber(meta.n_ctx) }
+        else
+          local types = (((m.capabilities or {}).thinking or {}).types) or {}
+          local thinking = nil
+          if ((types.adaptive or {}).supported) == true then
+            thinking = "adaptive"
+          elseif ((types.enabled or {}).supported) == true then
+            thinking = "budget"
+          end
+          -- max_tokens is the model's max response tokens; fn.anthropic_messages
+          -- uses it as the default max_tokens (as `max_output`). context
+          -- (max_input_tokens) drives the winbar fill.
+          models[#models + 1] = {
+            id = m.id,
+            label = m.display_name or m.id,
+            thinking = thinking,
+            max_output = tonumber(m.max_tokens),
+            context = tonumber(m.max_input_tokens),
+          }
+        end
+      end
+    end
+    if #models == 0 then
+      return fail("/v1/models returned no usable models")
+    end
+    return models
   end
-  if #models == 0 then
-    return fail("/v1/models returned no usable models")
+
+  if ctx then
+    return parse(ctx.await(function(resolve)
+      vim.system(argv, { text = true, timeout = 15000 }, resolve)
+    end))
   end
-  return models
+  return parse(vim.system(argv, { text = true }):wait(15000))
+end
+
+return function(provider_override, on_done)
+  if type(on_done) ~= "function" then return discover(provider_override) end
+  local registry = require("straps.registry")
+  local scope = registry.active_scope()
+  local co, resume
+  local ctx = {
+    await = function(start)
+      local resolved = false
+      start(function(...)
+        if resolved then return end
+        resolved = true
+        local args = vim.F.pack_len(...)
+        vim.schedule(function()
+          if coroutine.status(co) == "suspended" then
+            resume(unpack(args, 1, args.n))
+          end
+        end)
+      end)
+      return coroutine.yield()
+    end,
+  }
+  co = coroutine.create(function()
+    local ok, models, err = pcall(discover, provider_override, ctx)
+    if not ok then models, err = nil, tostring(models) end
+    vim.schedule(function()
+      local previous = registry.set_active_scope(scope)
+      local called, why = pcall(on_done, models, err)
+      registry.set_active_scope(previous)
+      if not called then error(why, 0) end
+    end)
+  end)
+  resume = function(...)
+    local previous = registry.set_active_scope(scope)
+    local ok, err = coroutine.resume(co, ...)
+    registry.set_active_scope(previous)
+    if not ok then error(err, 0) end
+  end
+  resume()
 end
 ]==]
 
@@ -3070,7 +3097,7 @@ your tool calls and streamed text live as you work.
   of the answer you want back.
 - readonly=true for pure research (all writes denied without prompting);
   allow={"edit",...} instead grants the child those permission categories
-  (edit/delete/exec/lua/net/spawn) — granted calls run unprompted, ungranted
+  (edit/delete/exec/lua/net/spawn/browser) — granted calls run unprompted, ungranted
   ones are denied, so use allow for a child that must edit but not run
   commands; tools=[...] to focus it; show=true when the user should watch it work.
 - A child's CAPABILITY is yours to choose: spawn takes model and effort,
@@ -3262,7 +3289,9 @@ returned string is appended to the tool result you see):
     name: "hook.after_write"
     kind: "hook"
     doc: "Run luacheck on every written file."
-    source: 'return function(path) return vim.fn.system({ "luacheck", path }) end'
+    source: 'return function(path, ctx) local r = ctx.await(function(done)
+      vim.system({ "luacheck", path }, { text = true }, done) end)
+      return r.stdout end'
 
 To keep an entry beyond this session, append its definition to
 .straps.lua at the project root: registry_get renders any entry
@@ -3910,7 +3939,7 @@ function M.register()
   define({
     name = "fn.list_models",
     kind = "fn",
-    doc = "GET /v1/models from the effective backend, or an explicit provider argument ('anthropic'/'openai'/'llamacpp'), and return picker entries { id, label, thinking, context?, max_output?, reasoning?, supported_reasoning_levels? } (Anthropic infers the thinking tag from capabilities; OpenAI and llama.cpp have none; a Codex login marks reasoning and flattens the catalog's supported_reasoning_levels to effort strings); (nil, err) on failure.",
+    doc = "(provider?, on_done?) GET /v1/models from the effective backend, or an explicit provider argument ('anthropic'/'openai'/'llamacpp'); with on_done it fetches in the background and calls on_done(entries, err), else it blocks and returns picker entries { id, label, thinking, context?, max_output?, reasoning?, supported_reasoning_levels? } (Anthropic infers the thinking tag from capabilities; OpenAI and llama.cpp have none; a Codex login marks reasoning and flattens the catalog's supported_reasoning_levels to effort strings); (nil, err) on failure.",
     source = LIST_MODELS_SRC,
   })
   define({

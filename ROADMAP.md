@@ -135,32 +135,17 @@ Sketch:
 
 ## Findings-list isolation for WINDOWLESS sessions
 
-Shipped: on-screen sessions route grep/bulk_replace/etc. to their window's
-*location* list (per-window, private), falling back to the global quickfix list
-when the session has no window (ui.lua `session_win`/`set_locations`/
-`get_locations`/`locations_do`). Residual gap: a location list cannot exist
-without a window, so **windowless subagents still share the global quickfix
-list** and two concurrent ones could stomp each other's bulk_replace target.
+Shipped: `lua/straps/findings.lua` keeps each session's findings in a private
+store. Visible sessions mirror that store into their window's location list
+for native navigation. Hidden sessions retain their findings without creating
+a window or changing the global quickfix list. Tools without a session still
+use the global quickfix list when no window is available.
 
-This is inherent, not a bug to design around: the location/quickfix list IS the
-native surface — `:cdo`, `:cfdo`, `:cnext`/`:lnext` and every quickfix-aware
-plugin operate on it, so the list must stay the source of truth. (A rejected
-idea: store findings in `vim.b.straps_findings` and treat the list as a display
-mirror — WRONG, it orphans `:cdo`/`:cfdo`/native navigation from the real set.)
-
-Given that, the only real options are:
-- **Accept it.** Windowless subagents rarely run grep→bulk_replace interactively,
-  and the on-screen main session (the common case) is already isolated. Cheapest,
-  and honest.
-- **Give a windowless session a real window on demand.** A location list needs a
-  window; before writing findings, ensure the session buffer has one — even in a
-  separate/background tabpage the user isn't focused on — so it gets a genuine,
-  native, per-window location list the agent's bulk_replace and the user's
-  `:ldo`/`:cfdo` both see. Heavier (window/tab lifecycle to manage), but keeps
-  everything native.
-
-Leaning toward "accept it" unless windowless-subagent bulk edits become a real
-pattern.
+`bulk_replace` reads the session store in both visibility states. Tracking
+extmarks retain finding positions across multiline replacements and native
+undo. Resetting findings or wiping the session removes its tracking marks.
+Showing a hidden session refreshes its location-list mirror; native list edits
+do not replace the stored findings.
 
 ## Forkable minds: branching the transcript, and live surgery on a running agent
 

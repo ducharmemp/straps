@@ -130,11 +130,11 @@ function M.register_spawn()
       .. " once for a finished child). Parameters: task (required); system (optional) — extra"
       .. " standing instructions, prepended to the task; provider (optional) —"
       .. " child backend, inherited from this session/global default when unset; tools (optional array"
-      .. " of tool names) — the child sees only these tools; readonly (optional"
+      .. " of tool names) — the child sees only these tools (an unknown name is an error); readonly (optional"
       .. " boolean) — the child may use only auto-allowed read-only tools,"
       .. " every write is denied without prompting (equivalent to allow={});"
       .. " allow (optional array) — grant these permission categories (edit,"
-      .. " delete, exec, lua, net, spawn) or specific tool names to the child:"
+      .. " delete, exec, lua, net, spawn, browser) or specific tool names to the child:"
       .. " granted calls run without prompting, everything else is DENIED"
       .. " (no prompt); a tool-name grant covers the tool's current definition, so"
       .. " a child that shadows that tool, or any redefinition of it, is denied under it;"
@@ -156,13 +156,13 @@ function M.register_spawn()
         tools = {
           type = "array",
           items = { type = "string" },
-          description = "Restrict the child to these tool names.",
+          description = "Restrict the child to these tool names (each must be a registered tool).",
         },
         readonly = { type = "boolean", description = "Read-only child: every write tool is denied." },
         allow = {
           type = "array",
           items = { type = "string" },
-          description = "Grant these permission categories (edit, delete, exec, lua, net, spawn) or specific tool names to the child: granted calls run without prompting; everything else is DENIED (no prompt). readonly=true is equivalent to allow={}.",
+          description = "Grant these permission categories (edit, delete, exec, lua, net, spawn, browser) or specific tool names to the child: granted calls run without prompting; everything else is DENIED (no prompt). readonly=true is equivalent to allow={}.",
         },
         show = { type = "boolean", description = "Open the child's transcript buffer in a split." },
         max_turns = { type = "integer", description = "Child turn budget (default 24)." },
@@ -176,7 +176,7 @@ function M.register_spawn()
 return function(input, ctx)
   local task = input.task
   if type(task) ~= "string" or task == "" then
-    error("spawn: task must be a non-empty string")
+    error("spawn: task must be a non-empty string", 0)
   end
   local registry = require("straps.registry")
   local state = require("straps.state")
@@ -188,14 +188,14 @@ return function(input, ctx)
   -- category or an existing tool, so "define"/"agent_tool" (not grantable) and typos
   -- error here instead of silently granting nothing.
   if input.readonly and type(input.allow) == "table" then
-    error("spawn: readonly and allow are mutually exclusive (readonly is allow={})")
+    error("spawn: readonly and allow are mutually exclusive (readonly is allow={})", 0)
   end
   if input.allow ~= nil and type(input.allow) ~= "table" then
-    error("spawn: allow must be an array of categories or tool names")
+    error("spawn: allow must be an array of categories or tool names", 0)
   end
   local providers = require("straps.provider")
   if type(input.provider) == "string" and input.provider ~= "" and not providers.is_provider(input.provider) then
-    error("spawn: " .. providers.unknown_provider_error(input.provider))
+    error("spawn: " .. providers.unknown_provider_error(input.provider), 0)
   end
   -- A gated spawner (itself a readonly/allow child, marked by the spawn:gated
   -- grant) is a permission ceiling for its own children: it may delegate only
@@ -209,6 +209,20 @@ return function(input, ctx)
     input.readonly = true
     forced_readonly = true
   end
+  if input.tools ~= nil then
+    if type(input.tools) ~= "table" then
+      error("spawn: tools must be an array of tool names", 0)
+    end
+    local unknown = {}
+    for _, t in ipairs(input.tools) do
+      if type(t) ~= "string" or registry.get("tool." .. t) == nil then
+        unknown[#unknown + 1] = vim.inspect(t)
+      end
+    end
+    if #unknown > 0 then
+      error("spawn: unknown tool name(s) in tools: " .. table.concat(unknown, ", "), 0)
+    end
+  end
   if type(input.allow) == "table" then
     local grantable = registry.try_call("fn.capability") or {}
     local is_grantable = {}
@@ -217,14 +231,14 @@ return function(input, ctx)
       if not (is_grantable[entry] or registry.get("tool." .. tostring(entry)) ~= nil) then
         error("spawn: allow entry " .. vim.inspect(entry)
           .. " is not a grantable category (" .. table.concat(grantable, ", ")
-          .. ") or an existing tool")
+          .. ") or an existing tool", 0)
       end
       -- A tool-name grant of a define-category tool (registry_define) would
       -- let the child shadow its own hook.confirm — an everything grant. The
       -- category ceiling must hold for name grants too.
       if registry.try_call("fn.capability", entry) == "define" then
         error("spawn: allow entry " .. vim.inspect(entry)
-          .. " is in the define category, which is never grantable")
+          .. " is in the define category, which is never grantable", 0)
       end
       if gated then
         local within
@@ -246,7 +260,7 @@ return function(input, ctx)
           end
           table.sort(held)
           error("spawn: allow entry " .. vim.inspect(entry)
-            .. " exceeds this session's own grants (" .. table.concat(held, ", ") .. ")")
+            .. " exceeds this session's own grants (" .. table.concat(held, ", ") .. ")", 0)
         end
       end
     end
@@ -485,7 +499,7 @@ return function(input, ctx)
 
   local bufs = input.buffers
   if type(bufs) ~= "table" or #bufs == 0 then
-    error("spawn_wait: buffers must be a non-empty array of subagent buffer numbers")
+    error("spawn_wait: buffers must be a non-empty array of subagent buffer numbers", 0)
   end
   -- Normalize + validate: only wait on live buffers that this session spawned
   -- (straps_parent == us). Unknown/invalid handles are reported, never awaited.
@@ -830,7 +844,7 @@ return function(input, ctx)
   local registry = require("straps.registry")
   local me = ctx and ctx.bufnr
   if type(me) ~= "number" or not vim.api.nvim_buf_is_valid(me) then
-    error("send_message: no session buffer in context")
+    error("send_message: no session buffer in context", 0)
   end
   local function bvar(b, name)
     local ok, v = pcall(function() return vim.b[b][name] end)
@@ -843,11 +857,11 @@ return function(input, ctx)
 
   local text = input.text
   if type(text) ~= "string" or not text:match("%S") then
-    error("send_message: text must be a non-empty string")
+    error("send_message: text must be a non-empty string", 0)
   end
   if #text > 4000 then
     error(("send_message: text is %d bytes; the cap is 4000 — a message is a note,"
-      .. " not a report (put a long one in a file and send its path)"):format(#text))
+      .. " not a report (put a long one in a file and send its path)"):format(#text), 0)
   end
 
   local my_parent = bvar(me, "straps_parent")
@@ -855,20 +869,20 @@ return function(input, ctx)
   local target
   if to == "parent" then
     if not is_session(my_parent) then
-      error("send_message: this session has no parent")
+      error("send_message: this session has no parent", 0)
     end
     target = my_parent
   else
     if type(to) ~= "string" or not to:match("^%d+$") then
-      error("send_message: to must be a buffer number as digits, or \"parent\"")
+      error("send_message: to must be a buffer number as digits, or \"parent\"", 0)
     end
     target = tonumber(to)
     if not is_session(target) then
-      error(("send_message: buffer %s is not a straps session in this Neovim"):format(tostring(to)))
+      error(("send_message: buffer %s is not a straps session in this Neovim"):format(tostring(to)), 0)
     end
   end
   if target == me then
-    error("send_message: that is this session")
+    error("send_message: that is this session", 0)
   end
 
   -- A gated session (readonly/allow child) stays inside its own family: its
@@ -877,7 +891,7 @@ return function(input, ctx)
   local gated = false
   pcall(function() gated = registry.granted(me)["spawn:gated"] == true end)
   if gated and target ~= my_parent and bvar(target, "straps_parent") ~= me then
-    error("send_message: a permission-gated session may message only its parent or its own children")
+    error("send_message: a permission-gated session may message only its parent or its own children", 0)
   end
 
   local label = "buffer " .. tostring(me)
@@ -893,7 +907,7 @@ return function(input, ctx)
     return ("appended to %s (buffer %d); it is idle and its run was not started")
       :format(target_label, target)
   end
-  error("send_message: delivery failed (the recipient buffer vanished)")
+  error("send_message: delivery failed (the recipient buffer vanished)", 0)
 end
 ]==],
   })
@@ -1088,7 +1102,7 @@ return function(spec)
         local prev = registry.set_active_scope(session)
         local ok_call, out = pcall(registry.try_call, spec.entry, args)
         registry.set_active_scope(prev)
-        if not ok_call then error(out) end
+        if not ok_call then error(out, 0) end
         return out
       end)
       if ok and type(s) == "string" and s ~= "" then

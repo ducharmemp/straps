@@ -6,17 +6,21 @@ if vim.g.loaded_straps then
 end
 vim.g.loaded_straps = true
 
--- Session buffers act on themselves (via ui.resolve_session); anything else
--- gets a polite error.
 local function resolve_session()
-  local target = require("straps.ui").resolve_session(vim.api.nvim_get_current_buf())
-  if not target then
-    vim.notify(
-      "straps: current buffer is not a straps session or input buffer (open one with :Straps)",
-      vim.log.levels.ERROR
-    )
+  return require("straps.ui").require_session(vim.api.nvim_get_current_buf())
+end
+
+local function ensure_setup()
+  if not require("straps.registry").get("fn.provider") then
+    require("straps").setup()
   end
-  return target
+end
+
+local function command(name, fn, opts)
+  vim.api.nvim_create_user_command(name, function(o)
+    ensure_setup()
+    return fn(o)
+  end, opts)
 end
 
 -- Turn a command's parsed <mods> into a :split command string, so window
@@ -71,7 +75,7 @@ local function parse_straps_args(args)
   return cats, instruction
 end
 
-vim.api.nvim_create_user_command("Straps", function(opts)
+command("Straps", function(opts)
   local cats, instruction = parse_straps_args(opts.args)
   require("straps.ui").open_session(split_cmd_of(opts.smods), {
     grants = cats,
@@ -83,8 +87,8 @@ end, {
   nargs = "*",
   bang = true,
   complete = function(arglead)
-    local ok, ui = pcall(require, "straps.ui")
-    local items = ok and ui.grantable_categories() or {}
+    ensure_setup()
+    local items = require("straps.ui").grantable_categories()
     items = vim.list_extend({ "all", "--" }, items)
     return vim.tbl_filter(function(it) return it:find(arglead, 1, true) == 1 end, items)
   end,
@@ -92,12 +96,12 @@ end, {
     .. " [categories] pre-grant permissions, `-- text` seeds the request, ! sends it",
 })
 
-vim.api.nvim_create_user_command("StrapsResume", function(opts)
+command("StrapsResume", function(opts)
   local ui = require("straps.ui")
   local arg = opts.args
   local split = split_cmd_of(opts.smods)
   if opts.bang then
-    return ui.pick_session() -- picker over all saved sessions
+    return ui.pick_session(split) -- picker over all saved sessions
   end
   if arg == "" then
     return ui.resume_session(nil, split) -- most recent
@@ -131,22 +135,21 @@ end, {
   desc = "straps: resume a saved session (no arg = most recent; ! = pick via picker)",
 })
 
-vim.api.nvim_create_user_command("StrapsRename", function(opts)
+command("StrapsRename", function(opts)
   local ui = require("straps.ui")
-  local target = ui.resolve_session(vim.api.nvim_get_current_buf())
+  local target = resolve_session()
   if not target then
-    vim.notify("straps: run :StrapsRename on a session buffer", vim.log.levels.ERROR)
     return
   end
   -- No arg: prompt (pre-filled with current title). Arg: set it directly.
   ui.rename_session(target, opts.args ~= "" and opts.args or nil)
 end, { nargs = "?", desc = "straps: give this session a durable title (no arg = prompt)" })
 
-vim.api.nvim_create_user_command("StrapsSearch", function(opts)
+command("StrapsSearch", function(opts)
   require("straps.ui").grep_sessions(opts.args)
 end, { nargs = "+", desc = "straps: full-text search across all saved session transcripts" })
 
-vim.api.nvim_create_user_command("StrapsSend", function()
+command("StrapsSend", function()
   local bufnr = resolve_session()
   if not bufnr then
     return
@@ -163,18 +166,20 @@ vim.api.nvim_create_user_command("StrapsSend", function()
   end
 end, { desc = "straps: send the trailing user block (or steer if a run is active)" })
 
-vim.api.nvim_create_user_command("StrapsSteer", function(opts)
+command("StrapsSteer", function(opts)
   local bufnr = resolve_session()
   if not bufnr then
     return
   end
-  local text = table.concat(opts.fargs, " ")
+  local text = opts.args
   if not require("straps.loop").steer(bufnr, text) then
-    vim.notify("straps: no active run to steer — start one with :StrapsSend", vim.log.levels.INFO)
+    require("straps.state").add_to_trailing_user(bufnr, text)
+    vim.notify("straps: no active run; added the text to the trailing user block (send it with :StrapsSend)",
+      vim.log.levels.WARN)
   end
 end, { nargs = "+", desc = "straps: queue a steering message for the active run" })
 
-vim.api.nvim_create_user_command("StrapsStop", function()
+command("StrapsStop", function()
   local bufnr = resolve_session()
   if not bufnr then
     return
@@ -184,10 +189,9 @@ end, { desc = "straps: cancel the active run in this session" })
 
 -- Continuing a STOPPED run, as opposed to :StrapsResume, which reopens a saved
 -- transcript from disk. Nothing to restore: :StrapsStop already leaves the
--- transcript sendable (every tool_use paired), it just ends on an assistant
--- block, which the loop refuses to send. Appending a user block is the whole
--- mechanism — the buffer IS the run state.
-vim.api.nvim_create_user_command("StrapsContinue", function(opts)
+-- transcript sendable (every tool_use paired). Appending a user block is the
+-- whole mechanism — the buffer IS the run state.
+command("StrapsContinue", function(opts)
   local bufnr = resolve_session()
   if not bufnr then
     return
@@ -203,21 +207,21 @@ vim.api.nvim_create_user_command("StrapsContinue", function(opts)
   loop.start(bufnr)
 end, { nargs = "?", desc = "straps: continue a stopped/interrupted run (optional instruction)" })
 
-vim.api.nvim_create_user_command("StrapsCompact", function()
+command("StrapsCompact", function()
   local bufnr = resolve_session()
   if not bufnr then
     return
   end
   local ok, summary = pcall(require("straps.registry").call, "fn.compact", bufnr)
   if ok then
-    vim.notify("straps: " .. tostring(summary))
+    vim.notify("straps: " .. tostring(summary), vim.log.levels.INFO)
   else
     vim.notify("straps: compact failed: " .. tostring(summary), vim.log.levels.ERROR)
   end
 end, { desc = "straps: compact old tool blocks in this session" })
 
-vim.api.nvim_create_user_command("StrapsEdit", function(opts)
-  require("straps.ui").open_entry(opts.args)
+command("StrapsEdit", function(opts)
+  require("straps.ui").open_entry(opts.args, split_cmd_of(opts.smods))
 end, {
   nargs = 1,
   complete = function(arglead)
@@ -232,43 +236,49 @@ end, {
   desc = "straps: edit a registry entry (:w to redefine)",
 })
 
-vim.api.nvim_create_user_command("StrapsRegistry", function()
-  require("straps.ui").registry_list()
+command("StrapsRegistry", function(opts)
+  require("straps.ui").registry_list(split_cmd_of(opts.smods))
 end, { desc = "straps: list registry entries" })
 
-vim.api.nvim_create_user_command("StrapsHelp", function(opts)
+command("StrapsHelp", function(opts)
   local tag = opts.args ~= "" and opts.args or "straps"
   vim.cmd("help " .. vim.fn.escape(tag, "\\ |\""))
 end, {
   nargs = "?",
   complete = function(arglead)
-    local tags = {
-      "straps", "straps-commands", "straps-session", "straps-config",
-      "straps-registry", "straps-tools", "straps-hooks", "straps-fn",
-      "straps-skills", "straps-subagents", "straps-health",
-    }
-    return vim.tbl_filter(function(tag) return tag:find(arglead, 1, true) == 1 end, tags)
+    local tags = {}
+    for _, path in ipairs(vim.api.nvim_get_runtime_file("doc/tags", true)) do
+      local ok, lines = pcall(vim.fn.readfile, path)
+      for _, line in ipairs(ok and lines or {}) do
+        local tag = line:match("^([^\t]+)\t")
+        if tag and tag:match("^straps") and vim.startswith(tag, arglead) then
+          tags[#tags + 1] = tag
+        end
+      end
+    end
+    table.sort(tags)
+    return vim.fn.uniq(tags)
   end,
   desc = "straps: open :help straps (or a straps help tag)",
 })
 
-vim.api.nvim_create_user_command("StrapsAgents", function(opts)
+command("StrapsAgents", function(opts)
   require("straps.ui").open_agents(split_cmd_of(opts.smods))
 end, { desc = "straps: open the agents buffer (running/loaded/saved sessions; :vertical for a vsplit)" })
 
-vim.api.nvim_create_user_command("StrapsEval", function()
+command("StrapsEval", function()
   require("straps.ui").eval_buffer()
 end, { desc = "straps: execute the current buffer as Lua" })
 
-vim.api.nvim_create_user_command("StrapsModel", function()
+command("StrapsModel", function()
   require("straps.ui").pick_model()
 end, { desc = "straps: pick the provider-specific model (per session on a session buffer; else global, persisted to ~/.config/straps/model_<provider>)" })
 
-vim.api.nvim_create_user_command("StrapsEffort", function()
+command("StrapsEffort", function()
   require("straps.ui").pick_effort()
 end, { desc = "straps: pick config.effort (extended-thinking budget) via a picker" })
 
-vim.api.nvim_create_user_command("StrapsProvider", function()
+command("StrapsProvider", function()
   require("straps.ui").pick_provider()
 end, { desc = "straps: pick the API backend (anthropic/openai/llamacpp); persists the global choice to ~/.config/straps/provider" })
 
@@ -280,7 +290,7 @@ local function provider_complete(arglead)
   return out
 end
 
-vim.api.nvim_create_user_command("StrapsLogin", function(opts)
+command("StrapsLogin", function(opts)
   require("straps.ui").login(opts.fargs)
 end, { nargs = "*", bang = true, complete = function(arglead, line)
   local after = line:match("StrapsLog%a*!?%s+(.*)$") or ""
@@ -293,7 +303,7 @@ end, { nargs = "*", bang = true, complete = function(arglead, line)
   return {}
 end, desc = "straps: store a provider credential (:StrapsLogin [provider [key]]; openai signs in with ChatGPT, openai codex signs in the way the Codex CLI does, then :StrapsLogin openai <redirect-url>; key stores an API key)" })
 
-vim.api.nvim_create_user_command("StrapsLogout", function(opts)
+command("StrapsLogout", function(opts)
   require("straps.ui").logout(opts.fargs)
 end, { nargs = "*", bang = true, complete = function(arglead, line)
   local after = line:match("StrapsLog%a*!?%s+(.*)$") or ""
@@ -301,13 +311,10 @@ end, { nargs = "*", bang = true, complete = function(arglead, line)
 end,
   desc = "straps: delete a provider's stored credentials (:StrapsLogout [provider])" })
 
-vim.api.nvim_create_user_command("StrapsAuto", function(opts)
+command("StrapsAuto", function(opts)
   require("straps.ui").auto(opts.args)
 end, { nargs = "?", complete = function(arglead)
-  local items = { "off", "edit", "delete", "exec", "lua", "net", "spawn" }
-  local out = {}
-  for _, it in ipairs(items) do
-    if it:find(arglead, 1, true) == 1 then out[#out + 1] = it end
-  end
-  return out
-end, desc = "Grant permission categories to this session (auto mode)" })
+  ensure_setup()
+  local items = vim.list_extend({ "off", "all" }, require("straps.ui").grantable_categories())
+  return vim.tbl_filter(function(it) return it:find(arglead, 1, true) == 1 end, items)
+end, desc = "straps: grant permission categories to this session (auto mode; off, all, or a list)" })

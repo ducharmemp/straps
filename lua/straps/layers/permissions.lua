@@ -24,15 +24,16 @@ function M.register()
       .. " (not undo-reversible, its own category), exec (shell), lua (eval_lua),"
       .. " net (fetch_url), define (registry_define — never grantable, a define"
       .. " grant could shadow hook.confirm), spawn (subagents and send_message), and agent_tool"
-      .. " (agent-defined tools, including session shadows of builtin names — never grantable). Called with no args it"
+      .. " (agent-defined tools, including session shadows of builtin names — never grantable), and browser"
+      .. " (tools a trusted plugin defines with capability = \"browser\", e.g. straps-buff). Called with no args it"
       .. " returns the array of GRANTABLE categories { edit, delete, exec, lua,"
-      .. " net, spawn }. Redefine it to add custom categories — e.g. classify"
+      .. " net, spawn, browser }. Redefine it to add custom categories — e.g. classify"
       .. " bash inputs matching ^git%s into a \"vcs\" category. A tool.* entry's"
       .. " own capability field (settable only via registry.define, not"
       .. " tool.registry_define) takes precedence over this classification.",
     source = [==[
 return function(name, input)
-  local grantable = { "edit", "delete", "exec", "lua", "net", "spawn" }
+  local grantable = { "edit", "delete", "exec", "lua", "net", "spawn", "browser" }
   if name == nil then return grantable end
 
   -- Entries may declare their own category (set only via trusted definition
@@ -144,14 +145,15 @@ end
     name = "hook.confirm",
     kind = "hook",
     doc = "Confirmation gate called before every tool execution as"
-      .. " (name, input, ctx) -> allowed, reason. Default behavior: auto-allow"
-      .. " the read-only tools (read_file, glob, tree, path_info, grep, registry_list,"
-      .. " registry_get, diagnostics, diagnostic_at, diagnostic_next, lsp_status,"
-      .. " declaration, definition, type_definition, implementation, references,"
-      .. " symbols, read_symbol, tree_sitter_status, node_at, read_node, hover,"
-      .. " workspace_symbols, context, show_user,"
-      .. " show_diff, show_buffer, set_findings, help_search, ask_user, agents,"
-      .. " code_action/fix_diagnostic in list mode i.e. without"
+      .. " (name, input, ctx) -> allowed, reason, source. source \"hook\" marks a policy veto: the"
+      .. " tool result reads \"blocked by hook.confirm: <reason>\"; any other refusal reads"
+      .. " \"user denied: <reason>\". Default behavior: auto-allow"
+      .. " the read-only tools, i.e. every call fn.capability classifies as read (read_file, glob,"
+      .. " tree, path_info, grep, registry_list, registry_get, skill, diagnostics, diagnostic_at,"
+      .. " diagnostic_next, lsp_status, declaration, definition, type_definition, implementation,"
+      .. " references, symbols, read_symbol, tree_sitter_status, node_at, read_node, hover,"
+      .. " workspace_symbols, context, show_user, help_search, agents, models, show_diff,"
+      .. " show_buffer, set_findings, ask_user, code_action/fix_diagnostic in list mode i.e. without"
       .. " index, undo_edit in history mode, and transcript_excise in list mode"
       .. " i.e. without blocks/range);"
       .. " otherwise prompt via vim.fn.confirm. For"
@@ -164,8 +166,14 @@ end
       .. " 'Always all edits': the directory choice grants every future"
       .. " write_file/edit_file/patch_file whose path falls under that file's PARENT"
       .. " directory (not just that one file), the project choice grants every"
-      .. " edit anywhere under the detected project root, and 'Always all edits'"
-      .. " grants every future write_file/edit_file/patch_file call regardless of path."
+      .. " such edit anywhere under the detected project root, and 'Always all edits'"
+      .. " (key editfiles:*) grants every future call in the edit category regardless of path:"
+      .. " write_file, edit_file, patch_file, bulk_replace, rename_symbol, format, move_file(s),"
+      .. " undo_edit and code_action/fix_diagnostic with an index."
+      .. " Other edit-category tools get Yes / No / 'Always this tool' / 'Always all edits'"
+      .. " and a field-per-line preview of their input (bulk_replace shows its pattern,"
+      .. " replacement and the findings-list entry and file counts). delete_file/delete_files"
+      .. " get Yes / No only, with a warning that deletion is not undo-reversible."
       .. " Other tools get Yes / No / 'Always this tool', scoped to the tool's current definition"
       .. " (registry.tool_grant_key: <name>@v<version>[@<bufnr>], so a redefinition or session shadow prompts again). All"
       .. " grants persist in the registry's per-session grant set (registry.granted). A cap:<category> key"
@@ -186,13 +194,11 @@ return function(name, input, ctx)
     return true
   end
 
-  -- File-editing tools (write_file, edit_file) get directory- and
-  -- global-scoped "always allow" options instead of a single per-tool
-  -- toggle, so the user can grant "everywhere under this directory" or
-  -- "all edits, any path" without being forced to blanket-authorize every
-  -- other tool too.
   local path_scoped = { write_file = true, edit_file = true, patch_file = true }
   local is_edit = path_scoped[name] and type(input) == "table" and type(input.path) == "string"
+  local category = require("straps.registry").try_call("fn.capability", name, input)
+  local is_edit_cap = category == "edit" and not is_edit
+  local is_delete = category == "delete"
 
   local function parent_dir(path)
     local p = vim.fn.fnamemodify(path, ":p:h")
@@ -244,8 +250,10 @@ return function(name, input, ctx)
   -- fn.capability classifies into that category. Only grantable categories
   -- are ever written as cap: keys, so honoring any present key is safe.
   if have_allowed then
-    local cap = require("straps.registry").try_call("fn.capability", name, input)
-    if cap and allowed["cap:" .. tostring(cap)] then
+    if category and allowed["cap:" .. tostring(category)] then
+      return true
+    end
+    if is_edit_cap and allowed["editfiles:*"] then
       return true
     end
   end
@@ -278,9 +286,16 @@ return function(name, input, ctx)
     pcall(function()
       local old = ""
       pcall(function()
-        local buf = vim.fn.bufadd(vim.fn.fnamemodify(input.path, ":p"))
-        vim.fn.bufload(buf)
-        old = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+        local full = vim.fn.fnamemodify(input.path, ":p")
+        local buf
+        for _, b in ipairs(vim.api.nvim_list_bufs()) do
+          if vim.api.nvim_buf_get_name(b) == full then buf = b break end
+        end
+        if buf and vim.api.nvim_buf_is_loaded(buf) then
+          old = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+        elseif vim.fn.filereadable(full) == 1 then
+          old = table.concat(vim.fn.readfile(full), "\n")
+        end
       end)
       local new
       if name == "write_file" then
@@ -349,12 +364,49 @@ return function(name, input, ctx)
     end)
   end
 
-  local preview = vim.inspect(input)
-  if #preview > 800 then
-    preview = preview:sub(1, 800) .. "..."
+  local function field_listing(t)
+    if type(t) ~= "table" then return vim.inspect(t) end
+    local keys = vim.tbl_keys(t)
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    local rows = {}
+    for _, k in ipairs(keys) do
+      local v = t[k]
+      local s = type(v) == "string" and v or vim.inspect(v, { newline = " ", indent = "" })
+      if #s > 300 then s = s:sub(1, 300) .. ("... (%d more bytes)"):format(#s - 300) end
+      rows[#rows + 1] = tostring(k) .. ": " .. s
+    end
+    if #rows > 30 then
+      local n = #rows
+      rows = vim.list_slice(rows, 1, 30)
+      rows[#rows + 1] = ("... (%d more fields)"):format(n - 30)
+    end
+    return table.concat(rows, "\n")
+  end
+
+  local preview = field_listing(input)
+  if name == "bulk_replace" and type(input) == "table" then
+    local entries, files = 0, 0
+    pcall(function()
+      local items = require("straps.findings").get_locations(ctx and ctx.bufnr)
+      local seen = {}
+      for _, e in ipairs(items) do
+        entries = entries + 1
+        if type(e.bufnr) == "number" and e.bufnr > 0 and not seen[e.bufnr] then
+          seen[e.bufnr] = true
+          files = files + 1
+        end
+      end
+    end)
+    preview = ("pattern: %s\nreplacement: %s\nflags: %s\nwould substitute over %d findings-list entr%s across %d file%s")
+      :format(tostring(input.pattern), tostring(input.replacement), tostring(input.flags or "ge"),
+        entries, entries == 1 and "y" or "ies", files, files == 1 and "" or "s")
+    if input.dry_run then preview = preview .. "\ndry_run: no files will change" end
   end
   if preview_win then
     preview = "diff preview shown in the split below"
+  end
+  if is_delete then
+    preview = "Deletion is NOT undo-reversible: there is no buffer undo for a removed file.\n" .. preview
   end
 
   -- For edits the choices are, in order:
@@ -385,6 +437,10 @@ return function(name, input, ctx)
     idx = idx + 1
     all_choice_idx = idx
     choices = choices .. "\nAlways &all edits"
+  elseif is_delete then
+    choices = "&Yes\n&No"
+  elseif is_edit_cap then
+    choices = "&Yes\n&No\n&Always this tool\nAlways a&ll edits"
   else
     choices = "&Yes\n&No\n&Always this tool"
   end
@@ -419,7 +475,11 @@ return function(name, input, ctx)
     grant("editfiles:*")
     return true
   end
-  if (not is_edit) and choice == 3 then
+  if is_edit_cap and choice == 4 then
+    grant("editfiles:*")
+    return true
+  end
+  if not is_edit and not is_delete and choice == 3 then
     grant(require("straps.registry").tool_grant_key(name))
     return true
   end

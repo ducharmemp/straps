@@ -56,15 +56,23 @@ local function drive(thunk, timeout_ms, ctx_extra)
     end,
   }
   for k, v in pairs(ctx_extra or {}) do ctx[k] = v end
+  local raised
   co = coroutine.create(function()
-    out = thunk(ctx)
+    local ok, r = pcall(thunk, ctx)
+    if ok then out = r else raised = r end
     finished = true
   end)
   local ok, err = coroutine.resume(co)
   if not ok then error(err) end
   vim.wait(timeout_ms or 10000, function() return finished end, 20)
   assert(finished, "drive: thunk did not finish within timeout")
-  return out
+  return out, raised
+end
+
+local function drive_err(thunk, timeout_ms, ctx_extra)
+  local out, raised = drive(thunk, timeout_ms, ctx_extra)
+  assert(raised ~= nil, "expected the tool to raise, got: " .. tostring(out))
+  return tostring(raised)
 end
 
 local function write_file(path, text)
@@ -104,33 +112,33 @@ end)
 
 -- --------------------------------------------------------- no-LSP fallbacks
 
-it("LSP tools degrade to clear messages with no client attached", function()
+it("LSP tools raise clear no-client errors with no client attached", function()
   local path = vim.fn.tempname() .. ".txt"
   write_file(path, "one two three\nfour five six\n")
 
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.hover", { path = path, line = 1, col = 1 }, ctx)
   end)
   assert(out:find("no LSP client", 1, true), "hover fallback wrong:\n" .. out)
 
-  out = drive(function(ctx)
+  out = drive_err(function(ctx)
     return registry.call("tool.rename_symbol",
       { path = path, line = 1, col = 1, new_name = "x" }, ctx)
   end)
   assert(out:find("no LSP client", 1, true), "rename_symbol fallback wrong:\n" .. out)
   assert(out:find("bulk_replace", 1, true), "rename_symbol should point at the textual fallback")
 
-  out = drive(function(ctx)
+  out = drive_err(function(ctx)
     return registry.call("tool.format", { path = path }, ctx)
   end)
   assert(out:find("no LSP client", 1, true), "format fallback wrong:\n" .. out)
 
-  out = drive(function(ctx)
+  out = drive_err(function(ctx)
     return registry.call("tool.code_action", { path = path, line = 1, col = 1 }, ctx)
   end)
   assert(out:find("no LSP client", 1, true), "code_action fallback wrong:\n" .. out)
 
-  out = drive(function(ctx)
+  out = drive_err(function(ctx)
     return registry.call("tool.workspace_symbols", { query = "anything" }, ctx)
   end)
   assert(out:find("no LSP client", 1, true), "workspace_symbols fallback wrong:\n" .. out)
@@ -183,22 +191,33 @@ end)
 it("show_user moves the user's view to path:line and reports it", function()
   local path = vim.fn.tempname() .. ".txt"
   write_file(path, "alpha\nbeta\ngamma\ndelta\n")
+  vim.cmd("only")
+  local user_win = vim.api.nvim_get_current_win()
+  local user_buf = vim.api.nvim_get_current_buf()
   local out = registry.call("tool.show_user", { path = path, line = 3 }, { bufnr = 0 })
   assert(out:find("showing", 1, true) and out:find(":3", 1, true),
     "unexpected result: " .. out)
-  local cur = vim.api.nvim_get_current_buf()
-  -- realpath, not :p — buffer names come back canonicalized (macOS
-  -- /var -> /private/var) and :p does not resolve symlinks.
-  assert(vim.api.nvim_buf_get_name(cur) == assert(vim.uv.fs_realpath(path)),
-    "current window does not show the file")
-  local pos = vim.api.nvim_win_get_cursor(0)
+  assert(vim.api.nvim_get_current_win() == user_win, "focus moved away from the user's window")
+  assert(vim.api.nvim_win_get_buf(user_win) == user_buf, "the user's window buffer was replaced")
+  local real = assert(vim.uv.fs_realpath(path))
+  local target
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(w)) == real then target = w end
+  end
+  assert(target, "no window shows the file")
+  local pos = vim.api.nvim_win_get_cursor(target)
   assert(pos[1] == 3, "cursor should be on line 3, got " .. pos[1])
+  local nwins = #vim.api.nvim_list_wins()
+  registry.call("tool.show_user", { path = path, line = 2 }, { bufnr = 0 })
+  assert(#vim.api.nvim_list_wins() == nwins, "second call should reuse the window showing the file")
+  assert(vim.api.nvim_win_get_cursor(target)[1] == 2, "reused window cursor not moved")
+  vim.cmd("only")
 end)
 
-it("show_user on a missing file returns an error string", function()
-  local out = registry.call("tool.show_user",
+it("show_user on a missing file raises", function()
+  local ok, err = pcall(registry.call, "tool.show_user",
     { path = vim.fn.tempname() .. "/nope.txt" }, { bufnr = 0 })
-  assert(out:find("no such file", 1, true), "unexpected: " .. out)
+  assert(not ok and tostring(err):find("show_user: no such file", 1, true), "unexpected: " .. tostring(err))
 end)
 
 -- ------------------------------------------------------------- run_in_terminal
@@ -214,6 +233,18 @@ it("run_in_terminal streams output and closes the split on success", function()
   assert(out:find("terminal split closed", 1, true), "closed note missing:\n" .. out:sub(1, 400))
   assert(#vim.api.nvim_list_wins() == wins_before,
     "terminal split should be closed after a successful command")
+end)
+
+it("run_in_terminal runs in Neovim's global working directory, not the window's", function()
+  local gdir = vim.uv.fs_realpath(vim.fn.getcwd(-1, -1))
+  local ldir = vim.fn.tempname()
+  vim.fn.mkdir(ldir, "p")
+  vim.cmd("lcd " .. vim.fn.fnameescape(ldir))
+  local out = drive(function(ctx)
+    return registry.call("tool.run_in_terminal", { command = "echo CWD=$(pwd -P)" }, ctx)
+  end, 15000)
+  vim.cmd("lcd " .. vim.fn.fnameescape(gdir))
+  assert(out:find("CWD=" .. gdir, 1, true), "terminal cwd was not " .. gdir .. ":\n" .. out:sub(1, 400))
 end)
 
 it("run_in_terminal reports a nonzero exit code and leaves the split open", function()
@@ -444,9 +475,11 @@ local function ask(b, input, during, ctx_extra)
   vim.schedule(during)
   local extra = { bufnr = b }
   for k, v in pairs(ctx_extra or {}) do extra[k] = v end
-  return pcall(drive, function(ctx)
+  local ok, out, raised = pcall(drive, function(ctx)
     return registry.call("tool.ask_user", input, ctx)
   end, 5000, extra)
+  if ok and raised ~= nil then return false, tostring(raised) end
+  return ok, out
 end
 
 local function ask_ns_marks(b)
@@ -600,7 +633,7 @@ end)
 it("ask_user refuses a buffer that is not a straps session", function()
   local b = vim.api.nvim_create_buf(false, true)
   local ok, out = ask(b, { question = "Pick?", options = { "a", "b" } }, function() end)
-  assert(ok, "ask_user errored: " .. tostring(out))
+  assert(not ok, "ask_user should raise on a non-session buffer")
   assert(out == "ask_user: no session buffer", "unexpected: " .. out)
   vim.api.nvim_buf_call(b, function()
     assert(vim.fn.maparg("j", "n", false, true).buffer ~= 1, "j map bound on a non-session buffer")
@@ -762,7 +795,8 @@ it("revert_seq refuses with a conflict when later edits overlap", function()
   registry.call("tool.edit_file",
     { path = path, old_string = "BETA", new_string = "BETA-MORE" }, { bufnr = 0 })
 
-  local out = registry.call("tool.undo_edit", { path = path, revert_seq = 1 }, { bufnr = 0 })
+  local ok, out = pcall(registry.call, "tool.undo_edit", { path = path, revert_seq = 1 }, { bufnr = 0 })
+  assert(not ok, "conflict should raise")
   assert(out:find("cannot surgically revert seq 1", 1, true), "expected a conflict: " .. out)
   assert(out:find("to_seq", 1, true), "conflict should point at the fallback: " .. out)
   assert(disk():find("BETA%-MORE"), "conflict must not change the file:\n" .. disk())
@@ -779,8 +813,11 @@ it("revert_seq refuses when the buffer has unsaved changes", function()
   vim.api.nvim_buf_set_lines(buf, 1, 2, false, { "bbb user-typing" })
   assert(vim.bo[buf].modified, "buffer should be modified for this test")
 
-  local out = registry.call("tool.undo_edit", { path = path, revert_seq = 1 }, { bufnr = 0 })
-  assert(out:find("unsaved changes", 1, true), "guard did not trip: " .. out)
+  for _, input in ipairs({ { path = path, revert_seq = 1 }, { path = path, steps = 1 }, { path = path, to_seq = 0 } }) do
+    local ok, out = pcall(registry.call, "tool.undo_edit", input, { bufnr = 0 })
+    assert(not ok, "undo_edit should raise on a modified buffer")
+    assert(out:find("unsaved changes", 1, true), "guard did not trip: " .. out)
+  end
   local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
   assert(text:find("user%-typing") and text:find("AAA", 1, true),
     "guard must leave the buffer untouched:\n" .. text)
@@ -1158,7 +1195,7 @@ it("show_buffer opens a filetype'd scratch split without stealing focus", functi
 end)
 
 it("show_buffer requires content", function()
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.show_buffer", { filetype = "lua" }, ctx)
   end, 5000)
   assert(out:find("content is required", 1, true), "expected a content-required error: " .. out)
@@ -1196,7 +1233,7 @@ it("show_diff reports identical versions", function()
 end)
 
 it("show_diff without a valid mode returns a usage hint", function()
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.show_diff", { filetype = "lua" }, ctx)
   end, 5000)
   assert(out:find("pass {path, content} or {left, right}", 1, true), "usage hint missing: " .. out)
@@ -1225,8 +1262,8 @@ it("set_findings loads locations and opens the findings list", function()
   vim.cmd("only")
 end)
 
-it("set_findings with no valid items reports it", function()
-  local out = drive(function(ctx)
+it("set_findings with no valid items raises", function()
+  local out = drive_err(function(ctx)
     return registry.call("tool.set_findings", { items = { { nope = 1 } } }, ctx)
   end, 5000)
   assert(out:find("no valid items", 1, true), "expected no-valid-items note: " .. out)

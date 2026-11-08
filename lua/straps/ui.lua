@@ -8,7 +8,7 @@ local AUGROUP = "StrapsUI"
 local REG_AUGROUP = "StrapsRegistryBuf" -- never cleared: holds per-buffer autocmds
 
 local function notify_err(msg)
-  vim.notify(msg, vim.log.levels.ERROR)
+  vim.notify(msg:match("^straps: ") and msg or ("straps: " .. msg), vim.log.levels.ERROR)
 end
 
 -- Transcript rendering ("quiet blocks"): a display-only layer over the raw
@@ -28,7 +28,9 @@ local HL_LINKS = {
   StrapsToolError = "DiagnosticError", -- ✗ on is_error
   StrapsRule = "Comment",          -- the turn rules
   StrapsCardBorder = "Comment",    -- the expanded-tool box art
-  StrapsWinbar = "StatusLine",     -- session-window winbar (model/effort/status)
+  StrapsWinbar = "WinBar",         -- session-window winbar (model/effort/status)
+  StrapsWinbarNC = "WinBarNC",     -- the same winbar in a non-current window
+  StrapsProgress = "Comment",      -- the run-progress virtual text on the last line
   StrapsFileRef = "Underlined",    -- path:line[:col] under treesitter (apply_file_ref_match)
   -- Treesitter captures (queries/straps/highlights.scm). The targets must
   -- stay in lockstep with the `hi def link straps*Marker` block in
@@ -42,12 +44,21 @@ local HL_LINKS = {
   ["@straps.esc"] = "Special",
 }
 
---- (Re)establish the straps highlight groups as default links. Called from
---- setup() and on every ColorScheme so scheme switches re-link them; default
+--- (Re)establish the straps highlight groups as default links. The first call
+--- creates the ColorScheme autocmd that re-runs it, so scheme switches re-link
+--- the groups on every path that reached it (setup(), the ftplugin); default
 --- = true keeps a user's explicit `hi link` override in force.
 function M.apply_highlights()
   for name, target in pairs(HL_LINKS) do
     vim.api.nvim_set_hl(0, name, { default = true, link = target })
+  end
+  if #vim.api.nvim_get_autocmds({ group = vim.api.nvim_create_augroup("StrapsHighlights", { clear = false }) }) == 0 then
+    vim.api.nvim_create_autocmd("ColorScheme", {
+      group = "StrapsHighlights",
+      callback = function()
+        M.apply_highlights()
+      end,
+    })
   end
 end
 
@@ -58,6 +69,67 @@ local effective_provider -- defined near picker helpers; session_status uses it 
 -- constant so both install sites and the opt-out clear in show_session
 -- compare against the same string.
 local WINBAR_EXPR = "%{%v:lua.require'straps.ui'.winbar()%}"
+local winbars = {}
+local winbar_lifecycle = false
+
+local function restore_winbar(win)
+  local saved = winbars[win]
+  if vim.api.nvim_get_option_value("winbar", { win = win, scope = "local" }) == WINBAR_EXPR then
+    vim.wo[win].winbar = saved and saved.value or ""
+  end
+end
+
+local function apply_winbar()
+  local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+  local cfg = require("straps").config
+  local want = vim.b[buf].straps_session == true and cfg.session_winbar ~= false
+    or vim.api.nvim_buf_get_name(buf) == "straps://agents" and cfg.agents_winbar ~= false
+  local value = vim.api.nvim_get_option_value("winbar", { win = win, scope = "local" })
+  if not want then
+    restore_winbar(win)
+    return
+  end
+  local saved = winbars[win]
+  if saved and saved.replaced then
+    vim.api.nvim_set_option_value("winbar", saved.value, { win = win, scope = "local" })
+    value = saved.value
+    if value ~= "" then return end
+  end
+  if saved and value ~= saved.value and value ~= WINBAR_EXPR then
+    if value ~= "" then return end
+    saved.value = value
+  end
+  if not saved then
+    saved = { value = value == WINBAR_EXPR and "" or value }
+    winbars[win] = saved
+  end
+  vim.api.nvim_set_option_value("winbar", WINBAR_EXPR, { win = win, scope = "local" })
+end
+
+local function register_winbar_lifecycle()
+  if winbar_lifecycle then return end
+  winbar_lifecycle = true
+  local group = vim.api.nvim_create_augroup("StrapsWinbar", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufLeave", "WinLeave" }, {
+    group = group,
+    callback = function()
+      local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+      local saved = winbars[win]
+      local value = vim.api.nvim_get_option_value("winbar", { win = win, scope = "local" })
+      local ordinary = vim.b[buf].straps_session ~= true and vim.api.nvim_buf_get_name(buf) ~= "straps://agents"
+      if saved and value ~= WINBAR_EXPR and (ordinary or saved.replaced) and value ~= saved.value then
+        saved.value = value
+        saved.replaced = true
+      end
+      restore_winbar(win)
+    end,
+  })
+  vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, { group = group, callback = apply_winbar })
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = group,
+    callback = function(ev) winbars[tonumber(ev.match)] = nil end,
+  })
+end
 
 -- byte length of the leading %%[straps:KIND]%% marker token on a line, or nil.
 local function marker_len(line)
@@ -472,13 +544,34 @@ function M.set_status(bufnr, status)
 end
 
 --- Resolve the session buffer a command should act on: a session buffer is
---- its own target, anything else resolves to nil.
+--- its own target; from any other buffer, the session shown in the only
+--- session window of the current tab; else nil.
 function M.resolve_session(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   if vim.b[bufnr].straps_session then
     return bufnr
   end
-  return nil
+  local found
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    local b = vim.api.nvim_win_get_buf(win)
+    if vim.b[b].straps_session and b ~= found then
+      if found then
+        return nil
+      end
+      found = b
+    end
+  end
+  return found
+end
+
+M.NOT_A_SESSION = "straps: not in a straps session (open one with :Straps, or keep exactly one session window visible)"
+
+function M.require_session(bufnr)
+  local target = M.resolve_session(bufnr)
+  if not target then
+    vim.notify(M.NOT_A_SESSION, vim.log.levels.WARN)
+  end
+  return target
 end
 
 -- Parse a path:line[:col] reference under the cursor. Returns path, line,
@@ -585,9 +678,28 @@ end
 function M.map_file_refs(bufnr)
   vim.keymap.set("n", "gf", function()
     if not M.open_file_ref() then
-      pcall(vim.cmd, "normal! gf")
+      local ok, err = pcall(vim.cmd, "normal! gf")
+      if not ok then
+        vim.notify("straps: gf: " .. tostring(err):gsub("^Vim%(normal%):", ""), vim.log.levels.WARN)
+      end
     end
   end, { buffer = bufnr, desc = "straps: open file[:line[:col]] under cursor" })
+end
+
+local function open_in_window(bufnr, split_cmd)
+  for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
+    if vim.api.nvim_win_get_tabpage(win) == vim.api.nvim_get_current_tabpage() then
+      vim.api.nvim_set_current_win(win)
+      return true
+    end
+  end
+  if split_cmd == "none" then
+    vim.cmd("buffer " .. bufnr)
+  else
+    vim.cmd(split_cmd and split_cmd ~= "" and split_cmd or "split")
+    vim.api.nvim_win_set_buf(0, bufnr)
+  end
+  return false
 end
 
 -- Given a session transcript bufnr, open it in a split with its <CR> keymap
@@ -607,7 +719,8 @@ end
 ---   user commands derive this from <mods>, so `:vertical Straps` just works.
 ---   The sentinel "none" reuses the current window (oil-style) via :buffer
 ---   instead of splitting, recording a jumplist entry so <C-o>/<C-i> navigate
----   back to the replaced buffer and forward again.
+---   back to the replaced buffer and forward again. A window in the current
+---   tab already showing bufnr is focused instead of opening another.
 function M.show_session(bufnr, split_cmd)
   -- Global corpus (stdpath("config")/straps/init.lua, if any): the user's
   -- cwd-independent library of skills/tools/hooks/fns, loaded FIRST so a
@@ -618,15 +731,7 @@ function M.show_session(bufnr, split_cmd)
   -- opening a session must never fail because either file is broken.
   pcall(require("straps").load_global_registry)
   pcall(require("straps").load_project_registry)
-  if split_cmd == "none" then
-    -- Reuse the current window (oil-style): swap the session buffer in via
-    -- :buffer, which records a jumplist entry so <C-o>/<C-i> step back to the
-    -- buffer being replaced (e.g. the agents buffer) and forward again.
-    vim.cmd("buffer " .. bufnr)
-  else
-    vim.cmd(split_cmd and split_cmd ~= "" and split_cmd or "split")
-    vim.api.nvim_win_set_buf(0, bufnr)
-  end
+  open_in_window(bufnr, split_cmd)
   -- Don't stomp a live status: a running subagent brought on-screen by the
   -- agents picker is still "running".
   if vim.b[bufnr].straps_status == nil then
@@ -637,26 +742,8 @@ function M.show_session(bufnr, split_cmd)
   -- window to land on; apply the fold options now that one exists.
   M.apply_fold_opts(bufnr)
   M.apply_file_ref_match(bufnr)
-  -- Window-local winbar: show the session's active model/effort (and run
-  -- phase) right on its own window, so "what am I talking to" is always
-  -- visible without touching the user's global statusline. config.session_winbar
-  -- = false opts out (some users reserve the winbar or dislike it). The
-  -- installed expression is the ui.winbar dispatcher — it re-checks the config
-  -- and the window's CURRENT buffer on every redraw, so a buffer swapped into
-  -- this window (the agents buffer's "none" path) gets the right bar.
-  do
-    local ok_s, s = pcall(require, "straps")
-    local want = not (ok_s and type(s) == "table" and s.config and s.config.session_winbar == false)
-    if want then
-      vim.wo[0].winbar = WINBAR_EXPR
-    elseif vim.wo[0].winbar == WINBAR_EXPR then
-      -- Opt-out with the dispatcher already on the window (a session swapped
-      -- into the agents window via the "none" path, or a split inheriting the
-      -- window-local value): clear it, or the non-empty option holds a blank
-      -- bar row open. Only OUR string — never stomp a user's own winbar.
-      vim.wo[0].winbar = ""
-    end
-  end
+  register_winbar_lifecycle()
+  apply_winbar()
   -- Transcript rendering: window-local conceal so the marker overlays show,
   -- one render now, and a debounced renderer for future appends/edits. The
   -- whole presentation is fn.render — config.render = false skips the wiring
@@ -669,20 +756,7 @@ function M.show_session(bufnr, split_cmd)
     require("straps.registry").try_call("fn.render", bufnr)
     M._attach_render(bufnr)
   end
-  vim.keymap.set("n", "<CR>", function()
-    local loop = require("straps.loop")
-    if loop.running(bufnr) then
-      vim.ui.input({ prompt = "steer: " }, function(txt)
-        if txt and txt ~= "" then
-          require("straps.loop").steer(bufnr, txt)
-        end
-      end)
-    else
-      loop.start(bufnr)
-    end
-  end, { buffer = bufnr, desc = "straps: send / steer" })
-  M.map_file_refs(bufnr)
-  M.map_navigation(bufnr)
+  M.map_session_keys(bufnr)
   vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(bufnr), 0 })
   return bufnr
 end
@@ -729,7 +803,7 @@ function M.open_session(split_cmd, opts)
   if #grants > 0 then
     local err = validate_categories(grants)
     if err then
-      return notify_err("straps: " .. err)
+      return notify_err("straps: " .. err .. "; put the request after `--` (:Straps -- fix the bug)")
     end
   end
   local state = require("straps.state")
@@ -794,7 +868,7 @@ function M.resume_session(path, split_cmd)
   if not path then
     local sessions = state.list_sessions()
     if not sessions[1] then
-      vim.notify("straps: no saved sessions")
+      vim.notify("straps: no saved sessions; opened a new session", vim.log.levels.WARN)
       return M.open_session(split_cmd)
     end
     path = sessions[1].path
@@ -881,16 +955,16 @@ function M._pick_session_rich(sessions, on_choice)
   return pok
 end
 
-function M.pick_session()
+function M.pick_session(split_cmd)
   local state = require("straps.state")
   local sessions = state.list_sessions()
   if #sessions == 0 then
-    vim.notify("straps: no saved sessions")
-    return M.open_session()
+    vim.notify("straps: no saved sessions; opened a new session", vim.log.levels.WARN)
+    return M.open_session(split_cmd)
   end
   local function resume(choice)
     if choice then
-      M.resume_session(choice.path)
+      M.resume_session(choice.path, split_cmd)
     end
   end
   -- Prefer a fuzzy picker with a live transcript preview; fall back to the
@@ -923,7 +997,7 @@ function M.rename_session(bufnr, title)
     local ok, err = state.set_session_title(path, t)
     if ok then
       vim.notify(t == "" and "straps: session title cleared"
-        or ("straps: session titled " .. t))
+        or ("straps: session titled " .. t), vim.log.levels.INFO)
     else
       vim.notify("straps: could not write session title: " .. tostring(err), vim.log.levels.WARN)
     end
@@ -941,23 +1015,25 @@ end
 --- for `pattern` and load the hits into the quickfix list (title
 --- "straps: sessions /pattern/"), so :cnext/:cprev step through them and <CR>
 --- opens the transcript at the matching line. Uses ripgrep when present, else
---- Vim's :vimgrep. Marker/escape lines are skipped so hits are conversation
---- content, not transcript scaffolding. Returns the number of matches.
-function M.grep_sessions(pattern)
+--- a vim.regex scan of each file. Marker/escape lines are skipped so hits are conversation
+--- content, not transcript scaffolding. ripgrep runs in the background; the
+--- quickfix list changes only when there are hits, and an rg failure or an
+--- invalid pattern is reported at ERROR. on_done(n), when given, receives the
+--- number of matches once the search settles.
+function M.grep_sessions(pattern, on_done)
   local state = require("straps.state")
-  if not pattern or pattern == "" then
-    vim.notify("straps: :StrapsSearch needs a pattern", vim.log.levels.WARN)
-    return 0
+  local function done(n)
+    if on_done then on_done(n) end
   end
   local dir = state.session_dir()
   if not dir then
     vim.notify("straps: no session dir to search", vim.log.levels.WARN)
-    return 0
+    return done(0)
   end
   local files = vim.fn.glob(dir .. "/*.straps", false, true)
   if #files == 0 then
-    vim.notify("straps: no saved sessions to search")
-    return 0
+    vim.notify("straps: no saved sessions to search", vim.log.levels.WARN)
+    return done(0)
   end
 
   local items = {}
@@ -980,43 +1056,56 @@ function M.grep_sessions(pattern)
     }
   end
 
-  if vim.fn.executable("rg") == 1 then
-    local out = vim.fn.systemlist({
-      "rg", "--vimgrep", "--no-heading", "--color=never",
-      "--", pattern, unpack(files),
+  local function finish()
+    if #items == 0 then
+      vim.notify("straps: no session matches for /" .. pattern .. "/", vim.log.levels.WARN)
+      return done(0)
+    end
+    vim.fn.setqflist({}, " ", {
+      title = "straps: sessions /" .. pattern .. "/",
+      items = items,
     })
-    if vim.v.shell_error <= 1 then -- 0 = matches, 1 = no matches
-      for _, line in ipairs(out) do
-        local f, l, _, t = line:match("^(.-):(%d+):(%d+):(.*)$")
-        if f then
-          add_hit(f, tonumber(l), t)
+    vim.cmd("botright copen")
+    done(#items)
+  end
+
+  if vim.fn.executable("rg") == 1 then
+    vim.system({ "rg", "--vimgrep", "--no-heading", "--color=never", "--", pattern, unpack(files) },
+      { text = true }, vim.schedule_wrap(function(res)
+        if res.code > 1 then
+          notify_err("straps: :StrapsSearch: rg exited " .. res.code .. ": " .. vim.trim(res.stderr or ""))
+          if res.code ~= 2 or (res.stdout or "") == "" then
+            return done(0)
+          end
+        end
+        for _, line in ipairs(vim.split(res.stdout or "", "\n", { trimempty = true })) do
+          local f, l, _, t = line:match("^(.-):(%d+):(%d+):(.*)$")
+          if f then
+            add_hit(f, tonumber(l), t)
+          end
+        end
+        finish()
+      end))
+    return
+  end
+  local ok_re, re = pcall(vim.regex, pattern)
+  if not ok_re then
+    notify_err("straps: :StrapsSearch: invalid pattern /" .. pattern .. "/: " .. tostring(re))
+    return done(0)
+  end
+  for _, path in ipairs(files) do
+    local ok_read, lines = pcall(vim.fn.readfile, path)
+    if not ok_read then
+      notify_err("straps: :StrapsSearch: cannot read " .. path)
+    else
+      for lnum, text in ipairs(lines) do
+        if re:match_str(text) then
+          add_hit(path, lnum, text)
         end
       end
     end
-  else
-    -- Fallback: Vim's :vimgrep (magic regex). pcall: no matches errors E480.
-    pcall(function()
-      vim.fn.setqflist({}, "r")
-      vim.cmd("silent noautocmd vimgrep /" .. pattern:gsub("/", "\\/")
-        .. "/j " .. table.concat(vim.tbl_map(vim.fn.fnameescape, files), " "))
-      for _, e in ipairs(vim.fn.getqflist()) do
-        local name = vim.api.nvim_buf_get_name(e.bufnr)
-        add_hit(name, e.lnum, e.text)
-      end
-    end)
   end
-
-  if #items == 0 then
-    vim.notify("straps: no session matches for /" .. pattern .. "/")
-    vim.fn.setqflist({}, "r", { title = "straps: sessions /" .. pattern .. "/", items = {} })
-    return 0
-  end
-  vim.fn.setqflist({}, "r", {
-    title = "straps: sessions /" .. pattern .. "/",
-    items = items,
-  })
-  vim.cmd("botright copen")
-  return #items
+  finish()
 end
 
 --- A short label for a session buffer: its filename tail, or a synthetic name
@@ -1067,10 +1156,10 @@ end
 --- (M.show_session), so a running subagent is navigable to watch its output
 --- live. Each row shows the session, its parent (for subagents), and the
 --- one-line task the parent gave it.
-function M.pick_agents()
+function M.pick_agents(split_cmd)
   local agents = M.running_agents()
   if #agents == 0 then
-    vim.notify("straps: no agents are running")
+    vim.notify("straps: no agents are running", vim.log.levels.WARN)
     return
   end
   M.pick(agents, {
@@ -1088,7 +1177,7 @@ function M.pick_agents()
     end,
   }, function(choice)
     if choice and vim.api.nvim_buf_is_valid(choice.bufnr) then
-      M.show_session(choice.bufnr)
+      M.show_session(choice.bufnr, split_cmd)
     end
   end)
 end
@@ -1235,20 +1324,15 @@ function M.session_winbar(bufnr)
   local usage = format_usage(info):gsub("%%", "%%%%")
   local mid = (usage ~= "") and (usage .. "  ") or ""
   local right = (info.status == "running") and "● running" or "○ idle"
-  return "%#StrapsWinbar#" .. left .. "%=" .. mid .. right .. " "
+  local winid = vim.g.statusline_winid
+  local group = (winid and winid ~= vim.api.nvim_get_current_win()) and "StrapsWinbarNC" or "StrapsWinbar"
+  return "%#" .. group .. "#" .. left .. "%=" .. mid .. right .. " "
 end
 
 function M._agents_winbar()
   return require("straps.agents").winbar()
 end
 
---- The one winbar expression installed on straps windows, dispatching on the
---- window's CURRENT buffer — so `<CR>` in the agents buffer swapping a session
---- into the same window (the "none" sentinel path) shows the right bar with no
---- reinstallation, and a split inheriting the window-local 'winbar' stays
---- correct. The config opt-outs live HERE, not at the install sites, so they
---- hold across those buffer swaps too. Installed as
---- %{%v:lua.require'straps.ui'.winbar()%}.
 function M.winbar()
   local bufnr = vim.api.nvim_get_current_buf()
   local ok_s, s = pcall(require, "straps")
@@ -1286,19 +1370,27 @@ local function write_entry_buffer(bufnr, name)
   end
   local entry = registry.get(name)
   local version = entry and entry.version or "?"
-  vim.notify(("straps: redefined %s v%s"):format(name, version))
+  vim.notify(("straps: redefined %s v%s"):format(name, version), vim.log.levels.INFO)
   vim.bo[bufnr].modified = false
 end
 
---- Open (or reuse) the editable buffer for a registry entry.
-function M.open_entry(name)
+--- Open (or reuse) the editable buffer for a registry entry. A window already
+--- showing it gets focus; otherwise split_cmd (default "split") opens one, and
+--- "none" swaps it into the current window.
+function M.open_entry(name, split_cmd)
   local registry = require("straps.registry")
   if not registry.get(name) then
     notify_err("straps: no registry entry named " .. tostring(name))
     return
   end
   local bufname = "straps://registry/" .. name
-  local bufnr = vim.fn.bufnr(bufname)
+  local bufnr = -1
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(b) == bufname then
+      bufnr = b
+      break
+    end
+  end
   local created = bufnr == -1
   if created then
     bufnr = vim.api.nvim_create_buf(false, false)
@@ -1323,12 +1415,13 @@ function M.open_entry(name)
       end,
     })
   end
-  vim.api.nvim_win_set_buf(0, bufnr)
+  open_in_window(bufnr, split_cmd)
   return bufnr
 end
 
---- Scratch listing of all registry entries; <CR> opens the entry under cursor.
-function M.registry_list()
+--- Scratch listing of all registry entries; <CR> opens the entry under cursor
+--- in the listing's window. split_cmd as for M.show_session.
+function M.registry_list(split_cmd)
   local registry = require("straps.registry")
   local lines = {}
   for _, name in ipairs(registry.names()) do
@@ -1346,10 +1439,10 @@ function M.registry_list()
   vim.keymap.set("n", "<CR>", function()
     local name = vim.api.nvim_get_current_line():match("^(%S+)")
     if name and require("straps.registry").get(name) then
-      M.open_entry(name)
+      M.open_entry(name, "none")
     end
   end, { buffer = bufnr, desc = "straps: edit entry" })
-  vim.cmd("split")
+  vim.cmd(split_cmd and split_cmd ~= "" and split_cmd or "split")
   vim.api.nvim_win_set_buf(0, bufnr)
   return bufnr
 end
@@ -1372,13 +1465,13 @@ function M.eval_buffer()
   if not ok then
     notify_err("straps: eval error: " .. tostring(results[1]))
   elseif #results == 0 then
-    vim.notify("straps: eval ok")
+    vim.notify("straps: eval ok", vim.log.levels.INFO)
   else
     local parts = {}
     for i, r in ipairs(results) do
       parts[i] = vim.inspect(r)
     end
-    vim.notify("straps: " .. table.concat(parts, ", "))
+    vim.notify("straps: " .. table.concat(parts, ", "), vim.log.levels.INFO)
   end
 end
 
@@ -1442,7 +1535,7 @@ local function progress_draw(bufnr)
   local text = ("%s · %ds%s · <CR> steer · :StrapsStop stop"):format(st.label, secs, live)
   vim.api.nvim_buf_clear_namespace(bufnr, progress_ns, 0, -1)
   vim.api.nvim_buf_set_extmark(bufnr, progress_ns, vim.api.nvim_buf_line_count(bufnr) - 1, 0, {
-    virt_text = { { text, "Comment" } },
+    virt_text = { { text, "StrapsProgress" } },
     virt_text_pos = "eol",
   })
 end
@@ -1569,20 +1662,8 @@ effective_provider = function(straps, bufnr)
   return name, err
 end
 
---- Model / effort selection is per-buffer when invoked ON a session buffer
---- (written to the provider's model variable — vim.b straps_model,
---- straps_openai_model or straps_llamacpp_model — and vim.b straps_effort,
---- which the backends read in preference to the global config), and sets the
---- global config default otherwise. These helpers centralize the "session
---- buffer? scope it; else global" decision and report the effective value for
---- the picker's current-* marker. Returns the target bufnr or nil (global).
 local function session_target_buf()
-  local bufnr = vim.api.nvim_get_current_buf()
-  local ok = pcall(function() return vim.b[bufnr].straps_session end)
-  if ok and vim.b[bufnr].straps_session then
-    return bufnr
-  end
-  return nil
+  return M.resolve_session()
 end
 
 --- Effective model for a target: provider.resolve_model, the rule fn.provider sends
@@ -1715,22 +1796,8 @@ end
 -- global pick of that key retries the write instead of treating the key as set
 -- by setup{} or at runtime.
 local unpersisted_picks = {}
+local open_model_picker
 
---- Open a picker over the active provider's models; picking one sets the
---- model PER-BUFFER (the provider's vim.b variable: straps_model,
---- straps_openai_model or straps_llamacpp_model) and saves it with the
---- provider in the transcript's .meta file (state.set_session_pin) when
---- run on a session buffer. Elsewhere it persists the pick with its entry
---- through fn.model_pref ($XDG_CONFIG_HOME/straps/model_<provider>), which
---- every Neovim reads on its next request; it sets the provider's config key
---- instead, for this Neovim only, when that key is already set (setup{} or
---- runtime) or the write fails. The list is that provider's config list
---- (models, openai_models or llamacpp_models) MERGED with a live GET
---- /v1/models via fn.list_models, so the menu reflects what the account or
---- server can actually use (new models appear without a config edit). A
---- merged entry inherits the API's thinking tag so extended thinking still
---- works. On fetch failure the static list is used with a notify — the picker
---- never breaks. No-op if the straps config isn't loaded.
 function M.pick_model()
   local ok, straps = pcall(require, "straps")
   if not ok or type(straps) ~= "table" then
@@ -1744,10 +1811,29 @@ function M.pick_model()
       .. table.concat(require("straps.provider").provider_names(), ", "))
   end
   local slot = require("straps.provider").provider_slot(provider)
+  local settled = false
+  local function open(live, err)
+    if settled or (target and not vim.api.nvim_buf_is_valid(target)) then
+      return
+    end
+    settled = true
+    open_model_picker(straps, target, provider, slot, live, err)
+  end
+  local res = vim.F.pack_len(pcall(require("straps.registry").try_call, "fn.list_models", provider, open))
+  if not res[1] then
+    return open(nil, res[2])
+  end
+  if res.n > 1 then
+    return open(res[2], res[3])
+  end
+  if not settled then
+    vim.notify("straps: fetching " .. provider .. " models…", vim.log.levels.INFO)
+  end
+end
+
+open_model_picker = function(straps, target, provider, slot, live, err)
   local models_key = slot.models_key
   local static_list = type(straps.config[models_key]) == "table" and straps.config[models_key] or {}
-
-  local live, err = require("straps.registry").try_call("fn.list_models", provider)
   if type(live) ~= "table" then
     if err then
       vim.notify("straps: live model discovery failed (" .. tostring(err)
@@ -1768,8 +1854,7 @@ function M.pick_model()
 
   local current_model = effective_model(straps, target)
   M.pick(models, {
-    prompt = (target and "straps: select " or "straps: select ")
-      .. provider .. " model" .. (target and " (this session)" or " (global)"),
+    prompt = "straps: select " .. provider .. " model" .. (target and " (this session)" or " (global)"),
     format_item = function(m)
       local id = type(m) == "table" and m.id or m
       local label = type(m) == "table" and m.label or nil
@@ -1783,7 +1868,7 @@ function M.pick_model()
     local id = type(choice) == "table" and choice.id or choice
     if target and vim.api.nvim_buf_is_valid(target) then
       require("straps.state").set_session_pin(target, provider, id, type(choice) == "table" and choice or nil)
-      vim.notify("straps: " .. provider .. " model = " .. tostring(id) .. " (this session)")
+      vim.notify("straps: " .. provider .. " model = " .. tostring(id) .. " (this session)", vim.log.levels.INFO)
     else
       -- A config key that is set (setup{} or runtime) wins over the persisted
       -- pick, so the pick goes into config for this Neovim only. Otherwise it
@@ -1793,7 +1878,7 @@ function M.pick_model()
       if type(configured) == "string" and configured ~= "" and not unpersisted_picks[slot.model_key] then
         straps.config[slot.model_key] = id
         vim.notify("straps: " .. provider .. " model = " .. tostring(id) .. " (this Neovim only: config."
-          .. slot.model_key .. " is set by setup{} or at runtime)")
+          .. slot.model_key .. " is set by setup{} or at runtime)", vim.log.levels.INFO)
       else
         local saved, err = require("straps.registry").try_call("fn.model_pref", provider, id,
           type(choice) == "table" and choice or nil)
@@ -1803,7 +1888,7 @@ function M.pick_model()
             unpersisted_picks[slot.model_key] = nil
           end
           vim.notify("straps: " .. provider .. " model = " .. tostring(id)
-            .. " (persisted; sessions that have made a request keep their own)")
+            .. " (persisted; sessions that have made a request keep their own)", vim.log.levels.INFO)
         else
           straps.config[slot.model_key] = id
           unpersisted_picks[slot.model_key] = true
@@ -1816,11 +1901,6 @@ function M.pick_model()
   end)
 end
 
---- Open a picker over config.efforts ({ name, budget_tokens? }); picking one
---- sets the effort PER-BUFFER (vim.b straps_effort) when run on a session
---- buffer, else the global straps.config.effort. provider.effort_applies
---- decides whether an effort changes the request for the active model
---- (thinking for Anthropic and llamacpp, reasoning for OpenAI).
 function M.pick_effort()
   local ok, straps = pcall(require, "straps")
   if not ok or type(straps) ~= "table" then
@@ -1852,23 +1932,15 @@ function M.pick_effort()
     end
     if target and vim.api.nvim_buf_is_valid(target) then
       vim.b[target].straps_effort = choice.name
-      vim.notify("straps: effort = " .. tostring(choice.name) .. " (this session)")
+      vim.notify("straps: effort = " .. tostring(choice.name) .. " (this session)", vim.log.levels.INFO)
     else
       straps.config.effort = choice.name
-      vim.notify("straps: effort = " .. tostring(choice.name))
+      vim.notify("straps: effort = " .. tostring(choice.name), vim.log.levels.INFO)
     end
     M.redraw_status(true)
   end)
 end
 
---- Open a picker over the available backends (anthropic / openai / llamacpp).
---- On a session buffer it sets the provider PER-BUFFER (vim.b straps_provider)
---- and, for a file-backed transcript, saves it to the transcript's .meta file
---- (state.set_session_pin) so a resume keeps it. Otherwise it persists the
---- GLOBAL default to $XDG_CONFIG_HOME/straps/provider (fn.provider_pref),
---- which every Neovim reads on its next request; config.provider is set only
---- when it is already set (setup{} or runtime; this Neovim only) or when the
---- write fails.
 function M.pick_provider()
   local ok, straps = pcall(require, "straps")
   if not ok or type(straps) ~= "table" then
@@ -1890,10 +1962,8 @@ function M.pick_provider()
       local providers = require("straps.provider")
       local model = providers.resolve_model(choice, target, straps.config)
       require("straps.state").set_session_pin(target, choice, model, providers.model_entry(choice, model, straps.config))
-      vim.notify("straps: provider = " .. choice .. " (this session)")
-      vim.schedule(function()
-        vim.notify("straps: run :StrapsModel to pick this session's " .. choice .. " model")
-      end)
+      vim.notify("straps: provider = " .. choice .. " (this session); run :StrapsModel to pick this session's "
+        .. choice .. " model", vim.log.levels.INFO)
     else
       -- Same rule as a global model pick: a config.provider that is set
       -- (setup{} or runtime) wins, so the pick goes into config for this
@@ -1903,7 +1973,7 @@ function M.pick_provider()
       if type(configured) == "string" and configured ~= "" and not unpersisted_picks.provider then
         straps.config.provider = choice
         vim.notify("straps: provider = " .. choice
-          .. " (this Neovim only: config.provider is set by setup{} or at runtime)")
+          .. " (this Neovim only: config.provider is set by setup{} or at runtime)", vim.log.levels.INFO)
         M.redraw_status(true)
         return
       end
@@ -1919,10 +1989,8 @@ function M.pick_provider()
           straps.config.provider = nil
           unpersisted_picks.provider = nil
         end
-        vim.notify("straps: provider = " .. choice .. " (persisted; sessions that have made a request keep their own)")
-        vim.schedule(function()
-          vim.notify("straps: run :StrapsModel to pick the global " .. choice .. " model")
-        end)
+        vim.notify("straps: provider = " .. choice .. " (persisted; sessions that have made a request keep their own);"
+          .. " run :StrapsModel to pick the global " .. choice .. " model", vim.log.levels.INFO)
       end
     end
     M.redraw_status(true)
@@ -2049,14 +2117,14 @@ function M.login(fargs)
       return notify_err(strip_prefix(res))
     end
     if url then
-      vim.notify("straps: exchanging the " .. (codex and "Codex" or "ChatGPT") .. " authorization code...")
+      vim.notify("straps: exchanging the " .. (codex and "Codex" or "ChatGPT") .. " authorization code...", vim.log.levels.INFO)
     else
       vim.notify("straps: " .. (opened and "sign in at the page that opened (URL below)" or "open this URL and sign in")
         .. ". The browser then fails to load " .. (codex and oauth.CODEX_REDIRECT_ORIGIN or oauth.REDIRECT_ORIGIN)
         .. "; copy that page's full URL from the address bar and run :StrapsLogin openai <url>"
         .. (codex and (". If a Codex CLI login is running, it holds port 1455 and takes the code first;"
           .. " stop it and sign in again") or "")
-        .. "\n" .. tostring(res))
+        .. "\n" .. tostring(res), vim.log.levels.INFO)
     end
     return
   end
@@ -2071,7 +2139,7 @@ function M.login(fargs)
   local ok_old, old = pcall(registry.call, "fn.api_key_store", name)
   local replaces = (not ok_old or old) and " (replaces the stored key)" or ""
   local key = vim.trim(vim.fn.inputsecret("straps: " .. name .. " API key" .. replaces .. ": ") or "")
-  if key == "" then return vim.notify("straps: login cancelled") end
+  if key == "" then return vim.notify("straps: login cancelled", vim.log.levels.INFO) end
   -- Store (and so validate) the key before touching the ChatGPT login, so a
   -- rejected key leaves every existing credential in place.
   local ok_key, saved, path = pcall(registry.call, "fn.api_key_store", name, key)
@@ -2084,7 +2152,7 @@ function M.login(fargs)
   if #set > 0 then
     done = done .. "; the default " .. providers.provider_slot(name).key_fn .. " reads it before " .. table.concat(set, " and ")
   end
-  if name ~= "openai" then return vim.notify(done) end
+  if name ~= "openai" then return vim.notify(done, vim.log.levels.INFO) end
   -- A stored ChatGPT or Codex login wins over the key, so sign out of both
   -- (under each login's lock, cancelling a pending login whose completion
   -- would delete the key).
@@ -2094,7 +2162,7 @@ function M.login(fargs)
         .. ", but signing out failed (" .. table.concat(errs, "; ")
         .. "); that login still takes precedence. Run :StrapsLogout openai, then :StrapsLogin openai key.")
     end
-    vim.notify(done .. (#said > 0 and ("; " .. table.concat(said, "; ")) or ""))
+    vim.notify(done .. (#said > 0 and ("; " .. table.concat(said, "; ")) or ""), vim.log.levels.INFO)
   end)
 end
 
@@ -2110,7 +2178,7 @@ function M.logout(fargs)
   if not name then return end
   if not require_entries({ "fn.api_key_store" }) then return end
   if not fargs[1] and vim.fn.confirm("straps: delete the stored " .. name .. " credentials?", "&Yes\n&No", 2) ~= 1 then
-    return vim.notify("straps: logout cancelled")
+    return vim.notify("straps: logout cancelled", vim.log.levels.INFO)
   end
   local registry = require("straps.registry")
   local slot = providers.provider_slot(name)
@@ -2134,7 +2202,7 @@ function M.logout(fargs)
       said[#said + 1] = table.concat(set, " and ") .. " are still set (the default " .. slot.key_fn
         .. " reads the first one set, in that order)"
     end
-    if #said > 0 then vim.notify("straps: " .. table.concat(said, "; ")) end
+    if #said > 0 then vim.notify("straps: " .. table.concat(said, "; "), vim.log.levels.INFO) end
   end
   if name ~= "openai" then return finish() end
   if not registry.get("fn.openai_oauth_logout") then
@@ -2161,9 +2229,9 @@ function M.logout(fargs)
 end
 
 function M.auto(arg)
-  local buf = vim.api.nvim_get_current_buf()
-  if not vim.b.straps_session then
-    return vim.notify("straps: not a straps session buffer", vim.log.levels.ERROR)
+  local buf = M.require_session(vim.api.nvim_get_current_buf())
+  if not buf then
+    return
   end
   local registry = require("straps.registry")
 
@@ -2178,7 +2246,7 @@ function M.auto(arg)
   end
 
   local function report()
-    vim.notify("straps: auto grants: " .. (grants_list() or "none"))
+    vim.notify("straps: auto grants: " .. (grants_list() or "none"), vim.log.levels.INFO)
   end
 
   arg = arg or ""
@@ -2256,11 +2324,17 @@ function M.auto(arg)
   if arg == "off" then
     local cleared = grants_list()
     registry.clear_grants(buf, "cap:")
-    return vim.notify("straps: auto grants cleared: " .. (cleared or "none"))
+    return vim.notify("straps: auto grants cleared: " .. (cleared or "none"), vim.log.levels.INFO)
   end
 
   local tokens = {}
-  for tok in arg:gmatch("[^%s,]+") do tokens[#tokens + 1] = tok end
+  for tok in arg:gmatch("[^%s,]+") do
+    if tok == "all" then
+      vim.list_extend(tokens, M.grantable_categories())
+    else
+      tokens[#tokens + 1] = tok
+    end
+  end
   local verr = validate_categories(tokens)
   if verr then
     return notify_err("straps: " .. verr)
@@ -2269,7 +2343,7 @@ function M.auto(arg)
     for _, tok in ipairs(tokens) do registry.grant(buf, "cap:" .. tok) end
   end)
   if not ok then return notify_err("straps: " .. tostring(err)) end
-  vim.notify("straps: auto grants: " .. (grants_list() or "none"))
+  vim.notify("straps: auto grants: " .. (grants_list() or "none"), vim.log.levels.INFO)
 end
 
 -- Only the MACHINERY folds: each tool_use fold swallows its following
@@ -2369,11 +2443,30 @@ function M.outline(bufnr)
     it.label = nil
   end
   if #items == 0 then
-    vim.notify("straps: no turns to outline")
+    vim.notify("straps: no turns to outline", vim.log.levels.WARN)
     return 0
   end
   M.set_locations(bufnr, { title = "straps: outline", items = items }, true)
   return #items
+end
+
+M.SESSION_KEYS = { "<CR>", "gf", "]]", "[[", "gO" }
+
+function M.map_session_keys(bufnr)
+  vim.keymap.set("n", "<CR>", function()
+    local loop = require("straps.loop")
+    if loop.running(bufnr) then
+      vim.ui.input({ prompt = "steer: " }, function(txt)
+        if txt and txt ~= "" then
+          require("straps.loop").steer(bufnr, txt)
+        end
+      end)
+    else
+      loop.start(bufnr)
+    end
+  end, { buffer = bufnr, desc = "straps: send / steer" })
+  M.map_file_refs(bufnr)
+  M.map_navigation(bufnr)
 end
 
 -- Buffer-local navigation for a session transcript: turn motions and the
@@ -2394,7 +2487,8 @@ end
 
 --- Apply the straps fold options (foldmethod=expr + foldexpr + foldtext +
 --- foldlevel from config.tools_expanded) to every window currently showing
---- bufnr. The default foldlevel is 0: tool calls and the system prompt
+--- bufnr. foldlevel is set only the first time a window gets the straps
+--- foldexpr, so re-showing a session keeps the level the user chose (zR/zM). The default foldlevel is 0: tool calls and the system prompt
 --- collapsed (`tools_expanded` opens them); conversation turns never fold.
 ---
 --- Folding is window-local, so this must run once the buffer is
@@ -2417,11 +2511,15 @@ function M.apply_fold_opts(bufnr)
   local ok, straps = pcall(require, "straps")
   local expanded = ok and type(straps) == "table" and straps.config
     and straps.config.tools_expanded
+  local expr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
   for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
+    local first = vim.wo[win].foldexpr ~= expr
     vim.wo[win][0].foldmethod = "expr"
-    vim.wo[win][0].foldexpr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
+    vim.wo[win][0].foldexpr = expr
     vim.wo[win][0].foldtext = "v:lua.require'straps.ui'.foldtext()"
-    vim.wo[win][0].foldlevel = expanded and 99 or 0
+    if first then
+      vim.wo[win][0].foldlevel = expanded and 99 or 0
+    end
   end
 end
 
@@ -2658,14 +2756,6 @@ function M.setup()
   })
   M.apply_highlights()
   local group = vim.api.nvim_create_augroup(AUGROUP, { clear = true })
-  -- Many colorschemes clear highlights on load; re-link on ColorScheme so the
-  -- straps groups survive a scheme switch (default = true keeps user overrides).
-  vim.api.nvim_create_autocmd("ColorScheme", {
-    group = group,
-    callback = function()
-      M.apply_highlights()
-    end,
-  })
   vim.api.nvim_create_autocmd("FileType", {
     group = group,
     pattern = "straps",
@@ -2678,8 +2768,6 @@ function M.setup()
       -- where FileType fires with the buffer already current.
       M.apply_fold_opts(ev.buf)
       M.apply_file_ref_match(ev.buf)
-      M.map_file_refs(ev.buf)
-      M.map_navigation(ev.buf)
     end,
   })
 end

@@ -1265,6 +1265,22 @@ do
   end)
 end
 
+it("fn.list_models with on_done returns at once and delivers the catalog via the callback", function()
+  local saved_path, saved_base, saved_provider = vim.env.PATH, straps.config.base_url, straps.config.provider
+  vim.env.PATH = tmp .. "/models:" .. real_path
+  vim.env.ANTHROPIC_API_KEY = "test-key-not-real"
+  straps.config.base_url = "http://straps-models.invalid"
+  straps.config.provider = "anthropic"
+  local got, n_ret
+  n_ret = select("#", registry.call("fn.list_models", nil, function(models, err) got = { models, err } end))
+  local immediate = got
+  assert(vim.wait(5000, function() return got ~= nil end, 10), "on_done never called")
+  vim.env.PATH, straps.config.base_url, straps.config.provider = saved_path, saved_base, saved_provider
+  assert.are.equal(0, n_ret)
+  assert(immediate == nil, "on_done ran synchronously")
+  assert(type(got[1]) == "table" and #got[1] == 4, "async catalog wrong: " .. vim.inspect(got))
+end)
+
 it("fn.list_models returns (nil, err) on HTTP failure, never throws", function()
   vim.fn.mkdir(tmp .. "/models_500", "p")
   write_exec(tmp .. "/models_500/curl", [[#!/usr/bin/env bash

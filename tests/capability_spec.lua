@@ -4,7 +4,9 @@
 -- consulting a tool entry's own capability field before the hardcoded
 -- classification, session shadows of builtins classified agent_tool, name
 -- grants keyed to the entry version (registry.tool_grant_key), render()
--- round-tripping the field, and builtins keeping their hardcoded categories.
+-- round-tripping the field, builtins keeping their hardcoded categories, and
+-- hook.confirm prompts: edit-category grants, bulk_replace/field previews, the
+-- delete prompt, no stray preview buffer, and the auto-allow doc list.
 
 local script = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(script, ":p"), ":h:h")
@@ -47,6 +49,22 @@ it("capability='vcs' -> classified but never grantable", function()
     if c == "vcs" then found = true end
   end
   assert(not found, "vcs must not appear in the grantable list")
+end)
+
+it("capability='browser' -> grantable; cap:browser allows without a prompt", function()
+  define_tool("tb", "browser")
+  assert(registry.call("fn.capability", "tb") == "browser", "expected tb capability browser")
+  assert(vim.tbl_contains(registry.call("fn.capability"), "browser"), "browser must be grantable")
+  local buf = require("straps.state").new_session()
+  local prompted = 0
+  local saved = vim.fn.confirm
+  vim.fn.confirm = function() prompted = prompted + 1; return 2 end
+  local denied = registry.call("hook.confirm", "tb", {}, { bufnr = buf })
+  registry.grant(buf, "cap:browser")
+  local allowed = registry.call("hook.confirm", "tb", {}, { bufnr = buf })
+  vim.fn.confirm = saved
+  assert(denied == false and prompted == 1, "ungranted browser tool must prompt")
+  assert(allowed == true and prompted == 1, "cap:browser must allow without a prompt")
 end)
 
 it("undeclared tool -> agent_tool", function()
@@ -220,4 +238,123 @@ it("registry.define with non-string capability errors", function()
   assert(not ok, "expected registry.define to raise on non-string capability")
   assert(tostring(err):find("capability", 1, true),
     "error message should mention capability: " .. tostring(err))
+end)
+
+local function with_confirm(answer, fn)
+  local seen = {}
+  local saved = vim.fn.confirm
+  vim.fn.confirm = function(msg, choices)
+    seen[#seen + 1] = { msg = msg, choices = choices }
+    return answer
+  end
+  local ok, err = pcall(fn, seen)
+  vim.fn.confirm = saved
+  assert(ok, err)
+  return seen
+end
+
+it("'Always all edits' on a non-path edit tool grants the whole edit category", function()
+  local buf = require("straps.state").new_session()
+  local seen = with_confirm(4, function()
+    assert.is_true(registry.call("hook.confirm", "bulk_replace", { pattern = "a", replacement = "b" }, { bufnr = buf }))
+  end)
+  assert.truthy(seen[1].choices:find("Always a&ll edits", 1, true), seen[1].choices)
+  assert.is_true(registry.granted(buf)["editfiles:*"])
+  with_confirm(2, function(s)
+    for _, call in ipairs({
+      { "bulk_replace", { pattern = "x", replacement = "y" } },
+      { "rename_symbol", { path = "a", line = 1, col = 1, new_name = "b" } },
+      { "format", { path = "a" } },
+      { "undo_edit", { path = "a", steps = 1 } },
+      { "code_action", { path = "a", line = 1, col = 1, index = 1 } },
+      { "move_file", { from = "a", to = "b" } },
+      { "move_files", { moves = {} } },
+      { "write_file", { path = vim.fn.tempname(), content = "c" } },
+    }) do
+      assert.is_true(registry.call("hook.confirm", call[1], call[2], { bufnr = buf }), call[1])
+    end
+    assert.are.equal(0, #s)
+    assert.are_not.equal(true, registry.call("hook.confirm", "bash", { command = "ls" }, { bufnr = buf }))
+    assert.are_not.equal(true, registry.call("hook.confirm", "delete_file", { path = "a" }, { bufnr = buf }))
+  end)
+end)
+
+it("'Always all edits' granted from write_file covers bulk_replace", function()
+  local buf = require("straps.state").new_session()
+  with_confirm(4, function()
+    assert.is_true(registry.call("hook.confirm", "write_file", { path = vim.fn.tempname() .. "/a.txt", content = "c" }, { bufnr = buf }))
+  end)
+  local seen = with_confirm(2, function()
+    assert.is_true(registry.call("hook.confirm", "bulk_replace", { pattern = "a", replacement = "b" }, { bufnr = buf }))
+  end)
+  assert.are.equal(0, #seen)
+end)
+
+it("bulk_replace's prompt shows pattern, replacement and findings-list counts", function()
+  local buf = require("straps.state").new_session()
+  local f1, f2 = vim.fn.tempname(), vim.fn.tempname()
+  require("straps.findings").set_locations(buf, { title = "t", items = {
+    { filename = f1, lnum = 1, text = "a" }, { filename = f1, lnum = 2, text = "b" }, { filename = f2, lnum = 1, text = "c" },
+  } }, false)
+  local seen = with_confirm(2, function()
+    registry.call("hook.confirm", "bulk_replace", { pattern = "PAT", replacement = "REP" }, { bufnr = buf })
+  end)
+  local msg = seen[1].msg
+  assert.truthy(msg:find("pattern: PAT", 1, true), msg)
+  assert.truthy(msg:find("replacement: REP", 1, true), msg)
+  assert.truthy(msg:find("3 findings-list entries across 2 files", 1, true), msg)
+end)
+
+it("other edit tools get a field-per-line preview with no 800-byte cut", function()
+  local buf = require("straps.state").new_session()
+  local long = string.rep("x", 900)
+  local seen = with_confirm(2, function()
+    registry.call("hook.confirm", "rename_symbol", { path = "a.lua", line = 3, col = 7, new_name = long }, { bufnr = buf })
+  end)
+  local msg = seen[1].msg
+  assert.truthy(msg:find("\nline: 3\n", 1, true), msg)
+  assert.truthy(msg:find("\npath: a.lua$"), msg)
+  assert.truthy(msg:find("new_name: " .. string.rep("x", 300) .. "... (600 more bytes)", 1, true), msg)
+  assert.falsy(msg:find("{", 1, true), msg)
+end)
+
+it("delete prompts warn about irreversibility and offer no Always choice", function()
+  local buf = require("straps.state").new_session()
+  for _, call in ipairs({ { "delete_file", { path = "a" } }, { "delete_files", { paths = { "a", "b" } } } }) do
+    local seen = with_confirm(3, function()
+      assert.are_not.equal(true, registry.call("hook.confirm", call[1], call[2], { bufnr = buf }))
+    end)
+    assert.are.equal("&Yes\n&No", seen[1].choices)
+    assert.truthy(seen[1].msg:find("NOT undo-reversible", 1, true), seen[1].msg)
+  end
+  assert.are.same({}, registry.granted(buf))
+end)
+
+it("a denied edit_file prompt leaves no stray buffer for the previewed file", function()
+  local path = vim.fn.tempname() .. ".txt"
+  local h = assert(io.open(path, "w")); h:write("keep\nFOO\n"); h:close()
+  local seen = with_confirm(2, function()
+    registry.call("hook.confirm", "edit_file", { path = path, old_string = "FOO", new_string = "BAR" },
+      { bufnr = require("straps.state").new_session() })
+  end)
+  assert.truthy(seen[1].msg:find("diff preview shown", 1, true), seen[1].msg)
+  assert.are.equal(-1, vim.fn.bufnr("^" .. vim.fn.fnameescape(path) .. "$"))
+end)
+
+it("hook.confirm's doc lists exactly the tools fn.capability reads as read", function()
+  local doc = registry.get("hook.confirm").doc
+  local listed = doc:match("auto%-allow the read%-only tools, i%.e%. every call fn%.capability classifies as read %((.-)%);")
+  assert(listed, "auto-allow list not found in doc")
+  local names = {}
+  for n in listed:gmatch("[%w_]+") do names[n] = true end
+  for _, n in ipairs({ "skill", "models", "agents", "help_search", "ask_user", "set_findings" }) do
+    assert.is_true(names[n] == true, n .. " missing from the doc list")
+    assert.are.equal("read", registry.call("fn.capability", n, {}))
+  end
+  for n in pairs(names) do
+    local tool = registry.get("tool." .. n)
+    if tool and not ({ code_action = true, fix_diagnostic = true, undo_edit = true, transcript_excise = true })[n] then
+      assert.are.equal("read", registry.call("fn.capability", n, {}), n .. " is listed but not read")
+    end
+  end
 end)

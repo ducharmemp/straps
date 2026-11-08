@@ -50,6 +50,22 @@ local function allow_all()
   define("hook.confirm", "hook", "test: allow everything", "return function() return true end")
 end
 
+local function assert_harness_note(bufnr, needle)
+  local found
+  for _, msg in ipairs(state.parse(bufnr).messages) do
+    for _, part in ipairs(msg.content) do
+      if part.type == "text" and part.text:find(needle, 1, true) then
+        found = { role = msg.role, text = part.text }
+      end
+    end
+  end
+  assert(found, "missing note: " .. needle)
+  assert.are.equal("user", found.role)
+  assert.are.equal("[straps] ", found.text:sub(1, 9))
+  local messages = state.parse(bufnr).messages
+  assert.are.equal("user", messages[#messages].role)
+end
+
 allow_all()
 
 it("provider entries registered and compiled", function()
@@ -282,7 +298,7 @@ end
   assert(text:find("ran-then-stopped", 1, true), "first tool of the batch should have run")
   assert(text:find("run cancelled before this tool executed", 1, true),
     "unexecuted tool_use missing its stub result")
-  assert(text:find("[straps: run cancelled]", 1, true), "missing cancellation note")
+  assert(text:find("[straps] run cancelled", 1, true), "missing cancellation note")
 
   -- Round-trip safety: every appended tool_use is paired with a result, so
   -- the next request cannot ship an unpaired tool_use block.
@@ -334,6 +350,41 @@ end
   assert(text:find('"is_error":true', 1, true), "denial not marked is_error")
   assert(not text:find("pong", 1, true), "denied tool ran anyway")
   assert(text:find("after-deny", 1, true), "run did not continue after denial")
+  assert(not text:find("blocked by hook.confirm", 1, true), "plain denial labeled as a hook veto")
+
+  allow_all()
+end)
+
+it("confirm returning false, reason, \"hook\" yields a hook-veto tool_result", function()
+  define("tool.ping", "tool", "ping", [[return function() return "pong" end]])
+  define("hook.confirm", "hook", "test: hook veto on ping", [[
+return function(name)
+  if name == "ping" then return false, "policy says no", "hook" end
+  return true
+end
+]])
+  _G.straps_test_calls = 0
+  define("fn.provider", "fn", "test: one vetoed tool then text", [==[
+return function(req, ctx)
+  _G.straps_test_calls = _G.straps_test_calls + 1
+  if _G.straps_test_calls == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "t1", name = "ping", input = vim.empty_dict() },
+    } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "after-veto" } } }
+end
+]==])
+
+  local bufnr = new_session_with_prompt("ping, a hook will veto")
+  loop.start(bufnr)
+  wait_done(bufnr)
+
+  local text = buf_text(bufnr)
+  assert(text:find("blocked by hook.confirm: policy says no", 1, true), "missing hook-veto tool_result")
+  assert(not text:find("user denied", 1, true), "hook veto labeled as a user denial")
+  assert(text:find('"is_error":true', 1, true), "veto not marked is_error")
+  assert(not text:find("pong", 1, true), "vetoed tool ran anyway")
 
   allow_all()
 end)
@@ -480,7 +531,7 @@ end
     "backstop did not force the wedged run to end")
 
   local text = buf_text(bufnr)
-  assert(text:find("[straps: run cancelled]", 1, true), "missing cancellation note")
+  assert(text:find("[straps] run cancelled", 1, true), "missing cancellation note")
 
   -- Every appended tool_use is paired with a result (the loop stubs results for
   -- cancelled tools), so the healed transcript ships no unpaired tool_use.
@@ -541,21 +592,32 @@ end
   assert(ended, "run did not end after stop")
 end)
 
-it("empty conversation fails fast with a helpful message, no provider call", function()
+local function start_capturing_notify(bufnr)
+  local notes, orig = {}, vim.notify
+  vim.notify = function(msg, level) notes[#notes + 1] = { msg = msg, level = level } end
+  local ok, err = pcall(loop.start, bufnr)
+  vim.notify = orig
+  assert(ok, err)
+  return notes
+end
+
+it("empty conversation warns via notify, starts no run, appends nothing", function()
   define("fn.provider", "fn", "test: must not be called", [==[
 return function() error("provider should not be reached for an empty conversation") end
 ]==])
   local bufnr = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false,
     { "%%[straps:system]%%", "sys", "", "%%[straps:user]%%" })
-  loop.start(bufnr)
-  wait_done(bufnr)
-  local text = buf_text(bufnr)
-  assert(text:find("nothing to send", 1, true), "missing friendly empty-conversation error")
-  assert(not text:find("should not be reached", 1, true), "provider was called")
+  local before = buf_text(bufnr)
+  local notes = start_capturing_notify(bufnr)
+  assert.is_false(loop.running(bufnr))
+  assert.are.equal(before, buf_text(bufnr))
+  assert.are.equal(1, #notes)
+  assert.are.equal(vim.log.levels.WARN, notes[1].level)
+  assert.truthy(notes[1].msg:find("nothing to send", 1, true))
 end)
 
-it("trailing assistant message fails fast with a helpful message, no provider call", function()
+it("trailing assistant message warns via notify, starts no run, appends nothing", function()
   define("fn.provider", "fn", "test: must not be called", [==[
 return function() error("provider should not be reached for a trailing assistant message") end
 ]==])
@@ -563,12 +625,13 @@ return function() error("provider should not be reached for a trailing assistant
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false,
     { "%%[straps:system]%%", "sys", "", "%%[straps:user]%%", "hi", "",
       "%%[straps:assistant]%%", "prior answer", "", "%%[straps:user]%%" })
-  loop.start(bufnr)
-  wait_done(bufnr)
-  local text = buf_text(bufnr)
-  assert(text:find("ends with an assistant message", 1, true),
-    "missing friendly trailing-assistant error")
-  assert(not text:find("should not be reached", 1, true), "provider was called")
+  local before = buf_text(bufnr)
+  local notes = start_capturing_notify(bufnr)
+  assert.is_false(loop.running(bufnr))
+  assert.are.equal(before, buf_text(bufnr))
+  assert.are.equal(1, #notes)
+  assert.are.equal(vim.log.levels.WARN, notes[1].level)
+  assert.truthy(notes[1].msg:find("type your request under the trailing", 1, true))
 end)
 
 it("stop_reason tool_use with no tool blocks errors, not a resend or user-blaming message", function()
@@ -728,6 +791,7 @@ end
   local text = buf_text(bufnr)
   assert(text:find("stopped after 3 turns", 1, true), "missing loud exhaustion note")
   assert(text:find("config.max_turns", 1, true), "note does not name config.max_turns")
+  assert_harness_note(bufnr, "stopped after 3 turns")
 
   local done_ev
   for _, ev in ipairs(_G.straps_test_progress) do
@@ -770,6 +834,7 @@ end
   assert(text:find("no apparent progress", 1, true), "missing loud stall note")
   assert(text:find("config.stall_limit=3", 1, true), "note does not name config.stall_limit")
   assert(text:find("kaboom", 1, true), "note does not quote the last error")
+  assert_harness_note(bufnr, "no apparent progress")
 end)
 
 it("stall detector catches an exact-repeat loop", function()
@@ -1039,6 +1104,7 @@ end
     "missing the nudge user block")
   assert(text:find("ending its turn silently", 1, true),
     "missing the loud blank ending note")
+  assert_harness_note(bufnr, "ending its turn silently")
 
   local done_ev
   for _, ev in ipairs(_G.straps_test_progress) do
@@ -1072,6 +1138,7 @@ end
     "provider called " .. _G.straps_test_calls .. " times, want 1 (no nudge on max_tokens)")
   local text = buf_text(bufnr)
   assert(text:find("hit max_tokens", 1, true), "missing the max_tokens blank note")
+  assert_harness_note(bufnr, "hit max_tokens")
 
   local done_ev
   for _, ev in ipairs(_G.straps_test_progress) do
@@ -1197,21 +1264,13 @@ end
   loop.stop(bufnr)
   wait_done(bufnr)
   local stopped = buf_text(bufnr)
-  assert(stopped:find("[straps: run cancelled]", 1, true), "missing cancellation note")
+  assert(stopped:find("[straps] run cancelled", 1, true), "missing cancellation note")
   assert(not stopped:find("continued-answer", 1, true), "run should have stopped before the answer")
   local turns_at_stop = _G.straps_test_calls
 
-  -- Sending as-is is exactly what :StrapsSend does, and it must fail: the
-  -- transcript ends on the assistant-role cancellation note (no prefill). This
-  -- is the whole reason :StrapsContinue has to append a user block.
-  pcall(loop.start, bufnr)
-  assert(vim.wait(2000, function() return not loop.running(bufnr) end, 10), "bare send did not settle")
-  assert(buf_text(bufnr):find("transcript ends with an assistant message", 1, true),
-    "sending a stopped transcript as-is should fail loudly")
+  local tail = state.parse(bufnr).messages
+  assert.are.equal("user", tail[#tail].role)
 
-  -- What :StrapsContinue does: append a user block, start the same buffer.
-  -- Assertions below read only the text appended from here on, so the
-  -- deliberate bare-send error above cannot satisfy or spoil them.
   local from = vim.api.nvim_buf_line_count(bufnr)
   state.append(bufnr, "user", nil, "[straps] Continue where you left off.")
   _G.straps_test_messages = nil -- so the assertion below reads THIS run's value

@@ -375,6 +375,34 @@ do
       "cancel should not change config.model, got " .. tostring(straps.config.model))
   end)
 
+  it("pick_model returns before an async fn.list_models settles, then opens the picker", function()
+    straps.config.provider = "anthropic"
+    with_list_models([[
+return function(provider, on_done)
+  _G.__pending_list_done = on_done
+end
+]], function()
+      local seen
+      ui.pick = function(items) seen = items end
+      local notes, orig = {}, vim.notify
+      vim.notify = function(msg) notes[#notes + 1] = msg end
+      local ok, err = pcall(ui.pick_model)
+      vim.notify = orig
+      assert(ok, tostring(err))
+      assert(seen == nil, "picker opened before the fetch settled")
+      assert(type(_G.__pending_list_done) == "function", "pick_model did not pass an on_done callback")
+      assert(notes[1] and notes[1]:find("fetching", 1, true), "no fetching notice: " .. vim.inspect(notes))
+      _G.__pending_list_done({ { id = "claude-async-1", label = "Async 1" } })
+      _G.__pending_list_done = nil
+      ui.pick = real_pick
+      local found
+      for _, m in ipairs(seen or {}) do
+        if m.id == "claude-async-1" then found = true end
+      end
+      assert(found, "the async catalog was not merged into the picker")
+    end)
+  end)
+
   it("pick_model merges live-discovered models into the picker list", function()
     -- A fresh discovery brings a model absent from config.models.
     with_list_models([[

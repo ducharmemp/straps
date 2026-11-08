@@ -344,6 +344,46 @@ it("core layer carries the self-extension triggers and .straps.lua persistence",
     "core prompt missing the test/build/lint tool trigger")
 end)
 
+it("the hook.after_write worked example runs through ctx.await and never blocks", function()
+  local core = registry.call("fn.system_prompt_core")
+  local src = core:match("name: \"hook.after_write\".-source: '(.-)'\n")
+  assert(src, "worked example source not found")
+  assert(not src:find("vim.fn.system", 1, true) and not src:find(":wait(", 1, true),
+    "worked example uses a blocking call: " .. src)
+  local fn = assert(load(src))()
+  local real_system, ran = vim.system, nil
+  vim.system = function(cmd, opts, on_exit)
+    ran = cmd
+    assert(type(on_exit) == "function", "vim.system called without a callback")
+    on_exit({ code = 0, stdout = "lint output" })
+  end
+  local awaited = false
+  local ok, out = pcall(fn, "x.lua", {
+    await = function(start)
+      awaited = true
+      local res
+      start(function(r) res = r end)
+      return res
+    end,
+  })
+  vim.system = real_system
+  assert(ok, tostring(out))
+  assert(awaited, "worked example did not use ctx.await")
+  assert.are.same({ "luacheck", "x.lua" }, ran)
+  assert.are.equal("lint output", out)
+end)
+
+it("the subagent allow list names every grantable category", function()
+  local core = registry.call("fn.system_prompt_core")
+  local list = core:match("permission categories\n%s*%(([%w/]+)%)")
+  assert(list, "allow-list category text not found")
+  local named = {}
+  for c in list:gmatch("[^/]+") do named[c] = true end
+  for _, c in ipairs(registry.call("fn.capability")) do
+    assert(named[c], "allow-list text misses category " .. c .. " (" .. list .. ")")
+  end
+end)
+
 -- ----------------------------------------------------------------- env VCS
 -- Runs in a freshly init'd repo, not the straps checkout: a flake/tarball
 -- copy of this source tree has no .git, so the checkout is not a reliable

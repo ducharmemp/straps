@@ -26,7 +26,7 @@ local function pack(...) return { n = select("#", ...), ... } end
 -- Minimal ctx.await driver: run a thunk that uses ctx.await inside a coroutine,
 -- resolve resumes it via vim.schedule (as the loop does), then vim.wait for it.
 local function drive(thunk, timeout_ms)
-  local out, finished, co
+  local out, raised, finished, co
   local ctx = {
     bufnr = 0,
     await = function(start)
@@ -46,14 +46,21 @@ local function drive(thunk, timeout_ms)
     end,
   }
   co = coroutine.create(function()
-    out = thunk(ctx)
+    local ok, r = pcall(thunk, ctx)
+    if ok then out = r else raised = r end
     finished = true
   end)
   local ok, err = coroutine.resume(co)
   if not ok then error(err) end
   vim.wait(timeout_ms or 8000, function() return finished end, 20)
   assert(finished, "drive: thunk did not finish within timeout")
-  return out
+  return out, raised
+end
+
+local function drive_err(thunk, timeout_ms)
+  local out, raised = drive(thunk, timeout_ms)
+  assert(raised ~= nil, "expected the tool to raise, got: " .. tostring(out))
+  return tostring(raised)
 end
 
 local function write_file(path, text)
@@ -197,22 +204,22 @@ end
 
 -- ------------------------------------------------ definition / references (no LSP)
 
-it("definition with no LSP client returns the graceful fallback", function()
+it("definition with no LSP client and no tags raises a no-client error", function()
   local path = vim.fn.tempname() .. ".py"
   write_file(path, "x = 1\n")
   -- col 3 sits on '=', so there is no identifier under the position and no
   -- tags are consulted: we land straight on the no-client message.
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.definition", { path = path, line = 1, col = 3 }, ctx)
   end)
   assert(out:find("no LSP client", 1, true), "expected no-client fallback, got: " .. tostring(out))
   assert(out:find("python", 1, true), "fallback should name the filetype: " .. tostring(out))
 end)
 
-it("references with no LSP client returns the graceful fallback", function()
+it("references with no LSP client and no tags raises a no-client error", function()
   local path = vim.fn.tempname() .. ".py"
   write_file(path, "y = 2\n")
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.references", { path = path, line = 1, col = 3 }, ctx)
   end)
   assert(out:find("no LSP client", 1, true), "expected no-client fallback, got: " .. tostring(out))
@@ -222,7 +229,7 @@ it("declaration/type_definition/implementation no-client messages name the metho
   local path = vim.fn.tempname() .. ".py"
   write_file(path, "z = 3\n")
   for _, n in ipairs({ "declaration", "type_definition", "implementation" }) do
-    local out = drive(function(ctx)
+    local out = drive_err(function(ctx)
       return registry.call("tool." .. n, { path = path, line = 1, col = 1 }, ctx)
     end)
     assert(out:find("no LSP client", 1, true), n .. " fallback wrong: " .. tostring(out))
@@ -267,7 +274,7 @@ it("move_file: plain move (no LSP client) relocates the file, creating dirs", fu
 end)
 
 it("move_file: missing source errors with a clear message", function()
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.move_file",
       { from = "/no/such/file.txt", to = "/tmp/whatever.txt" }, ctx)
   end)
@@ -281,7 +288,7 @@ it("move_file: existing destination refuses rather than overwriting", function()
   write_file(from, "a\n")
   write_file(to, "b\n")
 
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.move_file", { from = from, to = to }, ctx)
   end)
 
@@ -291,9 +298,9 @@ it("move_file: existing destination refuses rather than overwriting", function()
 end)
 
 it("move_file requires both from and to", function()
-  local out1 = drive(function(ctx) return registry.call("tool.move_file", { to = "x" }, ctx) end)
+  local out1 = drive_err(function(ctx) return registry.call("tool.move_file", { to = "x" }, ctx) end)
   assert(out1:find("from is required", 1, true), "missing from-required message: " .. tostring(out1))
-  local out2 = drive(function(ctx) return registry.call("tool.move_file", { from = "x" }, ctx) end)
+  local out2 = drive_err(function(ctx) return registry.call("tool.move_file", { from = "x" }, ctx) end)
   assert(out2:find("to is required", 1, true), "missing to-required message: " .. tostring(out2))
 end)
 
@@ -339,7 +346,7 @@ it("move_files: one invalid entry refuses the WHOLE batch (no partial move)", fu
   local c = dir .. "/c.txt"
   write_file(c, "C\n")
 
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.move_files", { moves = {
       { from = c, to = dir .. "/moved/c.txt" },
       { from = dir .. "/nope.txt", to = dir .. "/moved/nope.txt" },
@@ -357,7 +364,7 @@ it("move_files: two entries targeting the same destination are refused", functio
   write_file(dir .. "/d1.txt", "D1\n")
   write_file(dir .. "/d2.txt", "D2\n")
 
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.move_files", { moves = {
       { from = dir .. "/d1.txt", to = dir .. "/same.txt" },
       { from = dir .. "/d2.txt", to = dir .. "/same.txt" },
@@ -374,16 +381,16 @@ it("move_files: from == to in one entry is refused", function()
   vim.fn.mkdir(dir, "p")
   local p = dir .. "/same.txt"
   write_file(p, "x\n")
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.move_files", { moves = { { from = p, to = p } } }, ctx)
   end)
   assert(out:find("same path", 1, true), "unexpected result: " .. tostring(out))
 end)
 
 it("move_files requires a non-empty moves array", function()
-  local out1 = drive(function(ctx) return registry.call("tool.move_files", {}, ctx) end)
+  local out1 = drive_err(function(ctx) return registry.call("tool.move_files", {}, ctx) end)
   assert(out1:find("non-empty array", 1, true), "missing message: " .. tostring(out1))
-  local out2 = drive(function(ctx) return registry.call("tool.move_files", { moves = {} }, ctx) end)
+  local out2 = drive_err(function(ctx) return registry.call("tool.move_files", { moves = {} }, ctx) end)
   assert(out2:find("non-empty array", 1, true), "missing message: " .. tostring(out2))
 end)
 
@@ -415,7 +422,7 @@ it("delete_file: plain delete (no LSP client) removes the file", function()
 end)
 
 it("delete_file: missing file errors with a clear message", function()
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.delete_file", { path = "/no/such/file.txt" }, ctx)
   end)
   assert(out:find("no such file", 1, true), "unexpected message: " .. tostring(out))
@@ -430,7 +437,7 @@ it("delete_file: refuses when the buffer has unsaved changes", function()
   vim.fn.bufload(buf)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "MODIFIED" })
 
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.delete_file", { path = p }, ctx)
   end)
 
@@ -439,7 +446,7 @@ it("delete_file: refuses when the buffer has unsaved changes", function()
 end)
 
 it("delete_file requires path", function()
-  local out = drive(function(ctx) return registry.call("tool.delete_file", {}, ctx) end)
+  local out = drive_err(function(ctx) return registry.call("tool.delete_file", {}, ctx) end)
   assert(out:find("path is required", 1, true), "missing path-required message: " .. tostring(out))
 end)
 
@@ -477,7 +484,7 @@ it("delete_files: one invalid entry refuses the WHOLE batch (no partial delete)"
   local c = dir .. "/c.txt"
   write_file(c, "C\n")
 
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.delete_files", { paths = { c, dir .. "/nope.txt" } }, ctx)
   end)
 
@@ -490,7 +497,7 @@ it("delete_files: a duplicate path in the batch is refused", function()
   vim.fn.mkdir(dir, "p")
   local p = dir .. "/d.txt"
   write_file(p, "D\n")
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.delete_files", { paths = { p, p } }, ctx)
   end)
   assert(out:find("listed twice", 1, true), "unexpected result: " .. tostring(out))
@@ -507,7 +514,7 @@ it("delete_files: an unsaved buffer among many entries refuses the whole batch",
   vim.fn.bufload(buf)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "MODIFIED" })
 
-  local out = drive(function(ctx)
+  local out = drive_err(function(ctx)
     return registry.call("tool.delete_files", { paths = { a, b } }, ctx)
   end)
 
@@ -517,9 +524,9 @@ it("delete_files: an unsaved buffer among many entries refuses the whole batch",
 end)
 
 it("delete_files requires a non-empty paths array", function()
-  local out1 = drive(function(ctx) return registry.call("tool.delete_files", {}, ctx) end)
+  local out1 = drive_err(function(ctx) return registry.call("tool.delete_files", {}, ctx) end)
   assert(out1:find("non-empty array", 1, true), "missing message: " .. tostring(out1))
-  local out2 = drive(function(ctx) return registry.call("tool.delete_files", { paths = {} }, ctx) end)
+  local out2 = drive_err(function(ctx) return registry.call("tool.delete_files", { paths = {} }, ctx) end)
   assert(out2:find("non-empty array", 1, true), "missing message: " .. tostring(out2))
 end)
 

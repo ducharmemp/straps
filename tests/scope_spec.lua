@@ -16,7 +16,7 @@ local root = vim.fn.fnamemodify(vim.fn.fnamemodify(script, ":p"), ":h:h")
 vim.opt.runtimepath:prepend(root)
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
 
-local straps = require("straps").setup({})
+local straps = require("straps").setup({ provider = "anthropic" })
 straps.config.session_dir = vim.fn.tempname()
 
 local registry = require("straps.registry")
@@ -205,7 +205,7 @@ it("tool.registry_define defaults to session scope; scope='global' opts out", fu
   assert(registry.get("tool.rd_global") ~= nil, "scope='global' tool missing globally")
 end)
 
-it("tool.registry_define warns on blocking waits in tool sources", function()
+it("tool.registry_define warns on blocking waits in tool, hook and fn sources", function()
   local buf = vim.api.nvim_create_buf(true, false)
   local prev = registry.set_active_scope(buf)
   local ok, err = pcall(function()
@@ -223,12 +223,21 @@ it("tool.registry_define warns on blocking waits in tool sources", function()
       source = [[return function(_, ctx) return ctx.await(function(r) r("ok") end) end]],
     }, { bufnr = buf })
     assert(not out:find("warning:", 1, true), "non-blocking source wrongly warned: " .. out)
-    -- Non-tool kinds are exempt (hooks may legitimately vim.wait outside a run).
     out = registry.call("tool.registry_define", {
       name = "hook.rd_hook", kind = "hook",
       source = [[return function() vim.wait(1) end]],
     }, { bufnr = buf })
-    assert(not out:find("warning:", 1, true), "hook source wrongly warned: " .. out)
+    assert(out:find("warning: this hook source", 1, true), "blocking hook source should warn: " .. out)
+    out = registry.call("tool.registry_define", {
+      name = "fn.rd_fn", kind = "fn",
+      source = [[return function() return vim.fn.system("true") end]],
+    }, { bufnr = buf })
+    assert(out:find("warning: this fn source", 1, true), "blocking fn source should warn: " .. out)
+    out = registry.call("tool.registry_define", {
+      name = "skill.rd_skill", kind = "skill",
+      source = "Never call vim.wait in a tool.",
+    }, { bufnr = buf })
+    assert(not out:find("warning:", 1, true), "skill prose wrongly warned: " .. out)
   end)
   registry.set_active_scope(prev)
   assert(ok, err)
@@ -464,7 +473,7 @@ end)
 -- is unreliable (the parent transcript also holds the spawn tool_use input, and
 -- the child buffer may unload after its run), so record the child bufnr
 -- deterministically: the child is the run whose buffer has a straps_parent set.
-local function run_spawn_with(extra_input_lua)
+local function run_spawn_with(extra_input_lua, parent_vars)
   allow_all()
   _G.__spawn_child = nil
   define("hook.on_run_start", "hook", "test: capture the child bufnr", [[
@@ -501,6 +510,7 @@ end
 ]==]):format(extra_input_lua))
 
   local parent = state.new_session()
+  for name, value in pairs(parent_vars or {}) do vim.b[parent][name] = value end
   state.append_text(parent, "spawn please")
   loop.start(parent)
   wait_done(parent)
@@ -575,6 +585,28 @@ end
   assert(vim.b[child].straps_effort == "medium",
     "child did not inherit parent effort: " .. tostring(vim.b[child].straps_effort))
 end)
+
+for _, provider in ipairs({ "anthropic", "openai", "llamacpp" }) do
+  local variable = require("straps.provider").provider_slot(provider).buf_model_var
+  it("spawn propagates explicit model into the " .. provider .. " slot", function()
+    local child = run_spawn_with('input.model = "explicit-model"; input.effort = "high"', {
+      straps_provider = provider,
+      [variable] = "parent-model",
+    })
+    assert(child, "child buffer not captured")
+    assert.are.equal("explicit-model", vim.b[child][variable])
+  end)
+
+  it("spawn inherits model from the " .. provider .. " parent slot", function()
+    local child = run_spawn_with("", {
+      straps_provider = provider,
+      [variable] = "inherited-model",
+      straps_effort = "medium",
+    })
+    assert(child, "child buffer not captured")
+    assert.are.equal("inherited-model", vim.b[child][variable])
+  end)
+end
 
 it("readonly child: writes are denied by the child-scope confirm", function()
   allow_all() -- parent-side confirm allows spawn; the CHILD scope must deny
@@ -1166,7 +1198,7 @@ return function(name) if name == "spawn_wait" then _G.straps_parent_waiting = tr
   define("hook.before_tool", "hook", "test: noop", "return function() end")
   assert(vim.wait(4000, function() return not loop.running(child) end, 20),
     "cancelling the parent did not stop the child")
-  assert(buf_text(parent):find("[straps: run cancelled]", 1, true),
+  assert(buf_text(parent):find("[straps] run cancelled", 1, true),
     "parent missing its cancellation note")
 end)
 
@@ -1273,7 +1305,7 @@ it("fn.capability classifies every category and its input-split arms", function(
   -- no-arg: exactly the grantable list, in order.
   local grantable = registry.try_call("fn.capability")
   assert(type(grantable) == "table", "no-arg should return a list")
-  local want = { "edit", "delete", "exec", "lua", "net", "spawn" }
+  local want = { "edit", "delete", "exec", "lua", "net", "spawn", "browser" }
   assert(#grantable == #want, "grantable list wrong length: " .. #grantable)
   for i, c in ipairs(want) do
     assert(grantable[i] == c, "grantable[" .. i .. "] = " .. tostring(grantable[i]) .. ", want " .. c)
@@ -1468,6 +1500,13 @@ it("spawn allow validation rejects bad entries and readonly+allow", function()
   ok, err = try({ task = "T", readonly = true, allow = { "edit" } })
   assert(not ok and err:find("mutually exclusive", 1, true),
     "readonly+allow should error mutually exclusive: " .. err)
+  local before = #vim.api.nvim_list_bufs()
+  ok, err = try({ task = "T", tools = { "read_file", "no_such_tool", "grpe" } })
+  assert(not ok and err:find("spawn: unknown tool name(s) in tools: \"no_such_tool\", \"grpe\"", 1, true),
+    "unknown tools entries should be named: " .. err)
+  assert(#vim.api.nvim_list_bufs() == before, "a refused spawn must not create a child buffer")
+  ok, err = try({ task = "T", tools = "read_file" })
+  assert(not ok and err:find("spawn: tools must be an array", 1, true), "non-array tools should error: " .. err)
 end)
 
 it("default hook.confirm honors cap: grants and prompts without them", function()
@@ -1532,7 +1571,7 @@ it("ui.auto grants, validates, clears and refuses non-session buffers", function
   notes = {}
   ui.auto("edit")
   assert(next(registry.granted(plain)) == nil, "auto set grants on a non-session buffer")
-  assert(#notes > 0 and notes[#notes]:find("not a straps session", 1, true),
+  assert(#notes > 0 and notes[#notes]:find("not in a straps session", 1, true),
     "non-session auto should notify")
 
   vim.notify = orig_notify

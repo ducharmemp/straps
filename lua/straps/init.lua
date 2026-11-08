@@ -55,8 +55,7 @@ M.config = {
   -- it an explicit hard cap that wins over the per-model value — with one
   -- exception: a budget-thinking request whose budget_tokens meets or exceeds
   -- the cap still bumps above it, because the API rejects max_tokens <=
-  -- budget_tokens. Left nil like auto_compact_bytes/session_dir below;
-  -- vim.tbl_deep_extend ignores the nil.
+  -- budget_tokens.
   max_tokens = nil,
   -- Fallback response cap when config.max_tokens is nil AND the active model
   -- has no known max_output (an unlisted/custom model, or before :StrapsModel
@@ -76,8 +75,12 @@ M.config = {
   -- missing/ineffective cancel handler) is forcibly resumed with no values,
   -- so the awaiting tool errors and the run ends with the cancellation note.
   stop_backstop_ms = 4000,
+  blank_nudge_limit = 1,
   max_tool_result_bytes = 100000,
   cache = true,
+  cache_ttl = nil,
+  request_timeout_ms = 300000,
+  log_file = nil,
   -- gzip the Anthropic request body (Content-Encoding: gzip). The replayed
   -- transcript is the whole request and is re-uploaded every turn; gzip cuts
   -- it 3-4x. Falls back to the plain body when gzip is not on PATH. false for
@@ -108,7 +111,7 @@ M.config = {
   -- only grant its own children a subset of its own grants.
   max_spawn_depth = 1,
   -- How many straps-launched subprocesses (bash, run_in_terminal,
-  -- run_quickfix, grep) may run at once across every session in this Neovim.
+  -- run_quickfix, grep, fetch_url) may run at once across every session in this Neovim.
   -- nil means 2 * CPU count. fn.subprocess_limit reads it at every admission
   -- and halves it while the 1-minute load average exceeds 2 * CPU count; a
   -- waiter parks in ctx.await until a slot frees.
@@ -123,8 +126,8 @@ M.config = {
   -- absolute path to relocate saved sessions. A literal nil stores nothing,
   -- so state.session_dir() falls back to the default — this line documents it.
   session_dir = nil,
-  -- auto_compact_bytes intentionally absent (nil = off); vim.tbl_deep_extend
-  -- ignores nil defaults anyway. Documented in the README.
+  auto_compact_tokens = nil,
+  auto_compact_bytes = nil,
 
   -- Transcript rendering (fn.render): a display-only layer over the raw
   -- %%[straps:KIND]%% marker buffer — conceal + extmarks + folds give each

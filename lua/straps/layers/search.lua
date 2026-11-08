@@ -16,7 +16,8 @@ function M.register()
     doc = "Expand a file glob pattern and return matching paths, one per line,"
       .. " capped at 500 entries (a truncation note is added if more matched)."
       .. " Uses Neovim glob() semantics: * matches within a path component, **"
-      .. " matches recursively, ? matches one character, [abc] matches a set."
+      .. " matches recursively, ? matches one character, [abc] matches a set,"
+      .. " {a,b} matches either alternative (an unbalanced { is an error)."
       .. " Parameters: pattern (required) — e.g. 'lua/**/*.lua'.",
     input_schema = {
       type = "object",
@@ -27,7 +28,13 @@ function M.register()
     },
     source = [==[
 return function(input, ctx)
-  local matches = vim.fn.glob(input.pattern, false, true)
+  if type(input.pattern) ~= "string" or input.pattern == "" then
+    error("glob: pattern must be a non-empty string", 0)
+  end
+  local ok, matches = pcall(vim.fn.glob, input.pattern, false, true)
+  if not ok then
+    error("glob: invalid pattern " .. input.pattern .. ": " .. tostring(matches):gsub("^Vim:", ""), 0)
+  end
   if #matches == 0 then
     return "no matches for pattern: " .. tostring(input.pattern)
   end
@@ -78,7 +85,10 @@ return function(input, ctx)
           local ok, t = pcall(vim.uv.fs_readlink, full)
           if ok and t then target = " -> " .. t end
         end
-        local buf = vim.fn.bufnr(full)
+        local buf = -1
+        for _, b in ipairs(vim.api.nvim_list_bufs()) do
+          if vim.api.nvim_buf_get_name(b) == full then buf = b break end
+        end
         local mod = ""
         if buf ~= -1 and vim.api.nvim_buf_is_loaded(buf) then
           mod = vim.bo[buf].modified and " loaded modified" or " loaded clean"
@@ -172,17 +182,19 @@ end
       .. " (rg) when installed, otherwise falls back to `grep -rn`. Returns"
       .. " matching lines as file:line:text, capped at 100000 bytes with a"
       .. " truncation note. As a side effect it also populates this session's"
-      .. " findings list (the session window's location list when on-screen, else"
+      .. " findings list (the session window's location list when on-screen; a"
+      .. " windowless session keeps it in a private session store and never touches"
       .. " the global quickfix list; title 'straps: grep <pattern>'), so the user"
-      .. " can jump through the matches with :lnext/:lprev (or :cnext/:cprev when"
-      .. " it fell back) and bulk-edit them with the bulk_replace"
-      .. " tool. Parameters: pattern (required) — regex in rg/grep syntax; path"
+      .. " can jump through the matches with :lnext/:lprev and bulk-edit them with"
+      .. " the bulk_replace tool. The list window is not opened unless open=true,"
+      .. " and opening it never moves focus. Parameters: pattern (required) — regex in rg/grep syntax; path"
       .. " (optional, default '.') — file or directory to search; glob (optional)"
       .. " — only search files matching this glob, e.g. '*.lua'; case_insensitive"
       .. " (optional, default false); fixed_string (optional, default false) —"
       .. " treat pattern as a literal string, not a regex; context (optional) —"
       .. " show this many lines around each match; timeout_ms (optional, default"
-      .. " 30000) — the search is killed after this long and reports a timeout.",
+      .. " 30000) — the search is killed after this long and reports a timeout;"
+      .. " open (optional, default false) — open the findings list window.",
     input_schema = {
       type = "object",
       properties = {
@@ -193,6 +205,7 @@ end
         fixed_string = { type = "boolean", description = "Treat pattern as a literal string, not a regex (default false)." },
         context = { type = "integer", description = "Lines of context to show around each match." },
         timeout_ms = { type = "integer", description = "Kill the search after this many milliseconds (default 30000)." },
+        open = { type = "boolean", description = "Open the findings list window when there are matches (default false)." },
       },
       required = { "pattern" },
     },
@@ -201,7 +214,7 @@ return function(input, ctx)
   local context = tonumber(input.context)
   local registry = require("straps.registry")
   if not (ctx and ctx.await) then
-    error("grep: requires a run ctx (ctx.await)")
+    error("grep: requires a run ctx (ctx.await)", 0)
   end
   local release = registry.try_call("fn.subprocess_acquire", ctx,
     { tool = "grep", bufnr = ctx.bufnr, cmd = input.pattern }) or function() end
@@ -275,12 +288,11 @@ return function(input, ctx)
   -- findings list.
   local title = "straps: grep " .. tostring(input.pattern)
   -- Route to THIS session's findings list (its window's location list when
-  -- on-screen — private to the session — else the global quickfix list).
+  -- on-screen, its private store when windowless, else the global quickfix list).
+  local findings = require("straps.findings")
   local set_kind = "quickfix"
   local function set_qf(items)
-    local ok, kind = pcall(function()
-      return require("straps.findings").set_locations(ctx and ctx.bufnr, { title = title, items = items }, false)
-    end)
+    local ok, kind = pcall(findings.set_locations, ctx and ctx.bufnr, { title = title, items = items }, input.open == true)
     if ok and kind then set_kind = kind end
   end
   local function parse_items(text)
@@ -323,6 +335,9 @@ return function(input, ctx)
   if #out > cap then
     out = require("straps.state").utf8_cut(out, cap) .. "\n[truncated: output exceeded " .. cap .. " bytes; narrow the pattern or path]"
   end
+  if #items > 0 and set_kind == findings.STORE_KIND then
+    out = out .. "\n[" .. findings.nav_hint(set_kind) .. "]"
+  end
   return out
 end
 ]==],
@@ -335,18 +350,18 @@ end
     kind = "tool",
     doc = "Substitute text across the CURRENT findings list — the set the grep"
       .. " tool populates for THIS session — as a single native multi-file edit."
-      .. " Runs Vim's `:ldo`/`:cdo s/<pattern>/<replacement>/<flags> | update`"
-      .. " over every entry, editing each file THROUGH its buffer so the changes"
-      .. " enter each"
+      .. " Runs `s/<pattern>/<replacement>/<flags> | update` on the line of every"
+      .. " entry (as :ldo/:cdo would, but without moving any window or the jumplist),"
+      .. " editing each file THROUGH its buffer so the changes enter each"
       .. " file's native undo history (revert with `u`, `:earlier`, or undotree in"
       .. " that buffer). Populate the list with the grep tool first; an"
-      .. " empty list is an error. (Each session has its OWN findings list when"
-      .. " on-screen, so concurrent sessions never edit each other's target set.)"
+      .. " empty list returns a message. (Each session has its OWN findings list:"
+      .. " a private store mirrored to its window's location list when visible.)"
       .. " This is a WRITE tool and prompts for"
       .. " confirmation. Parameters: pattern (required) — a Vim :s search pattern"
       .. " (Vim regex, NOT rg/PCRE); replacement (required) — the replacement"
       .. " text (Vim :s syntax, e.g. \\1 backreferences); flags (optional, default"
-      .. " 'ge') — :s flags; the 'e' flag is always ensured so a file in the list"
+      .. " 'ge') — :s flags; c, n and & are rejected; the 'e' flag is always ensured so a file in the list"
       .. " with no match does not abort the run; dry_run (optional) — when true,"
       .. " report how many findings-list entries and distinct files WOULD be edited"
       .. " without changing anything. Returns the number of files changed.",
@@ -355,7 +370,7 @@ end
       properties = {
         pattern = { type = "string", description = "Vim :s search pattern (Vim regex)." },
         replacement = { type = "string", description = "Replacement text (Vim :s syntax)." },
-        flags = { type = "string", description = ":s flags (default 'ge'; 'e' is always ensured)." },
+        flags = { type = "string", description = ":s flags (default 'ge'; 'e' is always ensured; c, n and & are rejected)." },
         dry_run = { type = "boolean", description = "Report the would-edit count without changing files." },
       },
       required = { "pattern", "replacement" },
@@ -365,15 +380,21 @@ return function(input, ctx)
   local pattern = input.pattern
   local replacement = input.replacement
   if type(pattern) ~= "string" or pattern == "" then
-    error("bulk_replace: pattern must be a non-empty string")
+    error("bulk_replace: pattern must be a non-empty string", 0)
   end
   if type(replacement) ~= "string" then
-    error("bulk_replace: replacement must be a string")
+    error("bulk_replace: replacement must be a string", 0)
   end
+  local flags = input.flags
+  if type(flags) ~= "string" or flags == "" then flags = "ge" end
+  if flags:find("[cn]") then
+    error("bulk_replace: flags c (confirm each match) and n (count only, no substitution) are not supported", 0)
+  end
+  if not flags:match("^[egijklmpr#]*$") then
+    error("bulk_replace: flags contain unsupported characters", 0)
+  end
+  if not flags:find("e", 1, true) then flags = flags .. "e" end
 
-  -- Read THIS session's findings list: its window's location list when the
-  -- session is on-screen (private, so concurrent sessions never stomp each
-  -- other's target set), else the global quickfix list.
   local findings = require("straps.findings")
   local qf, list_kind = findings.get_locations(ctx and ctx.bufnr)
   if type(qf) ~= "table" or #qf == 0 then
@@ -399,7 +420,7 @@ return function(input, ctx)
   local function reject_cmd_chars(label, value)
     if value:find("\n", 1, true) or value:find("\r", 1, true)
       or value:find("|", 1, true) then
-      error("bulk_replace: " .. label .. " must not contain newline or |")
+      error("bulk_replace: " .. label .. " must not contain newline or |", 0)
     end
   end
   reject_cmd_chars("pattern", pattern)
@@ -410,15 +431,6 @@ return function(input, ctx)
   -- mistaken for a real character in the text.
   local pat = pattern:gsub("#", "\\#")
   local rep = replacement:gsub("#", "\\#")
-
-  -- Always ensure the 'e' flag: :cdo aborts on the first error, and a file in
-  -- the list with no match would otherwise raise E486 and stop the whole run.
-  local flags = input.flags
-  if type(flags) ~= "string" or flags == "" then flags = "ge" end
-  if not flags:match("^[&cegijklmnpr#]*$") then
-    error("bulk_replace: flags contain unsupported characters")
-  end
-  if not flags:find("e", 1, true) then flags = flags .. "e" end
 
   -- Snapshot changedtick of each target buffer so we can count what actually
   -- changed (a substitute bumps changedtick; `update` writing does not).
@@ -431,8 +443,7 @@ return function(input, ctx)
   local body = string.format("s#%s#%s#%s | update", pat, rep, flags)
   local ok, err = findings.locations_do(ctx and ctx.bufnr, body)
   if not ok then
-    -- Never leak a raw Vim error as the tool result; wrap it clearly.
-    return "bulk_replace: substitution failed: " .. tostring(err)
+    error("bulk_replace: substitution failed: " .. tostring(err), 0)
   end
 
   local changed = 0

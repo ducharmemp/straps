@@ -1119,11 +1119,9 @@ fn.capability(name, input) -> category
 				`lua`, `net`, `define`, `spawn` (spawn, spawn_wait
 				and send_message), or `agent_tool` (an unknown
 				tool, or any tool resolved from a session scope
-				without a trusted `capability` field), or
-				`browser` (tools a trusted plugin defines with
-				`capability = "browser"`). Called
+				without a trusted `capability` field). Called
 				with no arguments it returns the grantable list
-				({edit, delete, exec, lua, net, spawn, browser}); `read`
+				({edit, delete, exec, lua, net, spawn}); `read`
 				needs no grant, and `define`/`agent_tool` are never
 				grantable. |hook.confirm|, |fn.readonly_policy|,
 				|:StrapsAuto|, and subagent `allow` all read it, so

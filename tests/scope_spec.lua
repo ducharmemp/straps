@@ -1305,7 +1305,7 @@ it("fn.capability classifies every category and its input-split arms", function(
   -- no-arg: exactly the grantable list, in order.
   local grantable = registry.try_call("fn.capability")
   assert(type(grantable) == "table", "no-arg should return a list")
-  local want = { "edit", "delete", "exec", "lua", "net", "spawn", "browser" }
+  local want = { "edit", "delete", "exec", "lua", "net", "spawn" }
   assert(#grantable == #want, "grantable list wrong length: " .. #grantable)
   for i, c in ipairs(want) do
     assert(grantable[i] == c, "grantable[" .. i .. "] = " .. tostring(grantable[i]) .. ", want " .. c)

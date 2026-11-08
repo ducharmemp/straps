@@ -51,20 +51,47 @@ it("capability='vcs' -> classified but never grantable", function()
   assert(not found, "vcs must not appear in the grantable list")
 end)
 
-it("capability='browser' -> grantable; cap:browser allows without a prompt", function()
-  define_tool("tb", "browser")
-  assert(registry.call("fn.capability", "tb") == "browser", "expected tb capability browser")
-  assert(vim.tbl_contains(registry.call("fn.capability"), "browser"), "browser must be grantable")
-  local buf = require("straps.state").new_session()
-  local prompted = 0
+it("a trusted extension registers a custom grantable category", function()
+  local prior = registry.get("fn.capability")
   local saved = vim.fn.confirm
-  vim.fn.confirm = function() prompted = prompted + 1; return 2 end
-  local denied = registry.call("hook.confirm", "tb", {}, { bufnr = buf })
-  registry.grant(buf, "cap:browser")
-  local allowed = registry.call("hook.confirm", "tb", {}, { bufnr = buf })
+  local assertion = 0
+  local function check(condition, message)
+    assertion = assertion + 1
+    if tonumber(vim.env.STRAPS_CORE_INVERT) == assertion then condition = not condition end
+    assert(condition, message)
+  end
+  local ok, err = pcall(function()
+    check(not vim.tbl_contains(registry.call("fn.capability"), "custom"), "custom must be absent by default")
+    define_tool("custom_tool", "custom")
+    check(registry.call("fn.capability", "custom_tool") == "custom", "trusted metadata must classify custom_tool")
+    registry.define({
+      name = "fn.capability",
+      kind = "fn",
+      doc = prior.doc,
+      source = [[
+local previous = require("straps.registry").bind("fn.capability")
+return function(name, input)
+  if name ~= nil then return previous(name, input) end
+  local grantable = previous()
+  grantable[#grantable + 1] = "custom"
+  return grantable
+end]],
+    }, { scope = "global" })
+    check(vim.tbl_contains(registry.call("fn.capability"), "custom"), "extension must register custom as grantable")
+    local buf = require("straps.state").new_session()
+    local prompted = 0
+    vim.fn.confirm = function() prompted = prompted + 1; return 2 end
+    local denied = registry.call("hook.confirm", "custom_tool", {}, { bufnr = buf })
+    check(denied == false, "ungranted custom tool must be denied")
+    check(prompted == 1, "ungranted custom tool must prompt")
+    registry.grant(buf, "cap:custom")
+    local allowed = registry.call("hook.confirm", "custom_tool", {}, { bufnr = buf })
+    check(allowed == true, "cap:custom must allow the registered category")
+    check(prompted == 1, "cap:custom must allow without another prompt")
+  end)
   vim.fn.confirm = saved
-  assert(denied == false and prompted == 1, "ungranted browser tool must prompt")
-  assert(allowed == true and prompted == 1, "cap:browser must allow without a prompt")
+  registry.define(prior, { scope = "global" })
+  assert(ok, err)
 end)
 
 it("undeclared tool -> agent_tool", function()

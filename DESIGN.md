@@ -1850,9 +1850,8 @@ Default hooks registered here:
   `define` (registry_define); `spawn` (spawn, spawn_wait, send_message); `agent_tool` (any
   unknown tool, and any tool resolved from a session scope without a trusted
   `capability` field — a session shadow of `bash` is classified `agent_tool`, not
-  `exec`); `browser` (tools a trusted plugin such as straps-buff defines with
-  `capability = "browser"`). Called with NO arguments it returns the
-  GRANTABLE list `{edit, delete, exec, lua, net, spawn, browser}`. `read` needs no
+  `exec`). Called with NO arguments it returns the
+  GRANTABLE list `{edit, delete, exec, lua, net, spawn}`. `read` needs no
   grant. `define` and `agent_tool` are NEVER grantable — a `define` grant would
   let the agent shadow `hook.confirm` (an everything grant), and agent-defined
   tools cannot be classified by name.

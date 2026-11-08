@@ -24,16 +24,15 @@ function M.register()
       .. " (not undo-reversible, its own category), exec (shell), lua (eval_lua),"
       .. " net (fetch_url), define (registry_define — never grantable, a define"
       .. " grant could shadow hook.confirm), spawn (subagents and send_message), and agent_tool"
-      .. " (agent-defined tools, including session shadows of builtin names — never grantable), and browser"
-      .. " (tools a trusted plugin defines with capability = \"browser\", e.g. straps-buff). Called with no args it"
+      .. " (agent-defined tools, including session shadows of builtin names — never grantable). Called with no args it"
       .. " returns the array of GRANTABLE categories { edit, delete, exec, lua,"
-      .. " net, spawn, browser }. Redefine it to add custom categories — e.g. classify"
+      .. " net, spawn }. Redefine it to add custom categories — e.g. classify"
       .. " bash inputs matching ^git%s into a \"vcs\" category. A tool.* entry's"
       .. " own capability field (settable only via registry.define, not"
       .. " tool.registry_define) takes precedence over this classification.",
     source = [==[
 return function(name, input)
-  local grantable = { "edit", "delete", "exec", "lua", "net", "spawn", "browser" }
+  local grantable = { "edit", "delete", "exec", "lua", "net", "spawn" }
   if name == nil then return grantable end
 
   -- Entries may declare their own category (set only via trusted definition

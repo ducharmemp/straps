@@ -134,7 +134,7 @@ function M.register_spawn()
       .. " boolean) — the child may use only auto-allowed read-only tools,"
       .. " every write is denied without prompting (equivalent to allow={});"
       .. " allow (optional array) — grant these permission categories (edit,"
-      .. " delete, exec, lua, net, spawn, browser) or specific tool names to the child:"
+      .. " delete, exec, lua, net, spawn) or specific tool names to the child:"
       .. " granted calls run without prompting, everything else is DENIED"
       .. " (no prompt); a tool-name grant covers the tool's current definition, so"
       .. " a child that shadows that tool, or any redefinition of it, is denied under it;"
@@ -162,7 +162,7 @@ function M.register_spawn()
         allow = {
           type = "array",
           items = { type = "string" },
-          description = "Grant these permission categories (edit, delete, exec, lua, net, spawn, browser) or specific tool names to the child: granted calls run without prompting; everything else is DENIED (no prompt). readonly=true is equivalent to allow={}.",
+          description = "Grant these permission categories (edit, delete, exec, lua, net, spawn) or specific tool names to the child: granted calls run without prompting; everything else is DENIED (no prompt). readonly=true is equivalent to allow={}.",
         },
         show = { type = "boolean", description = "Open the child's transcript buffer in a split." },
         max_turns = { type = "integer", description = "Child turn budget (default 24)." },

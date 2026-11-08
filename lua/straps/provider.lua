@@ -3097,7 +3097,7 @@ your tool calls and streamed text live as you work.
   of the answer you want back.
 - readonly=true for pure research (all writes denied without prompting);
   allow={"edit",...} instead grants the child those permission categories
-  (edit/delete/exec/lua/net/spawn/browser) — granted calls run unprompted, ungranted
+  (edit/delete/exec/lua/net/spawn) — granted calls run unprompted, ungranted
   ones are denied, so use allow for a child that must edit but not run
   commands; tools=[...] to focus it; show=true when the user should watch it work.
 - A child's CAPABILITY is yours to choose: spawn takes model and effort,

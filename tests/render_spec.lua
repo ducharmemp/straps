@@ -63,6 +63,7 @@ local LN = {
   user_marker = 4,
   user_body = 5,
   assistant_marker = 7,
+  assistant_body = 8,
   tool_use_ok = 10,
   tool_result_ok = 15,
   tool_use_err = 18,
@@ -490,6 +491,32 @@ it("]] / [[ step between conversation turns", function()
   vim.api.nvim_win_close(win, true)
 end)
 
+it("][ / [] step between the last text lines of conversation turns", function()
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor", width = 60, height = 20, row = 1, col = 1,
+  })
+  vim.api.nvim_win_set_cursor(win, { 1, 0 })
+  assert(ui.goto_turn_end(1, 1), "forward motion should move")
+  assert(vim.api.nvim_win_get_cursor(win)[1] == LN.user_body,
+    "first ][ should land on the user turn's last text line, got " .. vim.api.nvim_win_get_cursor(win)[1])
+  assert(ui.goto_turn_end(1, 1), "second forward motion should move")
+  assert(vim.api.nvim_win_get_cursor(win)[1] == LN.assistant_body,
+    "second ][ should land on the assistant text, not inside its tool calls, got "
+    .. vim.api.nvim_win_get_cursor(win)[1])
+  vim.api.nvim_win_set_cursor(win, { 1, 0 })
+  assert(ui.goto_turn_end(1, 2), "count-2 motion should move")
+  assert(vim.api.nvim_win_get_cursor(win)[1] == LN.assistant_body, "2][ should skip to the second turn end")
+  vim.api.nvim_win_set_cursor(win, { LN.tool_use_err, 0 })
+  assert(ui.goto_turn_end(-1, 1), "backward motion should move")
+  assert(vim.api.nvim_win_get_cursor(win)[1] == LN.assistant_body, "[] from a tool call should return to the turn text")
+  assert(ui.goto_turn_end(-1, 1), "second backward motion should move")
+  assert(vim.api.nvim_win_get_cursor(win)[1] == LN.user_body, "[] should go back one turn end")
+  assert(ui.goto_turn_end(-1, 1) == false, "no turn end before the first: should decline")
+  vim.api.nvim_win_set_cursor(win, { LN.tool_use_err, 0 })
+  assert(ui.goto_turn_end(1, 1) == false, "no turn end after the last: should decline")
+  vim.api.nvim_win_close(win, true)
+end)
+
 it("gO outlines the transcript into the findings list", function()
   -- A real split, not a float: set_locations only routes to a window's private
   -- location list for non-floating session windows (ui.session_win).
@@ -527,7 +554,7 @@ it("ui.open_session()'s window actually gets fold options and navigation maps", 
     .. vim.wo[w].foldlevel)
   local maps = {}
   for _, m in ipairs(vim.api.nvim_buf_get_keymap(sbuf, "n")) do maps[m.lhs] = true end
-  for _, lhs in ipairs({ "]]", "[[", "gO" }) do
+  for _, lhs in ipairs({ "]]", "[[", "][", "[]", "gO" }) do
     assert(maps[lhs], "session buffer should map " .. lhs)
   end
   vim.api.nvim_win_close(w, true)

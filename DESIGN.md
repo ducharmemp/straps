@@ -2262,6 +2262,11 @@ from `state.list_blocks` (no new state, no new parse):
   honors `v:count1`, `m'` first so `ctrl-o` returns, `zv` to reveal the target
   through closed folds. Returns false rather than moving when there is no turn
   in that direction.
+- `ui.goto_turn_end(dir, count)` — bound to `][` / `[]`. Same contract, but
+  lands on the last non-blank line of each user/assistant block (the marker
+  when the block is empty). That line precedes the turn's tool calls, so the
+  target is never inside a fold. Unmapped, vim's `][`/`[]` jump to a `}` in
+  column 0, which in a transcript is the closing line of tool-call JSON.
 - `ui.outline(bufnr)` — bound to `gO`, the outline key `:help`/`man.vim`
   already use. Loads every turn into the session's findings list via
   `set_locations` (window-private loclist when on-screen, else quickfix) as
@@ -2529,7 +2534,7 @@ Existing suites must all still pass.
   would then render the user's source with the transcript's fold and conceal
   rules. `tests/render_spec.lua` pins this on the `&g:`/`&l:` dimension and
   rejects the `:set` form anywhere in the source.
-- Session navigation: `ui.goto_turn` (`]]`/`[[`) and `ui.outline` (`gO`), wired
+- Session navigation: `ui.goto_turn` (`]]`/`[[`), `ui.goto_turn_end` (`][`/`[]`) and `ui.outline` (`gO`), wired
   by `ui.map_navigation`. See [Navigation](#navigation-turn-motions--outline).
 - plugin/straps.lua defines commands lazily (`require` inside callbacks),
   guards double-load with `vim.g.loaded_straps`.

@@ -2364,19 +2364,8 @@ function M.foldexpr(lnum)
   return "="
 end
 
---- Jump to the count'th next (dir=1) or previous (dir=-1) conversation turn
---- marker — the `]]` / `[[` motions on a session buffer. Lands on the marker
---- line (rendered as the role rule), opening just enough folds to see it, and
---- pushes the jumplist so ctrl-o comes back. Returns true when it moved.
-function M.goto_turn(dir, count)
-  local bufnr = vim.api.nvim_get_current_buf()
+local function step_to(marks, dir, count)
   local cur = vim.api.nvim_win_get_cursor(0)[1]
-  local marks = {}
-  for _, b in ipairs(require("straps.state").list_blocks(bufnr)) do
-    if TURN_KIND[b.kind] then
-      marks[#marks + 1] = b.marker_lnum
-    end
-  end
   local target
   for _ = 1, math.max(1, count or 1) do
     local from = target or cur
@@ -2408,6 +2397,39 @@ function M.goto_turn(dir, count)
   vim.api.nvim_win_set_cursor(0, { target, 0 })
   pcall(vim.cmd, "normal! zv")
   return true
+end
+
+--- Jump to the count'th next (dir=1) or previous (dir=-1) conversation turn
+--- marker — the `]]` / `[[` motions on a session buffer. Lands on the marker
+--- line (rendered as the role rule), opening just enough folds to see it, and
+--- pushes the jumplist so ctrl-o comes back. Returns true when it moved.
+function M.goto_turn(dir, count)
+  local marks = {}
+  for _, b in ipairs(require("straps.state").list_blocks(vim.api.nvim_get_current_buf())) do
+    if TURN_KIND[b.kind] then
+      marks[#marks + 1] = b.marker_lnum
+    end
+  end
+  return step_to(marks, dir, count)
+end
+
+function M.goto_turn_end(dir, count)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local marks = {}
+  for _, b in ipairs(require("straps.state").list_blocks(bufnr)) do
+    if TURN_KIND[b.kind] then
+      local last = b.marker_lnum
+      local lines = vim.api.nvim_buf_get_lines(bufnr, b.first_lnum - 1, math.max(b.last_lnum, b.first_lnum - 1), false)
+      for i = #lines, 1, -1 do
+        if vim.trim(lines[i]) ~= "" then
+          last = b.first_lnum + i - 1
+          break
+        end
+      end
+      marks[#marks + 1] = last
+    end
+  end
+  return step_to(marks, dir, count)
 end
 
 --- Outline the transcript: load every conversation turn into this session's
@@ -2480,6 +2502,12 @@ function M.map_navigation(bufnr)
   end
   vim.keymap.set("n", "]]", motion(1), { buffer = bufnr, desc = "straps: next turn" })
   vim.keymap.set("n", "[[", motion(-1), { buffer = bufnr, desc = "straps: previous turn" })
+  vim.keymap.set("n", "][", function()
+    M.goto_turn_end(1, vim.v.count1)
+  end, { buffer = bufnr, desc = "straps: next turn end" })
+  vim.keymap.set("n", "[]", function()
+    M.goto_turn_end(-1, vim.v.count1)
+  end, { buffer = bufnr, desc = "straps: previous turn end" })
   vim.keymap.set("n", "gO", function()
     M.outline(bufnr)
   end, { buffer = bufnr, desc = "straps: outline the transcript" })

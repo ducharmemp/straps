@@ -5,7 +5,8 @@
 -- context, show_user, help_search) and run_in_terminal; the graceful "no LSP
 -- client" fallbacks; context reporting windows/cursor/selection; show_user
 -- moving the user's view; help_search excerpting :help; run_in_terminal
--- round-tripping output through a real :terminal split; ask_user's inline
+-- round-tripping output through a real windowless :terminal buffer, its
+-- per-session retention and show=true, and show_terminal opening it; ask_user's inline
 -- virt_lines question, its keymaps and live preview split; hook.confirm's new
 -- auto-allows, code_action list-vs-apply gating, and the diff-preview split
 -- being cleaned up after the dialog; fn.autocmd_bridge queueing a hook's
@@ -85,7 +86,7 @@ end
 
 it("new tools registered with schemas; autocmd_bridge registered as fn", function()
   for _, n in ipairs({ "hover", "workspace_symbols", "rename_symbol", "code_action",
-    "format", "context", "show_user", "help_search", "run_in_terminal",
+    "format", "context", "show_user", "help_search", "run_in_terminal", "show_terminal",
     "show_diff", "show_buffer", "set_findings" }) do
     local e = registry.get("tool." .. n)
     assert(e, "tool." .. n .. " not registered")
@@ -222,17 +223,32 @@ end)
 
 -- ------------------------------------------------------------- run_in_terminal
 
-it("run_in_terminal streams output and closes the split on success", function()
+local function session_buf()
+  local b = vim.api.nvim_create_buf(false, true)
+  return b
+end
+
+local function term_buf_of(out)
+  return tonumber(out:match("terminal buffer (%d+)"))
+end
+
+it("run_in_terminal streams output into a buffer with no window and keeps it", function()
   local wins_before = #vim.api.nvim_list_wins()
+  local sb = session_buf()
   local out = drive(function(ctx)
     return registry.call("tool.run_in_terminal",
       { command = "echo STRAPS-TERM-OK && exit 0" }, ctx)
-  end, 15000)
+  end, 15000, { bufnr = sb })
   assert(out:find("exit code: 0", 1, true), "exit code missing:\n" .. out:sub(1, 200))
   assert(out:find("STRAPS-TERM-OK", 1, true), "output missing:\n" .. out:sub(1, 400))
-  assert(out:find("terminal split closed", 1, true), "closed note missing:\n" .. out:sub(1, 400))
-  assert(#vim.api.nvim_list_wins() == wins_before,
-    "terminal split should be closed after a successful command")
+  assert(#vim.api.nvim_list_wins() == wins_before, "run_in_terminal opened a window")
+  local tb = term_buf_of(out)
+  assert(tb and out:find("show_terminal { buffer = " .. tb .. " }", 1, true), "buffer note missing:\n" .. out)
+  assert(vim.api.nvim_buf_is_valid(tb) and vim.bo[tb].buftype == "terminal", "terminal buffer not kept")
+  assert(vim.b[sb].straps_last_terminal == tb, "session's last terminal not recorded")
+  assert(vim.b[tb].straps_terminal.command == "echo STRAPS-TERM-OK && exit 0", "command tag missing")
+  vim.api.nvim_buf_delete(sb, { force = true })
+  assert(not vim.api.nvim_buf_is_valid(tb), "wiping the session did not wipe its hidden terminal")
 end)
 
 it("run_in_terminal runs in Neovim's global working directory, not the window's", function()
@@ -247,37 +263,48 @@ it("run_in_terminal runs in Neovim's global working directory, not the window's"
   assert(out:find("CWD=" .. gdir, 1, true), "terminal cwd was not " .. gdir .. ":\n" .. out:sub(1, 400))
 end)
 
-it("run_in_terminal reports a nonzero exit code and leaves the split open", function()
+it("run_in_terminal with no session wipes its windowless buffer", function()
+  local before = #vim.api.nvim_list_bufs()
+  local out = drive(function(ctx)
+    return registry.call("tool.run_in_terminal", { command = "echo x" }, ctx)
+  end, 15000)
+  assert(out:find("terminal buffer wiped: no session", 1, true), "wipe note missing:\n" .. out)
+  assert(#vim.api.nvim_list_bufs() == before, "bufnr-0 run leaked a buffer")
+end)
+
+it("run_in_terminal reports a nonzero exit code and keeps the buffer without a window", function()
   local wins_before = #vim.api.nvim_list_wins()
+  local sb = session_buf()
   local out = drive(function(ctx)
     return registry.call("tool.run_in_terminal", { command = "exit 3" }, ctx)
-  end, 15000)
+  end, 15000, { bufnr = sb })
   assert(out:find("exit code: 3", 1, true), "expected exit code 3:\n" .. out:sub(1, 200))
-  assert(out:find("terminal split left open", 1, true), "left-open note missing")
-  assert(#vim.api.nvim_list_wins() == wins_before + 1,
-    "terminal split should stay open after a failing command")
-  vim.cmd("only") -- normalize windows for later cases
+  assert(#vim.api.nvim_list_wins() == wins_before, "failing run opened a window")
+  local tb = term_buf_of(out)
+  assert(tb and vim.api.nvim_buf_is_valid(tb), "failing run's buffer not kept")
+  vim.api.nvim_buf_delete(sb, { force = true })
 end)
 
 it("run_in_terminal stops a job that exceeds timeout_ms", function()
   local wins_before = #vim.api.nvim_list_wins()
+  local sb = session_buf()
   local t0 = vim.uv.hrtime()
   local out = drive(function(ctx)
     return registry.call("tool.run_in_terminal",
       { command = "sleep 30", timeout_ms = 400 }, ctx)
-  end, 15000)
+  end, 15000, { bufnr = sb })
   local ms = (vim.uv.hrtime() - t0) / 1e6
   assert(out:find("stopped: exceeded timeout of 400 ms", 1, true),
     "timeout note missing:\n" .. out:sub(1, 200))
   assert(ms < 5000, "timeout did not stop the job promptly: " .. math.floor(ms) .. "ms")
-  assert(out:find("terminal split left open", 1, true), "left-open note missing")
-  assert(#vim.api.nvim_list_wins() == wins_before + 1,
-    "terminal split should stay open after a timeout")
-  vim.cmd("only")
+  assert(#vim.api.nvim_list_wins() == wins_before, "timed-out run opened a window")
+  assert(vim.api.nvim_buf_is_valid(term_buf_of(out)), "timed-out run's buffer not kept")
+  vim.api.nvim_buf_delete(sb, { force = true })
 end)
 
 it("run_in_terminal is killed by cancellation", function()
   local cancel_fns = {}
+  local tag = "sleep 31." .. vim.uv.os_getpid()
   -- Fire the registered cancel handlers shortly after the job starts, the
   -- way loop.stop does for a real run.
   vim.defer_fn(function()
@@ -285,15 +312,165 @@ it("run_in_terminal is killed by cancellation", function()
   end, 300)
   local t0 = vim.uv.hrtime()
   local out = drive(function(ctx)
-    return registry.call("tool.run_in_terminal", { command = "sleep 30" }, ctx)
+    return registry.call("tool.run_in_terminal", { command = tag }, ctx)
   end, 15000, {
     on_cancel = function(fn) cancel_fns[#cancel_fns + 1] = fn end,
   })
   local ms = (vim.uv.hrtime() - t0) / 1e6
   assert(#cancel_fns > 0, "tool never registered a cancel handler")
-  assert(out:find("exit code:", 1, true), "cancelled job should still report its exit")
+  assert(out:find("^exit code: %d+"), "cancelled job should report a numeric exit code:\n" .. out)
   assert(ms < 5000, "cancel did not stop the job promptly: " .. math.floor(ms) .. "ms")
+  local gone = vim.wait(2000, function()
+    vim.fn.system({ "pgrep", "-f", tag })
+    return vim.v.shell_error ~= 0
+  end, 100)
+  pcall(vim.fn.system, { "pkill", "-f", tag })
+  assert(gone, tag .. " survived the cancel")
+end)
+
+it("run_in_terminal with no session wipes its buffer after a cancel even when the run is never resumed", function()
+  local before = #vim.api.nvim_list_bufs()
+  local cancel_fns = {}
+  local co = coroutine.create(function()
+    return registry.call("tool.run_in_terminal", { command = "sleep 30" }, {
+      bufnr = 0,
+      await = function(begin) begin(function() end) return coroutine.yield() end,
+      on_cancel = function(fn) cancel_fns[#cancel_fns + 1] = fn end,
+    })
+  end)
+  assert(coroutine.resume(co))
+  assert(#vim.api.nvim_list_bufs() == before + 1, "terminal buffer was not created")
+  for _, fn in ipairs(cancel_fns) do pcall(fn) end
+  local cleaned = vim.wait(6000, function() return #vim.api.nvim_list_bufs() == before end, 50)
+  assert(cleaned, "abandoned no-session terminal buffer leaked")
+end)
+
+it("run_in_terminal keeps one hidden terminal per session; a shown one survives as bufhidden=wipe", function()
+  local sb = session_buf()
+  local function run(c)
+    return term_buf_of(drive(function(ctx)
+      return registry.call("tool.run_in_terminal", { command = c }, ctx)
+    end, 15000, { bufnr = sb }))
+  end
+  local first = run("echo one")
+  local second = run("echo two")
+  assert(not vim.api.nvim_buf_is_valid(first), "previous hidden terminal was not wiped")
+  assert(vim.api.nvim_buf_is_valid(second), "latest terminal was wiped")
+  drive(function(ctx) return registry.call("tool.show_terminal", {}, ctx) end, 5000, { bufnr = sb })
+  local third = run("echo three")
+  assert(vim.api.nvim_buf_is_valid(second), "a terminal shown in a window was wiped")
+  assert(vim.bo[second].bufhidden == "wipe", "shown previous terminal not marked bufhidden=wipe")
+  assert(vim.b[sb].straps_last_terminal == third, "last terminal not updated")
   vim.cmd("only")
+  assert(not vim.api.nvim_buf_is_valid(second), "closing the window did not wipe the superseded terminal")
+  vim.api.nvim_buf_delete(sb, { force = true })
+  assert(not vim.api.nvim_buf_is_valid(third), "session wipe left its last terminal")
+end)
+
+it("run_in_terminal show=true opens one split while it runs, focus unchanged", function()
+  local sb = session_buf()
+  local wins_before = #vim.api.nvim_list_wins()
+  local focus = vim.api.nvim_get_current_win()
+  local wins_during, tagged_during
+  vim.defer_fn(function()
+    wins_during = #vim.api.nvim_list_wins()
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      local b = vim.api.nvim_win_get_buf(w)
+      if vim.w[w].straps_view == "terminal" and vim.bo[b].buftype == "terminal"
+        and vim.b[b].straps_terminal then
+        tagged_during = b
+      end
+    end
+  end, 300)
+  local out = drive(function(ctx)
+    return registry.call("tool.run_in_terminal", { command = "sleep 0.8; echo done", show = true }, ctx)
+  end, 15000, { bufnr = sb })
+  assert(wins_during == wins_before + 1, "show=true did not open a split during the run")
+  assert(tagged_during and tagged_during == term_buf_of(out), "the split did not show the run's terminal")
+  assert(vim.api.nvim_get_current_win() == focus, "show=true moved focus")
+  assert(out:find("is shown in a window", 1, true), "shown note missing:\n" .. out)
+  vim.cmd("only")
+  vim.api.nvim_buf_delete(sb, { force = true })
+end)
+
+it("run_in_terminal show=true with no session marks the shown buffer bufhidden=wipe", function()
+  local out = drive(function(ctx)
+    return registry.call("tool.run_in_terminal", { command = "echo s", show = true }, ctx)
+  end, 15000)
+  local tb = term_buf_of(out)
+  assert(tb and vim.api.nvim_buf_is_valid(tb), "shown buffer missing:\n" .. out)
+  assert(vim.bo[tb].bufhidden == "wipe", "no-session shown buffer would leak after its window closes")
+  vim.cmd("only")
+  assert(not vim.api.nvim_buf_is_valid(tb), "closing the window did not wipe the no-session terminal")
+end)
+
+it("show_terminal opens the session's last terminal, reuses its window, and sets terminal window options", function()
+  local sb = session_buf()
+  local saved_nu, saved_scl = vim.wo.number, vim.wo.signcolumn
+  vim.wo.number = true
+  vim.wo.signcolumn = "yes"
+  local function run(c)
+    return term_buf_of(drive(function(ctx)
+      return registry.call("tool.run_in_terminal", { command = c }, ctx)
+    end, 15000, { bufnr = sb }))
+  end
+  local focus = vim.api.nvim_get_current_win()
+  local wins_before = #vim.api.nvim_list_wins()
+  local a = run("echo A; for i in $(seq 1 40); do echo line$i; done")
+  local out = drive(function(ctx) return registry.call("tool.show_terminal", {}, ctx) end, 5000, { bufnr = sb })
+  assert(out:find("opened buffer " .. a, 1, true), "default did not pick the last terminal: " .. out)
+  assert(#vim.api.nvim_list_wins() == wins_before + 1, "show_terminal should open exactly one window")
+  assert(vim.api.nvim_get_current_win() == focus, "show_terminal stole focus")
+  local w = vim.fn.win_findbuf(a)[1]
+  assert(w and vim.w[w].straps_view == "terminal", "window not tagged")
+  assert(vim.wo[w].number == false and vim.wo[w].signcolumn == "no", "terminal window options not set")
+  assert(vim.api.nvim_win_get_cursor(w)[1] == vim.api.nvim_buf_line_count(a), "cursor not at the end")
+  local b = run("echo B")
+  drive(function(ctx) return registry.call("tool.show_terminal", { buffer = b }, ctx) end, 5000, { bufnr = sb })
+  assert(#vim.api.nvim_list_wins() == wins_before + 1, "second show_terminal added a window")
+  assert(vim.api.nvim_win_get_buf(w) == b, "tagged window was not reused for the explicit buffer")
+  vim.cmd("only")
+  vim.wo.number, vim.wo.signcolumn = saved_nu, saved_scl
+  vim.api.nvim_buf_delete(sb, { force = true })
+end)
+
+it("show_terminal does not reuse a tagged window whose buffer the user replaced", function()
+  local sb = session_buf()
+  local tb = term_buf_of(drive(function(ctx)
+    return registry.call("tool.run_in_terminal", { command = "echo r" }, ctx)
+  end, 15000, { bufnr = sb }))
+  drive(function(ctx) return registry.call("tool.show_terminal", {}, ctx) end, 5000, { bufnr = sb })
+  local w = vim.fn.win_findbuf(tb)[1]
+  local user = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_win_set_buf(w, user)
+  drive(function(ctx) return registry.call("tool.show_terminal", {}, ctx) end, 5000, { bufnr = sb })
+  assert(vim.api.nvim_win_get_buf(w) == user, "show_terminal replaced the user's buffer")
+  local shown_in = vim.fn.win_findbuf(tb)
+  assert(#shown_in == 1 and shown_in[1] ~= w, "show_terminal did not open a new split for the terminal")
+  vim.cmd("only")
+  vim.api.nvim_buf_delete(sb, { force = true })
+  vim.api.nvim_buf_delete(user, { force = true })
+end)
+
+it("show_terminal refuses buffers that are not run_in_terminal terminals", function()
+  local plain = vim.api.nvim_create_buf(false, true)
+  local e1 = drive_err(function(ctx) return registry.call("tool.show_terminal", { buffer = plain }, ctx) end, 5000)
+  assert(e1:find("is not a run_in_terminal buffer", 1, true), e1)
+  local user_term = vim.api.nvim_create_buf(false, false)
+  vim.api.nvim_buf_call(user_term, function() vim.fn.jobstart({ "true" }, { term = true }) end)
+  local e2 = drive_err(function(ctx) return registry.call("tool.show_terminal", { buffer = user_term }, ctx) end, 5000)
+  assert(e2:find("is not a run_in_terminal buffer", 1, true), e2)
+  local empty_session = session_buf()
+  local e3 = drive_err(function(ctx) return registry.call("tool.show_terminal", {}, ctx) end, 5000,
+    { bufnr = empty_session })
+  assert(e3:find("has no terminal", 1, true), e3)
+  local e4 = drive_err(function(ctx) return registry.call("tool.show_terminal", { buffer = 99999 }, ctx) end, 5000)
+  assert(e4:find("no longer exists", 1, true), e4)
+  local e5 = drive_err(function(ctx) return registry.call("tool.show_terminal", { buffer = 0 }, ctx) end, 5000)
+  assert(e5:find("has no terminal", 1, true), "buffer=0 should mean the session default: " .. e5)
+  for _, b in ipairs({ plain, user_term, empty_session }) do
+    pcall(vim.api.nvim_buf_delete, b, { force = true })
+  end
 end)
 
 -- Poll pgrep for up to `timeout_ms` for a pattern to disappear, to avoid a
@@ -358,13 +535,10 @@ it("bash timeout kills a surviving process tree", function()
   assert(ok, tostring(err))
 end)
 
-it("run_in_terminal cleans up the split when the job cannot start", function()
-  -- An extra window, with focus kept in it: with only two windows, closing
-  -- the terminal split would land focus back on the right window by accident,
-  -- so an explicit focus restore would be indistinguishable from luck.
-  vim.cmd("new")
+it("run_in_terminal wipes its buffer when the job cannot start", function()
+  local sb = session_buf()
+  local bufs_before = #vim.api.nvim_list_bufs()
   local wins_before = #vim.api.nvim_list_wins()
-  local win_before = vim.api.nvim_get_current_win()
   -- Force the start-failure path: both job starters report failure.
   local real_jobstart, real_termopen = vim.fn.jobstart, vim.fn.termopen
   vim.fn.jobstart = function() return -1 end
@@ -372,16 +546,15 @@ it("run_in_terminal cleans up the split when the job cannot start", function()
   local dok, out = pcall(drive, function(ctx)
     local ok, err = pcall(registry.call, "tool.run_in_terminal", { command = "echo hi" }, ctx)
     return ok and "unexpectedly succeeded" or tostring(err)
-  end, 15000)
+  end, 15000, { bufnr = sb })
   vim.fn.jobstart = real_jobstart
   vim.fn.termopen = real_termopen
   assert(dok, tostring(out))
   assert(out:find("could not start the terminal job", 1, true), "start error missing: " .. out)
-  assert(#vim.api.nvim_list_wins() == wins_before,
-    "split should be cleaned up when the job never starts")
-  assert(vim.api.nvim_get_current_win() == win_before,
-    "focus should return to the previous window")
-  vim.cmd("only") -- normalize windows for later cases
+  assert(#vim.api.nvim_list_bufs() == bufs_before, "the unstarted terminal buffer was not wiped")
+  assert(#vim.api.nvim_list_wins() == wins_before, "a failed start opened a window")
+  assert(vim.b[sb].straps_last_terminal == nil, "a failed start was recorded as the session's terminal")
+  vim.api.nvim_buf_delete(sb, { force = true })
 end)
 
 -- ---------------------------------------------------------------- hook.confirm
@@ -1270,7 +1443,7 @@ it("set_findings with no valid items raises", function()
 end)
 
 it("hook.confirm auto-allows the presentation tools", function()
-  for _, n in ipairs({ "show_diff", "show_buffer", "set_findings" }) do
+  for _, n in ipairs({ "show_diff", "show_buffer", "show_terminal", "set_findings" }) do
     local allowed = registry.call("hook.confirm", n, {}, { bufnr = 0 })
     assert(allowed == true, n .. " should be auto-allowed (read-only view)")
   end

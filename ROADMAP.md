@@ -116,8 +116,8 @@ jj first (per AGENTS.md), git fallback.
 
 ## Persistent terminals / long-running job handles
 
-`run_in_terminal` is excellent for visible one-shot tests/builds, but every call
-owns a short-lived terminal split and returns only when the job exits. Some
+`run_in_terminal` runs one-shot tests/builds in a windowless terminal buffer
+(`show_terminal` opens it) and returns only when the job exits. Some
 workflows want a persistent job surface the agent can revisit: dev servers,
 watch-mode tests, REPLs, log tails, or a build that should keep streaming while
 the agent edits.

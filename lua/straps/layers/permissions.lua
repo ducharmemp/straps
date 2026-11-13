@@ -61,7 +61,7 @@ return function(name, input)
     models = true,
     -- presentation tools: they open views / set the findings list but change
     -- no files, exactly like show_user.
-    show_diff = true, show_buffer = true, set_findings = true,
+    show_diff = true, show_buffer = true, show_terminal = true, set_findings = true,
     -- ask_user IS user interaction; gating it behind a confirm dialog would
     -- be asking permission to ask a question.
     ask_user = true,
@@ -171,7 +171,7 @@ end
       .. " diagnostic_next, lsp_status, declaration, definition, type_definition, implementation,"
       .. " references, symbols, read_symbol, tree_sitter_status, node_at, read_node, hover,"
       .. " workspace_symbols, context, show_user, help_search, agents, models, show_diff,"
-      .. " show_buffer, set_findings, ask_user, code_action/fix_diagnostic in list mode i.e. without"
+      .. " show_buffer, show_terminal, set_findings, ask_user, code_action/fix_diagnostic in list mode i.e. without"
       .. " index, undo_edit in history mode, and transcript_excise in list mode"
       .. " i.e. without blocks/range);"
       .. " otherwise prompt via vim.fn.confirm. For"

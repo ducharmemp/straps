@@ -1659,6 +1659,32 @@ API names (registry names prefixed `tool.`):
   `[straps: this exact command has run N times ...]` line suggesting a
   registry_define'd tool. Tests in `tests/bash_guard_spec.lua`.
   Holds a subprocess slot (below) for the life of the process.
+- `run_in_terminal {command, timeout_ms?, show?}` — runs `bash -lc cmd` in a
+  `:terminal` buffer that has no window: `nvim_create_buf(false, false)` with
+  `bufhidden=hide`, the job started inside `nvim_buf_call` with
+  `width = vim.o.columns, height = 15` and `cwd = getcwd(-1, -1)` computed
+  before the call (inside it, `getcwd` reads the temporary window's directory).
+  N agents running terminals therefore add no windows. The buffer carries
+  `b:straps_terminal = {session, command}` and is kept after any exit code;
+  per session (`ctx.bufnr`, nonzero and valid) only the most recent one is
+  kept in `b:straps_last_terminal` on the session buffer: the next run wipes
+  the previous one, or, if a window shows it, sets its `bufhidden=wipe` so
+  closing the window wipes it. A once BufWipeout autocmd on the session
+  buffer applies the same rule to its last terminal. A caller with no session
+  (`bufnr` 0) gets its buffer wiped at the end of the call, or, if a window
+  shows it, set to `bufhidden=wipe`. `show=true` calls `show_terminal` at job start so the user watches
+  live; a failure there is reported in the result, not raised. A job that
+  cannot start wipes the buffer and raises. Holds a subprocess slot for the
+  life of the job.
+- `show_terminal {buffer?}` — opens a `run_in_terminal` buffer (default: the
+  session's `b:straps_last_terminal`) in a `botright 15split` without moving
+  focus, reusing a window tagged `w:straps_view = "terminal"` whose buffer is
+  still a straps terminal; turns off number/relativenumber/signcolumn (the
+  window would otherwise inherit the user's), puts the cursor on the last
+  line and the command in the winbar. Refuses buffers without
+  `b:straps_terminal` (the user's own terminals). Read-only for
+  `hook.confirm`, like show_buffer. Lives in the exec layer beside
+  run_in_terminal so `show=true` works with `layers.editor = false`.
 - `glob {pattern}` — `vim.fn.glob(pattern, false, true)`, cap 500 entries.
 - `grep {pattern, path?, timeout_ms?}` — prefer `rg` if executable, else
   `grep -rn`, cap output. Holds a subprocess slot; under `rg` passes
@@ -1690,7 +1716,7 @@ API names (registry names prefixed `tool.`):
   waiters without waiting for a release; a ctx without `await` is admitted at
   once and may exceed the limit by one, and `grep` refuses such a ctx before
   acquiring). Each tool pcalls its `vim.system`/`jobstart` and the terminal
-  split, releasing on failure, so the EAGAIN the gate exists to prevent
+  buffer creation, releasing on failure, so the EAGAIN the gate exists to prevent
   cannot itself leak a slot. The tools call acquire through `try_call`, so a
   build with the fn removed runs ungated. The counter lives in `registry`
   module state, not a buffer variable, so a redefined limit fn reads the
@@ -2157,7 +2183,7 @@ Written for agent-ability and ecosystem norms; concise, imperative:
   the only place the completion notice is described at all.
 - Presentation norms (`# Showing the user`): a short stub in the core —
   the editor is the display surface; match the medium to the data's shape
-  (show_user / set_findings / show_diff / show_buffer / eval_lua views);
+  (show_user / set_findings / show_diff / show_buffer / show_terminal / eval_lua views);
   views are for hand-off and supplement the reply text. The full guidance
   (medium-by-medium detail, extmarks for line-pinned notes, wiring real UI
   components live, the 4+-locations worklist rule for closing recaps,
@@ -2801,6 +2827,9 @@ unified-diff renderer that the confirm-dialog edit preview also uses.
   agent-assembled locations into the session's findings list and open it. For
   findings the agent built itself; grep and run_quickfix already fill the list
   for searches and build output, so the doc points there first.
+- `show_terminal {buffer?}` is the terminal counterpart; it lives in
+  `layers/exec.lua` beside run_in_terminal (see the tools list above) and is
+  auto-allowed the same way.
 
 ### 2. Native-undo edits (layers/files.lua: write_file, edit_file, patch_file)
 

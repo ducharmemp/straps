@@ -29,7 +29,7 @@ function M.register()
   -- called at the points where those groups originally sat.
   files.register_tools()      -- read_file, write_file, edit_file, patch_file, fn.reconcile_buf, fn.check_writer, fn.mark_seen
   agents.register_peers()     -- fn.peer_agents
-  exec.register()             -- bash, run_in_terminal, run_quickfix
+  exec.register()             -- bash, run_in_terminal, show_terminal, run_quickfix
   agents.register_spawn()     -- spawn, spawn_wait
   session.register()          -- transcript_excise, hook.on_run_start.reply_refs, hook.on_run_end.reply_refs
   search.register()           -- glob, path_info, tree, grep, bulk_replace

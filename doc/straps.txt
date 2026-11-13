@@ -640,7 +640,7 @@ tool.NAME|) and every write goes through |hook.confirm|. The defaults:
 
 File & shell:
 	read_file, write_file, edit_file, patch_file, path_info, tree,
-	fetch_url, glob, grep, bash, run_in_terminal, run_quickfix,
+	fetch_url, glob, grep, bash, run_in_terminal, show_terminal, run_quickfix,
 	move_file(s), delete_file(s)
 
 Editor-native (tree-sitter / LSP; with no server or parser the call fails
@@ -691,6 +691,16 @@ instead. A redirect,
 command run. From the second identical command (12+ characters) in a
 session, the result ends with a note suggesting a `registry_define`d tool.
 
+`run_in_terminal` runs its command in a |terminal| buffer that has no window,
+so agents running terminals do not change your layout. The result names the
+buffer. Each session keeps only its most recent terminal buffer; the next run
+wipes the previous one, or, if a window shows it, wipes it when that window
+closes. `show_terminal` opens a
+terminal buffer (default: the session's last one) in a 15-line split at the
+bottom without moving focus, and reuses that split on later calls.
+`run_in_terminal` with `show=true` opens the split when the job starts, so
+the output can be watched live. To open one yourself: `:sbuffer {N}` with the
+buffer number from the tool result.
 Writes (write_file/edit_file and the LSP refactors) apply THROUGH the file's
 buffer, so they land in the file's native undo tree — the user reverts with
 |u|, |:earlier| or undotree, and `undo_edit` can revert a specific past edit.

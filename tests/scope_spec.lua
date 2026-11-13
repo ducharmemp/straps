@@ -679,7 +679,7 @@ it("fn.readonly_policy is the single source of truth for read-only calls", funct
   -- Presentation / help / interaction tools that had drifted out of spawn's
   -- readonly copy are read-only.
   for _, n in ipairs({
-    "read_file", "grep", "show_user", "show_diff", "show_buffer",
+    "read_file", "grep", "show_user", "show_diff", "show_buffer", "show_terminal",
     "set_findings", "ask_user", "help_search", "definition", "references",
   }) do
     assert(policy(n) == true, n .. " should be read-only")

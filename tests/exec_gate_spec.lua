@@ -10,7 +10,7 @@
 -- (a parked waiter, a running holder, a waiter admitted then cancelled before
 -- or after its resume); the direct-call (no await) path; the derived
 -- --threads count on rg's argv; the grep timeout; a raising vim.system
--- (EAGAIN) in each tool; a failing terminal split; grep refusing a ctx with
+-- (EAGAIN) in each tool; a terminal buffer that cannot be created; grep refusing a ctx with
 -- no await; and the removed-fn fallback.
 
 local here = debug.getinfo(1, "S").source:sub(2)
@@ -395,19 +395,40 @@ it("release from a fast-event callback defers admission to the main loop", funct
   assert(in_flight() == 0, "slots not released, in_flight=" .. in_flight())
 end)
 
-it("run_in_terminal releases the slot when the split cannot be opened", function()
+it("run_in_terminal releases the slot when the terminal buffer cannot be created", function()
   define_limit(4)
-  local real_cmd = vim.cmd
-  vim.cmd = setmetatable({}, { __call = function(_, s)
-    if type(s) == "string" and s:find("15new", 1, true) then error("E36: Not enough room") end
-    return real_cmd(s)
-  end, __index = real_cmd })
-  local h = start(function(ctx) return registry.call("tool.run_in_terminal", { command = "echo never" }, ctx) end)
+  local real_create = vim.api.nvim_create_buf
+  local h
+  vim.api.nvim_create_buf = function() error("E000: no buffers") end
+  local ok_start, start_err = pcall(function()
+    h = start(function(ctx) return registry.call("tool.run_in_terminal", { command = "echo never" }, ctx) end)
+  end)
+  vim.api.nvim_create_buf = real_create
+  assert(ok_start, tostring(start_err))
   local ok_wait = wait_for(function() return h.done end, 3000)
-  vim.cmd = real_cmd
   assert(ok_wait, "run_in_terminal hung")
-  assert(h.err and tostring(h.err):find("could not open the terminal split", 1, true), "expected the split error, got " .. tostring(h.err) .. tostring(h.out))
-  assert(in_flight() == 0, "failed split leaked a slot, in_flight=" .. in_flight())
+  assert(h.err and tostring(h.err):find("could not create the terminal buffer", 1, true), "expected the buffer error, got " .. tostring(h.err) .. tostring(h.out))
+  assert(in_flight() == 0, "failed buffer creation leaked a slot, in_flight=" .. in_flight())
+end)
+
+it("run_in_terminal releases its slot after a normal exit, a start failure and a timeout", function()
+  define_limit(4)
+  local h = start(function(ctx) return registry.call("tool.run_in_terminal", { command = "exit 0" }, ctx) end)
+  assert(wait_for(function() return h.done end, 8000), "normal run hung")
+  assert(in_flight() == 0, "normal exit leaked a slot, in_flight=" .. in_flight())
+
+  local real_jobstart, real_termopen = vim.fn.jobstart, vim.fn.termopen
+  vim.fn.jobstart = function() return -1 end
+  vim.fn.termopen = function() return -1 end
+  h = start(function(ctx) return registry.call("tool.run_in_terminal", { command = "echo never" }, ctx) end)
+  vim.fn.jobstart, vim.fn.termopen = real_jobstart, real_termopen
+  assert(wait_for(function() return h.done end, 3000), "start-failure run hung")
+  assert(h.err and tostring(h.err):find("could not start the terminal job", 1, true), tostring(h.err))
+  assert(in_flight() == 0, "start failure leaked a slot, in_flight=" .. in_flight())
+
+  h = start(function(ctx) return registry.call("tool.run_in_terminal", { command = "sleep 30", timeout_ms = 200 }, ctx) end)
+  assert(wait_for(function() return h.done end, 8000), "timed-out run hung")
+  assert(in_flight() == 0, "timeout leaked a slot, in_flight=" .. in_flight())
 end)
 
 it("grep refuses a ctx without await before taking a slot", function()

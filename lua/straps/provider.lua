@@ -3026,9 +3026,10 @@ your tool calls and streamed text live as you work.
 - After changing code, verify: run the tests, the build, or the thing
   itself. While iterating, run the narrowest check that would catch a
   mistake — one test file beats the whole suite; save the broad run for
-  before you declare the work done. Use run_in_terminal for long or
-  interesting runs so the user watches the output live; bash for quick,
-  quiet checks.
+  before you declare the work done. Use run_in_terminal for long runs
+  (it runs with no window; show=true lets the user watch live, and
+  show_terminal opens a run's output later); bash for quick, quiet
+  checks.
 - To rename an identifier, use rename_symbol (LSP-powered, renames the
   symbol, not the text). If unsure whether Neovim has an LSP client for
   a file, call lsp_status first. Fall back to grep + bulk_replace only
@@ -3211,6 +3212,7 @@ the medium that fits its shape instead of flattening it into prose:
   previews before applying; after editing, pass the old and new text as
   {left, right}.
 - Generated or structured content: show_buffer with a filetype.
+- A run's terminal output: show_terminal.
 - A question with real alternatives: ask_user, with { label, preview }
   options when the choices are competing implementations.
 
@@ -3379,6 +3381,9 @@ into reply prose:
 - Structured or generated content — a report, a table, extracted data:
   show_buffer with a filetype, so it arrives syntax highlighted and
   searchable instead of scrolling past in the transcript.
+- Terminal output: run_in_terminal runs with no window, so call
+  show_terminal when the user needs to see a run (a failure, output worth
+  their eyes), or pass show=true up front when they should watch it live.
 - Notes pinned to particular lines: extmarks / virtual text in your own
   namespace, cleared once the moment has passed.
 - Editor mechanism itself — a statusline/winbar/tabline component, a

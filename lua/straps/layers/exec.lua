@@ -1,5 +1,5 @@
 -- straps/layers/exec.lua — the EXEC layer: shell execution (bash, the
--- terminal split, and the quickfix-parsing runner).
+-- windowless terminal runner and show_terminal, and the quickfix-parsing runner).
 -- Future prompt-fragment slot: fn.system_prompt_layer.exec.
 
 local M = {}
@@ -209,99 +209,141 @@ end
   define({
     name = "tool.run_in_terminal",
     kind = "tool",
-    doc = "Run a shell command in a visible :terminal split so the user can"
-      .. " WATCH the output stream live — use it for test suites, builds, and"
-      .. " anything long-running or interesting; use bash for quick, quiet"
-      .. " commands. Focus stays where the user was; the split keeps streaming."
-      .. " The full terminal output is also returned. When the command exits 0"
-      .. " the split is closed automatically (kept only if it cannot be closed,"
-      .. " e.g. it is the last window — the result note says which happened);"
-      .. " on failure or timeout it is left open for inspection (the user"
-      .. " closes it with :q). If the job cannot start at all, the empty split"
-      .. " is cleaned up and the tool errors."
+    doc = "Run a shell command in a :terminal buffer that has NO window by default,"
+      .. " so N agents running terminals do not clutter the user's layout. Use it for"
+      .. " test suites, builds, and anything long-running; use bash for quick, quiet"
+      .. " commands. The full terminal output is returned. The buffer is kept after"
+      .. " the job exits (whatever the exit code; a call with no session buffer wipes"
+      .. " it unless it is shown) and its number is in the result;"
+      .. " this session keeps only its most recent terminal buffer — the next"
+      .. " run_in_terminal wipes the previous one unless a window shows it. Pass"
+      .. " show=true to open the terminal in a split at job start so the user can"
+      .. " watch it stream live; otherwise call show_terminal when the user needs to"
+      .. " see the output (a failure, something worth their eyes). If the job cannot"
+      .. " start at all, the buffer is wiped and the tool errors."
       .. " Parameters: command (required) — shell command run via bash -lc;"
       .. " timeout_ms (optional, default 300000) — the job is stopped if it"
-      .. " runs longer.",
+      .. " runs longer; show (optional, default false) — open the terminal in a"
+      .. " split while it runs.",
     input_schema = {
       type = "object",
       properties = {
-        command = { type = "string", description = "Shell command to run in the terminal split." },
+        command = { type = "string", description = "Shell command to run in the terminal buffer." },
         timeout_ms = { type = "integer", description = "Timeout in milliseconds (default 300000)." },
+        show = { type = "boolean", description = "Open the terminal in a split while it runs (default false)." },
       },
       required = { "command" },
     },
     source = [==[
+local function wipe(buf)
+  if vim.api.nvim_buf_is_valid(buf) then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  end
+end
+
+local function shown(buf)
+  return vim.api.nvim_buf_is_valid(buf) and #vim.fn.win_findbuf(buf) > 0
+end
+
+local function drop_last(sid)
+  local prev = vim.b[sid].straps_last_terminal
+  if type(prev) ~= "number" or not vim.api.nvim_buf_is_valid(prev) then return end
+  if shown(prev) then
+    vim.bo[prev].bufhidden = "wipe"
+  else
+    wipe(prev)
+  end
+end
+
 return function(input, ctx)
   local cmd = input.command
   if type(cmd) ~= "string" or cmd == "" then
     error("run_in_terminal: command must be a non-empty string", 0)
   end
   local timeout_ms = tonumber(input.timeout_ms) or 300000
+  local sid = ctx.bufnr
+  if type(sid) ~= "number" or sid == 0 or not vim.api.nvim_buf_is_valid(sid) then sid = nil end
   local release = require("straps.registry").try_call("fn.subprocess_acquire", ctx,
     { tool = "run_in_terminal", bufnr = ctx.bufnr, cmd = cmd }) or function() end
 
-  local prev_win = vim.api.nvim_get_current_win()
-  local ok_split, split_err = pcall(vim.cmd, "botright 15new")
-  if not ok_split then
+  local ok_buf, term_buf = pcall(vim.api.nvim_create_buf, false, false)
+  if not ok_buf then
     release()
-    error("run_in_terminal: could not open the terminal split: " .. tostring(split_err), 0)
+    error("run_in_terminal: could not create the terminal buffer: " .. tostring(term_buf), 0)
   end
-  local term_buf = vim.api.nvim_get_current_buf()
+  vim.bo[term_buf].bufhidden = "hide"
 
   local timed_out, finished = false, false
+  local show_err
   local code, start_err = ctx.await(function(resolve)
     local function on_exit(_, c)
       finished = true
       release()
       resolve(c)
     end
-    -- nvim 0.11+: jobstart {term=true}; older: termopen. Both must run with
-    -- the fresh scratch buffer current, so start BEFORE restoring focus.
     local job = 0
-    local okj, j = pcall(vim.fn.jobstart, { "bash", "-lc", cmd },
-      { term = true, cwd = vim.fn.getcwd(-1, -1), on_exit = on_exit })
-    if okj and type(j) == "number" and j > 0 then
-      job = j
-    else
-      local okt, t = pcall(vim.fn.termopen, { "bash", "-lc", cmd }, { cwd = vim.fn.getcwd(-1, -1), on_exit = on_exit })
-      if okt and type(t) == "number" and t > 0 then job = t end
-    end
+    local cwd = vim.fn.getcwd(-1, -1)
+    vim.api.nvim_buf_call(term_buf, function()
+      local okj, j = pcall(vim.fn.jobstart, { "bash", "-lc", cmd },
+        { term = true, cwd = cwd, width = vim.o.columns, height = 15, on_exit = on_exit })
+      if okj and type(j) == "number" and j > 0 then
+        job = j
+      else
+        local okt, t = pcall(vim.fn.termopen, { "bash", "-lc", cmd }, { cwd = cwd, on_exit = on_exit })
+        if okt and type(t) == "number" and t > 0 then job = t end
+      end
+    end)
     if job <= 0 then
       release()
       resolve(nil, "could not start the terminal job")
       return
     end
-    pcall(vim.api.nvim_set_current_win, prev_win)
+    vim.b[term_buf].straps_terminal = { session = sid, command = cmd }
+    if sid then
+      drop_last(sid)
+      if vim.b[sid].straps_last_terminal == nil then
+        vim.api.nvim_create_autocmd("BufWipeout", {
+          buffer = sid,
+          once = true,
+          callback = function() drop_last(sid) end,
+        })
+      end
+      vim.b[sid].straps_last_terminal = term_buf
+    end
+    if input.show == true then
+      local ok_show, e = pcall(require("straps.registry").call, "tool.show_terminal", { buffer = term_buf }, ctx)
+      if not ok_show then show_err = tostring(e) end
+    end
     vim.defer_fn(function()
       if not finished then
         timed_out = true
         pcall(vim.fn.jobstop, job)
-        -- jobstop sends SIGTERM; a child trapping/ignoring it survives and
-        -- the split would keep running while we report a timeout. Escalate to
-        -- SIGKILL on the process group after a short grace period.
         vim.defer_fn(function()
           if not finished then
-            local pid = tonumber(vim.fn.jobpid(job))
+            local ok_pid, pid = pcall(vim.fn.jobpid, job)
+            pid = ok_pid and tonumber(pid)
             if pid then pcall(vim.uv.kill, -pid, 9) end
           end
         end, 2000)
       end
     end, timeout_ms)
     if ctx.on_cancel then
-      ctx.on_cancel(function() pcall(vim.fn.jobstop, job) end)
+      ctx.on_cancel(function()
+        pcall(vim.fn.jobstop, job)
+        if not sid and vim.api.nvim_buf_is_valid(term_buf) then
+          if shown(term_buf) then
+            vim.bo[term_buf].bufhidden = "wipe"
+          else
+            vim.defer_fn(function()
+              if not shown(term_buf) then wipe(term_buf) end
+            end, 3000)
+          end
+        end
+      end)
     end
   end)
   if start_err then
-    -- The job never started, so the split holds nothing to inspect: close it,
-    -- wipe its buffer, and put the user back where they were (focus was never
-    -- restored on this path — the job had to start with the split current).
-    for _, win in ipairs(vim.fn.win_findbuf(term_buf)) do
-      pcall(vim.api.nvim_win_close, win, true)
-    end
-    if vim.api.nvim_buf_is_valid(term_buf) then
-      pcall(vim.api.nvim_buf_delete, term_buf, { force = true })
-    end
-    pcall(vim.api.nvim_set_current_win, prev_win)
+    wipe(term_buf)
     error("run_in_terminal: " .. start_err, 0)
   end
 
@@ -313,26 +355,100 @@ return function(input, ctx)
     table.remove(out_lines)
   end
 
-  -- On success there is nothing left to inspect: close the split and wipe the
-  -- terminal buffer. Failures and timeouts keep it open for the user. If a
-  -- window survives (e.g. the split became the last window, which cannot be
-  -- closed), keep the buffer too so what it shows stays inspectable.
-  local closed = false
-  if code == 0 and not timed_out then
-    for _, win in ipairs(vim.fn.win_findbuf(term_buf)) do
-      pcall(vim.api.nvim_win_close, win, true)
-    end
-    closed = #vim.fn.win_findbuf(term_buf) == 0
-    if closed and vim.api.nvim_buf_is_valid(term_buf) then
-      pcall(vim.api.nvim_buf_delete, term_buf, { force = true })
-    end
+  local note
+  if not vim.api.nvim_buf_is_valid(term_buf) then
+    note = "[terminal buffer was wiped while the job ran]"
+  elseif shown(term_buf) then
+    if not sid then vim.bo[term_buf].bufhidden = "wipe" end
+    note = ("[terminal buffer %d is shown in a window]"):format(term_buf)
+  elseif sid then
+    note = ("[terminal buffer %d has no window; show_terminal { buffer = %d } opens it]")
+      :format(term_buf, term_buf)
+  else
+    wipe(term_buf)
+    note = "[terminal buffer wiped: no session to keep it]"
   end
+  if show_err then note = note .. "\n[show=true failed: " .. show_err .. "]" end
 
   return "exit code: " .. tostring(code)
     .. (timed_out and (" (stopped: exceeded timeout of " .. timeout_ms .. " ms)") or "")
     .. "\noutput:\n" .. table.concat(out_lines, "\n")
-    .. (closed and "\n[terminal split closed]"
-      or "\n[terminal split left open — the user can close it with :q]")
+    .. "\n" .. note
+end
+]==],
+  })
+
+  -- ------------------------------------------------------------ show_terminal
+
+  define({
+    name = "tool.show_terminal",
+    kind = "tool",
+    doc = "Show the user a terminal buffer from run_in_terminal (which runs with no"
+      .. " window) in a 15-line split at the bottom, scrolled to the end. Call it when"
+      .. " the user needs to see the output: a failure, a result worth their eyes."
+      .. " Focus stays where the user was; a later call reuses the window a previous"
+      .. " call opened (tagged w:straps_view='terminal') instead of adding a split."
+      .. " Read-only (opens a view; changes no files). Parameters: buffer (optional)"
+      .. " — the terminal buffer number from a run_in_terminal result; defaults to"
+      .. " this session's most recent terminal.",
+    input_schema = {
+      type = "object",
+      properties = {
+        buffer = { type = "integer", description = "Terminal buffer number (default: this session's last terminal)." },
+      },
+    },
+    source = [==[
+return function(input, ctx)
+  input = input or {}
+  local buf = tonumber(input.buffer)
+  if buf == 0 then buf = nil end
+  if not buf then
+    local sid = ctx and ctx.bufnr
+    if type(sid) == "number" and sid ~= 0 and vim.api.nvim_buf_is_valid(sid) then
+      buf = vim.b[sid].straps_last_terminal
+    end
+    if type(buf) ~= "number" then
+      error("show_terminal: this session has no terminal; pass buffer", 0)
+    end
+  end
+  if not vim.api.nvim_buf_is_valid(buf) then
+    error("show_terminal: buffer " .. buf .. " no longer exists", 0)
+  end
+  local info = vim.b[buf].straps_terminal
+  if vim.bo[buf].buftype ~= "terminal" or type(info) ~= "table" then
+    error("show_terminal: buffer " .. buf .. " is not a run_in_terminal buffer", 0)
+  end
+  local win
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.w[w].straps_view == "terminal"
+      and type(vim.b[vim.api.nvim_win_get_buf(w)].straps_terminal) == "table" then
+      win = w
+      break
+    end
+  end
+  if not win then
+    local cur = vim.api.nvim_get_current_win()
+    local ok, err = pcall(vim.cmd, "botright 15split")
+    if not ok then error("show_terminal: could not open a split: " .. tostring(err), 0) end
+    win = vim.api.nvim_get_current_win()
+    pcall(vim.api.nvim_set_current_win, cur)
+    local ok_set, set_err = pcall(vim.api.nvim_win_set_buf, win, buf)
+    if not ok_set then
+      pcall(vim.api.nvim_win_close, win, true)
+      error("show_terminal: " .. tostring(set_err), 0)
+    end
+    vim.w[win].straps_view = "terminal"
+  else
+    local ok_set, set_err = pcall(vim.api.nvim_win_set_buf, win, buf)
+    if not ok_set then error("show_terminal: " .. tostring(set_err), 0) end
+  end
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
+  vim.wo[win].signcolumn = "no"
+  local command = tostring(info.command or "")
+  pcall(function() vim.wo[win].winbar = (command:gsub("%%", "%%%%")) end)
+  pcall(vim.api.nvim_win_set_cursor, win, { vim.api.nvim_buf_line_count(buf), 0 })
+  return ("show_terminal: opened buffer %d — %s"):format(buf, command)
 end
 ]==],
   })

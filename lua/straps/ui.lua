@@ -1561,7 +1561,7 @@ function M.progress(bufnr, ev)
       end
     end))
   end
-  if ev.type == "tool" then
+  if ev.type == "tool" or ev.type == "gate" then
     st.label = "⚙ " .. tostring(ev.name)
     st.streaming = false -- a local tool produces no stream bytes
   elseif ev.type == "thinking" then

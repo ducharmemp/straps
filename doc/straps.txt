@@ -462,8 +462,9 @@ compact_keep_turns	(number) 2. Assistant turns |fn.compact| keeps intact.
 after_write_diagnostics	(boolean) true. Default |hook.after_write|: feed the
 			attached LSP's ERROR/WARN diagnostics for a written file
 			back into the tool result. false makes the hook a no-op.
-after_write_diagnostics_ms (number) 800. How long that hook waits for the
-			language server to re-lint before reporting.
+after_write_diagnostics_ms (number) 800. The longest |fn.write_diagnostics|
+			waits for the language server to re-lint. In a batch the
+			wait runs once, for every file the batch wrote.
 spawn_notify		(boolean) true. Default
 			|hook.on_run_end.notify_parent|: when a subagent's run
 			ends, deliver a one-line notice to its parent session,
@@ -746,7 +747,11 @@ hook.confirm(name, input, ctx) -> allowed, reason, source
 		`registry.tool_grant_key(name)` (`<name>@v<version>[@<bufnr>]`), so a
 		redefinition or session shadow of the tool prompts again.
 		Never loosen this on the agent's initiative. See
-		|straps-auto|.
+		|straps-auto|. In a batch, every call of a segment is
+		confirmed before the first one runs; for a second edit to the
+		same file, `ctx.batch_preview(path)` returns the file as the
+		earlier edits of the segment leave it, and the diff preview
+		is computed against that text.
 
 						*hook.guard* *straps-guards*
 hook.guard.<suffix>(op, ...) -> verdict, reason
@@ -819,6 +824,22 @@ hook.after_write(path, ctx) -> string|nil
 		`hook.after_write.<suffix>` subscriber runs, and all their string
 		results are appended in registration order — add a linter without
 		replacing the diagnostics default.
+		Inside a batch the loop sets `ctx.defer_diagnostics(path)`: the
+		default records the file and returns nil, and after the batch
+		segment's last call the loop runs |fn.write_diagnostics| once for
+		every written file, appending each file's report to its last
+		successful write.
+
+fn.write_diagnostics(records, ctx) -> { [bufnr] = text }	*fn.write_diagnostics*
+		Wait once for the buffers in `records` ({ bufnr, path, last_write,
+		last_event? }) to be re-linted: each settles 120 ms after its last
+		DiagnosticChanged, capped at `after_write_diagnostics_ms`; a stop
+		ends the wait. Returns each buffer's ERROR/WARN diagnostics.
+
+fn.starts_segment(name, input) -> boolean		*fn.starts_segment*
+		True makes this call start a new batch segment, so the calls before
+		it run and land in the transcript before it is gated. Default: the
+		tool entry's `segment_break` field (set only via registry.define).
 
 						*hook.on_run_start*
 hook.on_run_start(ctx)

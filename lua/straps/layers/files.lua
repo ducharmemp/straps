@@ -769,19 +769,19 @@ function M.register_hooks()
       .. " the file it just changed, then returns any ERROR/WARN diagnostics so"
       .. " the agent sees breakage it caused without having to ask. No LSP client"
       .. " on the file, or no new diagnostics, returns nil (nothing appended)."
+      .. " Inside a batch the loop sets ctx.defer_diagnostics(path): the default"
+      .. " then records the file and returns nil, and the loop runs"
+      .. " fn.write_diagnostics once for every file the batch segment wrote,"
+      .. " appending each file's report to the last successful write of it."
       .. " Turn it off with config.after_write_diagnostics = false, or redefine"
       .. " this hook (it is the canonical 'always do X after Y' seam — e.g. run"
       .. " an external linter instead and return its output). Additional"
       .. " subscribers can be added as hook.after_write.<suffix> entries"
       .. " without replacing this default — this entry plus every"
       .. " hook.after_write.<suffix> entry runs and their string results are"
-      .. " all appended, in registration order.",
+      .. " all appended, in registration order; they receive the same ctx.",
     source = [==[
 return function(path, ctx)
-  -- Editor-native lint feedback: after the edit (which already sent the LSP a
-  -- didChange via the buffer's on_lines callbacks), wait for diagnostics to
-  -- settle and report the file's ERROR/WARN. Every failure path returns nil so
-  -- a write is never turned into an error by its own feedback loop.
   local ok, out = pcall(function()
     local cfg = {}
     local sok, straps = pcall(require, "straps")
@@ -789,45 +789,96 @@ return function(path, ctx)
       cfg = straps.config
     end
     if cfg.after_write_diagnostics == false then return nil end
-
-    local full = vim.fn.fnamemodify(path, ":p")
-    local buf = -1
-    for _, b in ipairs(vim.api.nvim_list_bufs()) do
-      if vim.api.nvim_buf_get_name(b) == full then buf = b break end
-    end
-    if buf < 0 or not vim.api.nvim_buf_is_valid(buf)
-      or not vim.api.nvim_buf_is_loaded(buf) then
-      return nil
-    end
-    -- No language server attached -> nothing to report (the file may just be a
-    -- filetype with no server, which is not a problem).
+    local buf = require("straps.state").find_buf(path)
+    if not buf or not vim.api.nvim_buf_is_loaded(buf) then return nil end
     local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
     if #(get_clients({ bufnr = buf }) or {}) == 0 then return nil end
-
-    local timeout = tonumber(cfg.after_write_diagnostics_ms) or 800
-
-    -- Wait for a DiagnosticChanged on this buffer (the server's re-lint), with
-    -- a hard cap. Prefer ctx.await (yields the coroutine, never blocks the UI);
-    -- fall back to vim.wait if the hook is somehow called outside a run.
-    local function settle(finish_after)
-      local settled, aug, tmr = false, nil, nil
-      local function finish()
-        if settled then return end
-        settled = true
-        if aug then pcall(vim.api.nvim_del_autocmd, aug) end
-        if tmr then pcall(function() tmr:stop(); tmr:close() end) end
-        finish_after()
-      end
-      aug = vim.api.nvim_create_autocmd("DiagnosticChanged", {
-        callback = function(args)
-          -- Debounce: diagnostics often arrive in a short burst; take the last.
-          if args.buf == buf then vim.defer_fn(finish, 120) end
-        end,
-      })
-      tmr = vim.defer_fn(finish, timeout)
-      if ctx and ctx.on_cancel then ctx.on_cancel(finish) end
+    if ctx and type(ctx.defer_diagnostics) == "function" and ctx.defer_diagnostics(path) then
+      return nil
     end
+    local texts = require("straps.registry").call("fn.write_diagnostics",
+      { { bufnr = buf, path = path, last_write = vim.uv.hrtime() } }, ctx)
+    return texts and texts[buf] or nil
+  end)
+  if not ok then return nil end
+  return out
+end
+]==],
+  })
 
+  -- ------------------------------------------------------ fn.write_diagnostics
+
+  define({
+    name = "fn.write_diagnostics",
+    kind = "fn",
+    doc = "Called as (records, ctx) -> { [bufnr] = text }. Each record is { bufnr, path,"
+      .. " last_write, last_event? } (hrtime ns). Waits, in one ctx.await, until every"
+      .. " buffer whose server has not re-linted since its last write has had a"
+      .. " DiagnosticChanged followed by 120 ms of quiet (each event restarts that buffer's"
+      .. " debounce), capped at config.after_write_diagnostics_ms (default 800); a stop"
+      .. " (ctx.on_cancel) ends the wait at once. Then returns each buffer's ERROR/WARN"
+      .. " diagnostics as 'diagnostics after write (N):' lines. Without ctx.await it"
+      .. " falls back to vim.wait.",
+    source = [==[
+return function(records, ctx)
+  local cfg = {}
+  local sok, straps = pcall(require, "straps")
+  if sok and type(straps) == "table" and rawget(straps, "config") then
+    cfg = straps.config
+  end
+  local timeout = tonumber(cfg.after_write_diagnostics_ms) or 800
+  local debounce = 120
+  local pending = {}
+  local n = 0
+  for _, r in ipairs(records or {}) do
+    local fresh = r.last_event and r.last_write and r.last_event >= r.last_write
+      and (vim.uv.hrtime() - r.last_event) / 1e6 >= debounce
+    if not fresh and vim.api.nvim_buf_is_valid(r.bufnr) and not pending[r.bufnr] then
+      pending[r.bufnr] = r
+      n = n + 1
+    end
+  end
+
+  local function settle(finish_after)
+    local settled, aug, cap = false, nil, nil
+    local timers = {}
+    local function close(t) pcall(function() t:stop(); t:close() end) end
+    local function finish()
+      if settled then return end
+      settled = true
+      if aug then pcall(vim.api.nvim_del_autocmd, aug) end
+      if cap then close(cap) end
+      for _, t in pairs(timers) do close(t) end
+      finish_after()
+    end
+    local function quiet(buf)
+      if timers[buf] then close(timers[buf]) end
+      local t = vim.uv.new_timer()
+      timers[buf] = t
+      t:start(debounce, 0, vim.schedule_wrap(function()
+        if timers[buf] ~= t then return end
+        timers[buf] = nil
+        close(t)
+        if pending[buf] then
+          pending[buf] = nil
+          n = n - 1
+          if n <= 0 then finish() end
+        end
+      end))
+    end
+    aug = vim.api.nvim_create_autocmd("DiagnosticChanged", {
+      callback = function(args)
+        if pending[args.buf] then quiet(args.buf) end
+      end,
+    })
+    for buf, r in pairs(pending) do
+      if r.last_event and r.last_write and r.last_event >= r.last_write then quiet(buf) end
+    end
+    cap = vim.defer_fn(finish, timeout)
+    if ctx and ctx.on_cancel then ctx.on_cancel(finish) end
+  end
+
+  if n > 0 then
     if ctx and ctx.await then
       ctx.await(function(resolve) settle(resolve) end)
     else
@@ -835,27 +886,31 @@ return function(path, ctx)
       settle(function() done = true end)
       vim.wait(timeout + 200, function() return done end, 30)
     end
+  end
 
-    if not vim.api.nvim_buf_is_valid(buf) then return nil end
-    local sev = vim.diagnostic.severity
-    local names = { [sev.ERROR] = "ERROR", [sev.WARN] = "WARN" }
-    local diags = vim.diagnostic.get(buf, { severity = { min = sev.WARN } }) or {}
-    if #diags == 0 then return nil end
-    table.sort(diags, function(a, b)
-      if (a.lnum or 0) ~= (b.lnum or 0) then return (a.lnum or 0) < (b.lnum or 0) end
-      return (a.col or 0) < (b.col or 0)
-    end)
-    local rel = vim.fn.fnamemodify(path, ":.")
-    local lines = { ("diagnostics after write (%d):"):format(#diags) }
-    for _, d in ipairs(diags) do
-      local source = (d.source and d.source ~= "") and (" [" .. d.source .. "]") or ""
-      lines[#lines + 1] = string.format("%s:%d:%d: %s %s%s",
-        rel, (d.lnum or 0) + 1, (d.col or 0) + 1,
-        names[d.severity] or "WARN", tostring(d.message or ""), source)
+  local out = {}
+  local sev = vim.diagnostic.severity
+  local names = { [sev.ERROR] = "ERROR", [sev.WARN] = "WARN" }
+  for _, r in ipairs(records or {}) do
+    if vim.api.nvim_buf_is_valid(r.bufnr) then
+      local diags = vim.diagnostic.get(r.bufnr, { severity = { min = sev.WARN } }) or {}
+      if #diags > 0 then
+        table.sort(diags, function(a, b)
+          if (a.lnum or 0) ~= (b.lnum or 0) then return (a.lnum or 0) < (b.lnum or 0) end
+          return (a.col or 0) < (b.col or 0)
+        end)
+        local rel = vim.fn.fnamemodify(r.path or vim.api.nvim_buf_get_name(r.bufnr), ":.")
+        local lines = { ("diagnostics after write (%d):"):format(#diags) }
+        for _, d in ipairs(diags) do
+          local source = (d.source and d.source ~= "") and (" [" .. d.source .. "]") or ""
+          lines[#lines + 1] = string.format("%s:%d:%d: %s %s%s",
+            rel, (d.lnum or 0) + 1, (d.col or 0) + 1,
+            names[d.severity] or "WARN", tostring(d.message or ""), source)
+        end
+        out[r.bufnr] = table.concat(lines, "\n")
+      end
     end
-    return table.concat(lines, "\n")
-  end)
-  if not ok then return nil end
+  end
   return out
 end
 ]==],

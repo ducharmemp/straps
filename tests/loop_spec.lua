@@ -751,7 +751,7 @@ end
   wait_done(bufnr)
 
   local seq = table.concat(_G.straps_test_progress, ",")
-  assert(seq:find("start,thinking,tool,tool_done,thinking", 1, true),
+  assert(seq:find("start,thinking,gate,tool,tool_done,thinking", 1, true),
     "unexpected progress sequence: " .. seq)
   assert(_G.straps_test_progress[#_G.straps_test_progress] == "done",
     "progress sequence does not end with done: " .. seq)

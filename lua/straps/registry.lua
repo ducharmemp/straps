@@ -165,7 +165,7 @@ local function merged_entries()
   return out
 end
 
-local COPY_FIELDS = { "name", "kind", "doc", "input_schema", "capability", "source", "version", "seq", "scope" }
+local COPY_FIELDS = { "name", "kind", "doc", "input_schema", "capability", "segment_break", "source", "version", "seq", "scope" }
 
 -- Read-only view: a shallow copy of the public fields. The compiled fn is
 -- deliberately absent — handing it out would be a way to run a tool without
@@ -311,6 +311,9 @@ function M.define(spec, opts)
   if spec.capability ~= nil and type(spec.capability) ~= "string" then
     error(("straps.registry.define: %s: capability must be a string"):format(spec.name), 0)
   end
+  if spec.segment_break ~= nil and type(spec.segment_break) ~= "boolean" then
+    error(("straps.registry.define: %s: segment_break must be a boolean"):format(spec.name), 0)
+  end
 
   local scope_opt = opts and opts.scope
   local guard = is_guard_name(spec.name)
@@ -381,6 +384,7 @@ function M.define(spec, opts)
     input_schema = spec.input_schema,
     source = spec.source,
     capability = spec.capability,
+    segment_break = spec.segment_break,
     fn = fn,
     version = (prev and prev.version or 0) + 1,
     seq = seq,
@@ -774,6 +778,9 @@ function M.render(name)
   end
   if e.capability ~= nil then
     parts[#parts + 1] = ("  capability = %q,"):format(e.capability)
+  end
+  if e.segment_break ~= nil then
+    parts[#parts + 1] = ("  segment_break = %s,"):format(tostring(e.segment_break))
   end
   parts[#parts + 1] = ("  source = [%s[\n%s]%s],"):format(eq, e.source, eq)
   parts[#parts + 1] = "}"

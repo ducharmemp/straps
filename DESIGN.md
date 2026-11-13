@@ -520,29 +520,69 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
       provider emits `text_delta` events which the loop appends via
       `state.append_text`. (If the response has no text, the empty assistant
       block is harmless — parse omits empty text.)
-   e. For each `tool_use` block in `resp.content`:
-      - `state.append(bufnr, "tool_use", {id=, name=}, pretty_json(input))`
-      - `allowed, reason, run = registry.gate_tool(name, input, ctx, { confirm = cb })`
-        where `cb` runs `hook.confirm` then the `hook.before_tool` fan-out.
-        Inside the gate: the before-guards (`hook.guard.*`, op `"before"`)
-        run first — any `false` blocks with `"blocked by <guard>: <reason>"`
-        and confirm is never reached; then confirm — not allowed →
-        `"user denied: " .. (reason or "")`, or
-        `"blocked by hook.confirm: " .. (reason or "")` when confirm returns
-        `false, reason, "hook"` (a policy veto, not a user answer). Either way a refusal becomes a
-        tool_result with `is_error=true`; continue to the next tool_use.
-      - `ok, result = run(ctx)` — the entry resolved at gate time, `pcall`'d.
-        Result: string, or table (json-encode), or nil → "ok". Truncate
-        results > `config.max_tool_result_bytes` (default 100_000) with a note.
-      - `hook.after_tool` FOLDS over `registry.hook_entries("hook.after_tool")`:
-        each subscriber is called `(name, input, result, ok, ctx)` in seq order
-        and a non-nil return replaces `result` for the NEXT subscriber (so
-        subscriber N sees subscriber N-1's transformation); a raising
-        subscriber is `pcall`'d away so it cannot break the ones after it.
-      - `result, ok = registry.after_guards(name, input, result, ok, ctx)` —
-        the after-guards (op `"after"`) see exactly the bytes the model will;
-        `false` blocks, a string replaces.
-      - `state.append(bufnr, "tool_result", {id=, is_error=not ok}, tostring(result))`
+   e. Append a `tool_use` block for every call in `resp.content`
+      (`state.append(bufnr, "tool_use", {id=, name=}, pretty_json(input))`), then run
+      them. A batch of two or more calls that are all in `PARALLEL_READONLY` runs
+      as the parallel read-only batch (below). Every other batch runs in
+      SEGMENTS (`run_segments`), each in four phases on the run coroutine:
+      1. Gate run. For consecutive blocks, in order:
+         `allowed, reason, run = registry.gate_tool(name, input, ctx, { confirm = cb })`
+         where `cb` runs `hook.confirm` then the `hook.before_tool` fan-out.
+         Inside the gate the before-guards (`hook.guard.*`, op `"before"`) run
+         first; any `false` blocks with `"blocked by <guard>: <reason>"` and
+         confirm is never reached. Then confirm: not allowed →
+         `"user denied: " .. (reason or "")`, or `"blocked by hook.confirm: " ..
+         (reason or "")` when confirm returns `false, reason, "hook"` (a policy
+         veto). A refusal becomes that block's `is_error` result. The gate run
+         ends AFTER a block `fn.capability` classifies `define`, `lua` or
+         `agent_tool` (allowed or not): such a call can define a tool or replace
+         `hook.confirm`/`fn.capability` for the calls after it, and `gate_tool`
+         resolves its entry at gate time. It ends BEFORE a block (not the first
+         of the run) for which `fn.starts_segment(name, input)` is true; the
+         default is true for an entry with `segment_break = true` (a
+         `registry.define`-only field, like `capability`), so a tool that copies
+         the transcript (straps-divergent's fork) sees the results before it.
+         During the gate run `ctx.batch_preview(path)` returns the text a
+         write_file/edit_file/patch_file target will have after the earlier
+         allowed edits of the same run (`state.simulate_edit`, keyed by
+         `state.path_key`), so `hook.confirm`'s diff preview of a second edit to
+         one file shows that edit, not the pre-batch file. A `gate` log event
+         and a `gate` progress event fire per block.
+      2. Execute the allowed blocks in order: `ok, raw = run(ctx)` (the entry
+         resolved at gate time, `pcall`'d). The `tool` log event's `ms` is this
+         execution only.
+      3. Diagnostics: the default `hook.after_write` called during phase 2
+         recorded each written buffer through `ctx.defer_diagnostics` instead of
+         waiting; `fn.write_diagnostics` (pcall'd) now waits once for all of
+         them and its text for each buffer is appended to the last successful
+         write of that buffer.
+      4. For each block in order: normalize (string, table → json-encode, nil →
+         "ok"), truncate results > `config.max_tool_result_bytes` (default
+         100_000) with a note, FOLD `hook.after_tool` (each subscriber called
+         `(name, input, result, ok, ctx)` in seq order; a non-nil return
+         replaces `result` for the NEXT subscriber; a raising subscriber is
+         `pcall`'d away), then `registry.after_guards(name, input, result, ok,
+         ctx)` (op `"after"`; they see exactly the bytes the model will;
+         `false` blocks, a string replaces), then append the `tool_result`.
+      Consequences: the confirm prompts of a segment all come before its first
+      call runs; a guard or confirm for call N sees the files as they were
+      before its segment (plus the preview above); `hook.before_tool` fires
+      for a whole gate run before any of it executes; results land in the
+      transcript when their segment ends; a batch with `eval_lua`,
+      `registry_define` or an `agent_tool` call (any tool without a declared
+      `capability` that `fn.capability` does not list, plugin tools included)
+      still prompts around those calls one segment at a time. Cancel: blocks
+      not executed get "run cancelled before this tool executed"; executed
+      blocks keep their real results. A raise that escapes the segment loop
+      (a raising `hook.confirm`, say) reaches `M.start`'s pcall, which first
+      pairs the turn (`pair_turn`, covering both batch paths: a call that ran
+      but whose result was not post-processed gets "run interrupted after this
+      tool ran; its result was not processed", so no unguarded or untruncated
+      output reaches the transcript; a refused call keeps its refusal; the rest
+      get "run interrupted before this tool finished"; every diagnostics
+      listener is removed) and only then appends the
+      "straps: run error" block, so the transcript never holds an unpaired
+      `tool_use`; `crashed` pairs the same way.
       The parallel read-only batch gates EVERY block first (on the run
       coroutine, so an awaiting guard finishes before any job starts), stubs
       the batch if the run was cancelled meanwhile, then spawns one job per
@@ -1940,11 +1980,24 @@ with none installed behavior is identical to a build without the mechanism.
   spawn (it defines the child's confirm shadow inside a run) — scope guards by
   `op` and name.
 - `hook.after_write` — default is the editor-native lint feedback loop: after
-  a write, wait (bounded via `ctx.await`, `config.after_write_diagnostics_ms`,
-  default 800ms) for the file's LSP to re-lint, then return its ERROR/WARN
-  diagnostics so they append to the tool result. No client / no diagnostics →
-  nil. `config.after_write_diagnostics = false` makes it a no-op. Redefinable
-  like everything (e.g. to shell out to an external linter instead).
+  a write, wait for the file's LSP to re-lint, then return its ERROR/WARN
+  diagnostics so they append to the tool result. The wait and formatting live
+  in `fn.write_diagnostics(records, ctx)`: one `ctx.await` over any number of
+  buffers, each settled by a `DiagnosticChanged` followed by 120 ms of quiet
+  (every event restarts that buffer's debounce, so a burst reports its last
+  state), skipped for a buffer already re-linted since its write, capped at
+  `config.after_write_diagnostics_ms` (default 800ms), ended at once by a stop.
+  Inside a batch segment the loop sets `ctx.defer_diagnostics(path)`; the
+  default hook calls it and returns nil, the loop listens for that buffer's
+  events from the write onward and calls `fn.write_diagnostics` once for every
+  written buffer after the segment's last call (see the loop, step e). Writes
+  made through `editor.lua`'s `after_writes` (format, code actions,
+  rename_symbol) defer the same way. Suffix subscribers still run per write and
+  see the same ctx. The buffer is found by `state.find_buf`, which matches by
+  name or by realpath, so a path through a symlinked directory finds the
+  buffer Neovim named by its target. No client / no diagnostics → nil.
+  `config.after_write_diagnostics = false` makes it a no-op. Redefinable like
+  everything (e.g. to shell out to an external linter instead).
 - `hook.on_run_start` — the multiplayer notice (see "Multiplayer AWARENESS"
   below); a no-op whenever this session is the only agent running.
 - `hook.on_turn_start` — no-op; the per-turn seam for budget checks and

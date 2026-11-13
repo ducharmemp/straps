@@ -118,6 +118,25 @@ end
 ]==],
   })
 
+  -- ---------------------------------------------------------- fn.starts_segment
+
+  define({
+    name = "fn.starts_segment",
+    kind = "fn",
+    doc = "Called as (name, input) for every block after the first of a batch's"
+      .. " gate run; true makes that block start a new segment, so every block before it is gated,"
+      .. " executed and appended to the transcript before this block is gated. Default: true for a"
+      .. " tool entry whose segment_break field is true (settable only via registry.define, like"
+      .. " capability), so a tool that copies or reads the transcript (fork) sees the real results"
+      .. " of the calls before it.",
+    source = [==[
+return function(name)
+  local e = require("straps.registry").get("tool." .. tostring(name))
+  return e ~= nil and e.segment_break == true
+end
+]==],
+  })
+
   -- -------------------------------------------------------- fn.readonly_policy
 
   -- Thin wrapper over fn.capability: read-only == the "read" category. Both the
@@ -158,7 +177,8 @@ end
       .. " otherwise prompt via vim.fn.confirm. For"
       .. " file-editing tools (write_file, edit_file, patch_file) a unified diff of the"
       .. " proposed change is shown in a scratch split while the dialog is up"
-      .. " (closed after), and the prompt offers"
+      .. " (closed after; inside a batch it is computed against ctx.batch_preview(path),"
+      .. " the file as the segment's earlier edits leave it), and the prompt offers"
       .. " Yes / No / 'Always in <parent dir>' / 'Always in this project <root>'"
       .. " (shown only when a project root marker — .jj/.git/.straps.lua/.hg/.svn —"
       .. " is found above the file, and not identical to the parent dir) /"
@@ -283,63 +303,17 @@ return function(name, input, ctx)
   local preview_win
   if is_edit then
     pcall(function()
-      local old = ""
-      pcall(function()
-        local full = vim.fn.fnamemodify(input.path, ":p")
-        local buf
-        for _, b in ipairs(vim.api.nvim_list_bufs()) do
-          if vim.api.nvim_buf_get_name(b) == full then buf = b break end
-        end
-        if buf and vim.api.nvim_buf_is_loaded(buf) then
-          old = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-        elseif vim.fn.filereadable(full) == 1 then
-          old = table.concat(vim.fn.readfile(full), "\n")
-        end
-      end)
-      local new
-      if name == "write_file" then
-        -- The buffer join above has no trailing newline; normalize content
-        -- the same way so the diff doesn't show a phantom last-line change.
-        new = (input.content or ""):gsub("\n$", "")
-      elseif name == "patch_file" then
-        local lines = vim.split(old, "\n", { plain = true })
-        local hunks = input.hunks
-        if type(hunks) ~= "table" then return end
-        local normalized = {}
-        for _, h in ipairs(hunks) do
-          local s, e = tonumber(h.start_line), tonumber(h.end_line)
-          if not s or not e or type(h.new_text) ~= "string" then return end
-          normalized[#normalized + 1] = { s = math.floor(s), e = math.floor(e), text = h.new_text }
-        end
-        table.sort(normalized, function(a, b) return a.s < b.s end)
-        for i = #normalized, 1, -1 do
-          local h = normalized[i]
-          local repl = h.text == "" and {} or vim.split(h.text, "\n", { plain = true })
-          if repl[#repl] == "" then table.remove(repl) end
-          for j = h.e, h.s, -1 do table.remove(lines, j) end
-          for j = #repl, 1, -1 do table.insert(lines, h.s, repl[j]) end
-        end
-        new = table.concat(lines, "\n")
-      else -- edit_file: preview the same plain-text replacement the tool does
-        local olds, news = input.old_string, input.new_string or ""
-        if type(olds) ~= "string" or olds == "" then return end
-        if not old:find(olds, 1, true) then return end
-        if input.replace_all then
-          local parts, idx = {}, 1
-          while true do
-            local s, e = string.find(old, olds, idx, true)
-            if not s then break end
-            parts[#parts + 1] = old:sub(idx, s - 1)
-            parts[#parts + 1] = news
-            idx = e + 1
-          end
-          parts[#parts + 1] = old:sub(idx)
-          new = table.concat(parts)
-        else
-          local s, e = string.find(old, olds, 1, true)
-          new = old:sub(1, s - 1) .. news .. old:sub(e + 1)
-        end
+      local state = require("straps.state")
+      local old
+      if ctx and type(ctx.batch_preview) == "function" then
+        pcall(function() old = ctx.batch_preview(input.path) end)
       end
+      if type(old) ~= "string" then
+        old = ""
+        pcall(function() old = state.file_text(input.path) end)
+      end
+      local new = state.simulate_edit(name, input, old)
+      if new == nil then return end
       local differ = (vim.text and vim.text.diff) or vim.diff
       local diff = differ(old .. "\n", new .. "\n", { ctxlen = 3 })
       if type(diff) ~= "string" or diff == "" then return end

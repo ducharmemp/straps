@@ -109,8 +109,11 @@ local function finish_events(bufnr, reason, turns)
     { pattern = "StrapsRunEnd", data = { bufnr = bufnr, reason = reason, turns = turns } })
 end
 
+local pair_turn
+
 local function crashed(bufnr, run, err)
   runs[bufnr] = nil
+  if run then pcall(pair_turn, bufnr, run) end
   finish_events(bufnr, "error", run and run.turns or 0)
   vim.notify("straps: run crashed: " .. tostring(err), vim.log.levels.ERROR)
 end
@@ -210,21 +213,19 @@ local function gate_tool(ctx, block)
   return registry.gate_tool(block.name, block.input or {}, ctx, { confirm = confirm_then_before_tool })
 end
 
--- Stage 2: run -> normalize -> truncate -> after_tool fold -> after-guards.
-local function finish_tool(ctx, block, cfg, run)
-  local name, input = block.name, block.input or {}
-  local ok, result = run(ctx)
+local function normalize_result(ok, result)
   if ok then
     if result == nil then
-      result = "ok"
+      return "ok"
     elseif type(result) == "table" then
-      result = vim.json.encode(result)
-    else
-      result = tostring(result)
+      return vim.json.encode(result)
     end
-  else
-    result = tostring(result)
   end
+  return tostring(result)
+end
+
+local function post_tool(ctx, block, cfg, ok, result)
+  local name, input = block.name, block.input or {}
   if #result > cfg.max_tool_result_bytes then
     -- Back the cut up to a UTF-8 character boundary so we never emit a byte
     -- sequence split mid-character into the transcript / API payload.
@@ -254,19 +255,36 @@ local function finish_tool(ctx, block, cfg, run)
   return ok, tostring(result)
 end
 
--- One tool_use block (its tool_use marker is already in the buffer), serially:
--- gate -> run -> normalized result. The caller appends tool_result blocks.
-local function execute_tool(ctx, block, cfg)
-  local allowed, reason, run = gate_tool(ctx, block)
-  if not allowed then
-    return false, reason
-  end
-  return finish_tool(ctx, block, cfg, run)
+-- Stage 2: run -> normalize -> post_tool.
+local function finish_tool(ctx, block, cfg, run)
+  local ok, result = run(ctx)
+  return post_tool(ctx, block, cfg, ok, normalize_result(ok, result))
 end
 
-local function append_tool_result(bufnr, block, ok, result)
+local function append_tool_result(bufnr, block, ok, result, run)
   require("straps.state").append(bufnr, "tool_result",
     { id = block.id, is_error = not ok }, tostring(result))
+  if run and run.turn_appended then run.turn_appended[block] = true end
+end
+
+pair_turn = function(bufnr, run)
+  if run.diag_teardown then pcall(run.diag_teardown) end
+  if run.ctx then run.ctx.batch_preview = nil end
+  local blocks = run.turn_blocks
+  run.turn_blocks = nil
+  if not blocks then return end
+  for _, block in ipairs(blocks) do
+    if not run.turn_appended[block] then
+      local item = run.turn_items[block]
+      local text = "run interrupted before this tool finished"
+      if item and item.executed then
+        text = "run interrupted after this tool ran; its result was not processed"
+      elseif item and item.final then
+        text = item.final
+      end
+      pcall(append_tool_result, bufnr, block, false, text, run)
+    end
+  end
 end
 
 -- Builtin read-only tools whose effects are safe to overlap when the model
@@ -322,6 +340,175 @@ local function child_ctx(parent_ctx, bufnr, finish, run)
     return coroutine.yield()
   end
   return ctx
+end
+
+local CANCELLED_TEXT = "run cancelled before this tool executed"
+local PREVIEW_TOOLS = { write_file = true, edit_file = true, patch_file = true }
+
+local function ends_gate_run(block)
+  local ok, cap = pcall(registry.try_call, "fn.capability", block.name, block.input or {})
+  return not ok or cap == "define" or cap == "lua" or cap == "agent_tool"
+end
+
+local function starts_segment(block)
+  local ok, v = pcall(registry.try_call, "fn.starts_segment", block.name, block.input or {})
+  return ok and v == true
+end
+
+local function begin_diagnostics(ctx, run, bufnr)
+  local state = require("straps.state")
+  local records, order, aug = {}, {}, nil
+  local d = { current = nil }
+  local function teardown()
+    if aug then pcall(vim.api.nvim_del_augroup_by_id, aug) end
+    aug = nil
+    ctx.defer_diagnostics = nil
+    run.diag_teardown = nil
+  end
+  run.diag_teardown = teardown
+  ctx.defer_diagnostics = function(path)
+    local buf = state.find_buf(path)
+    if not buf then return false end
+    local r = records[buf]
+    if not r then
+      r = { bufnr = buf, blocks = {} }
+      records[buf] = r
+      order[#order + 1] = r
+      if not aug then
+        aug = vim.api.nvim_create_augroup("straps_batch_diagnostics_" .. bufnr, { clear = true })
+        vim.api.nvim_create_autocmd("DiagnosticChanged", {
+          group = aug,
+          callback = function(args)
+            local rec = records[args.buf]
+            if rec then rec.last_event = vim.uv.hrtime() end
+          end,
+        })
+      end
+    end
+    r.path = path
+    r.last_write = vim.uv.hrtime()
+    if d.current then r.blocks[#r.blocks + 1] = d.current end
+    return true
+  end
+  function d.finish(items)
+    local texts = {}
+    if #order == 0 or run.cancelled then teardown() return texts end
+    local ok, by_buf = pcall(registry.call, "fn.write_diagnostics", order, ctx)
+    teardown()
+    if not ok then
+      log(bufnr, { ev = "diagnostics_error", err = tostring(by_buf) })
+      return texts
+    end
+    for _, r in ipairs(order) do
+      local text = type(by_buf) == "table" and by_buf[r.bufnr] or nil
+      if type(text) == "string" and text ~= "" then
+        for j = #r.blocks, 1, -1 do
+          local item = items[r.blocks[j]]
+          if item and item.executed and item.ok == true then
+            texts[r.blocks[j]] = texts[r.blocks[j]] and (texts[r.blocks[j]] .. "\n" .. text) or text
+            break
+          end
+        end
+      end
+    end
+    return texts
+  end
+  return d
+end
+
+local function run_segments(bufnr, ctx, run, cfg, blocks)
+  local state = require("straps.state")
+  local out = { n_calls = 0, n_errors = 0 }
+  local items = run.turn_items
+  local function record(block, ok, text, ms)
+    append_tool_result(bufnr, block, ok, text, run)
+    if not ok then
+      out.n_errors = out.n_errors + 1
+      out.last_error = text
+    end
+    log(bufnr, { ev = "tool", name = block.name, ms = ms or 0, is_error = not ok })
+    progress(bufnr, ctx, { type = "tool_done", name = block.name, is_error = not ok })
+  end
+  local i = 1
+  while i <= #blocks and not run.cancelled do
+    local seg, preview = {}, {}
+    ctx.batch_preview = function(path)
+      return preview[state.path_key(path)]
+    end
+    while i <= #blocks and not run.cancelled do
+      local block = blocks[i]
+      if #seg > 0 and starts_segment(block) then break end
+      local item = {}
+      items[block] = item
+      seg[#seg + 1] = block
+      i = i + 1
+      out.n_calls = out.n_calls + 1
+      local key = tostring(block.name) .. "\0" .. pretty_json(block.input or {})
+      if run.seen_calls[key] then out.any_repeat = true else out.any_new = true end
+      run.seen_calls[key] = true
+      progress(bufnr, ctx, { type = "gate", name = block.name }, "gate: " .. tostring(block.name))
+      local t0 = vim.uv.hrtime()
+      local allowed, reason, gated = gate_tool(ctx, block)
+      log(bufnr, { ev = "gate", name = block.name, ms = math.floor((vim.uv.hrtime() - t0) / 1e6), allowed = allowed })
+      if allowed then
+        item.run = gated
+        local input = block.input or {}
+        if PREVIEW_TOOLS[block.name] and type(input.path) == "string" then
+          pcall(function()
+            local k = state.path_key(input.path)
+            local base = preview[k] or state.file_text(input.path)
+            preview[k] = state.simulate_edit(block.name, input, base) or base
+          end)
+        end
+      else
+        item.final = reason
+      end
+      if ends_gate_run(block) then break end
+    end
+    ctx.batch_preview = nil
+
+    local diag = begin_diagnostics(ctx, run, bufnr)
+    for _, block in ipairs(seg) do
+      local item = items[block]
+      if item.run and run.cancelled then
+        item.final = CANCELLED_TEXT
+      elseif item.run then
+        progress(bufnr, ctx, { type = "tool", name = block.name }, "tool: " .. tostring(block.name))
+        diag.current = block
+        local t0 = vim.uv.hrtime()
+        item.ok, item.raw = item.run(ctx)
+        item.executed = true
+        item.ms = math.floor((vim.uv.hrtime() - t0) / 1e6)
+        diag.current = nil
+      end
+    end
+    local texts = diag.finish(items)
+
+    for _, block in ipairs(seg) do
+      local item = items[block]
+      if item.executed then
+        local ok, text = item.ok, nil
+        local nok, s = pcall(normalize_result, item.ok, item.raw)
+        if nok then
+          text = s
+        else
+          ok, text = false, "straps: could not encode the tool result: " .. tostring(s)
+        end
+        if texts[block] then text = text .. "\n" .. texts[block] end
+        ok, text = post_tool(ctx, block, cfg, ok, text)
+        record(block, ok, text, item.ms)
+      else
+        record(block, false, item.final or CANCELLED_TEXT, 0)
+      end
+    end
+  end
+  for j = i, #blocks do
+    out.n_calls = out.n_calls + 1
+    record(blocks[j], false, CANCELLED_TEXT, 0)
+  end
+  run.turn_blocks, run.turn_items, run.turn_appended = nil, nil, nil
+  out.cancelled = run.cancelled
+  return out
 end
 
 -- Drain the steering queue (vim.b straps_steering): append each queued string
@@ -493,19 +680,21 @@ local function run_turns(bufnr, ctx, run)
       pcall(function() require("straps.ui").redraw_status(true) end)
     end
 
-    -- Two phases: append EVERY tool_use marker first, THEN execute each and
-    -- append its result. The transcript then replays as ONE assistant
+    -- Two phases: append EVERY tool_use marker first, THEN run the batch
+    -- (run_segments, or the parallel read-only path) and append the results
+    -- in tool_use order. The transcript then replays as ONE assistant
     -- message carrying the whole batch of tool_use blocks followed by one
     -- user message with all the results (parse merges adjacent same-role
     -- blocks) — the exact shape the model sent. Interleaving use/result
     -- pairs would rewrite a batched turn into single-call turns, teaching
     -- the model by its own example never to batch.
     local tool_blocks = {}
+    run.turn_blocks, run.turn_items, run.turn_appended = tool_blocks, {}, {}
     for _, block in ipairs(resp.content or {}) do
       if block.type == "tool_use" then
-        tool_blocks[#tool_blocks + 1] = block
         state.append(bufnr, "tool_use",
           { id = block.id, name = block.name }, pretty_json(block.input or {}))
+        tool_blocks[#tool_blocks + 1] = block
       end
     end
     -- Per-turn stall signals, folded in as each tool runs. any_new tracks
@@ -555,6 +744,7 @@ local function run_turns(bufnr, ctx, run)
           local co = coroutine.create(function()
             local cctx = child_ctx(ctx, bufnr, finish, run)
             finish(finish_tool(cctx, block, cfg, job.run))
+            if run.turn_items then run.turn_items[block] = { executed = true } end
           end)
           local prev_scope = registry.set_active_scope(bufnr)
           local ok_resume, err = coroutine.resume(co)
@@ -582,7 +772,7 @@ local function run_turns(bufnr, ctx, run)
         if run.cancelled and not job.done then
           ok, result = false, "run cancelled before this tool executed"
         end
-        append_tool_result(bufnr, block, ok, result)
+        append_tool_result(bufnr, block, ok, result, run)
         if not ok then
           n_errors = n_errors + 1
           last_error = result
@@ -590,40 +780,14 @@ local function run_turns(bufnr, ctx, run)
         log(bufnr, { ev = "tool", name = block.name, ms = job.ms or 0, is_error = not ok })
         progress(bufnr, ctx, { type = "tool_done", name = block.name, is_error = not ok })
       end
+      run.turn_blocks, run.turn_items, run.turn_appended = nil, nil, nil
       if run.cancelled then return cancelled_note() end
     else
-      for i, block in ipairs(tool_blocks) do
-        if run.cancelled then
-          -- Every appended tool_use must get a result, or the next parse
-          -- ships an unpaired tool_use block and the API rejects the request.
-          for j = i, #tool_blocks do
-            append_tool_result(bufnr, tool_blocks[j], false,
-              "run cancelled before this tool executed")
-          end
-          return cancelled_note()
-        end
-        progress(bufnr, ctx, { type = "tool", name = block.name }, "tool: " .. tostring(block.name))
-        -- (tool.name .. canonical input) identifies a call for repeat detection;
-        -- pretty_json sorts object keys, so equivalent inputs hash identically.
-        local key = tostring(block.name) .. "\0" .. pretty_json(block.input or {})
-        if run.seen_calls[key] then
-          any_repeat = true
-        else
-          any_new = true
-        end
-        run.seen_calls[key] = true
-        local t0 = vim.uv.hrtime()
-        local ok, result = execute_tool(ctx, block, cfg)
-        append_tool_result(bufnr, block, ok, result)
-        n_calls = n_calls + 1
-        if not ok then
-          n_errors = n_errors + 1
-          last_error = result
-        end
-        log(bufnr, { ev = "tool", name = block.name,
-          ms = math.floor((vim.uv.hrtime() - t0) / 1e6), is_error = not ok })
-        progress(bufnr, ctx, { type = "tool_done", name = block.name, is_error = not ok })
-      end
+      local outcome = run_segments(bufnr, ctx, run, cfg, tool_blocks)
+      n_calls, n_errors, last_error = outcome.n_calls, outcome.n_errors, outcome.last_error
+      if outcome.any_repeat then any_repeat = true end
+      if outcome.any_new then any_new = true end
+      if outcome.cancelled then return cancelled_note() end
     end
 
     -- Classify the turn for the stall detector. A turn with no tool calls is
@@ -749,6 +913,7 @@ function M.start(bufnr)
     local ok, ret = pcall(run_turns, bufnr, ctx, run)
     run.done = true
     if not ok then
+      pcall(pair_turn, bufnr, run)
       pcall(state.append, bufnr, "assistant", nil, "straps: run error: " .. tostring(ret))
     end
     -- done fires on every exit; run_turns names its own ending
@@ -828,7 +993,7 @@ function M.stop(bufnr)
   -- leaves the run coroutine suspended in ctx.await forever — run.cancelled is
   -- flipped but nothing resumes the coroutine to observe it. After
   -- stop_backstop_ms we force a resume with NO values. The awaiting tool then
-  -- receives nil, errors on it, execute_tool's pcall catches that as a tool
+  -- receives nil, errors on it, gate_tool's run pcall catches that as a tool
   -- error, and the loop's run.cancelled checks end the run with the
   -- cancellation note — the clean path. A forced resume that lands in a
   -- provider (or hook.confirm) await instead escapes as an error into

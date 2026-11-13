@@ -49,6 +49,99 @@ function M.utf8_cut(s, n)
   return s:sub(1, n + vim.str_utf_start(s, n + 1))
 end
 
+function M.path_key(path)
+  local full = vim.fn.fnamemodify(path, ":p")
+  local real = vim.uv.fs_realpath(full)
+  if real then return real end
+  local parent = vim.uv.fs_realpath(vim.fn.fnamemodify(full, ":h"))
+  if parent then return parent .. "/" .. vim.fn.fnamemodify(full, ":t") end
+  return full
+end
+
+local function file_buffer(b)
+  local name = vim.api.nvim_buf_get_name(b)
+  if name == "" or name:match("^%a[%w+.-]*://") then return nil end
+  if vim.bo[b].buftype ~= "" then return nil end
+  return name
+end
+
+function M.find_buf(path)
+  local full = vim.fn.fnamemodify(path, ":p")
+  local candidates = {}
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    local name = file_buffer(b)
+    if name == full then return b end
+    if name then candidates[#candidates + 1] = { b, name } end
+  end
+  local key = M.path_key(full)
+  for _, c in ipairs(candidates) do
+    if M.path_key(c[2]) == key then return c[1] end
+  end
+  return nil
+end
+
+function M.file_text(path)
+  local buf = M.find_buf(path)
+  if buf and vim.api.nvim_buf_is_loaded(buf) then
+    return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+  end
+  local full = vim.fn.fnamemodify(path, ":p")
+  if vim.fn.filereadable(full) == 1 then
+    return table.concat(vim.fn.readfile(full), "\n")
+  end
+  return ""
+end
+
+function M.simulate_edit(name, input, old)
+  if type(input) ~= "table" or type(old) ~= "string" then return nil end
+  if name == "write_file" then
+    return ((input.content or ""):gsub("\n$", ""))
+  elseif name == "patch_file" then
+    local hunks = input.hunks
+    if type(hunks) ~= "table" or #hunks == 0 then return nil end
+    local lines = vim.split(old, "\n", { plain = true })
+    local normalized = {}
+    for _, h in ipairs(hunks) do
+      local s, e = tonumber(h.start_line), tonumber(h.end_line)
+      if not s or not e or s % 1 ~= 0 or e % 1 ~= 0 or type(h.new_text) ~= "string" then return nil end
+      if s < 1 or e < s - 1 or s > #lines + 1 or e > #lines then return nil end
+      if type(h.expected_old_text) == "string" then
+        local actual = e >= s and table.concat(vim.list_slice(lines, s, e), "\n") or ""
+        if actual ~= h.expected_old_text:gsub("\n$", "") then return nil end
+      end
+      normalized[#normalized + 1] = { s = s, e = e, text = h.new_text }
+    end
+    table.sort(normalized, function(a, b) return a.s < b.s end)
+    for i = 2, #normalized do
+      if normalized[i].s <= normalized[i - 1].e then return nil end
+    end
+    for i = #normalized, 1, -1 do
+      local h = normalized[i]
+      local repl = h.text == "" and {} or vim.split(h.text, "\n", { plain = true })
+      if repl[#repl] == "" then table.remove(repl) end
+      for j = h.e, h.s, -1 do table.remove(lines, j) end
+      for j = #repl, 1, -1 do table.insert(lines, h.s, repl[j]) end
+    end
+    return table.concat(lines, "\n")
+  elseif name == "edit_file" then
+    local olds, news = input.old_string, input.new_string or ""
+    if type(olds) ~= "string" or olds == "" then return nil end
+    local parts, idx, count = {}, 1, 0
+    while true do
+      local s, e = string.find(old, olds, idx, true)
+      if not s then break end
+      count = count + 1
+      parts[#parts + 1] = old:sub(idx, s - 1)
+      parts[#parts + 1] = news
+      idx = e + 1
+    end
+    if count == 0 or (count > 1 and not input.replace_all) then return nil end
+    parts[#parts + 1] = old:sub(idx)
+    return table.concat(parts)
+  end
+  return nil
+end
+
 local REPLACEMENT = "\239\191\189"
 
 local function seq_len(s, j)

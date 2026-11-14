@@ -368,7 +368,7 @@ function M.key(buf, key)
   elseif key == "i" and entry.bufnr then
     local target = entry.bufnr
     vim.ui.input({ prompt = "Message " .. fit(title(target), 60) .. ": " }, function(text)
-      if text and text:match("%S") then require("straps.registry").try_call("fn.session_notify", target, text); M.refresh() end
+      if text and text:match("%S") then require("straps.registry").try_call("fn.session_notify", target, text, { source = "user" }); M.refresh() end
     end)
   elseif key == "r" then
     if entry.bufnr then ui().rename_session(entry.bufnr)
@@ -393,7 +393,7 @@ function M.key(buf, key)
       end
     end
     if descendants > 0 and vim.fn.confirm("Stop selected agent and " .. descendants .. " running descendants?", "&Stop\n&Cancel", 2) ~= 1 then return end
-    loop.stop(entry.bufnr)
+    loop.user_stop(entry.bufnr)
     M.refresh()
   end
 end

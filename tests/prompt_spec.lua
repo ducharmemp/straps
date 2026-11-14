@@ -219,6 +219,8 @@ it("peer-agent messages are declared as a peer's claim, in both prompt shapes", 
   local ro = registry.call("fn.system_prompt_core", { subagent = true, readonly = true })
   assert(ro:find('except send_message{to="parent"}', 1, true),
     "the readonly note must carry the parent-message exception")
+  assert(ro:find('and watch_agent{to="parent"}', 1, true),
+    "the readonly note must carry the parent-watch exception")
 end)
 
 it("the harness-speech section enumerates the subagent notice, not just peers", function()

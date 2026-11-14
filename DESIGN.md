@@ -596,7 +596,10 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
       CONSECUTIVE stalled turns; a productive turn resets it to 0. When it
       reaches `config.stall_limit` (default 6, 0 disables), end the run with
       reason `"stalled"` and a loud, distinct note (below). This measures the
-      spinning `max_turns` was only ever a proxy for.
+      spinning `max_turns` was only ever a proxy for. A tool whose repeat is
+      progress removes its own call from the seen set with
+      `ctx.forget_call(name, input)`; `spawn_wait` does so after an early
+      return.
    g. `resp.stop_reason == "tool_use"` → continue loop; else break.
 3. `pcall(registry.call_hooks, "hook.on_run_end", ctx, reason)` — fan-out,
    carrying the same ending reason the log and `{type="done"}` progress events
@@ -621,16 +624,26 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
 
 ### Steering (mid-run user messages)
 
-- Queue: `vim.b[bufnr].straps_steering` — a list of strings (buffer state).
-- `loop.steer(bufnr, text, quiet)`: if a run is active, push onto the queue (read
+- Queue: `vim.b[bufnr].straps_steering` — a list of `{ text, source }` entries
+  (buffer state). `source` is `"user"` (typed by the user), `"harness"` (a
+  notice: subagent completion, watch, autocmd bridge) or `"agent"`
+  (`send_message`). Readers go through `loop.steering_entry(entry)`, which also
+  accepts a legacy plain string as a user entry.
+- `loop.steer(bufnr, text, opts)`: `opts = { quiet, source }` (source defaults
+  to `"user"`); a legacy boolean `opts` is `quiet`, and a quiet legacy caller
+  is the harness. If a run is active, push onto the queue (read
   vim.b, copy, write back — vim.b tables are snapshots), emit progress event
   `{type="steer_queued"}`, notify "steering queued" unless `quiet` is set
   (harness-generated steering — a subagent completion notice — must not toast
   at the user). If no run is active,
   return false (callers fall back to `loop.start`). The return value is
   therefore the ATOMIC "is a run active" test: `fn.session_notify` relies on
-  there being no window between the check and the enqueue.
-- Draining (single helper): pop all queued strings and
+  there being no window between the check and the enqueue. A user-sourced
+  steer, like a user-sourced `loop.start(bufnr, opts)` (source defaults to
+  `"user"`), re-arms watch wakes (see "Lifecycle watches").
+- A non-empty queue ends a `spawn_wait` in progress early, so the agent reads
+  the entry at its next turn (see `spawn_wait`).
+- Draining (single helper): pop all queued entries and
   `state.append(bufnr, "user", nil, text)` each, clear the queue. Called at
   two points in `run_turns`:
   1. top of every turn iteration, before `state.parse` — so the next request
@@ -1812,9 +1825,26 @@ API names (registry names prefixed `tool.`):
   Before its first await (one synchronous segment, so no child can finish
   in between) it also **claims** each validated child
   (`vim.b[child].straps_spawn_claimed = true`) and drops any already-queued
-  completion notice for it from the parent's steering queue — see below. A child
-  buffer wiped mid-wait no longer aborts the call: `nvim_buf_get_name` is
-  pcall'd, so one dead child cannot lose its live siblings' answers.
+  completion notice for it from the parent's steering queue — see below. Only
+  entries with source `harness` are candidates, so text the user typed with the
+  notice prefix stays. A child buffer wiped mid-wait no longer aborts the call:
+  `nvim_buf_get_name` is pcall'd, so one dead child cannot lose its live
+  siblings' answers.
+  **Early return.** The poll also resolves when the parent's steering queue is
+  non-empty, whatever the entry's source (user, agent message, a notice for a
+  child outside this wait, a watch notice). A message that sits unread while
+  the parent blocks is the bug this prevents: before it, a child's
+  `send_message{to="parent"}` reached the parent only after the child ended.
+  After the 200 ms settle tick, one synchronous segment classifies each child:
+  timed out first, then still running (`loop.running`), then finished. Each
+  still-running child gets a `still running` section with no answer and has its
+  claim released, so its completion notice is pushed when it ends; no await
+  separates that check from the release, so the child cannot pass
+  `hook.on_run_end` in between. A header names the still-running buffers and
+  tells the agent to call `spawn_wait` again. The tool then calls
+  `ctx.forget_call("spawn_wait", input)`, which removes that call's key from
+  `run.seen_calls`, so the identical re-wait is not counted as a repeat by the
+  stall detector. `max_turns` still bounds a run of wakes.
 
 #### Subagent completion notices
 
@@ -1850,15 +1880,75 @@ parent through `fn.session_notify`.
   `ctx.cancelled()` half is not redundant: a stopped run whose forced resume
   raises inside the provider ends `"error"` seconds later (the
   `config.stop_backstop_ms` path), and reporting a user-killed child as
-  "crashed" would be a lie. The claim covers the other half — once `spawn_wait`
-  has claimed a child, its tool result IS the report, on every path including a
-  parent cancelled mid-wait.
+  "crashed" would be a lie. The claim covers the other half: while `spawn_wait`
+  holds a child's claim, its tool result IS the report. The claim lasts for the
+  wait only. The result releases every claim, so a child reported still running
+  sends its notice when it ends, and a collected child that runs again (a user
+  restart, a watch wake) notifies again.
 - **Staleness is tolerated in the text, not chased in code.** A notice that
   already drained into the parent's transcript cannot be filtered, and queued
   steering survives a cancelled run to drain into the parent's NEXT run — so a
-  stale notice can cost one extra parent turn. `fn.spawn_notice`'s body
-  therefore tells the agent to ignore a notice for a child it already
+  stale notice can cost one extra parent turn. A child that finishes after an
+  early return and before the parent's next turn start is reported twice: its
+  notice drains at that turn start, and the re-wait returns its answer (a
+  notice still queued when the re-wait runs is dropped). `fn.spawn_notice`'s
+  body therefore tells the agent to ignore a notice for a child it already
   collected, and to restate its answer if it had already finished.
+
+#### Lifecycle watches (`watch_agent` / `unwatch_agent`)
+
+A session subscribes to another session's lifecycle with
+`watch_agent {to, events?, wake?}`; `unwatch_agent {to}` removes the watch.
+Events are `run_start`, `run_end` and `closed` (default `run_end` and `closed`).
+The watch is stored on the TARGET as
+`vim.b[target].straps_watchers[tostring(watcher)] = { events, wake }`; the
+variable is set to nil, never `{}`, when its last watch goes, because an empty
+table written to `vim.b` reads back as a list.
+
+- **Detection.** A global `straps_watch` augroup listens to the
+  `StrapsRunStart` and `StrapsRunEnd` User autocmds (the latter fires on every
+  ending path, including `crashed()` and a failed first resume, which skip
+  `hook.on_run_end`) and to `BufUnload` for `closed`. BufUnload covers
+  `:bdelete` and `:bwipeout` and fires while `b:` variables are still readable;
+  `:bdelete` then clears them, so a later wipeout finds no watchers and
+  `closed` fires once. Nothing fires while `v:exiting` is set.
+- **Scope.** The autocmds fire inside the target's run, with the target's
+  registry scope active. The dispatcher sets the active scope to nil before it
+  resolves `fn.notify_watchers`, so a session cannot decide delivery for its
+  watchers by shadowing the notifier. Each watcher is then notified under its
+  own scope.
+- **Delivery** (`fn.notify_watchers(target, event, reason, cancelled)`). A
+  `run_end` with reason `cancelled`, or a run whose stop flag is set (a user
+  stop, a parent's cascade, a `spawn_wait` timeout), is not delivered and
+  leaves the watch armed, so `:StrapsStop` on a tree cannot restart anything. Each matching watch is removed (one-shot) and the watcher
+  gets `[straps] watched agent <label> (buffer N): <event>`, queued with source
+  `harness`. A running watcher gets it as steering, and a `spawn_wait` it is
+  blocked in returns early. An idle watcher is handled in a `vim.schedule`
+  callback, so `loop.start` never runs inside the target's coroutine. That
+  callback re-tests `loop.steer` (a run started in between takes the notice as
+  steering); otherwise, when the watch has `wake = true`, the trailing prompt is
+  empty, the session is not paused, and its wake count is below
+  `config.watch_wake_limit` (default 20), it appends the entry to the steering
+  queue (entries a stopped run left undrained stay ahead of it), increments `straps_watch_wakes`, and calls
+  `loop.start(watcher, { source = "harness" })`. In every other case the
+  notice is appended through `fn.session_notify` without a start. The notice
+  is queued and not appended because `M.start` refuses an empty trailing user
+  block ("nothing to send") unless the queue is non-empty.
+- **Starting an idle session.** This is the one place the harness starts a run
+  the user did not start. It happens only for a watch the agent asked for, and
+  three limits bound it: each watch fires once, the wake count caps wakes per
+  session, and a user stop pauses wakes. The wake count and the pause
+  (`straps_watch_paused`) reset on any user-sourced activity: a
+  `loop.start` without a source, a user-sourced `loop.steer`, a drained user
+  entry, or `fn.session_notify` with `source = "user"`. `loop.user_stop`, called
+  by `:StrapsStop` and the dashboard `x` key, sets the pause; cascade and
+  timeout stops call `loop.stop` and do not. A draft in the trailing prompt is
+  never sent by a wake.
+- **Permissions.** Both tools are in the `spawn` category. A gated child's
+  confirm shadow passes `to = "parent"` like `send_message`, and the tool body
+  limits a gated session to its parent and its own children.
+- A parent that watches its own child gets both the watch notice and the
+  completion notice; only the watch starts an idle parent.
 - `transcript_excise {session?, blocks?, range?, note?}` — **context surgery**:
   the agent excising dead weight from its OWN transcript (or a child's) so it
   stops being replayed. Invariant 1 is what makes it possible — the buffer IS
@@ -2045,7 +2135,8 @@ with none installed behavior is identical to a build without the mechanism.
   title, or re-set under the same title, therefore survives.
 - `fn.session_notify` — deliver a harness-generated user message to a session:
   steering when it is running, an appended user block when idle, never starting
-  its run.
+  its run (`fn.notify_watchers` is the one path that starts an idle session,
+  for a watch that session asked for).
 - `fn.spawn_notice` — the body of that notice.
 
 ## System prompt: layered, composed, each layer redefinable
@@ -2195,7 +2286,10 @@ Written for agent-ability and ecosystem norms; concise, imperative:
   imperative shape — do NOT block on a child whose answer is not the next step,
   because a finishing child pushes a `[straps]` notice and `spawn_wait` on an
   already-finished child returns at once. Blocking in the spawn turn is right
-  only when the child's answer IS the next step. Plus: write the task
+  only when the child's answer IS the next step. The spawn_wait bullet also
+  says a message for the agent ends the wait early and to call it again; a
+  watch_agent bullet says a watch fires once and starts an idle watcher's
+  run. Plus: write the task
   self-contained (the child sees none of the parent's conversation),
   `readonly`/`allow`/`tools`/`show`, and choosing the child's model/effort
   instead of inheriting by habit.

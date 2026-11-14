@@ -9,6 +9,9 @@
 -- to="parent" passes the child-scope confirm hook, a peer target is denied
 -- by it, a depth-2 grandchild reaches its own parent through the inherited
 -- hook, and a gated child with a name grant cannot reach outside its family.
+-- Also covers spawn_wait's early return on queued steering (a child's
+-- message, user steering), the released claim of a still-running child, the
+-- stall detector ignoring re-waits, and the source carried by queued entries.
 
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(here, ":p"), ":h:h")
@@ -177,9 +180,10 @@ end]])
   local out = send(me, { to = tostring(peer), text = "hold off on loop.lua" })
   assert(out:find("queued as steering", 1, true), "running peer should get steering: " .. out)
   local queue = vim.b[peer].straps_steering
-  assert(type(queue) == "table" and #queue == 1 and type(queue[1]) == "string",
-    "steering queue should hold one string entry: " .. vim.inspect(queue))
-  local n = state.notice_of(queue[1])
+  assert(type(queue) == "table" and #queue == 1 and type(queue[1]) == "table",
+    "steering queue should hold one entry: " .. vim.inspect(queue))
+  assert(queue[1].source == "agent", "a peer message is queued with source agent: " .. vim.inspect(queue[1]))
+  local n = state.notice_of(queue[1].text)
   assert(n and n.from == "agent" and n.bufnr == me, "queued text must carry the agent frame")
   wait_idle(peer)
   assert(_G.msg_seen, "the peer's next request should contain the message")
@@ -337,6 +341,19 @@ return function(req, ctx)
         { type = "tool_use", id = "d2", name = "send_message", input = { to = "%d", text = "MIDDLE-OUT" } },
         { type = "tool_use", id = "sw", name = "spawn_wait", input = { buffers = { tonumber(handle) } } } } }
     end
+    local last = req.messages[n]
+    local early = false
+    for _, p in ipairs(last.content) do
+      if p.type == "tool_result" and type(p.content) == "string" and p.content:find("still running", 1, true) then
+        early = true
+      end
+    end
+    if early then
+      _G.middle_woken = true
+      local handle = req.messages[3].content[1].content:match("buffer (%%d+)")
+      return { stop_reason = "tool_use", content = {
+        { type = "tool_use", id = "sw" .. n, name = "spawn_wait", input = { buffers = { tonumber(handle) } } } } }
+    end
     ctx.await(function(resolve)
       vim.defer_fn(function() ctx.emit({ type = "text_delta", text = "middle-done" }); resolve() end, 5)
     end)
@@ -386,7 +403,204 @@ end]]):format(stranger, stranger))
     local stxt = text_of(stranger)
     assert(not stxt:find("GRAND-OUT", 1, true) and not stxt:find("MIDDLE-OUT", 1, true),
       "nothing from the gated family may reach a peer")
+    assert(mtxt:find("grand-done", 1, true), "the middle should still collect the grandchild's answer")
   end)
   straps.config.max_spawn_depth = prev_depth
   assert(ok, tostring(err))
+end)
+
+-- ------------------------------------------------- spawn_wait wakes on steering
+
+-- A parent run (real loop) that spawns one child and waits on it, re-waiting
+-- while the result says "still running". Records when each parent request
+-- first carried `marker`, how many early returns it saw, and the final text.
+local function waiting_parent_provider(child_script)
+  _G.wake = { marker_at = nil, early = 0, child_done_at = nil, notice_seen = false }
+  define("fn.provider", "fn", "test: parent waits, child scripted", ([==[
+return function(req, ctx)
+  local n = #req.messages
+  local first = req.messages[1].content[1].text or ""
+  if first:find("WAKE-CHILD", 1, true) then
+    %s
+  end
+  local function texts(m)
+    local out = {}
+    for _, p in ipairs(m.content) do
+      if p.type == "text" then out[#out + 1] = p.text end
+      if p.type == "tool_result" and type(p.content) == "string" then out[#out + 1] = p.content end
+    end
+    return table.concat(out, "\n")
+  end
+  for _, m in ipairs(req.messages) do
+    local t = texts(m)
+    if not _G.wake.marker_at and m.role == "user" and t:find(_G.wake_marker, 1, true) then
+      _G.wake.marker_at = vim.uv.now()
+    end
+    if m.role == "user" and t:find("[straps] subagent buffer", 1, true) then _G.wake.notice_seen = true end
+  end
+  if n == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "sp", name = "spawn", input = { task = "WAKE-CHILD" } } } }
+  end
+  local handle = tonumber(texts(req.messages[3]):match("buffer (%%d+)"))
+  local last = texts(req.messages[n])
+  if n == 3 or last:find("still running", 1, true) then
+    if n > 3 then _G.wake.early = _G.wake.early + 1 end
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "w" .. n, name = "spawn_wait", input = { buffers = { handle } } } } }
+  end
+  _G.wake.final = last
+  ctx.await(function(r) vim.defer_fn(function() ctx.emit({ type = "text_delta", text = "parent-done" }); r() end, 5) end)
+  return { stop_reason = "end_turn", content = { { type = "text", text = "parent-done" } } }
+end]==]):format(child_script))
+end
+
+local CHILD_SLEEP_THEN_ANSWER = [[
+    if n == 1 and _G.wake_child_sends then
+      ctx.await(function(r) vim.defer_fn(r, 600) end)
+      local calls = {}
+      for i, t in ipairs(_G.wake_child_sends) do
+        calls[#calls + 1] = { type = "tool_use", id = "m" .. i, name = "send_message", input = { to = "parent", text = t } }
+      end
+      return { stop_reason = "tool_use", content = calls }
+    end
+    ctx.await(function(r) vim.defer_fn(r, _G.wake_child_sleep or 1500) end)
+    _G.wake.child_done_at = vim.uv.now()
+    ctx.await(function(r) vim.defer_fn(function() ctx.emit({ type = "text_delta", text = "child-done" }); r() end, 5) end)
+    return { stop_reason = "end_turn", content = { { type = "text", text = "child-done" } } }
+]]
+
+it("a child's message wakes a parent blocked in spawn_wait; the re-wait collects the child", function()
+  _G.wake_marker = "WAKE-BLOCKER"
+  _G.wake_child_sends = { "WAKE-BLOCKER" }
+  _G.wake_child_sleep = 1500
+  waiting_parent_provider(CHILD_SLEEP_THEN_ANSWER)
+  local parent = state.new_session()
+  state.append_text(parent, "go")
+  loop.start(parent)
+  wait_idle(parent, 20000)
+  assert(_G.wake.marker_at and _G.wake.child_done_at, "both times recorded: " .. vim.inspect(_G.wake))
+  assert(_G.wake.marker_at < _G.wake.child_done_at,
+    "the parent must read the message before the child finishes: " .. vim.inspect(_G.wake))
+  assert(_G.wake.early >= 1, "spawn_wait should have returned early with 'still running'")
+  assert(text_of(parent):find("spawn_wait returned early", 1, true), "early-return header missing")
+  assert(text_of(parent):find("child-done", 1, true), "the re-wait should collect the child's answer")
+end)
+
+it("a child left running after an early return still sends its completion notice", function()
+  _G.no_rewait = {}
+  define("fn.provider", "fn", "test: parent does not re-wait", [[
+return function(req, ctx)
+  local n = #req.messages
+  local first = req.messages[1].content[1].text or ""
+  if first:find("NOTICE-CHILD", 1, true) then
+    if n == 1 then
+      ctx.await(function(r) vim.defer_fn(r, 400) end)
+      return { stop_reason = "tool_use", content = {
+        { type = "tool_use", id = "m", name = "send_message", input = { to = "parent", text = "EARLY" } } } }
+    end
+    ctx.await(function(r) vim.defer_fn(r, 1200) end)
+    ctx.await(function(r) vim.defer_fn(function() ctx.emit({ type = "text_delta", text = "child-done" }); r() end, 5) end)
+    return { stop_reason = "end_turn", content = { { type = "text", text = "child-done" } } }
+  end
+  if n == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "sp", name = "spawn", input = { task = "NOTICE-CHILD" } } } }
+  elseif n == 3 then
+    local h = tonumber(req.messages[3].content[1].content:match("buffer (%d+)"))
+    _G.no_rewait.child = h
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "w", name = "spawn_wait", input = { buffers = { h } } } } }
+  end
+  ctx.await(function(r) vim.defer_fn(function() ctx.emit({ type = "text_delta", text = "parent-done" }); r() end, 5) end)
+  return { stop_reason = "end_turn", content = { { type = "text", text = "parent-done" } } }
+end]])
+  local parent = state.new_session()
+  state.append_text(parent, "go")
+  loop.start(parent)
+  wait_idle(parent, 10000)
+  local child = _G.no_rewait.child
+  assert(loop.running(child), "the child should outlive the parent's early-returned wait")
+  assert(vim.b[child].straps_spawn_claimed == nil, "an early return must release a still-running child's claim")
+  wait_idle(child, 10000)
+  local notice = ("[straps] subagent buffer %d: finished"):format(child)
+  assert(vim.wait(2000, function() return text_of(parent):find(notice, 1, true) ~= nil end, 10),
+    "the child's completion notice should reach the parent:\n" .. text_of(parent):sub(-600))
+end)
+
+it("user steering wakes a parent blocked in spawn_wait", function()
+  _G.wake_marker = "USER-STEER-WAKE"
+  _G.wake_child_sends = nil
+  _G.wake_child_sleep = 2500
+  waiting_parent_provider(CHILD_SLEEP_THEN_ANSWER)
+  local parent = state.new_session()
+  state.append_text(parent, "go")
+  _G.straps_in_wait = false
+  define("hook.before_tool", "hook", "test: note spawn_wait", [[
+return function(name) if name == "spawn_wait" then _G.straps_in_wait = true end end]])
+  local ok, err = pcall(function()
+    loop.start(parent)
+    assert(vim.wait(8000, function() return _G.straps_in_wait end, 10), "parent never reached spawn_wait")
+    vim.wait(300)
+    assert(loop.steer(parent, "USER-STEER-WAKE"), "steer should queue on the running parent")
+    wait_idle(parent, 20000)
+  end)
+  define("hook.before_tool", "hook", "test: noop", "return function() end")
+  assert(ok, tostring(err))
+  assert(_G.wake.marker_at and _G.wake.child_done_at and _G.wake.marker_at < _G.wake.child_done_at,
+    "user steering must reach the parent before the child finishes: " .. vim.inspect(_G.wake))
+end)
+
+it("repeated wakes and re-waits do not trip the stall detector", function()
+  local prev = straps.config.stall_limit
+  straps.config.stall_limit = 2
+  _G.wake_marker = "PING-3"
+  _G.wake_child_sends = nil
+  _G.wake_child_sleep = 3000
+  waiting_parent_provider(CHILD_SLEEP_THEN_ANSWER)
+  local parent = state.new_session()
+  state.append_text(parent, "go")
+  _G.straps_in_wait = false
+  define("hook.before_tool", "hook", "test: note spawn_wait", [[
+return function(name) if name == "spawn_wait" then _G.straps_in_wait = true end end]])
+  local ok, err = pcall(function()
+    loop.start(parent)
+    assert(vim.wait(8000, function() return _G.straps_in_wait end, 10), "parent never reached spawn_wait")
+    for i = 1, 3 do
+      local before = _G.wake.early
+      _G.straps_in_wait = false
+      loop.steer(parent, "PING-" .. i, { quiet = true, source = "agent" })
+      assert(vim.wait(2000, function() return _G.wake.early > before and _G.straps_in_wait end, 10),
+        "ping " .. i .. " did not produce an early return and a re-wait")
+    end
+    wait_idle(parent, 20000)
+  end)
+  define("hook.before_tool", "hook", "test: noop", "return function() end")
+  straps.config.stall_limit = prev
+  assert(ok, tostring(err))
+  assert(_G.wake.early >= 3, "expected at least three early returns, got " .. _G.wake.early)
+  assert(vim.b[parent].straps_run_reason == "ok",
+    "the parent run must end ok, not " .. tostring(vim.b[parent].straps_run_reason))
+end)
+
+it("queued entries carry their source; a legacy quiet steer is the harness", function()
+  define("fn.provider", "fn", "test: slow", [[
+return function(req, ctx)
+  ctx.await(function(r) vim.defer_fn(r, 400) end)
+  ctx.await(function(r) vim.defer_fn(function() ctx.emit({ type = "text_delta", text = "ok" }); r() end, 5) end)
+  return { stop_reason = "end_turn", content = { { type = "text", text = "ok" } } }
+end]])
+  local b = state.new_session()
+  state.append_text(b, "go")
+  loop.start(b)
+  loop.steer(b, "typed")
+  loop.steer(b, "legacy harness", true)
+  registry.call("fn.session_notify", b, "notify default")
+  registry.call("fn.session_notify", b, "notify user", { source = "user" })
+  local q = vim.b[b].straps_steering
+  local got = {}
+  for _, e in ipairs(q) do got[#got + 1] = e.text .. "=" .. e.source end
+  wait_idle(b)
+  assert(table.concat(got, ",") == "typed=user,legacy harness=harness,notify default=harness,notify user=user",
+    table.concat(got, ","))
 end)

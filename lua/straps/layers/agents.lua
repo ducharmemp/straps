@@ -375,10 +375,11 @@ return function(name, tin, tctx)
     if cap and allowed["cap:" .. tostring(cap)] then return true end
     if allowed[reg.tool_grant_key(name)] then return true end
   end
-  -- A gated child can always report to its parent: the parent-only shape is
-  -- the one message a research child must be able to send, and the tool body
+  -- A gated child can always report to (and watch) its parent: the parent-only
+  -- shape is the one message a research child must be able to send, and the tool body
   -- confines a gated sender to its own family on every other target.
-  if name == "send_message" and type(tin) == "table" and tin.to == "parent" then
+  if (name == "send_message" or name == "watch_agent" or name == "unwatch_agent")
+    and type(tin) == "table" and tin.to == "parent" then
     return true
   end
   local names = {}
@@ -404,7 +405,7 @@ end
   end
   state.append_text(child, header)
 
-  loop.start(child)
+  loop.start(child, { source = "agent" })
   -- If the parent run is cancelled before the matching spawn_wait, nothing
   -- else would stop this child; register a cancel handler so it is not
   -- orphaned (spawn_wait installs its own for the wait window).
@@ -478,7 +479,10 @@ end
       .. " outstanding child. Returns one section per child: its handle, task,"
       .. " status (finished/timed out), and its final answer text. Collecting a"
       .. " child here is what silences its completion notice, so a child that"
-      .. " already finished is reported once, not twice."
+      .. " already finished is reported once, not twice. A message arriving for"
+      .. " this session (from the user, a peer, a child, or the harness) ends the"
+      .. " wait early: children still running are listed as 'still running' and"
+      .. " the message follows the result; call spawn_wait again to keep waiting."
       .. " Parameters: buffers (required) — array of subagent buffer numbers"
       .. " returned by spawn.",
     input_schema = {
@@ -520,10 +524,12 @@ return function(input, ctx)
   -- for it. Both happen here, in one synchronous segment before the first
   -- await, so no child can finish in between.
   --
-  -- The claim is what silences hook.on_run_end.notify_parent: from here on THIS
-  -- tool's result is how the child gets reported, on every path including the
-  -- parent being cancelled mid-wait. It is never cleared — a report already
-  -- delivered does not become undelivered.
+  -- The claim is what silences hook.on_run_end.notify_parent: while it holds,
+  -- THIS tool's result is how the child gets reported. It holds for the wait
+  -- only: the result (below) releases every claim, so a child reported still
+  -- running sends its notice when it finishes, and a finished child's later
+  -- runs notify again. A parent cancelled mid-wait never reaches the release,
+  -- and the cancelled child's run end is silent anyway.
   --
   -- Only `children` are claimed, never `bad`: a handle belonging to another
   -- session is somebody else's child, and claiming it would silence a SIBLING
@@ -545,18 +551,21 @@ return function(input, ctx)
       prefixes[#prefixes + 1] = ("[straps] subagent buffer %d: "):format(c)
     end
     local kept = {}
-    for _, s in ipairs(queue) do
+    for _, entry in ipairs(queue) do
+      local s, source = loop.steering_entry(entry)
       local drop = false
-      for _, pre in ipairs(prefixes) do
-        -- Plain prefix compare: the notice text contains [ and ], so a pattern
-        -- match would silently find nothing. The trailing ": " in the prefix is
-        -- what keeps child 1 from matching child 12.
-        if type(s) == "string" and s:sub(1, #pre) == pre then
-          drop = true
-          break
+      if source == "harness" then
+        for _, pre in ipairs(prefixes) do
+          -- Plain prefix compare: the notice text contains [ and ], so a pattern
+          -- match would silently find nothing. The trailing ": " in the prefix is
+          -- what keeps child 1 from matching child 12.
+          if s:sub(1, #pre) == pre then
+            drop = true
+            break
+          end
         end
       end
-      if not drop then kept[#kept + 1] = s end
+      if not drop then kept[#kept + 1] = entry end
     end
     if #kept ~= #queue then vim.b[ctx.bufnr].straps_steering = kept end
   end)
@@ -567,6 +576,12 @@ return function(input, ctx)
   -- child past its deadline is stopped and marked timed out. Cancelling the
   -- parent stops every child at once.
   local timed_out = {}
+  local woken = false
+  local function steering_queued()
+    local queue
+    pcall(function() queue = vim.b[ctx.bufnr].straps_steering end)
+    return type(queue) == "table" and #queue > 0
+  end
   if #children > 0 then
     ctx.await(function(resolve)
       local starts = {}
@@ -592,7 +607,14 @@ return function(input, ctx)
             end
           end
         end
-        if pending then vim.defer_fn(poll, 100) else resolve(true) end
+        if not pending then
+          resolve(true)
+        elseif steering_queued() then
+          woken = true
+          resolve(true)
+        else
+          vim.defer_fn(poll, 100)
+        end
       end
       if ctx.on_cancel then
         ctx.on_cancel(function()
@@ -626,7 +648,12 @@ return function(input, ctx)
     return answer
   end
 
-  local out = {}
+  -- Every claim is released here: a finished child's run end already passed
+  -- hook.on_run_end, and a later run of it (a user restart, a watch wake)
+  -- notifies again. From the settle tick to the return there is no await, so a
+  -- child judged still running here cannot reach hook.on_run_end before its
+  -- claim is released: its completion notice is pushed when it finishes.
+  local out, still = {}, {}
   for _, child in ipairs(children) do
     -- A child buffer wiped during the wait makes nvim_buf_get_name raise,
     -- which would abort the whole call and lose the answers of its live
@@ -636,14 +663,30 @@ return function(input, ctx)
     local where = nm ~= "" and vim.fn.fnamemodify(nm, ":~:.") or ("buffer " .. child)
     local task = ""
     pcall(function() task = vim.b[child].straps_task or "" end)
-    local answer = answer_of(child)
-    local status = timed_out[child] and "timed out (stopped)" or "finished"
-    out[#out + 1] = ("## subagent (buffer %d) — %s\ntask: %s\ntranscript: %s\n\n%s")
-      :format(child, status, task ~= "" and task or "(none)", where,
-        answer ~= "" and answer or "(no final answer text)")
+    pcall(function() vim.b[child].straps_spawn_claimed = nil end)
+    if not timed_out[child] and woken and loop.running(child) then
+      still[#still + 1] = child
+      out[#out + 1] = ("## subagent (buffer %d) — still running\ntask: %s\ntranscript: %s")
+        :format(child, task ~= "" and task or "(none)", where)
+    else
+      local answer = answer_of(child)
+      local status = timed_out[child] and "timed out (stopped)" or "finished"
+      out[#out + 1] = ("## subagent (buffer %d) — %s\ntask: %s\ntranscript: %s\n\n%s")
+        :format(child, status, task ~= "" and task or "(none)", where,
+          answer ~= "" and answer or "(no final answer text)")
+    end
   end
   for _, b in ipairs(bad) do
     out[#out + 1] = ("## buffer %d — not a subagent of this session (skipped)"):format(b)
+  end
+  if #still > 0 then
+    local list = {}
+    for _, c in ipairs(still) do list[#list + 1] = tostring(c) end
+    table.insert(out, 1, ("spawn_wait returned early: a message arrived for this session and follows"
+      .. " this result. Still running: buffer(s) %s. Call spawn_wait{ buffers = { %s } } again to keep"
+      .. " waiting, or keep working; each still-running child sends a completion notice when it ends.")
+      :format(table.concat(list, ", "), table.concat(list, ", ")))
+    if ctx.forget_call then pcall(ctx.forget_call, "spawn_wait", input) end
   end
   return table.concat(out, "\n\n")
 end
@@ -811,8 +854,8 @@ end
       .. " agent <label> (buffer N): ...` (your session label and buffer"
       .. " number), rendered as `agent N`, so it is never mistaken for the"
       .. " user. A running recipient reads it at its next turn boundary"
-      .. " (steering); an idle one finds it appended, and its run is NOT"
-      .. " started. In an ungated session this call prompts for confirmation"
+      .. " (steering), and one blocked in spawn_wait is woken to read it; an"
+      .. " idle one finds it appended, and its run is NOT started. In an ungated session this call prompts for confirmation"
       .. " unless the spawn category is granted. Use it for a"
       .. " note that cannot wait for a final answer: a child reporting a"
       .. " blocker or a collision to its parent, a parent redirecting a running"
@@ -897,7 +940,7 @@ return function(input, ctx)
   local label = "buffer " .. tostring(me)
   pcall(function() label = require("straps.ui").session_label(me) end)
   local msg = require("straps.state").agent_message(label, me, text)
-  local how = registry.try_call("fn.session_notify", target, msg, { quiet = true })
+  local how = registry.try_call("fn.session_notify", target, msg, { quiet = true, source = "agent" })
   local target_label = "buffer " .. tostring(target)
   pcall(function() target_label = require("straps.ui").session_label(target) end)
   if how == "steer" then
@@ -910,6 +953,194 @@ return function(input, ctx)
   error("send_message: delivery failed (the recipient buffer vanished)", 0)
 end
 ]==],
+  })
+
+  -- ------------------------------------------------------------- watch_agent
+
+  define({
+    name = "tool.watch_agent",
+    kind = "tool",
+    doc = "Subscribe to another straps agent session's lifecycle, so you hear"
+      .. " when it starts a run, ends a run, or its buffer closes. When a"
+      .. " watched event fires, a `[straps] watched agent <label> (buffer N):"
+      .. " <event>` notice arrives in this session: as steering if you are"
+      .. " running (a spawn_wait in progress returns early to let it through),"
+      .. " and, when you are idle and wake is true, it STARTS your run so you"
+      .. " can act on it. A watch fires once and is then removed; call"
+      .. " watch_agent again to keep watching. A stopped run (by the user, its"
+      .. " parent's stop, or a spawn_wait timeout) never notifies, and the watch"
+      .. " stays armed. Wakes are capped per session by"
+      .. " config.watch_wake_limit until the user sends to it, and none happen"
+      .. " after the user stops this session or while the user has unsent text"
+      .. " in its prompt; the notice is then appended without starting a run."
+      .. " Parameters: to (required) — the session's buffer number as digits,"
+      .. " or \"parent\"; events (optional) — any of run_start, run_end, closed"
+      .. " (default run_end and closed); wake (optional, default true). A"
+      .. " readonly/allow-gated session may watch only its parent or its own"
+      .. " children.",
+    input_schema = {
+      type = "object",
+      properties = {
+        to = { type = "string", description = "Session to watch: a buffer number as digits, or \"parent\"." },
+        events = {
+          type = "array",
+          items = { type = "string", enum = { "run_start", "run_end", "closed" } },
+          description = "Events to watch (default run_end and closed).",
+        },
+        wake = { type = "boolean", description = "Start this session's run when idle (default true)." },
+      },
+      required = { "to" },
+    },
+    source = [==[
+return function(input, ctx)
+  local registry = require("straps.registry")
+  local me = ctx and ctx.bufnr
+  if type(me) ~= "number" or not vim.api.nvim_buf_is_valid(me) then
+    error("watch_agent: no session buffer in context", 0)
+  end
+  local function bvar(b, name)
+    local ok, v = pcall(function() return vim.b[b][name] end)
+    if ok then return v end
+  end
+  local function is_session(b)
+    return type(b) == "number" and b > 0 and vim.api.nvim_buf_is_valid(b)
+      and bvar(b, "straps_session") == true
+  end
+  local my_parent = bvar(me, "straps_parent")
+  local to, target = input.to, nil
+  if to == "parent" then
+    if not is_session(my_parent) then error("watch_agent: this session has no parent", 0) end
+    target = my_parent
+  else
+    if type(to) ~= "string" or not to:match("^%d+$") then
+      error("watch_agent: to must be a buffer number as digits, or \"parent\"", 0)
+    end
+    target = tonumber(to)
+    if not is_session(target) then
+      error(("watch_agent: buffer %s is not a straps session in this Neovim"):format(to), 0)
+    end
+  end
+  if target == me then error("watch_agent: that is this session", 0) end
+  local gated = false
+  pcall(function() gated = registry.granted(me)["spawn:gated"] == true end)
+  if gated and target ~= my_parent and bvar(target, "straps_parent") ~= me then
+    error("watch_agent: a permission-gated session may watch only its parent or its own children", 0)
+  end
+
+  local known = { run_start = true, run_end = true, closed = true }
+  local events = input.events
+  if events == nil then
+    events = { "run_end", "closed" }
+  elseif type(events) ~= "table" or #events == 0 then
+    error("watch_agent: events must be a non-empty array of run_start, run_end, closed", 0)
+  end
+  local seen, list = {}, {}
+  for _, e in ipairs(events) do
+    if not known[e] then
+      error(("watch_agent: unknown event %q (run_start, run_end, closed)"):format(tostring(e)), 0)
+    end
+    if not seen[e] then seen[e] = true; list[#list + 1] = e end
+  end
+  local wake = input.wake ~= false
+
+  local watchers = bvar(target, "straps_watchers")
+  if type(watchers) ~= "table" then watchers = {} end
+  watchers[tostring(me)] = { events = list, wake = wake }
+  vim.b[target].straps_watchers = watchers
+
+  local label = "buffer " .. tostring(target)
+  pcall(function() label = require("straps.ui").session_label(target) end)
+  return ("watching %s (buffer %d) for %s; fires once, then call watch_agent again to keep watching; %s")
+    :format(label, target, table.concat(list, ", "),
+      wake and "an event starts this session's run if it is idle" or "an event never starts this session's run")
+end
+]==],
+  })
+
+  -- ----------------------------------------------------------- unwatch_agent
+
+  define({
+    name = "tool.unwatch_agent",
+    kind = "tool",
+    doc = "Remove this session's watch_agent subscription on another session."
+      .. " Parameters: to (required) — the watched session's buffer number as"
+      .. " digits, or \"parent\".",
+    input_schema = {
+      type = "object",
+      properties = {
+        to = { type = "string", description = "Watched session: a buffer number as digits, or \"parent\"." },
+      },
+      required = { "to" },
+    },
+    source = [==[
+return function(input, ctx)
+  local me = ctx and ctx.bufnr
+  if type(me) ~= "number" or not vim.api.nvim_buf_is_valid(me) then
+    error("unwatch_agent: no session buffer in context", 0)
+  end
+  local target
+  if input.to == "parent" then
+    pcall(function() target = vim.b[me].straps_parent end)
+    if type(target) ~= "number" then error("unwatch_agent: this session has no parent", 0) end
+  elseif type(input.to) == "string" and input.to:match("^%d+$") then
+    target = tonumber(input.to)
+  else
+    error("unwatch_agent: to must be a buffer number as digits, or \"parent\"", 0)
+  end
+  local watchers
+  pcall(function() watchers = vim.b[target].straps_watchers end)
+  if type(watchers) ~= "table" or watchers[tostring(me)] == nil then
+    return ("no watch on buffer %d to remove"):format(target)
+  end
+  watchers[tostring(me)] = nil
+  vim.b[target].straps_watchers = next(watchers) and watchers or nil
+  return ("stopped watching buffer %d"):format(target)
+end
+]==],
+  })
+end
+
+-- Lifecycle events reach fn.notify_watchers from autocmds. The autocmds fire
+-- inside the TARGET's run (its registry scope active), so the dispatcher
+-- resolves the global entry: a session must not decide delivery for its
+-- watchers by shadowing the notifier.
+local function dispatch_watch(target, event, reason, cancelled)
+  local registry = require("straps.registry")
+  local prev = registry.set_active_scope(nil)
+  pcall(registry.try_call, "fn.notify_watchers", target, event, reason, cancelled)
+  registry.set_active_scope(prev)
+end
+
+local function install_watch_autocmds()
+  local group = vim.api.nvim_create_augroup("straps_watch", { clear = true })
+  vim.api.nvim_create_autocmd("User", {
+    group = group,
+    pattern = "StrapsRunStart",
+    callback = function(args)
+      local d = args.data or {}
+      if type(d.bufnr) == "number" then dispatch_watch(d.bufnr, "run_start") end
+    end,
+  })
+  vim.api.nvim_create_autocmd("User", {
+    group = group,
+    pattern = "StrapsRunEnd",
+    callback = function(args)
+      local d = args.data or {}
+      if type(d.bufnr) == "number" then dispatch_watch(d.bufnr, "run_end", d.reason, d.cancelled) end
+    end,
+  })
+  -- BufUnload covers :bdelete and :bwipeout alike and fires while b: variables
+  -- are still readable; :bdelete then clears them, so a later wipeout of the
+  -- unloaded buffer has no watchers left to notify.
+  vim.api.nvim_create_autocmd("BufUnload", {
+    group = group,
+    callback = function(args)
+      if vim.v.exiting ~= vim.NIL then return end
+      local watchers
+      pcall(function() watchers = vim.b[args.buf].straps_watchers end)
+      if type(watchers) ~= "table" or next(watchers) == nil then return end
+      dispatch_watch(args.buf, "closed")
+    end,
   })
 end
 
@@ -1107,7 +1338,7 @@ return function(spec)
       end)
       if ok and type(s) == "string" and s ~= "" then
         vim.schedule(function()
-          require("straps.registry").try_call("fn.session_notify", session, s)
+          require("straps.registry").try_call("fn.session_notify", session, s, { source = "harness" })
         end)
       end
     end,
@@ -1133,17 +1364,23 @@ end
     kind = "fn",
     doc = "Deliver a harness-generated user message to a session. Call as"
       .. " (bufnr, text, opts) with opts = { quiet = true } to suppress the"
-      .. " steering toast (for messages the user did not type). A session with"
-      .. " an active run gets it as steering, drained into the transcript at the"
-      .. " next turn boundary; an idle session gets an ordinary user block plus a"
-      .. " restored trailing user block, and is NEVER auto-started. Returns"
-      .. " 'steer', 'append', or nil for an invalid buffer or empty text.",
+      .. " steering toast (for messages the user did not type) and opts.source"
+      .. " = 'harness' (default), 'agent' or 'user' to label the queued entry."
+      .. " A session with an active run gets it as steering, drained into the"
+      .. " transcript at the next turn boundary (and a spawn_wait in progress"
+      .. " returns early to let it through); an idle session gets an ordinary"
+      .. " user block plus a restored trailing user block, and is not started"
+      .. " here (fn.notify_watchers is the one path that starts an idle"
+      .. " session, for a watch it asked for). Returns 'steer', 'append', or nil"
+      .. " for an invalid buffer or empty text.",
     source = [==[
 return function(bufnr, text, opts)
   if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then return end
   if type(text) ~= "string" or text == "" then return end
   local loop = require("straps.loop")
-  local quiet = opts and opts.quiet or nil
+  local source = opts and opts.source or "harness"
+  local quiet = { quiet = opts and opts.quiet or nil, source = source }
+  if source == "user" then loop.note_user_activity(bufnr) end
   if loop.steer(bufnr, text, quiet) then return "steer" end
   -- Idle: append directly. Scheduled so any already-scheduled streaming delta
   -- from the run that just ended lands first (ctx.emit schedules its appends
@@ -1216,8 +1453,9 @@ end
   -- ordinary stop; ctx.cancelled() covers the case reason cannot — a stopped
   -- run whose forced resume raises inside the provider ends "error" seconds
   -- after the stop, and reporting a user-killed child as "crashed" would be a
-  -- lie. straps_spawn_claimed covers the other half: once spawn_wait has
-  -- claimed a child, its tool result is the report and the push is redundant.
+  -- lie. straps_spawn_claimed covers the other half: while spawn_wait holds a
+  -- child's claim, its tool result is the report and the push is redundant.
+  -- An early-returning spawn_wait releases the claim of a still-running child.
   define({
     name = "hook.on_run_end.notify_parent",
     kind = "hook",
@@ -1273,6 +1511,116 @@ return function(ctx, reason)
 end
 ]==],
   })
+
+  -- ------------------------------------------------------- fn.notify_watchers
+
+  define({
+    name = "fn.notify_watchers",
+    kind = "fn",
+    doc = "Deliver a lifecycle event of session `target` to the sessions"
+      .. " watching it (tool.watch_agent). Called as (target, event, reason,"
+      .. " cancelled) from the StrapsRunStart / StrapsRunEnd User autocmds and"
+      .. " BufUnload, always resolved globally. event is run_start, run_end or"
+      .. " closed. A run_end that was cancelled (reason 'cancelled' or a stopped"
+      .. " run) is not delivered and leaves the watches armed. Each matching"
+      .. " watch is removed (one-shot) and gets a `[straps] watched agent"
+      .. " <label> (buffer N): <event>` notice, under the watcher's registry"
+      .. " scope: steering if the watcher is running; if it is idle and its"
+      .. " watch has wake = true, the notice is queued and its run is started,"
+      .. " unless the user stopped that session, its trailing prompt holds"
+      .. " unsent text, or it has used config.watch_wake_limit wakes since the"
+      .. " user last sent to it, in which case the notice is appended without a"
+      .. " start. Returns the number of watchers notified.",
+    source = [==[
+return function(target, event, reason, cancelled)
+  if type(target) ~= "number" then return 0 end
+  if event == "run_end" and (reason == "cancelled" or cancelled) then return 0 end
+  local watchers
+  pcall(function() watchers = vim.b[target].straps_watchers end)
+  if type(watchers) ~= "table" then return 0 end
+
+  local due, kept = {}, {}
+  for key, w in pairs(watchers) do
+    local match = false
+    if type(w) == "table" and type(w.events) == "table" then
+      for _, e in ipairs(w.events) do
+        if e == event then match = true break end
+      end
+    end
+    if match then due[#due + 1] = { bufnr = tonumber(key), wake = w.wake ~= false } else kept[key] = w end
+  end
+  if #due == 0 then return 0 end
+  if event ~= "closed" then
+    pcall(function() vim.b[target].straps_watchers = next(kept) and kept or nil end)
+  end
+
+  local label = "buffer " .. tostring(target)
+  pcall(function() label = require("straps.ui").session_label(target) end)
+  local what = event
+  if event == "run_end" and reason ~= nil then what = ("run_end (%s)"):format(tostring(reason)) end
+  local notice = ("[straps] watched agent %s (buffer %d): %s. This watch has fired and is removed;"
+    .. " call watch_agent again to keep watching."):format(label, target, what)
+
+  local registry = require("straps.registry")
+  local loop = require("straps.loop")
+  local state = require("straps.state")
+  local limit = 20
+  pcall(function()
+    local cfg = require("straps").config
+    if cfg and tonumber(cfg.watch_wake_limit) then limit = tonumber(cfg.watch_wake_limit) end
+  end)
+
+  local function is_session(b)
+    if type(b) ~= "number" or not vim.api.nvim_buf_is_valid(b) then return false end
+    local ok, v = pcall(function() return vim.b[b].straps_session end)
+    return ok and v == true
+  end
+
+  local function wake_or_append(watcher, wake)
+    if not is_session(watcher) then return end
+    local prev = registry.set_active_scope(watcher)
+    local ok = pcall(function()
+      if loop.steer(watcher, notice, { quiet = true, source = "harness" }) then return end
+      local paused, wakes = false, 0
+      pcall(function()
+        paused = vim.b[watcher].straps_watch_paused == true
+        wakes = tonumber(vim.b[watcher].straps_watch_wakes) or 0
+      end)
+      local draft = state.last_user_text(watcher)
+      local blank = draft == nil or not draft:match("%S")
+      if wake and not paused and wakes < limit and blank then
+        local queue = vim.b[watcher].straps_steering
+        if type(queue) ~= "table" then queue = {} end
+        queue[#queue + 1] = { text = notice, source = "harness" }
+        vim.b[watcher].straps_steering = queue
+        vim.b[watcher].straps_watch_wakes = wakes + 1
+        loop.start(watcher, { source = "harness" })
+      else
+        registry.try_call("fn.session_notify", watcher, notice, { quiet = true, source = "harness" })
+      end
+    end)
+    registry.set_active_scope(prev)
+    return ok
+  end
+
+  local n = 0
+  for _, d in ipairs(due) do
+    if d.bufnr ~= target and is_session(d.bufnr) then
+      n = n + 1
+      local prev = registry.set_active_scope(d.bufnr)
+      local steered = loop.steer(d.bufnr, notice, { quiet = true, source = "harness" })
+      registry.set_active_scope(prev)
+      if not steered then
+        vim.schedule(function() wake_or_append(d.bufnr, d.wake) end)
+      end
+    end
+  end
+  return n
+end
+]==],
+  })
+
+  install_watch_autocmds()
 end
 
 return M

@@ -35,10 +35,10 @@ function M.register()
   search.register()           -- glob, path_info, tree, grep, bulk_replace
   selfext.register()          -- registry_list, registry_get, registry_define, skill, eval_lua
   net.register()              -- fetch_url
-  agents.register_tools()     -- agents, models, send_message
+  agents.register_tools()     -- agents, models, send_message, watch_agent, unwatch_agent
   permissions.register()      -- fn.capability, fn.readonly_policy, hook.confirm
   files.register_hooks()      -- hook.after_write
-  agents.register_hooks()     -- hook.on_run_start, hook.on_turn_start, fn.model_note, hook.on_run_end, fn.autocmd_bridge, fn.session_notify, fn.spawn_notice, hook.on_run_end.notify_parent
+  agents.register_hooks()     -- hook.on_run_start, hook.on_turn_start, fn.model_note, hook.on_run_end, fn.autocmd_bridge, fn.session_notify, fn.spawn_notice, hook.on_run_end.notify_parent, fn.notify_watchers
 
   -- Skeleton pass: an empty prompt-fragment slot per layer, registered AFTER
   -- every entry above so the registry.dump() prefix stays byte-identical and

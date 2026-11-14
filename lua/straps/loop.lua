@@ -100,13 +100,13 @@ local function log(bufnr, ev)
   pcall(registry.try_call, "fn.log", ev)
 end
 
-local function finish_events(bufnr, reason, turns)
+local function finish_events(bufnr, reason, run)
   pcall(function() vim.b[bufnr].straps_status = "idle" end)
   pcall(function() vim.b[bufnr].straps_run_reason = reason end)
   pcall(vim.api.nvim_exec_autocmds, "User",
     { pattern = "StrapsStatusChanged", data = { bufnr = bufnr, status = "idle" } })
-  pcall(vim.api.nvim_exec_autocmds, "User",
-    { pattern = "StrapsRunEnd", data = { bufnr = bufnr, reason = reason, turns = turns } })
+  pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "StrapsRunEnd",
+    data = { bufnr = bufnr, reason = reason, turns = run.turns, cancelled = run.cancelled == true } })
 end
 
 local pair_turn
@@ -114,7 +114,7 @@ local pair_turn
 local function crashed(bufnr, run, err)
   runs[bufnr] = nil
   if run then pcall(pair_turn, bufnr, run) end
-  finish_events(bufnr, "error", run and run.turns or 0)
+  finish_events(bufnr, "error", run or {})
   vim.notify("straps: run crashed: " .. tostring(err), vim.log.levels.ERROR)
 end
 
@@ -181,6 +181,10 @@ local function new_ctx(bufnr, run)
 
     cancelled = function()
       return run.cancelled
+    end,
+
+    forget_call = function(name, input)
+      run.seen_calls[tostring(name) .. "\0" .. pretty_json(input or {})] = nil
     end,
 
     -- Stream liveness heartbeat: the provider calls this from its stdout
@@ -316,6 +320,7 @@ local function child_ctx(parent_ctx, bufnr, finish, run)
     on_cancel = parent_ctx.on_cancel,
     cancelled = parent_ctx.cancelled,
     activity = parent_ctx.activity,
+    forget_call = parent_ctx.forget_call,
   }
   ctx.await = function(start)
     local co = assert(coroutine.running(), "straps: child ctx.await outside coroutine")
@@ -511,17 +516,48 @@ local function run_segments(bufnr, ctx, run, cfg, blocks)
   return out
 end
 
--- Drain the steering queue (vim.b straps_steering): append each queued string
--- as an ordinary user block and clear the queue. Returns true if anything was
--- drained. The buffer IS the request, so the next parse picks these up.
+--- A steering queue entry as (text, source). Entries are { text, source }
+--- tables; a legacy plain string is the user's.
+function M.steering_entry(entry)
+  if type(entry) == "string" then return entry, "user" end
+  if type(entry) == "table" and type(entry.text) == "string" then
+    return entry.text, entry.source or "user"
+  end
+  return nil, nil
+end
+
+--- User activity on a session re-arms watch wakes: the wake count returns to
+--- zero and a :StrapsStop pause is lifted.
+function M.note_user_activity(bufnr)
+  pcall(function()
+    vim.b[bufnr].straps_watch_wakes = 0
+    vim.b[bufnr].straps_watch_paused = nil
+  end)
+end
+
+--- The user's stop: cancel the run and pause watch wakes for the session
+--- until the user sends to it again. Cascaded and timeout stops call M.stop.
+function M.user_stop(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  pcall(function() vim.b[bufnr].straps_watch_paused = true end)
+  return M.stop(bufnr)
+end
+
+-- Drain the steering queue (vim.b straps_steering): append each queued entry's
+-- text as an ordinary user block and clear the queue. Returns true if anything
+-- was drained. The buffer IS the request, so the next parse picks these up.
 local function drain_steering(bufnr)
   local state = require("straps.state")
   local queue = vim.b[bufnr].straps_steering
   if type(queue) ~= "table" or #queue == 0 then
     return false
   end
-  for _, text in ipairs(queue) do
-    state.append(bufnr, "user", nil, text)
+  for _, entry in ipairs(queue) do
+    local text, source = M.steering_entry(entry)
+    if text then
+      state.append(bufnr, "user", nil, text)
+      if source == "user" then M.note_user_activity(bufnr) end
+    end
   end
   vim.b[bufnr].straps_steering = nil
   return true
@@ -878,8 +914,11 @@ local function run_turns(bufnr, ctx, run)
 end
 
 --- Start a run for bufnr (default: current buffer). One active run per buffer.
-function M.start(bufnr)
+--- opts.source names who started it ("user" by default, "harness" for a
+--- watch wake); a user start re-arms watch wakes.
+function M.start(bufnr, opts)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local source = type(opts) == "table" and opts.source or "user"
   if runs[bufnr] then
     vim.notify("straps: a run is already active for this buffer", vim.log.levels.WARN)
     return
@@ -897,6 +936,7 @@ function M.start(bufnr)
   local state = require("straps.state")
 
   pcall(function() vim.b[bufnr].straps_run_reason = nil end)
+  if source == "user" then M.note_user_activity(bufnr) end
 
   local run = { cancelled = false, cancel_fns = {}, await_seq = 0, done = false, turns = 0 }
   runs[bufnr] = run
@@ -936,7 +976,7 @@ function M.start(bufnr)
     end
     pcall(state.ensure_trailing_user, bufnr)
     runs[bufnr] = nil
-    finish_events(bufnr, reason, run.turns)
+    finish_events(bufnr, reason, run)
     -- all windows: subagent finishing updates the parent's count
     pcall(function() require("straps.ui").redraw_status(true) end)
   end)
@@ -949,7 +989,7 @@ function M.start(bufnr)
   registry.set_active_scope(prev_scope)
   if not ok then
     runs[bufnr] = nil
-    finish_events(bufnr, "error", run.turns)
+    finish_events(bufnr, "error", run)
     error(err)
   end
 end
@@ -1047,11 +1087,19 @@ vim.api.nvim_create_autocmd("VimLeavePre", {
 --- Queue a mid-run user message ("steering"). Returns true if queued, false
 --- if no run is active (callers fall back to M.start) — so the return value
 --- is also the atomic "is a run active" test, with no window between the check
---- and the enqueue. The queue lives in vim.b straps_steering; vim.b tables are
---- snapshots, so copy-modify-write. `quiet` suppresses only the user-facing
---- toast, for harness-generated steering the user did not type.
-function M.steer(bufnr, text, quiet)
+--- and the enqueue. The queue lives in vim.b straps_steering as { text, source }
+--- entries; vim.b tables are snapshots, so copy-modify-write. opts is
+--- { quiet, source }: source is "user" (default), "harness" or "agent", and
+--- quiet suppresses only the user-facing toast. A legacy boolean opts is
+--- quiet, and a quiet legacy caller is the harness.
+function M.steer(bufnr, text, opts)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local quiet, source
+  if type(opts) == "table" then
+    quiet, source = opts.quiet, opts.source or "user"
+  else
+    quiet, source = opts, opts and "harness" or "user"
+  end
   local run = runs[bufnr]
   if not run then
     return false
@@ -1060,8 +1108,9 @@ function M.steer(bufnr, text, quiet)
   if type(queue) ~= "table" then
     queue = {}
   end
-  queue[#queue + 1] = text
+  queue[#queue + 1] = { text = text, source = source }
   vim.b[bufnr].straps_steering = queue
+  if source == "user" then M.note_user_activity(bufnr) end
   progress(bufnr, run.ctx, { type = "steer_queued" })
   if not quiet then
     vim.notify("straps: steering queued", vim.log.levels.INFO)

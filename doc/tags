@@ -35,6 +35,7 @@ fn.llamacpp_api_key	straps.txt	/*fn.llamacpp_api_key*
 fn.log	straps.txt	/*fn.log*
 fn.model_note	straps.txt	/*fn.model_note*
 fn.model_pref	straps.txt	/*fn.model_pref*
+fn.notify_watchers	straps.txt	/*fn.notify_watchers*
 fn.openai_api_key	straps.txt	/*fn.openai_api_key*
 fn.openai_codex_credential	straps.txt	/*fn.openai_codex_credential*
 fn.openai_codex_login	straps.txt	/*fn.openai_codex_login*
@@ -108,6 +109,8 @@ straps-steering	straps.txt	/*straps-steering*
 straps-subagents	straps.txt	/*straps-subagents*
 straps-subprocesses	straps.txt	/*straps-subprocesses*
 straps-tools	straps.txt	/*straps-tools*
+straps-watch-agent-tool	straps.txt	/*straps-watch-agent-tool*
 straps.nvim	straps.txt	/*straps.nvim*
 straps.setup()	straps.txt	/*straps.setup()*
 straps.txt	straps.txt	/*straps.txt*
+watch_agent	straps.txt	/*watch_agent*

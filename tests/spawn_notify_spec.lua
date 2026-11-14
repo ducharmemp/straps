@@ -380,15 +380,26 @@ it("spawn_wait claims its children and drops their queued notices", function()
   -- A notice whose buffer number EXTENDS a collected child's (child 7 vs 79):
   -- dropping it would mean the prefix match is not anchored on the ": ".
   local lookalike = ("[straps] subagent buffer %d: finished"):format(mine_a * 10 + 9)
-  vim.b[parent].straps_steering =
-    { notice_a, "a real user message", notice_s, notice_b, lookalike }
+  -- The user typing the notice prefix is still the user: only harness entries
+  -- are notices.
+  local typed = ("[straps] subagent buffer %d: typed by the user"):format(mine_a)
+  local function h(text) return { text = text, source = "harness" } end
+  vim.b[parent].straps_steering = {
+    h(notice_a), { text = "a real user message", source = "user" }, h(notice_s), h(notice_b), h(lookalike),
+    { text = typed, source = "user" },
+  }
 
   local unpack = unpack or table.unpack
   local function pack(...) return { n = select("#", ...), ... } end
   local out, finished, co
+  local claimed_in_wait
   local ctx = {
     bufnr = parent,
     await = function(start)
+      if claimed_in_wait == nil then
+        claimed_in_wait = { vim.b[mine_a].straps_spawn_claimed, vim.b[mine_b].straps_spawn_claimed,
+          vim.b[stranger].straps_spawn_claimed }
+      end
       local resolved = false
       start(function(...)
         if resolved then return end
@@ -412,14 +423,19 @@ it("spawn_wait claims its children and drops their queued notices", function()
   assert(ok, tostring(err))
   assert(vim.wait(10000, function() return finished end, 20), "spawn_wait did not return")
 
-  assert(vim.b[mine_a].straps_spawn_claimed == true, "own child A must be claimed")
-  assert(vim.b[mine_b].straps_spawn_claimed == true, "own child B must be claimed")
-  assert(vim.b[stranger].straps_spawn_claimed == nil,
+  assert(claimed_in_wait[1] == true, "own child A must be claimed during the wait")
+  assert(claimed_in_wait[2] == true, "own child B must be claimed during the wait")
+  assert(claimed_in_wait[3] == nil,
     "another session's child must NEVER be claimed — that would silence a sibling's notice")
+  assert(vim.b[mine_a].straps_spawn_claimed == nil and vim.b[mine_b].straps_spawn_claimed == nil,
+    "the result releases every claim, so a later run of the child notifies again")
 
   local queue = vim.b[parent].straps_steering
   assert(type(queue) == "table", "the steering queue should survive as a table")
-  local left = table.concat(queue, "\n")
+  local texts = {}
+  for _, e in ipairs(queue) do texts[#texts + 1] = e.text end
+  local left = table.concat(texts, "\n")
+  assert(left:find(typed, 1, true), "a user entry carrying the notice prefix must never be dropped")
   assert(not left:find(notice_a, 1, true), "notice for collected child A should be dropped")
   assert(not left:find(notice_b, 1, true), "notice for collected child B should be dropped")
   assert(left:find(notice_s, 1, true), "a stranger's notice must be left alone")

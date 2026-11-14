@@ -184,7 +184,7 @@ command("StrapsStop", function()
   if not bufnr then
     return
   end
-  require("straps.loop").stop(bufnr)
+  require("straps.loop").user_stop(bufnr)
 end, { desc = "straps: cancel the active run in this session" })
 
 -- Continuing a STOPPED run, as opposed to :StrapsResume, which reopens a saved

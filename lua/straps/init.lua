@@ -97,12 +97,16 @@ M.config = {
   after_write_diagnostics_ms = 800,
   -- Default hook.on_run_end.notify_parent behaviour: when a subagent's run
   -- ends, deliver a one-line notice to its parent session (steering if the
-  -- parent is running, an ordinary user block if idle — never starting the
-  -- parent's run), so a parent can spawn, keep working, and collect the answer
+  -- parent is running, an ordinary user block if idle — this notice never
+  -- starts the parent's run; tool.watch_agent does), so a parent can spawn, keep working, and collect the answer
   -- when the notice lands instead of blocking in spawn_wait. false silences the
   -- notice; redefining hook.on_run_end.notify_parent or fn.spawn_notice
   -- reshapes it.
   spawn_notify = true,
+  -- How many times a watched event (tool.watch_agent) may start an idle
+  -- session's run before the user sends to that session again. Past the cap
+  -- the notice is appended without starting a run.
+  watch_wake_limit = 20,
   -- How deep subagents may nest. 1 (default): a top-level session spawns
   -- children, children cannot spawn. 2 lets children spawn grandchildren;
   -- each further level adds one generation. 0 hides spawn everywhere.

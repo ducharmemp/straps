@@ -379,7 +379,11 @@ run) and drained into the transcript at the next turn boundary, so the model
 acts on it mid-flight. |:StrapsSteer| queues directly; <CR>/|:StrapsSend|
 prompt for the text. The harness steers too, through |fn.session_notify|: a
 subagent completion notice reaches a busy parent this way, without the
-"steering queued" toast a message you typed produces.
+"steering queued" toast a message you typed produces. Each queued entry records
+its source: `user` (you), `harness` (a notice), or `agent` (|send_message|).
+Any queued entry ends a `spawn_wait` early, so a waiting agent reads it at
+once. Steering you send, and any run you start, re-arms |watch_agent| wakes
+for that session.
 
 Progress. While a run is active a virtual-text indicator on the last line
 shows the phase, elapsed time, stream liveness and the stop/steer hints. The
@@ -434,6 +438,8 @@ max_turns		(number) 128. Hard backstop on turns per run; a
 stall_limit		(number) 6. End a run after this many CONSECUTIVE
 			stalled turns (every tool call errored, or a
 			(tool,input) call repeated). 0 disables the detector.
+			A `spawn_wait` repeated after an early return does
+			not count as a repeat.
 stop_backstop_ms	(number) 4000. |:StrapsStop| backstop: a run still
 			suspended on the same await this long after the
 			cancel handlers fired is forcibly resumed, so the
@@ -471,6 +477,10 @@ spawn_notify		(boolean) true. Default
 			so the parent can keep working instead of blocking in
 			`spawn_wait`. See |straps-subagents|. false silences
 			the notice, or redefine the hook or |fn.spawn_notice|.
+watch_wake_limit	(number) 20. How many times |watch_agent| events may
+			start an idle session's run before the user sends to
+			that session again. Past the cap the notice is
+			appended without starting a run.
 max_spawn_depth		(number) 1. How deep subagents nest: 1 lets a
 			top-level session spawn children that cannot spawn;
 			2 lets children spawn grandchildren; 0 hides `spawn`
@@ -661,6 +671,7 @@ Self-extension & orchestration:
 	registry_list, registry_get, registry_define, skill, eval_lua,
 	spawn, spawn_wait (|straps-subagents|), agents
 	(|straps-multiplayer|), send_message (|straps-send-message-tool|),
+	watch_agent, unwatch_agent (|straps-watch-agent-tool|),
 	transcript_excise
 
 `transcript_excise` is context surgery: with no arguments it lists the
@@ -872,7 +883,8 @@ hook.on_run_end.notify_parent(ctx, reason)
 		one-line notice to its parent session, so the parent can keep
 		working instead of blocking in `spawn_wait`. See
 		|straps-subagents|. Silent for an ordinary run, a child the
-		user stopped, a child `spawn_wait` already collected, and when
+		user stopped, a child a running `spawn_wait` holds (the claim
+		ends when the wait returns, so later runs notify), and when
 		`spawn_notify` is false. Text comes from |fn.spawn_notice|.
 
 					*hook.on_run_end.reply_refs*
@@ -898,12 +910,23 @@ fn.session_notify({bufnr}, {text}, {opts})
 		Deliver a harness-generated user message to a session:
 		steering if a run is active (drained at the next turn
 		boundary), an ordinary user block plus a restored trailing user
-		block if it is idle. Never starts the session's run. `opts` =
-		`{ quiet = true }` suppresses the steering toast, for messages
-		the user did not type. Returns "steer", "append", or nil for an
-		invalid buffer or empty text. Shared by |fn.autocmd_bridge| and
+		block if it is idle. Never starts the session's run;
+		|fn.notify_watchers| is the one path that does. `opts` =
+		`{ quiet, source }`: `quiet = true` suppresses the steering
+		toast, for messages the user did not type; `source` labels the
+		queued entry "harness" (default), "agent" or "user". Returns
+		"steer", "append", or nil for an invalid buffer or empty text.
+		Shared by |fn.autocmd_bridge|, |send_message| and
 		|hook.on_run_end.notify_parent|, so redefining it changes every
 		harness-to-agent channel at once.
+
+						*fn.notify_watchers*
+fn.notify_watchers({target}, {event}, {reason}, {cancelled})
+		Deliver a lifecycle event of session {target} to the sessions
+		watching it (|watch_agent|). Called from the StrapsRunStart and
+		StrapsRunEnd User autocmds and from BufUnload, always resolved
+		in the global scope; each watcher is notified under its own
+		scope. See |straps-watch-agent-tool| for the delivery rules.
 
 						*fn.spawn_notice*
 fn.spawn_notice({child}, {reason})
@@ -1147,8 +1170,9 @@ fn.build_tools() -> tools	Map every tool.* entry to an API tool def.
 fn.capability(name, input) -> category
 				Classify a tool call into a permission category:
 				`read` (auto-allowed), `edit`, `delete`, `exec`,
-				`lua`, `net`, `define`, `spawn` (spawn, spawn_wait
-				and send_message), or `agent_tool` (an unknown
+				`lua`, `net`, `define`, `spawn` (spawn, spawn_wait,
+				send_message, watch_agent and unwatch_agent), or
+				`agent_tool` (an unknown
 				tool, or any tool resolved from a session scope
 				without a trusted `capability` field). Called
 				with no arguments it returns the grantable list
@@ -1289,15 +1313,20 @@ setup().
 `spawn` launches a subagent in its own session buffer and returns immediately
 with a handle; the child runs concurrently. `spawn_wait` blocks on one or more
 handles and returns their final answers — waiting on N children costs the
-slowest, not the sum. Issue N `spawn` calls in one turn to fan out.
+slowest, not the sum. Issue N `spawn` calls in one turn to fan out. A message
+for the waiting session (from you, a peer, a child, or the harness) ends the
+wait early: the result lists each child still running, the message follows,
+and the agent calls `spawn_wait` again to keep waiting. A child left running
+this way still sends its completion notice when it ends.
 
 A parent does not have to block, and the system prompt tells the agent not to:
 work that does not depend on a child's answer should proceed while the child
 runs. When a child's run ends,
 |hook.on_run_end.notify_parent| delivers one line to the parent naming the
 child's buffer, its task, the outcome and how to collect it — as steering if
-the parent is running, as an ordinary user block if it is idle. A child never
-starts its parent's run. So "spawn, keep working, collect when the notice
+the parent is running, as an ordinary user block if it is idle. The notice
+never starts its parent's run; a parent that wants to be started when a child
+ends watches it with |watch_agent|. So "spawn, keep working, collect when the notice
 lands" is the default shape, and `spawn_wait` in the same turn as `spawn` is
 for when the child's answer is the next step; `spawn_wait` on a child that
 already finished returns at once. The notice never carries the child's answer
@@ -1347,7 +1376,8 @@ Dashboard keys:
   <CR>       Open the selected transcript in the dashboard window.
   g<CR>      Start or continue the selected idle session.
   i          Message the selected session; an idle recipient does not start.
-  x          Stop a running session; confirm descendant cancellation.
+  x          Stop a running session; confirm descendant cancellation. Like
+             |:StrapsStop|, this pauses |watch_agent| wakes for the session.
   r          Rename the durable title without changing the transcript path.
   R          Clear cached saved summaries and refresh.
   p          Open selected-agent details in a read-only split.
@@ -1431,6 +1461,33 @@ send_message	Tool. Send a message to another session in this Neovim:
 		child may always send `to="parent"`; any other target needs
 		a grant and must be its parent or one of its own children.
 
+					*straps-watch-agent-tool* *watch_agent*
+watch_agent	Tool. Subscribe to another session's lifecycle: `to` is its
+		buffer number as digits or `"parent"`; `events` is any of
+		`run_start`, `run_end`, `closed` (default `run_end` and
+		`closed`); `wake` defaults to true. When a watched event
+		fires, a `[straps] watched agent <label> (buffer N): <event>`
+		notice reaches the watcher: as steering if it is running (a
+		`spawn_wait` it is blocked in returns early), and if it is
+		idle with `wake` true, the notice is queued and its run is
+		STARTED. Each watch fires once and is then removed. A stopped
+		run (by you, its parent's stop, or a `spawn_wait` timeout)
+		notifies nobody and leaves the watch armed. `closed` fires
+		when the buffer is unloaded or
+		wiped, once, and never while Neovim exits. An idle watcher is
+		not started, and the notice is appended instead, when:
+		- `wake` is false;
+		- its trailing prompt holds text you have not sent;
+		- you stopped it with |:StrapsStop| or the dashboard `x` key;
+		- it has used `watch_wake_limit` wakes since you last sent
+		  to it or started it.
+		A parent watching its own child receives both the watch
+		notice and the subagent completion notice; only the watch
+		starts an idle parent.
+		Permissions match |send_message|: the `spawn` category; a
+		gated child may always watch `"parent"`; any other target
+		needs a grant and must be in its family.
+unwatch_agent	Tool. Remove this session's watch on `to`.
 Harness notices use the same mechanism: a user block beginning `[straps] `
 (the multiplayer notice, a subagent completion notice) renders as `harness`.
 The prefix is a content convention, so a block you type yourself starting

@@ -3075,7 +3075,9 @@ your tool calls and streamed text live as you work.
 - spawn launches a subagent in its own session buffer and returns
   IMMEDIATELY with a handle (its buffer number); the child runs
   concurrently. spawn_wait{ buffers = {...} } then blocks until the named
-  children finish and returns their answers. Use spawn when a broad
+  children finish and returns their answers, or until a message arrives
+  for you: it then returns early, lists the children still running, and the
+  message follows; read it and call spawn_wait again. Use spawn when a broad
   investigation would flood this transcript with tool results you will not
   need again — the child burns its own context, you keep the conclusion.
 - To run N investigations in PARALLEL, emit N spawn calls in one turn (or
@@ -3093,6 +3095,10 @@ your tool calls and streamed text live as you work.
   arrives as steering at the child's next turn boundary); a child uses
   send_message{to="parent"} for a blocker or a collision that cannot wait
   for its final answer. Neither starts the recipient's run.
+- watch_agent{to=<bufnr>} subscribes you to another session's run_end and
+  close (events= adds run_start): when it fires, a [straps] notice reaches
+  you, and starts your run if you are idle. Each watch fires once; call it
+  again to keep watching.
 - The child sees NONE of this conversation: write the task complete and
   self-contained, including every path, constraint, and the exact shape
   of the answer you want back.
@@ -3339,7 +3345,8 @@ your grants, and a child spawned without allow is read-only.]]
       sub[#sub + 1] = [[This is a READ-ONLY session: every write tool is denied without
 prompting, except send_message{to="parent"}, which is allowed so you can
 report a blocker to the session that spawned you (it is appended there if
-that session is idle, and read at its next turn if it is running).
+that session is idle, and read at its next turn if it is running, ending a
+spawn_wait it is blocked in), and watch_agent{to="parent"}.
 Investigate and report; do not attempt writes or workarounds, and mark
 conclusions you could not verify empirically as such.]]
     end

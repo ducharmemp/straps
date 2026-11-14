@@ -183,8 +183,8 @@ end
       .. " the conversation. Skills that existed at session start are listed"
       .. " under '# Skills' in the system prompt; call with no name to list"
       .. " every skill available now: registry skill.* entries, including ones"
-      .. " defined mid-session, plus SKILL.md files found on disk (listed with"
-      .. " '(file: <path>)'). Parameters: name (optional) — the skill to load,"
+      .. " defined mid-session, plus SKILL.md files found on disk."
+      .. " Parameters: name (optional) — the skill to load,"
       .. " with or without the 'skill.' prefix; omit to list.",
     input_schema = {
       type = "object",
@@ -226,7 +226,7 @@ return function(input, ctx)
     for _, n in ipairs(found.order) do
       local s = found.skills[n]
       if s and not registry.get("skill." .. n) then
-        lines[#lines + 1] = n .. " (file: " .. s.path .. "): " .. s.description
+        lines[#lines + 1] = n .. ": " .. s.description
       end
     end
     if #lines == 0 then

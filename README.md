@@ -93,6 +93,14 @@ With lazy.nvim:
 
 Run `:checkhealth straps` after installation.
 
+## Terminal attention
+
+On Neovim 0.12 or later, Straps sends OSC 7501 status reports by default. Supporting terminals and multiplexers, including Zellij, can show working, done, blocked, and error states. Set `terminal_status = false` in `setup()` to disable reporting and clear Straps' existing statuses.
+
+Each session has a distinct task ID. Successful runs report done; cancellation reports idle; other run endings report error. Agent permission and question prompts report blocked while displayed. API key entry and logout confirmation use temporary task IDs. Reports contain no conversation content, credentials, error details, or progress percentages. Unloading a session buffer (`:bdelete`, `:bwipeout`, or `:bunload`) or exiting Neovim clears its status. Hiding or renaming a loaded session preserves its task ID. Unloading does not cancel a running agent; later callbacks cannot republish the cleared task.
+
+Neovim before 0.12 sends no reports. Headless instances have no terminal recipient. Neovim broadcasts reports to every attached UI advertising `stdout_tty`; Straps cannot select one terminal. Browser authorization intervals, project-trust dialogs, and descendant-stop confirmations do not report blocked. Replacement permission/question implementations must manage their own waiting state; Straps does not infer waiting from tool names or progress hooks.
+
 ## Start a session
 
 Session windows show a model/status winbar. Leaving the buffer or window removes only the Straps expression and restores the prior local value. Returning to the session restores its winbar. Straps preserves the global winbar and user replacements; set `session_winbar = false` to disable the session bar.
@@ -126,7 +134,7 @@ The registry contains four entry types:
 - `fn.*` implements providers, prompts, rendering, and other core behavior.
 - `skill.*` stores reusable knowledge that loads when needed.
 
-Straps also finds Agent Skills on disk: `SKILL.md` directories under `~/.agents/skills`, `~/.claude/skills`, `stdpath("config")/straps/skills`, and `.agents/skills` or `.claude/skills` in the working directory and its ancestors (stopping below `$HOME` when the working directory is inside it). They appear under `# Skills` in the system prompt and load through the `skill` tool. See `:help straps-skill-files`.
+Straps also finds Agent Skills on disk: `SKILL.md` directories under `~/.agents/skills`, `~/.claude/skills`, `stdpath("config")/straps/skills`, and `.agents/skills` or `.claude/skills` in the working directory and its ancestors (stopping below `$HOME` when the working directory is inside it). Their names and descriptions appear under `# Skills` in the system prompt and the `skill` tool's listing without file paths. Load them by name through the `skill` tool. See `:help straps-skill-files`.
 
 Use `:StrapsRegistry` to browse entries. Use `:StrapsEdit {name}` to edit one as Lua. Writing that buffer redefines the entry immediately.
 

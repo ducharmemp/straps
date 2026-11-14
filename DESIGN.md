@@ -213,9 +213,9 @@ source string, so a redefinition changes all of them.
   chars, 1024-char description) only warn.
 
 Consumers: `fn.system_prompt_skills` appends
-`- <name> (file: <path>): <description>` per discovered skill that no
-`skill.<name>` registry entry shadows, and `tool.skill` lists them the same
-way and loads one by reading the file at call time (body without frontmatter,
+`- <name>: <description>` per discovered skill that no
+`skill.<name>` registry entry shadows. `tool.skill` lists them as
+`<name>: <description>` and loads one by reading the file at call time (body without frontmatter,
 then the file path, directory, and up to 50 bundled files sorted, at most
 three directory levels deep, skipping `.git` and `node_modules`; a symlink is
 listed only when it points to a regular file inside the directory, and
@@ -231,7 +231,7 @@ registry, so registry_list, registry_get and `registry.dump()` do not show
 them. A `skill.<name>` registry entry shadows the file. The project tier loads
 without a trust gate, like AGENTS.md/CLAUDE.md; its descriptions reach the
 system prompt without a define-time guard check, and guards on `tool.skill`
-see only `{ name }`, not the path read. The prompt line carries the path, and
+see only `{ name }`, not the path read. Listings omit file paths, and
 the realpath containment check bounds what `tool.skill` reads.
 
 ### Capability metadata on entries
@@ -756,6 +756,14 @@ edit.
   buffer. Run-scoped bookkeeping — turn budget, stall counter, blank nudges —
   starts over; the conversation does not. Distinct from `:StrapsResume`, which
   reopens a saved transcript from disk.
+
+### Terminal attention
+
+`attention.lua` translates admitted loop runs and actual prompt lifetimes into OSC 7501 reports through Neovim 0.12's `nvim_ui_send`. `terminal_status` defaults to true. Disabling through `setup()` clears owned task IDs; enabling replays current records. This core mechanism preserves registry hooks and does not infer blocked states from tool names or progress events.
+
+Each session ID includes a process nonce and buffer number. Wait tokens belong to a specific run identity, so a callback from an old run cannot alter its replacement. Run start reports working; only `ok` reports done; cancellation reports idle; all other ending reasons report error. Actual built-in permission and question prompts report blocked with permission/question kinds. Standalone API key entry and logout confirmation use temporary task IDs. Prompt exception, dismissal, cancellation, and forced-resume paths release their waiting tokens.
+
+Buffer unload (`:bdelete`, `:bwipeout`, or `:bunload`) clears the session ID without cancelling an active run. Hiding a loaded session, `:file`, and `:saveas` preserve its task ID. Late wait releases and run completion cannot republish an unloaded session's cleared record. Shutdown clears all records before run cancellation callbacks execute and suppresses later reports. UI attachment replays current records. No transcript content, credential data, error details, or invented progress leaves the reporter. Neovim broadcasts to all attached `stdout_tty` UIs; headless instances have no terminal recipient and versions before 0.12 perform no reporting. Browser authorization intervals, project-trust dialogs, and descendant-stop confirmations are excluded. Those dialogs can leave an active run reported as working.
 
 ### Progress
 

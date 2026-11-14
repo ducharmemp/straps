@@ -3655,13 +3655,6 @@ end
 ]==]
 
 local SYSTEM_PROMPT_SKILLS_SRC = [==[
--- Skills layer of the system prompt: one "- name: doc" line per skill.*
--- entry, then one "- name (file: path): description" line per SKILL.md
--- found by fn.discover_skills that no skill.* entry shadows, so the model
--- knows what knowledge is loadable via tool.skill without paying for the
--- bodies up front. A failing or absent fn.discover_skills adds nothing.
--- Returns "" when no skills exist (the composition skips the section,
--- keeping the default prompt — and its cache prefix — unchanged).
 return function()
   local registry = require("straps.registry")
   local lines = {}
@@ -3676,7 +3669,7 @@ return function()
       local s = found.skills[name]
       if type(name) == "string" and type(s) == "table" and type(s.path) == "string"
           and type(s.description) == "string" and not registry.get("skill." .. name) then
-        lines[#lines + 1] = "- " .. name .. " (file: " .. s.path .. "): " .. s.description
+        lines[#lines + 1] = "- " .. name .. ": " .. s.description
       end
     end
   end

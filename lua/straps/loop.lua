@@ -101,6 +101,7 @@ local function log(bufnr, ev)
 end
 
 local function finish_events(bufnr, reason, run)
+  require("straps.attention").finish(bufnr, run, reason)
   pcall(function() vim.b[bufnr].straps_status = "idle" end)
   pcall(function() vim.b[bufnr].straps_run_reason = reason end)
   pcall(vim.api.nvim_exec_autocmds, "User",
@@ -940,6 +941,7 @@ function M.start(bufnr, opts)
 
   local run = { cancelled = false, cancel_fns = {}, await_seq = 0, done = false, turns = 0 }
   runs[bufnr] = run
+  require("straps.attention").start(bufnr, run)
   pcall(function() vim.b[bufnr].straps_status = "running" end)
   pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "StrapsRunStart", data = { bufnr = bufnr } })
   pcall(vim.api.nvim_exec_autocmds, "User",
@@ -1074,6 +1076,7 @@ end
 vim.api.nvim_create_autocmd("VimLeavePre", {
   group = vim.api.nvim_create_augroup("straps_loop_exit", { clear = true }),
   callback = function()
+    require("straps.attention").shutdown()
     for _, run in pairs(runs) do
       run.cancelled = true
       for _, fn in ipairs(run.cancel_fns) do

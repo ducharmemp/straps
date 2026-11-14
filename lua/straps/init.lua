@@ -161,6 +161,7 @@ M.config = {
   -- ui.session_status() / ui.session_winbar() components stay available for a
   -- manual statusline either way.
   session_winbar = true,
+  terminal_status = true,
 
   -- Agents-buffer winbar (:StrapsAgents): the keymap legend in a window-local
   -- winbar, so it is visible without scrolling past the saved rows. false
@@ -423,6 +424,7 @@ end
 --- so runtime redefinitions (yours or the agent's) survive.
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+  require("straps.attention").setup(M.config.terminal_status)
   require("straps.provider").register()
   require("straps.tools").register()
   -- layers.editor = false skips the LSP/tree-sitter tool group (see the

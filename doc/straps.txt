@@ -471,6 +471,24 @@ after_write_diagnostics	(boolean) true. Default |hook.after_write|: feed the
 after_write_diagnostics_ms (number) 800. The longest |fn.write_diagnostics|
 			waits for the language server to re-lint. In a batch the
 			wait runs once, for every file the batch wrote.
+terminal_status		(boolean) true. OSC 7501 terminal attention reports on
+			Neovim >= 0.12 through nvim_ui_send. setup() with false
+			clears owned IDs and suppresses reports. Each session
+			has its own ID: working at run start, done for success,
+			idle for cancellation, error for other run endings.
+			Built-in agent permission/question prompts report
+			blocked; API key entry and logout confirmation use
+			temporary IDs. Unload (:bdelete, :bwipeout, :bunload)
+			and shutdown clear owned statuses. Unload does not
+			cancel an active run; late callbacks cannot republish
+			its cleared task. Hiding or renaming a loaded session
+			preserves its ID. UI attachment replays current records. Reports contain
+			no prompt text, secrets, error details or percentages.
+			No reports before 0.12; headless has no terminal
+			recipient. All attached stdout_tty UIs receive reports.
+			Browser authorization, project-trust and descendant-stop
+			prompts do not report blocked. Replacement prompt
+			implementations must manage their own waiting status.
 spawn_notify		(boolean) true. Default
 			|hook.on_run_end.notify_parent|: when a subagent's run
 			ends, deliver a one-line notice to its parent session,
@@ -1334,7 +1352,7 @@ collision:
 
 Each immediate subdirectory of a root that contains a file named `SKILL.md`
 is one skill. The `# Skills` prompt section lists it as
-`- <name> (file: <path>): <description>`, and the `skill` tool loads its body
+`- <name>: <description>` without file paths, and the `skill` tool loads its body
 plus a footer naming the skill directory and up to 50 bundled files, sorted,
 at most three directory levels deep (listed, not read; the list is marked
 truncated past 50 files or when entries remain past 2000 scanned).

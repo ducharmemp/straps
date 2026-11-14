@@ -2820,19 +2820,26 @@ return function(input, ctx)
     end
   end
 
+  local attention = require("straps.attention")
   local function free_text(prefix)
-    local typed = ctx.await(function(resolve)
+    local release = attention.wait(ctx, "question")
+    local ok_wait, typed = pcall(ctx.await, function(resolve)
       local resolved = false
       local function finish(v)
         if resolved then return end
         resolved = true
+        release()
         resolve(v)
       end
       if type(ctx.on_cancel) == "function" then
         ctx.on_cancel(function() finish(nil) end)
       end
-      vim.ui.input({ prompt = question .. " " }, function(text) finish(text) end)
+      if not resolved then
+        vim.ui.input({ prompt = question .. " " }, function(text) finish(text) end)
+      end
     end)
+    release()
+    if not ok_wait then error(typed, 0) end
     if typed == nil or typed == "" then
       return "user dismissed the input without answering — do not re-ask the identical question"
     end
@@ -3020,11 +3027,13 @@ return function(input, ctx)
     if vim.api.nvim_win_is_valid(user_win) then pcall(vim.api.nvim_set_current_win, user_win) end
   end
 
+  local release = function() end
   local ok_wait, res = pcall(ctx.await, function(resolve)
     local resolved = false
     local function finish(v)
       if resolved then return end
       resolved = true
+      release()
       resolve(v)
     end
     local function map(lhs, fn)
@@ -3056,9 +3065,13 @@ return function(input, ctx)
     local ok_draw, err = pcall(draw)
     if not ok_draw then
       vim.notify("ask_user: " .. tostring(err), vim.log.levels.ERROR)
+      finish({ dismissed = true })
+    elseif not resolved then
+      release = attention.wait(ctx, "question")
     end
   end)
 
+  release()
   restore()
   if not ok_wait then error(res, 0) end
   if type(res) ~= "table" or res.dismissed then

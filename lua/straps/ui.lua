@@ -2144,7 +2144,8 @@ function M.login(fargs)
   -- replaces a stored one.
   local ok_old, old = pcall(registry.call, "fn.api_key_store", name)
   local replaces = (not ok_old or old) and " (replaces the stored key)" or ""
-  local key = vim.trim(vim.fn.inputsecret("straps: " .. name .. " API key" .. replaces .. ": ") or "")
+  local key = vim.trim(require("straps.attention").prompt(nil, "auth", vim.fn.inputsecret,
+    "straps: " .. name .. " API key" .. replaces .. ": ") or "")
   if key == "" then return vim.notify("straps: login cancelled", vim.log.levels.INFO) end
   -- Store (and so validate) the key before touching the ChatGPT login, so a
   -- rejected key leaves every existing credential in place.
@@ -2183,7 +2184,8 @@ function M.logout(fargs)
   local name = auth_provider(fargs[1], ":StrapsLogout")
   if not name then return end
   if not require_entries({ "fn.api_key_store" }) then return end
-  if not fargs[1] and vim.fn.confirm("straps: delete the stored " .. name .. " credentials?", "&Yes\n&No", 2) ~= 1 then
+  if not fargs[1] and require("straps.attention").prompt(nil, "permission", vim.fn.confirm,
+    "straps: delete the stored " .. name .. " credentials?", "&Yes\n&No", 2) ~= 1 then
     return vim.notify("straps: logout cancelled", vim.log.levels.INFO)
   end
   local registry = require("straps.registry")

@@ -422,7 +422,7 @@ return function(name, input, ctx)
     choices = "&Yes\n&No\n&Always this tool"
   end
 
-  local choice = vim.fn.confirm(
+  local choice = require("straps.attention").prompt(ctx, "permission", vim.fn.confirm,
     "straps: allow " .. tostring(name) .. "?\n" .. preview, choices, 2)
 
   if preview_win then

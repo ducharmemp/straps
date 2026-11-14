@@ -182,9 +182,10 @@ end
     doc = "Load a skill — a named piece of stored knowledge (prose) — into"
       .. " the conversation. Skills that existed at session start are listed"
       .. " under '# Skills' in the system prompt; call with no name to list"
-      .. " every skill currently defined, including ones defined mid-session."
-      .. " Parameters: name (optional) — the skill to load, with or without"
-      .. " the 'skill.' prefix; omit to list.",
+      .. " every skill available now: registry skill.* entries, including ones"
+      .. " defined mid-session, plus SKILL.md files found on disk (listed with"
+      .. " '(file: <path>)'). Parameters: name (optional) — the skill to load,"
+      .. " with or without the 'skill.' prefix; omit to list.",
     input_schema = {
       type = "object",
       properties = {
@@ -197,6 +198,22 @@ end
     source = [==[
 return function(input, ctx)
   local registry = require("straps.registry")
+  local uv = vim.uv or vim.loop
+  local function discovered()
+    local ok, found = pcall(registry.try_call, "fn.discover_skills")
+    local out = { skills = {}, order = {} }
+    if ok and type(found) == "table" and type(found.skills) == "table" and type(found.order) == "table" then
+      for _, n in ipairs(found.order) do
+        local s = found.skills[n]
+        if type(n) == "string" and type(s) == "table" and type(s.path) == "string"
+            and type(s.dir) == "string" and type(s.description) == "string" then
+          out.skills[n] = s
+          out.order[#out.order + 1] = n
+        end
+      end
+    end
+    return out
+  end
   local name = input and input.name
   if name == nil or name == "" then
     local lines = {}
@@ -204,6 +221,13 @@ return function(input, ctx)
       local e = registry.get(n)
       local doc = tostring(e.doc or ""):match("^[^\n]*") or ""
       lines[#lines + 1] = n .. (doc ~= "" and (": " .. doc) or "")
+    end
+    local found = discovered()
+    for _, n in ipairs(found.order) do
+      local s = found.skills[n]
+      if s and not registry.get("skill." .. n) then
+        lines[#lines + 1] = n .. " (file: " .. s.path .. "): " .. s.description
+      end
     end
     if #lines == 0 then
       return "no skills defined"
@@ -214,10 +238,294 @@ return function(input, ctx)
   if not (entry and entry.kind == "skill") then
     entry = registry.get("skill." .. name)
   end
-  if not entry or entry.kind ~= "skill" then
-    return "skill: no skill named " .. tostring(name) .. " (call with no name to list)"
+  if entry and entry.kind == "skill" then
+    return entry.source
   end
-  return entry.source
+  local bare = tostring(name):gsub("^skill%.", "")
+  local s = discovered().skills[bare]
+  if not s then
+    return "skill: no skill named " .. tostring(name)
+      .. " (call with no name to list; discovery cwd: " .. vim.fn.getcwd() .. ")"
+  end
+  local f = io.open(s.path, "r")
+  if not f then
+    return "skill: could not read " .. s.path
+  end
+  local text = f:read("*a")
+  f:close()
+  text = text:gsub("^\239\187\191", ""):gsub("\r", "")
+  local lines = vim.split(text, "\n", { plain = true })
+  local first = 1
+  if lines[1] and lines[1]:match("^%-%-%-%s*$") then
+    for i = 2, #lines do
+      if lines[i]:match("^%-%-%-%s*$") then
+        first = i + 1
+        break
+      end
+    end
+  end
+  local body = table.concat(lines, "\n", first):gsub("^%s+", ""):gsub("%s+$", "")
+
+  local files, walked, capped, LIMIT, WALK_CAP = {}, 0, false, 50, 2000
+  local prefix = s.dir == "/" and "/" or s.dir .. "/"
+  local function walk(dir, rel, depth)
+    local handle = uv.fs_scandir(dir)
+    if not handle then return end
+    while true do
+      local entry_name, typ = uv.fs_scandir_next(handle)
+      if not entry_name then break end
+      if walked >= WALK_CAP then
+        capped = true
+        break
+      end
+      walked = walked + 1
+      local full = dir .. "/" .. entry_name
+      local relpath = rel == "" and entry_name or (rel .. "/" .. entry_name)
+      if typ == nil or typ == "unknown" then
+        local lst = uv.fs_lstat(full)
+        typ = lst and lst.type
+      end
+      if relpath == "SKILL.md" then
+      elseif typ == "link" then
+        local target = uv.fs_realpath(full)
+        local st = target and uv.fs_stat(target)
+        if target and st and st.type == "file" and target:sub(1, #prefix) == prefix then
+          files[#files + 1] = relpath
+        end
+      elseif typ == "directory" then
+        if entry_name ~= ".git" and entry_name ~= "node_modules" and depth < 3 then
+          walk(full, relpath, depth + 1)
+        end
+      elseif typ == "file" then
+        files[#files + 1] = relpath
+      end
+    end
+  end
+  walk(s.dir, "", 1)
+  table.sort(files)
+
+  local out = { body, "", "Skill file: " .. s.path, "Skill directory: " .. s.dir,
+    "Relative paths in this skill resolve against that directory." }
+  if #files > 0 then
+    out[#out + 1] = "Bundled files (listed, not loaded):"
+    for i = 1, math.min(#files, LIMIT) do
+      out[#out + 1] = "  " .. files[i]
+    end
+    if #files > LIMIT or capped then
+      out[#out + 1] = "  (listing truncated)"
+    end
+  end
+  return table.concat(out, "\n")
+end
+]==],
+  })
+
+  define({
+    name = "fn.discover_skills",
+    kind = "fn",
+    doc = "Find SKILL.md skills on disk (user, project, config.skill_paths roots); returns { skills, order, diagnostics }.",
+    source = [==[
+return function()
+  local uv = vim.uv or vim.loop
+  local ok_straps, straps = pcall(require, "straps")
+  local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
+  local result = { skills = {}, order = {}, diagnostics = {} }
+  if config.skill_discovery == false then
+    return result
+  end
+  local function diag(msg)
+    result.diagnostics[#result.diagnostics + 1] = msg
+  end
+
+  local function parse(text)
+    text = text:gsub("^\239\187\191", ""):gsub("\r", "")
+    local lines = vim.split(text, "\n", { plain = true })
+    if not (lines[1] and lines[1]:match("^%-%-%-%s*$")) then
+      return nil
+    end
+    local fields, i, closed = {}, 2, false
+    while i <= #lines do
+      local line = lines[i]
+      if line:match("^%-%-%-%s*$") then
+        closed = true
+        break
+      end
+      local key, value = line:match("^([%w_%-]+):%s*(.-)%s*$")
+      if key then
+        local parts = {}
+        local style = value:match("^[>|][%-+]?%d?[%-+]?$")
+        if not style and value ~= "" then parts[1] = value end
+        while lines[i + 1] and (lines[i + 1]:match("^%s+%S") or lines[i + 1]:match("^%s*$"))
+            and not lines[i + 1]:match("^%-%-%-%s*$") do
+          i = i + 1
+          local piece = lines[i]:match("^%s*(.-)%s*$")
+          if piece ~= "" then parts[#parts + 1] = piece end
+        end
+        if style then
+          fields[key] = table.concat(parts, " ")
+        elseif value == "" and #parts > 0 and parts[1]:match("^[%w_%-]+:") then
+          fields[key] = ""
+        else
+          value = table.concat(parts, " ")
+          local q = value:sub(1, 1)
+          if (q == '"' or q == "'") and #value >= 2 and value:sub(-1) == q then
+            value = value:sub(2, -2)
+          end
+          fields[key] = value
+        end
+      end
+      i = i + 1
+    end
+    if not closed then
+      return nil
+    end
+    return fields
+  end
+
+  local function read_head(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local chunks, n = {}, 0
+    for line in f:lines() do
+      if n >= 400 then
+        f:close()
+        return nil, true
+      end
+      n = n + 1
+      chunks[n] = line
+      local bare = line:gsub("\r$", "")
+      if n == 1 and not bare:gsub("^\239\187\191", ""):match("^%-%-%-%s*$") then break end
+      if n > 1 and bare:match("^%-%-%-%s*$") then break end
+    end
+    f:close()
+    return table.concat(chunks, "\n")
+  end
+
+  local function scan_root(root)
+    local real_root = uv.fs_realpath(root)
+    if not real_root then return end
+    local handle = uv.fs_scandir(real_root)
+    if not handle then return end
+    local dirs = {}
+    while true do
+      local entry, typ = uv.fs_scandir_next(handle)
+      if not entry then break end
+      if typ == nil or typ == "unknown" then
+        local lst = uv.fs_lstat(real_root .. "/" .. entry)
+        typ = lst and lst.type
+      end
+      if typ == "directory" or typ == "link" then dirs[#dirs + 1] = entry end
+    end
+    table.sort(dirs)
+    for _, entry in ipairs(dirs) do
+      local dir = uv.fs_realpath(real_root .. "/" .. entry)
+      local st = dir and uv.fs_stat(dir)
+      local skill_md = st and st.type == "directory" and uv.fs_realpath(dir .. "/SKILL.md")
+      local md_stat = skill_md and uv.fs_stat(skill_md)
+      if skill_md then
+        local prefix = dir == "/" and "/" or dir .. "/"
+        if skill_md:find("%c") then
+          diag(vim.inspect(skill_md) .. ": path contains a control character; skipped")
+        elseif skill_md:sub(1, #prefix) ~= prefix then
+          diag(root .. "/" .. entry .. "/SKILL.md resolves outside its skill directory (" .. skill_md .. "); skipped")
+        elseif not (md_stat and md_stat.type == "file") then
+          diag(skill_md .. ": not a regular file; skipped")
+        else
+          local head, too_long = read_head(skill_md)
+          local fields = parse(head or "")
+          if too_long then
+            diag(skill_md .. ": frontmatter longer than 400 lines; skipped")
+          elseif not fields then
+            diag(skill_md .. ": no YAML frontmatter; skipped")
+          elseif not fields.description or fields.description == "" then
+            diag(skill_md .. ": empty or missing description; skipped")
+          else
+            local name = fields.name
+            if not name or name == "" then
+              name = entry
+              diag(skill_md .. ": missing name; using directory name " .. entry)
+            end
+            if not name:match("^[%w_][%w_%-]*$") then
+              diag(skill_md .. ": name " .. name .. " has characters outside [A-Za-z0-9_-]; skipped")
+            else
+              if name ~= entry then
+                diag(skill_md .. ": name " .. name .. " does not match directory " .. entry)
+              end
+              if #name > 64 or name:find("[^a-z0-9%-]") then
+                diag(skill_md .. ": name " .. name .. " breaks the spec (lowercase a-z, 0-9, '-', at most 64 chars)")
+              end
+              if #fields.description > 1024 then
+                diag(skill_md .. ": description is longer than the spec's 1024 characters")
+              end
+              local prev = result.skills[name]
+              if prev and prev.path ~= skill_md then
+                diag("skill " .. name .. ": " .. skill_md .. " shadows " .. prev.path)
+              end
+              result.skills[name] = {
+                name = name,
+                description = (fields.description:gsub("%c", " "):gsub("%s+", " ")),
+                path = skill_md,
+                dir = dir,
+              }
+            end
+          end
+        end
+      end
+    end
+  end
+
+  local function configured(key, p)
+    if type(p) ~= "string" or p == "" then
+      diag("config." .. key .. " has a " .. type(p) .. " entry; expected a non-empty path string")
+      return nil
+    end
+    local abs = vim.fn.fnamemodify(p, ":p")
+    return #abs > 1 and abs:gsub("/$", "") or abs
+  end
+  for _, key in ipairs({ "skill_roots", "skill_paths" }) do
+    if config[key] ~= nil and type(config[key]) ~= "table" then
+      diag("config." .. key .. " is a " .. type(config[key]) .. "; expected a list of paths")
+    end
+  end
+
+  local home = uv.os_homedir()
+  local roots = {}
+  if type(config.skill_roots) == "table" then
+    for _, r in ipairs(config.skill_roots) do roots[#roots + 1] = configured("skill_roots", r) end
+  elseif home and home ~= "" then
+    roots[#roots + 1] = home .. "/.agents/skills"
+    roots[#roots + 1] = home .. "/.claude/skills"
+    roots[#roots + 1] = vim.fn.stdpath("config") .. "/straps/skills"
+  end
+
+  local real_home = home and uv.fs_realpath(home)
+  local cwd = uv.fs_realpath(vim.fn.getcwd()) or vim.fn.getcwd()
+  local chain, dir = {}, cwd
+  local below_home = real_home ~= nil and (cwd == real_home or cwd:sub(1, #real_home + 1) == real_home .. "/")
+  while dir and dir ~= "" do
+    if below_home and dir == real_home then break end
+    table.insert(chain, 1, dir)
+    local parent = vim.fs.dirname(dir)
+    if not parent or parent == dir then break end
+    dir = parent
+  end
+  for _, d in ipairs(chain) do
+    local base = d == "/" and "" or d
+    roots[#roots + 1] = base .. "/.agents/skills"
+    roots[#roots + 1] = base .. "/.claude/skills"
+  end
+  if type(config.skill_paths) == "table" then
+    for _, p in ipairs(config.skill_paths) do roots[#roots + 1] = configured("skill_paths", p) end
+  end
+
+  for _, root in ipairs(roots) do
+    scan_root(root)
+  end
+  for name in pairs(result.skills) do
+    result.order[#result.order + 1] = name
+  end
+  table.sort(result.order)
+  return result
 end
 ]==],
   })

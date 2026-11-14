@@ -4,12 +4,15 @@
 -- tool.registry_define, loadable via tool.skill (with or without the
 -- "skill." prefix), listed in the "# Skills" system-prompt layer, excluded
 -- from the API tool list, and renderable for .straps.lua persistence.
+-- SKILL.md discovery is off here (its "no skills" case asserts none exist);
+-- tests/skill_dirs_spec.lua covers discovery.
 
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(here, ":p"), ":h:h")
 vim.opt.rtp:prepend(root)
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
 
+require("straps").config.skill_discovery = false
 
 local registry = require("straps.registry")
 require("straps.tools").register()

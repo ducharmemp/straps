@@ -124,6 +124,17 @@ M.config = {
   -- after the auto-discovered AGENTS.md/CLAUDE.md. Paths, absolute or
   -- relative to cwd; unreadable entries are skipped silently.
   instructions_files = {},
+  -- SKILL.md discovery (fn.discover_skills, layers/selfext.lua). false turns
+  -- it off. skill_roots = nil scans the default user roots ~/.agents/skills,
+  -- ~/.claude/skills and stdpath("config")/straps/skills; a list replaces
+  -- them ({} = no user roots). The cwd and its ancestors are scanned for
+  -- .agents/skills and .claude/skills, excluding $HOME and above (every
+  -- ancestor when the cwd is outside $HOME). skill_paths adds roots scanned
+  -- last, so they win a name collision. Entries of both lists expand ~ and
+  -- resolve relative to the cwd.
+  skill_discovery = true,
+  skill_roots = nil,
+  skill_paths = {},
   -- Directory for durable, file-backed session transcripts (*.straps).
   -- session_dir = nil means the computed default:
   -- stdpath("data")/straps/sessions (created on first use). Set it to an

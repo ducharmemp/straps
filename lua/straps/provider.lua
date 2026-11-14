@@ -3656,10 +3656,12 @@ end
 
 local SYSTEM_PROMPT_SKILLS_SRC = [==[
 -- Skills layer of the system prompt: one "- name: doc" line per skill.*
--- entry, so the model knows what knowledge is loadable via tool.skill
--- without paying for the bodies up front. Returns "" when no skills exist
--- (the composition skips the section, keeping the default prompt — and its
--- cache prefix — unchanged).
+-- entry, then one "- name (file: path): description" line per SKILL.md
+-- found by fn.discover_skills that no skill.* entry shadows, so the model
+-- knows what knowledge is loadable via tool.skill without paying for the
+-- bodies up front. A failing or absent fn.discover_skills adds nothing.
+-- Returns "" when no skills exist (the composition skips the section,
+-- keeping the default prompt — and its cache prefix — unchanged).
 return function()
   local registry = require("straps.registry")
   local lines = {}
@@ -3667,6 +3669,16 @@ return function()
     local e = registry.get(name)
     local doc = tostring(e.doc or ""):match("^[^\n]*") or ""
     lines[#lines + 1] = "- " .. name .. (doc ~= "" and (": " .. doc) or "")
+  end
+  local ok, found = pcall(registry.try_call, "fn.discover_skills")
+  if ok and type(found) == "table" and type(found.skills) == "table" and type(found.order) == "table" then
+    for _, name in ipairs(found.order) do
+      local s = found.skills[name]
+      if type(name) == "string" and type(s) == "table" and type(s.path) == "string"
+          and type(s.description) == "string" and not registry.get("skill." .. name) then
+        lines[#lines + 1] = "- " .. name .. " (file: " .. s.path .. "): " .. s.description
+      end
+    end
   end
   return table.concat(lines, "\n")
 end
@@ -3785,7 +3797,7 @@ function M.register()
   define({
     name = "fn.system_prompt_skills",
     kind = "fn",
-    doc = "Skills layer of the system prompt: one line per skill.* entry, loadable via tool.skill.",
+    doc = "Skills layer of the system prompt: one line per skill.* entry and per discovered SKILL.md, loadable via tool.skill.",
     source = SYSTEM_PROMPT_SKILLS_SRC,
   })
   -- Layer fns: the composable seam fn.system_prompt iterates over. Order

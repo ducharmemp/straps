@@ -104,6 +104,7 @@ straps-registry	straps.txt	/*straps-registry*
 straps-send-message-tool	straps.txt	/*straps-send-message-tool*
 straps-session	straps.txt	/*straps-session*
 straps-setup	straps.txt	/*straps-setup*
+straps-skill-files	straps.txt	/*straps-skill-files*
 straps-skills	straps.txt	/*straps-skills*
 straps-steering	straps.txt	/*straps-steering*
 straps-subagents	straps.txt	/*straps-subagents*

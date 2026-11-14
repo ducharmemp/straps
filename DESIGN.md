@@ -178,6 +178,62 @@ Namespacing convention: tools are `tool.<api_name>` where `<api_name>` (the
 part after `tool.`) is what the LLM sees and must match `^[a-zA-Z0-9_-]+$`;
 `skill.<name>` entries are knowledge/prose, not callable capabilities.
 
+### Skills discovered from SKILL.md files
+
+`fn.discover_skills()` (layers/selfext.lua) finds skills in the Agent Skills
+format: a directory holding `SKILL.md` with YAML frontmatter (`name`,
+`description`) and a markdown body. It returns
+`{ skills = {name -> {name, description, path, dir}}, order, diagnostics }`
+and reads each file only up to the closing `---`; a frontmatter longer than 400
+lines skips the file. The root list, scanner and parser live in the entry's
+source string, so a redefinition changes all of them.
+
+- Roots, scanned in order, later wins a name collision (diagnostic):
+  `config.skill_roots` when it is a table, else `~/.agents/skills`,
+  `~/.claude/skills`, `stdpath("config")/straps/skills`; then `.agents/skills`
+  and `.claude/skills` in `getcwd()` and each ancestor, farthest first,
+  excluding `$HOME` and above (realpath compare; every ancestor when the cwd is
+  outside `$HOME`); then `config.skill_paths`. Entries of both config lists
+  expand `~` and resolve against the cwd. `config.skill_discovery = false`
+  returns an empty result.
+- A skill is an immediate subdirectory containing a regular file named
+  `SKILL.md` whose realpath stays inside that subdirectory and contains no
+  control character. Config lists of the wrong type and non-string entries
+  produce diagnostics.
+- The parser is lenient: BOM and CR stripped, quotes stripped, colons kept in
+  values, indented continuation lines joined (blank lines between them
+  skipped), a key whose value is an indented map read as empty, `>`/`|` block
+  scalars (with chomping and indentation indicators) collapsed to one line,
+  indented keys under maps ignored, control characters in the description
+  replaced with spaces. It does not handle YAML comments after a value or
+  escapes inside quoted values. No or unclosed frontmatter or an empty
+  description skips the file; a missing name falls back to the directory name;
+  a name starting with `-` or with characters outside `[A-Za-z0-9_-]` skips it.
+  A name that differs from its directory and the spec limits (lowercase, 64
+  chars, 1024-char description) only warn.
+
+Consumers: `fn.system_prompt_skills` appends
+`- <name> (file: <path>): <description>` per discovered skill that no
+`skill.<name>` registry entry shadows, and `tool.skill` lists them the same
+way and loads one by reading the file at call time (body without frontmatter,
+then the file path, directory, and up to 50 bundled files sorted, at most
+three directory levels deep, skipping `.git` and `node_modules`; a symlink is
+listed only when it points to a regular file inside the directory, and
+symlinked directories are not followed; the list is marked truncated past 50
+files or when entries remain past 2000 scanned). Both call the fn under pcall
+and drop entries whose fields are not strings: an error or an absent entry
+means nothing is discovered, and the prompt is then byte-identical to the
+registry-only output.
+
+Discovered skills are an exception to invariant 1's "registry entries are
+exposed as editable Lua buffers": they are files, never written into the
+registry, so registry_list, registry_get and `registry.dump()` do not show
+them. A `skill.<name>` registry entry shadows the file. The project tier loads
+without a trust gate, like AGENTS.md/CLAUDE.md; its descriptions reach the
+system prompt without a define-time guard check, and guards on `tool.skill`
+see only `{ name }`, not the path read. The prompt line carries the path, and
+the realpath containment check bounds what `tool.skill` reads.
+
 ### Capability metadata on entries
 
 `spec.capability` is an optional string on `define()`: when present it must be
@@ -2192,7 +2248,9 @@ of redefining `fn.system_prompt` wholesale) is documented under
   `"# Environment\n\n"`, else nil), `.skills` (delegates to
   `fn.system_prompt_skills` via `registry.try_call` — an absent entry is
   tolerated — wraps a non-empty result in a `"# Skills\n\n"` preamble, else
-  nil), `.project` (delegates to `fn.system_prompt_project` via
+  nil; the underlying fn lists `skill.*` entries, then discovered SKILL.md
+  files, see "Skills discovered from SKILL.md files"), `.project` (delegates
+  to `fn.system_prompt_project` via
   `registry.call`, wraps a non-empty result in a `"# Project instructions\n\n"`
   preamble, else nil). CONTRACT: every layer fn is called as `(opts)`, not
   `()` — a change from the old composition, where only the core layer received

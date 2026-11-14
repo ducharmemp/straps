@@ -126,6 +126,8 @@ The registry contains four entry types:
 - `fn.*` implements providers, prompts, rendering, and other core behavior.
 - `skill.*` stores reusable knowledge that loads when needed.
 
+Straps also finds Agent Skills on disk: `SKILL.md` directories under `~/.agents/skills`, `~/.claude/skills`, `stdpath("config")/straps/skills`, and `.agents/skills` or `.claude/skills` in the working directory and its ancestors (stopping below `$HOME` when the working directory is inside it). They appear under `# Skills` in the system prompt and load through the `skill` tool. See `:help straps-skill-files`.
+
 Use `:StrapsRegistry` to browse entries. Use `:StrapsEdit {name}` to edit one as Lua. Writing that buffer redefines the entry immediately.
 
 An agent can also define session-scoped entries while it works. Ask it to persist an entry when the improvement belongs in future sessions.

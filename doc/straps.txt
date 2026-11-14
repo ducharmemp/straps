@@ -495,6 +495,14 @@ max_subprocesses	(number|nil) nil -> 2 * CPU count. How many
 			ctx.await until a slot frees. See |straps-subprocesses|.
 instructions_files	(list) {}. Extra memory files included in the system
 			prompt after AGENTS.md/CLAUDE.md.
+skill_discovery		(boolean) true. false turns off SKILL.md discovery
+			(|straps-skill-files|).
+skill_roots		(list|nil) nil -> ~/.agents/skills, ~/.claude/skills,
+			stdpath("config")/straps/skills. A list replaces those
+			user roots; {} scans none. Entries in this list and in
+			skill_paths expand ~ and resolve relative to the cwd.
+skill_paths		(list) {}. Extra skill roots, scanned last, so they win
+			a name collision.
 session_dir		(string|nil) nil -> stdpath("data")/straps/sessions.
 			Where `*.straps` transcripts are written.
 auto_compact_tokens	(number|nil) nil (off). Auto-compact when the estimated
@@ -1296,9 +1304,10 @@ fn.subprocess_acquire({ctx}, {info})
 
 A skill is knowledge, not capability: stored prose (a procedure, a subsystem's
 true shape) loaded into the conversation when its trigger matches. Skills are
-`skill.*` registry entries; the agent lists them with the `skill` tool and
-loads one by name. Define one with `registry_define` (kind "skill", source =
-the prose). Contrast with tools/hooks/fns, which add capability.
+`skill.*` registry entries or SKILL.md files on disk (|straps-skill-files|);
+the agent lists them with the `skill` tool and loads one by name. Define one
+with `registry_define` (kind "skill", source = the prose). Contrast with
+tools/hooks/fns, which add capability.
 
 Two skills ship as builtins: `skill.showing_user` — the full presentation
 guidance behind the core prompt's `# Showing the user` stub, loaded before
@@ -1306,6 +1315,46 @@ building a hand-off view — and `skill.multiplayer`, the protocol for working
 alongside another agent in the same Neovim (see |straps-multiplayer|). Both
 are registered with define_default, so redefining them survives re-running
 setup().
+
+SKILL.md files						*straps-skill-files*
+
+Skills in the Agent Skills format (https://agentskills.io/specification) are
+also found on disk: a directory holding a `SKILL.md` whose YAML frontmatter
+has `name` and `description`, followed by a markdown body.
+`fn.discover_skills` scans these roots in order, and a later root wins a name
+collision:
+
+	~/.agents/skills
+	~/.claude/skills
+	stdpath("config")/straps/skills
+	.agents/skills, then .claude/skills, in the cwd and each ancestor,
+	    farthest first, excluding $HOME and above (every ancestor when
+	    the cwd is outside $HOME)
+	config.skill_paths
+
+Each immediate subdirectory of a root that contains a file named `SKILL.md`
+is one skill. The `# Skills` prompt section lists it as
+`- <name> (file: <path>): <description>`, and the `skill` tool loads its body
+plus a footer naming the skill directory and up to 50 bundled files, sorted,
+at most three directory levels deep (listed, not read; the list is marked
+truncated past 50 files or when entries remain past 2000 scanned).
+
+A name that starts with `-` or has characters outside [A-Za-z0-9_-], an empty
+description, a missing or unclosed frontmatter, or a frontmatter longer than
+400 lines skips the file; other spec violations only warn. Discovered skills
+are files, not registry entries: registry_list and registry_get do not show
+them. A `skill.<name>` registry entry of the same name shadows the file.
+Discovery reruns for each new session and each `skill` call, so an edited
+`SKILL.md` takes effect without a restart.
+
+Project-tier skills load without a trust prompt, like AGENTS.md: a cloned
+repository's skill descriptions enter the system prompt. Each SKILL.md and
+each listed bundled file must resolve inside its skill directory: a bundled
+symlink is listed only when it points to a regular file inside that
+directory, and symlinked directories are not followed. A skill whose path
+contains a control character is skipped. `:checkhealth straps` lists
+discovered skills, shadowed ones, and parse diagnostics. Set
+`skill_discovery = false` to turn discovery off.
 
 ==============================================================================
 11. SUBAGENTS						*straps-subagents*

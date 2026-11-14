@@ -421,6 +421,54 @@ local function check_registry()
   end
 end
 
+local function check_skills()
+  health.start("straps: SKILL.md discovery")
+  local registry = try(function() return require("straps.registry") end)
+  if not registry or not registry.get("fn.discover_skills") then
+    health.info("fn.discover_skills is not registered")
+    return
+  end
+  if config().skill_discovery == false then
+    health.info("config.skill_discovery = false")
+    return
+  end
+  local ok, found = pcall(registry.call, "fn.discover_skills")
+  if not ok then
+    health.error("fn.discover_skills raised: " .. tostring(found))
+    return
+  end
+  if type(found) ~= "table" or type(found.skills) ~= "table" or type(found.order) ~= "table" then
+    health.error("fn.discover_skills returned " .. type(found) .. ", not { skills, order, diagnostics }")
+    return
+  end
+  local valid, malformed = {}, 0
+  for _, name in ipairs(found.order) do
+    local s = type(name) == "string" and found.skills[name]
+    if type(s) == "table" and type(s.path) == "string" and type(s.description) == "string" then
+      valid[#valid + 1] = { name = name, path = s.path }
+    else
+      malformed = malformed + 1
+    end
+  end
+  health.ok(("%d skill%s discovered from cwd %s"):format(#valid, #valid == 1 and "" or "s", vim.fn.getcwd()))
+  for _, v in ipairs(valid) do
+    if registry.get("skill." .. v.name) then
+      health.info(("%s (%s) is shadowed by registry entry skill.%s"):format(v.name, v.path, v.name))
+    else
+      health.info(v.name .. ": " .. v.path)
+    end
+  end
+  if malformed > 0 then
+    health.warn(("fn.discover_skills returned %d malformed entr%s; the prompt and the skill tool ignore them")
+      :format(malformed, malformed == 1 and "y" or "ies"))
+  end
+  if type(found.diagnostics) == "table" then
+    for _, d in ipairs(found.diagnostics) do
+      health.warn(tostring(d))
+    end
+  end
+end
+
 -- config.layers gates whole registration groups (see init.lua's layers
 -- config). A layer left on but missing its sentinel entry means setup()
 -- never ran or its registration failed; a layer turned off is expected
@@ -534,6 +582,7 @@ function M.check()
   check_global()
   check_project()
   check_registry()
+  check_skills()
   check_layers()
   check_model()
   check_runs()

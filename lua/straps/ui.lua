@@ -66,7 +66,7 @@ local render_ns = vim.api.nvim_create_namespace("straps_render")
 local RULE_WIDTH = 52 -- fixed-ish width of the turn rules / card art
 local effective_provider -- defined near picker helpers; session_status uses it earlier
 -- The one winbar option value straps installs (the ui.winbar dispatcher). A
--- constant so both install sites and the opt-out clear in show_session
+-- constant so both install sites and the opt-out clear in present_session
 -- compare against the same string.
 local WINBAR_EXPR = "%{%v:lua.require'straps.ui'.winbar()%}"
 local winbars = {}
@@ -702,35 +702,23 @@ local function open_in_window(bufnr, split_cmd)
   return false
 end
 
--- Given a session transcript bufnr, open it in a split with its <CR> keymap
--- (send, or prompt to steer if a run is active) and idle status, after
--- loading the project registry. This is the whole "session stack" now: one
--- ordinary buffer, edited like any other — the transcript IS the input;
--- type your message under the trailing %%[straps:user]%% marker (anywhere,
--- really: editing earlier history is a feature) and press <CR>.
--- open_session and resume_session differ ONLY in how they obtain the
--- transcript bufnr (new_session vs open_session_file).
---- Public so callers holding a live session bufnr (e.g. the running-agents
---- picker) can bring it on-screen with the full session wiring.
---- @param bufnr integer session transcript buffer
---- @param split_cmd string? the :split command to open the window with;
----   defaults to "split" (horizontal). Pass "vertical split" for a vsplit,
----   or any modifier chain ("botright vsplit", "leftabove split", ...). The
----   user commands derive this from <mods>, so `:vertical Straps` just works.
----   The sentinel "none" reuses the current window (oil-style) via :buffer
----   instead of splitting, recording a jumplist entry so <C-o>/<C-i> navigate
----   back to the replaced buffer and forward again. A window in the current
----   tab already showing bufnr is focused instead of opening another.
-function M.show_session(bufnr, split_cmd)
-  -- Global corpus (stdpath("config")/straps/init.lua, if any): the user's
-  -- cwd-independent library of skills/tools/hooks/fns, loaded FIRST so a
-  -- project .straps.lua below can override an entry (later define wins).
-  -- Project registry (trusted .straps.lua, if any) loads next, so
-  -- project-defined tools exist for the session's first request and land
-  -- after the builtins in seq order (append-only, cache-safe). pcall:
-  -- opening a session must never fail because either file is broken.
+-- Global corpus (stdpath("config")/straps/init.lua, if any): the user's
+-- cwd-independent library of skills/tools/hooks/fns, loaded FIRST so a
+-- project .straps.lua can override an entry (later define wins). Project
+-- registry (trusted .straps.lua, if any) loads next, so project-defined
+-- tools exist for the session's first request and land after the builtins
+-- in seq order (append-only, cache-safe). pcall: opening a session must
+-- never fail because either file is broken.
+local function load_registries()
   pcall(require("straps").load_global_registry)
   pcall(require("straps").load_project_registry)
+end
+
+-- Open a loaded session transcript in a window with its <CR> keymap (send,
+-- or prompt to steer if a run is active), idle status, folds and rendering.
+-- Registry loading is the caller's job: open_session loads before
+-- state.new_session builds the system prompt, show_session loads here.
+local function present_session(bufnr, split_cmd)
   open_in_window(bufnr, split_cmd)
   -- Don't stomp a live status: a running subagent brought on-screen by the
   -- agents picker is still "running".
@@ -759,6 +747,23 @@ function M.show_session(bufnr, split_cmd)
   M.map_session_keys(bufnr)
   vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(bufnr), 0 })
   return bufnr
+end
+
+--- Bring a session transcript on-screen with the full session wiring, after
+--- loading the global corpus and the project registry. Public so callers
+--- holding a live session bufnr (e.g. the running-agents picker) can use it.
+--- @param bufnr integer session transcript buffer
+--- @param split_cmd string? the :split command to open the window with;
+---   defaults to "split" (horizontal). Pass "vertical split" for a vsplit,
+---   or any modifier chain ("botright vsplit", "leftabove split", ...). The
+---   user commands derive this from <mods>, so `:vertical Straps` just works.
+---   The sentinel "none" reuses the current window (oil-style) via :buffer
+---   instead of splitting, recording a jumplist entry so <C-o>/<C-i> navigate
+---   back to the replaced buffer and forward again. A window in the current
+---   tab already showing bufnr is focused instead of opening another.
+function M.show_session(bufnr, split_cmd)
+  load_registries()
+  return present_session(bufnr, split_cmd)
 end
 
 --- The grantable permission categories (fn.capability() with no args).
@@ -823,6 +828,7 @@ function M.open_session(split_cmd, opts)
     vim.g.straps_stdin_buf = nil
   end
 
+  load_registries()
   local bufnr = state.new_session()
   for _, c in ipairs(grants) do
     registry.grant(bufnr, "cap:" .. c)
@@ -841,7 +847,7 @@ function M.open_session(split_cmd, opts)
   if stdin_buf then
     vim.bo[stdin_buf].bufhidden = "hide"
   end
-  M.show_session(bufnr, reuse and "none" or split_cmd)
+  present_session(bufnr, reuse and "none" or split_cmd)
   if stdin_buf then
     pcall(vim.api.nvim_buf_delete, stdin_buf, { force = true })
   end
@@ -2610,7 +2616,7 @@ end
 --- only when the treesitter highlighter owns the buffer — under legacy syntax
 --- the strapsFileRef rule in syntax/straps.vim already does this. matchadd is
 --- window-local with the same set-while-hidden trap as the fold options (see
---- apply_fold_opts), so the ftplugin, show_session and the FileType autocmd
+--- apply_fold_opts), so the ftplugin, present_session and the FileType autocmd
 --- all call this, guarded per-window by the returned match id.
 function M.apply_file_ref_match(bufnr)
   if not vim.treesitter.highlighter.active[bufnr] then

@@ -467,11 +467,13 @@ transcript format is already plain text, so buffer content == file content.
   Called from `ui.resume_session`, not from the loop.
 
 **ui.lua** — `open_session()` is unchanged in spirit (new_session is now
-durable; the `<CR>` keymap, folding, load_project_registry all stay). Add
+durable; the `<CR>` keymap, folding, load_project_registry all stay); it runs
+load_global_registry and load_project_registry BEFORE `state.new_session`, so
+the new session's system prompt lists their entries. Add
 `resume_session(path?)`: same split, but opens the transcript via
 `state.open_session_file` instead of new_session; path nil → most recent from
 list_sessions (none → notify + fall through to a new session). Still runs
-load_project_registry. Runs `state.heal_interrupted` on the reopened buffer and
+load_global_registry and load_project_registry (via show_session). Runs `state.heal_interrupted` on the reopened buffer and
 notifies when it repaired anything, so a session interrupted mid-tool is
 sendable again rather than permanently rejected by the API.
 
@@ -1637,9 +1639,11 @@ mechanics (trigger language in the tool doc itself lifts usage).
   and returned, never thrown. Track path in-memory so the same file executes
   at most once per nvim session; a file that FAILS is not marked, so a fixed
   file retries next session.
-- Called from `ui.show_session()` (pcall-wrapped) BEFORE
-  `load_project_registry`, so a project `.straps.lua` can OVERRIDE a global
-  entry (later `define` wins), and both land after builtins in seq order.
+- Called (pcall-wrapped) from `ui.open_session()` before `state.new_session`
+  builds the system prompt, and from `ui.show_session()` (resume, picker),
+  in both cases BEFORE `load_project_registry`, so a project `.straps.lua` can
+  OVERRIDE a global entry (later `define` wins), and both land after builtins
+  in seq order.
 - Plain Lua — `registry.define` calls; `registry.dump()` output is valid
   content — same shape as `.straps.lua`. A dumped entry pins the source it had
   when dumped and replaces the default, so a corpus dumped from an older
@@ -1663,8 +1667,10 @@ mechanics (trigger language in the tool doc itself lifts usage).
   2)`; Yes → persist hash + execute; anything else (incl. headless 0) →
   skip, notify once. NEVER execute untrusted content silently.
 - Called from `ui.open_session()` (pcall-wrapped) BEFORE state.new_session,
-  so project-defined tools exist for the session's first request and land
-  after builtins in seq order (append-only, cache-safe).
+  so project-defined entries reach the new session's system prompt and tools
+  exist for its first request, landing after builtins in seq order
+  (append-only, cache-safe). `ui.show_session()` (resume, picker) also calls
+  it; the once-guard makes the repeat a no-op for trusted content.
 - The file itself is plain Lua — `registry.define` calls; `registry.dump()`
   output is valid content. The save-back convention is documented in
   `doc/straps.txt` under `straps-registry`.
@@ -2505,7 +2511,8 @@ from `state.list_blocks` (no new state, no new parse):
   (subagents) get `bufnr` items rather than a filename.
 
 `ui.map_navigation(bufnr)` installs both, called from the same two sites as
-`map_file_refs` (show_session and the FileType autocmd).
+`map_file_refs` (present_session, used by open_session and show_session, and
+the FileType autocmd).
 
 ### Command-style tool display (fn.tool_display)
 
@@ -2621,8 +2628,8 @@ Existing suites must all still pass.
   only), sets `bufhidden=hide` on it (so the takeover below survives
   `set nohidden`), then force-deletes it; (2) window reuse: when no
   `<mods>` were given and the current buffer is the stdin buffer or the
-  empty unnamed startup buffer, the session takes over that window via
-  `show_session(bufnr, "none")`; `nvim file +Straps` still splits. Caveat:
+  empty unnamed startup buffer, the session takes over that window (split_cmd
+  "none"); `nvim file +Straps` still splits. Caveat:
   a plugin manager that loads straps on first use of the `Straps` command
   sources plugin/straps.lua after `StdinReadPost` fired, so stdin is not
   captured; load at startup for the stdin form. `:StrapsResume` takes no

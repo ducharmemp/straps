@@ -287,3 +287,64 @@ it("broken global file: no throw, not marked loaded (retried next session)", fun
   assert(loaded2 == true, "fixed global file must load on retry (not blocked by the guard)")
   assert(_G.STRAPS_GLOBAL_FIXED == true, "fixed global file did not execute on retry")
 end)
+
+-- ==================================================================
+-- Load order: ui.open_session loads both registries BEFORE
+-- state.new_session builds the system prompt, so entries from either file
+-- reach the FIRST session's prompt. A fresh headless Neovim gives clean
+-- once-guards and a real stdpath("config").
+-- ==================================================================
+it("open_session's system prompt includes skills from init.lua and .straps.lua", function()
+  local base = tmp .. "/order"
+  local cfg = base .. "/xdg_config"
+  local proj = base .. "/proj"
+  vim.fn.mkdir(cfg .. "/nvim/straps", "p")
+  vim.fn.mkdir(proj, "p")
+  write_file(cfg .. "/nvim/straps/init.lua", [[
+require("straps.registry").define({ name = "skill.order_global", kind = "skill",
+  doc = "order-global-doc", source = "g" })
+require("straps.registry").define({ name = "skill.order_both", kind = "skill",
+  doc = "order-both-from-global", source = "g" })
+]])
+  local proj_src = [[
+require("straps.registry").define({ name = "skill.order_project", kind = "skill",
+  doc = "order-project-doc", source = "p" })
+require("straps.registry").define({ name = "skill.order_both", kind = "skill",
+  doc = "order-both-from-project", source = "p" })
+]]
+  write_file(proj .. "/.straps.lua", proj_src)
+  local data = base .. "/xdg_data"
+  vim.fn.mkdir(data .. "/nvim/straps", "p")
+  write_file(data .. "/nvim/straps/trusted.json",
+    vim.json.encode({ [vim.fn.fnamemodify(proj .. "/.straps.lua", ":p")] = vim.fn.sha256(proj_src) }))
+  local out_file = base .. "/prompt.txt"
+  write_file(base .. "/run.lua", ([[
+local ok, err = pcall(function()
+  require("straps").setup({ session_dir = %q, skill_discovery = false })
+  local b = require("straps.ui").open_session()
+  local f = assert(io.open(%q, "w"))
+  f:write(table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n"))
+  f:close()
+end)
+if not ok then
+  io.stderr:write(tostring(err) .. "\n")
+  vim.cmd("cquit 1")
+end
+vim.cmd("qall!")
+]]):format(base .. "/sessions", out_file))
+  vim.fn.mkdir(base .. "/home", "p")
+  local res = vim.system({ vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
+    "--cmd", "set rtp^=" .. vim.fn.fnameescape(root),
+    "-c", "luafile " .. vim.fn.fnameescape(base .. "/run.lua") },
+    { cwd = proj, text = true,
+      env = { HOME = base .. "/home", NVIM_APPNAME = "nvim", XDG_CONFIG_HOME = cfg, XDG_DATA_HOME = data,
+        XDG_STATE_HOME = base .. "/xdg_state" } }):wait(30000)
+  assert(res.code == 0, "child nvim failed (code " .. tostring(res.code) .. "): " .. tostring(res.stderr))
+  local prompt = read_file(out_file)
+  assert(prompt:find("- skill.order_both: order-both-from-project", 1, true),
+    ".straps.lua must load after init.lua so its entry wins")
+  assert(prompt:find("- skill.order_global: order-global-doc", 1, true),
+    "init.lua skill missing from the first session's prompt")
+  assert(prompt:find("- skill.order_project: order-project-doc", 1, true),
+    ".straps.lua skill missing from the first session's prompt")
+end)

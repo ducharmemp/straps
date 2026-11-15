@@ -3,6 +3,12 @@ local M = {}
 function M.new(resolve)
   local records, categories = {}, {}
   local revision = 0
+  local extensions = require("straps.extension_policy")
+  local function category_for(scope, identity, name)
+    if categories[identity] ~= nil then return categories[identity] end
+    local entry = resolve and resolve(scope, name)
+    if entry and entry.identity == identity then return extensions.tool_category(entry) end
+  end
   local grantable = { edit = true, delete = true, exec = true, lua = true, net = true, spawn = true }
   local function normalize(spec, scope)
     assert(type(spec) == "table" and (spec.readonly == nil or type(spec.readonly) == "boolean"), "invalid ceiling specification")
@@ -22,7 +28,8 @@ function M.new(resolve)
       else
         local definition = resolve and resolve(scope, "tool." .. key)
         assert(definition and definition.kind == "tool", "unknown ceiling tool grant")
-        identities[definition.identity] = true
+        assert(not extensions.protected(definition.name), "protected definition tool is never grantable")
+        identities[definition.identity] = definition.name
       end
     end
     return { parent = spec.parent, restricted = spec.readonly == true or spec.allow ~= nil, allow = allow, identities = identities }
@@ -47,7 +54,7 @@ function M.new(resolve)
       if name == "send_message" and type(input) == "table" and input.to == "parent" then return true end
     end
     if category == "define" then return false end
-    return record.identities[definition.identity] == true or record.allow[category] == true
+    return record.identities[definition.identity] ~= nil or record.allow[category] == true
   end
   local function reclaim(bufnr)
     local record = records[bufnr]
@@ -85,8 +92,8 @@ function M.new(resolve)
       assert(not old.restricted or record.restricted, "cannot widen ceiling")
       if old.restricted then
         for key in pairs(record.allow) do assert(old.allow[key], "cannot widen ceiling") end
-        for key in pairs(record.identities) do
-          local category = categories[key]
+        for key, name in pairs(record.identities) do
+          local category = category_for(bufnr, key, name)
           assert(old.identities[key] or (type(category) == "string" and old.allow[category]), "cannot widen ceiling")
         end
       end
@@ -106,8 +113,8 @@ function M.new(resolve)
           for category in pairs(candidate.allow) do
             if not record.allow[category] then return false end
           end
-          for identity in pairs(candidate.identities) do
-            local category = categories[identity]
+          for identity, name in pairs(candidate.identities) do
+            local category = category_for(child, identity, name)
             if not record.identities[identity] and not (type(category) == "string" and record.allow[category]) then return false end
           end
         end
@@ -121,7 +128,9 @@ function M.new(resolve)
     end,
     check = function(bufnr, definition, input)
       if not records[bufnr] or records[bufnr].closed then return false, "capability ceiling unavailable" end
-      local category = categories[definition.identity] or "agent_tool"
+      local stored = resolve and resolve(bufnr, definition.name)
+      if not stored or stored.identity ~= definition.identity then return false, "tool definition changed" end
+      local category = category_for(bufnr, stored.identity, stored.name) or "agent_tool"
       if type(category) == "function" then
         local detached = vim.deepcopy(input)
         local co = coroutine.create(category)

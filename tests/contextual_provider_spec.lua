@@ -51,6 +51,11 @@ vim.fn.exepath = function(name) assert.equals("curl", name); return tmp .. "/cur
 vim.system = function(argv, opts, done)
   calls = calls + 1
   capture = { argv = vim.deepcopy(argv), opts = opts, body = vim.json.decode(opts.stdin) }
+  for i, arg in ipairs(argv) do
+    if arg == "--header" and argv[i + 1]:sub(1, 1) == "@" then
+      capture.headers = table.concat(vim.fn.readfile(argv[i + 1]:sub(2)), "\n")
+    end
+  end
   process = { kills = {}, stdout = opts.stdout, done = done, kill = function(self, signal) self.kills[#self.kills + 1] = signal end }
   if before_dispatch then before_dispatch() end
   if spawn_error then error("offline spawn exception") end
@@ -161,7 +166,9 @@ describe("configured contextual provider", function()
     assert.is_true(capture.opts.clear_env)
     assert.same({}, capture.opts.env)
     assert.equals("-q", capture.argv[2])
-    assert.equals("https://api.openai.com/v1/responses", capture.argv[#capture.argv])
+    assert.is_true(vim.tbl_contains(capture.argv, "https://api.openai.com/v1/responses"))
+    assert.is_nil(table.concat(capture.argv, " "):find("offline-test-key", 1, true))
+    assert.equals("Authorization: Bearer offline-test-key", capture.headers)
     assert.is_nil(vim.json.encode(adapter.identity):find("offline%-test%-key"))
     adapter.identity.model = "mutated"
     assert.equals("gpt-6.1-sol", adapter.resolve_identity().model)
@@ -170,7 +177,8 @@ describe("configured contextual provider", function()
     write(tmp .. "/openai_oauth.json", vim.json.encode({ access = "offline-oauth-token", refresh = "never-transmit", expires = 9999999999999 }))
     local adapter = assert(construct(config()))
     assert.equals("{}", send(adapter).text)
-    assert.is_truthy(table.concat(capture.argv, " "):find("Bearer offline-oauth-token", 1, true))
+    assert.is_nil(table.concat(capture.argv, " "):find("offline-oauth-token", 1, true))
+    assert.equals("Authorization: Bearer offline-oauth-token", capture.headers)
     assert.is_nil(capture.opts.stdin:find("offline-oauth-token", 1, true))
     assert.is_nil(capture.opts.stdin:find("never-transmit", 1, true))
     assert.is_nil(vim.json.encode(adapter.identity):find("offline-oauth-token", 1, true))

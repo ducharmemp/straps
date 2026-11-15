@@ -25,7 +25,7 @@ vim.env.PATH = tmp .. "/bin:" .. vim.env.PATH
 local fake = ([[#!/usr/bin/env bash
 D=%q
 N=$(cat "$D/n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/n"
-printf '%%s\n' "$*" >> "$D/argv"
+printf '%%s\n' "$(for arg in "$@"; do case "$arg" in @/*) tr '\n' ' ' < "${arg#@}";; esac; done) $*" >> "$D/argv"
 BODY=$(cat)
 printf '%%s' "$BODY" > "$D/stdin.$N"
 case "$*" in
@@ -44,7 +44,7 @@ case "$*" in
     fi
     ;;
   *v1/responses*)
-    if printf '%%s' "$*" | grep -q 'Bearer acc-old'; then
+    if for arg in "$@"; do case "$arg" in @/*) cat "${arg#@}";; esac; done | grep -q 'Bearer acc-old'; then
       printf '{"error":{"message":"expired","type":"invalid_request_error"}}'
       echo "STRAPS_HTTP_STATUS:401" >&2
     else

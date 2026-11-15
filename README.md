@@ -115,7 +115,7 @@ Session windows show a model/status winbar. Leaving the buffer or window removes
 
 The transcript is the session state. You can use normal Vim editing to revise history before the next request.
 
-Straps renders the transcript as a conversation and folds tool calls, harness notices, and agent messages by default. The underlying text remains visible with `:set conceallevel=0`.
+Straps renders the transcript as a conversation and folds tool calls, harness notices, and agent messages by default. Switching buffers or splits configures transcript folds in each window while preserving existing windows' open and closed folds. The underlying text remains visible with `:set conceallevel=0`.
 
 ### From the shell
 
@@ -125,7 +125,7 @@ Start Neovim in a working session:
 printf 'context for the task' | nvim - +'Straps! edit,exec -- fix the failing test'
 ```
 
-`edit,exec` grants those permission categories to the session, the same set `:StrapsAuto` accepts (`edit`, `delete`, `exec`, `lua`, `net`, `spawn`; `all` grants every one; `registry_define` and agent-defined tools still prompt). The text after `--` is the request; piped stdin is appended to it. `!` sends the request at once. Each part is optional: `nvim +Straps` opens an empty session in the startup window. A plugin manager that loads straps on first use of the `Straps` command misses the piped text; load it at startup for the stdin form. See `:help :Straps`.
+`edit,exec` grants those permission categories to the session, the same set `:StrapsAuto` accepts (`edit`, `delete`, `exec`, `lua`, `net`, `spawn`; `all` grants every one; `define` and unknown global tools still prompt). The text after `--` is the request; piped stdin is appended to it. `!` sends the request at once. Each part is optional: `nvim +Straps` opens an empty session in the startup window. A plugin manager that loads straps on first use of the `Straps` command misses the piped text; load it at startup for the stdin form. See `:help :Straps`.
 
 ## Malleable tooling
 
@@ -140,7 +140,9 @@ Straps also finds Agent Skills on disk: `SKILL.md` directories under `~/.agents/
 
 Use `:StrapsRegistry` to browse entries. Use `:StrapsEdit {name}` to edit one as Lua. Writing that buffer redefines the entry immediately.
 
-An agent can also define session-scoped entries while it works. Ask it to persist an entry when the improvement belongs in future sessions.
+An agent can also define session-scoped entries while it works. The `lua` grant covers structurally valid session-local tool, hook, and function definitions and calls to session-scoped tools without explicit trusted capability metadata, including later revisions. Session skills use the permission-free `read` category even though definitions change the session registry. Ask it to persist an entry when the improvement belongs in future sessions.
+
+Direct global definitions, malformed or unclassified definition requests, and definitions of `hook.confirm`, `fn.capability`, `fn.readonly_policy`, `tool.registry_define`, `hook.guard`, and `hook.guard.*` use `define` and require confirmation. `registry_define` has no blanket “Always this tool” approval or tool-name grant bypass; invoking its session shadow also remains `define`. Unknown global tools remain `agent_tool`. These are dispatch rules, not a Lua sandbox: approved Lua runs with Neovim process privileges. A `lua`-enabled restricted child may use ordinary session extensions, and a readonly child may define session skills; bare `allow={"registry_define"}` is denied. Contextual dispatch retains ancestor ceiling checks and definition identities. Transcript excision permissions are unchanged. Combined manual approval for defining and using an extension is deferred.
 
 ### Persistent entries
 
@@ -284,9 +286,13 @@ Each session buffer carries `b:straps_status` ("running" or "idle"). `b:straps_r
 
 Straps is not a sandbox. Approved commands, Lua, file changes, and trusted registry files run with your user privileges.
 
-Every tool call passes a guard chain you install in `stdpath("config")/straps/init.lua` and the agent cannot modify (`:help straps-guards`). No guard ships by default. A guard is a filter and a tripwire, not a boundary: an approved `eval_lua` or `bash` call runs in the same Lua state as the guard.
+Every tool call enters the registry gate. Restricted-child permissions run before the guard chain and again before execution; the child's confirmation hook delegates to the same `registry.child_permission` check. The `spawn:gated` marker survives every `clear_grants` prefix until session disposal. Install guards in `stdpath("config")/straps/init.lua`; the agent cannot modify the frozen chain (`:help straps-guards`). No guard ships by default.
+
+Ordinary gates bind the session, cancellation function, original context, working directory, tool definition, and resolution scope. Nested calls inherit a private per-coroutine binding throughout the gate and tool body. A nested coroutine, including `coroutine.wrap`, can inherit an unambiguous in-flight binding matching the active session; conflicting bindings or supplied context mismatches reject the call. Direct `registry.call("tool.*")` calls do not add ordinary manual confirmation. Trusted context-free calls remain available outside gated scopes. Arbitrary Lua manipulation of `set_active_scope` and independent asynchronous escapes remain deferred; these checks do not sandbox approved Lua or shell commands.
 
 Subprocesses the tools `bash`, `run_in_terminal`, `run_quickfix`, `grep` and `fetch_url` start share one semaphore across every session in the Neovim, default 2 × CPU count (`max_subprocesses`), halved while the load average exceeds 2 × CPU count, so N sessions together do not start N times one session's processes. The limit, the counter and the admission mechanism are each a redefinable `fn` (`:help straps-subprocesses`). Outside the gate: the provider's `curl` and `gzip`, and whatever a gated command starts on its own (`xargs -P`, `parallel`, `for … & done`).
+
+Provider subprocesses receive authentication through mode-600 temporary header files, removed on process exit, cancellation, or spawn failure. Their arguments contain no authentication header values, and their environments exclude `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LLAMACPP_API_KEY`, and `LLAMA_API_KEY`. Curl's default config is disabled. These measures do not protect against root, processes with the same user's file access, process-memory inspection, or abrupt Neovim termination leaving temporary files.
 
 Providers receive API credentials and full conversation payloads. Session transcripts persist under Neovim's data directory and can contain prompts, source code, and tool output.
 

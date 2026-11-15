@@ -1,14 +1,5 @@
 -- tests/messaging_spec.lua — agent-to-agent messages and their attribution.
 --   busted tests/messaging_spec.lua
--- No network: fn.provider is scripted per case. Covers state.notice_of /
--- state.agent_message (the `[straps] ` content convention), session_summary
--- never titling a session with a notice, tool.send_message's two delivery
--- paths (steering into a running peer, an appended block on an idle one that
--- is NOT started), its target validation and byte cap, fn.capability's spawn
--- classification, and the gated-child rules through REAL readonly children:
--- to="parent" passes the child-scope confirm hook, a peer target is denied
--- by it, a depth-2 grandchild reaches its own parent through the inherited
--- hook, and a gated child with a name grant cannot reach outside its family.
 -- Also covers spawn_wait's early return on queued steering (a child's
 -- message, user steering), the released claim of a still-running child, the
 -- stall detector ignoring re-waits, and the source carried by queued entries.
@@ -246,9 +237,6 @@ end)
 
 -- ------------------------------------------------ gated children, for real
 
--- A readonly child whose scripted run calls send_message twice — once to its
--- parent, once to a stranger — and then finishes. The child-scope confirm
--- hook (defined by tool.spawn) decides each call.
 local function gated_provider(stranger)
   define("fn.provider", "fn", "test: readonly child sends two messages", ([[
 return function(req, ctx)
@@ -290,7 +278,7 @@ it("a readonly child may message its parent but not a peer", function()
   end
   assert(child, "gated child not found")
   assert(text_of(child):find("readonly subagent: send_message is not allowed", 1, true),
-    "the peer send should be denied by the child-scope hook:\n" .. text_of(child):sub(-500))
+    "the peer send should be denied by the common gate:\n" .. text_of(child):sub(-500))
 end)
 
 it("a gated child with a send_message grant still cannot leave its family", function()
@@ -356,7 +344,7 @@ end]])
     else
       assert(not text_of(recipient):find("GATED-OUT", 1, true), "readonly child must not reach its sibling")
       assert(text_of(sender):find("readonly subagent: send_message is not allowed", 1, true),
-        "readonly sibling denial must come from the child confirm hook")
+        "readonly sibling denial must come from the child permission gate")
     end
   end)
 end
@@ -365,6 +353,7 @@ for _, relationship in ipairs({ "nil parent", "invalid parent", "non-session par
   it("the gated send_message body denies a " .. relationship .. " target", function()
     local sender, target = state.new_session(), state.new_session()
     registry.grant(sender, "spawn:gated")
+    registry.grant(sender, "cap:spawn")
     if relationship == "invalid parent" or relationship == "non-session parent" then
       local shared = vim.api.nvim_create_buf(true, false)
       if relationship == "invalid parent" then vim.api.nvim_buf_delete(shared, { force = true }) end
@@ -472,7 +461,7 @@ end]]):format(stranger, stranger))
     local gtxt = text_of(grand)
     assert(gtxt:find("MIDDLE-DOWN", 1, true), "a gated spawner should reach its own child:\n" .. gtxt:sub(-800))
     assert(gtxt:find("readonly subagent: send_message is not allowed", 1, true),
-      "the grandchild's peer send should be denied by its inherited hook")
+      "the grandchild's peer send should be denied by the common gate")
     assert(mtxt:find("may message only its parent, its own children, or its immediate siblings", 1, true),
       "the middle's peer send should be refused in the tool body:\n" .. mtxt:sub(-800))
     local stxt = text_of(stranger)

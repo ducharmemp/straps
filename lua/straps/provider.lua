@@ -562,10 +562,10 @@ local function discover(provider_override, ctx)
 
   if ctx then
     return parse(ctx.await(function(resolve)
-      vim.system(argv, { text = true, timeout = 15000 }, resolve)
+      require("straps.provider_transport").system(argv, { text = true, timeout = 15000 }, resolve)
     end))
   end
-  return parse(vim.system(argv, { text = true }):wait(15000))
+  return parse(require("straps.provider_transport").system(argv, { text = true }):wait(15000))
 end
 
 return function(provider_override, on_done)
@@ -955,7 +955,7 @@ return function(req, ctx, opts)
   local wire, wire_headers = payload, {}
   if config.gzip ~= false and opts.gzip ~= false and vim.fn.executable("gzip") == 1 then
     local gz = ctx.await(function(resolve)
-      local ok_spawn, p = pcall(vim.system, { "gzip", "-c", "-6" }, { stdin = payload }, resolve)
+      local ok_spawn, p = pcall(require("straps.provider_transport").system, { "gzip", "-c", "-6" }, { stdin = payload }, resolve)
       if not ok_spawn then
         resolve(nil)
         return
@@ -1173,7 +1173,7 @@ return function(req, ctx, opts)
       "-w", "%{stderr}\nSTRAPS_HTTP_STATUS:%{http_code}\n",
       "--data-binary", "@-",
     })
-    local ok_spawn, spawned = pcall(vim.system, argv, { stdin = wire, stdout = on_stdout }, function(res)
+    local ok_spawn, spawned = pcall(require("straps.provider_transport").system, argv, { stdin = wire, stdout = on_stdout }, function(res)
       watchdog_close()
       if ctx.cancelled() then
         resolve({ ok = true, cancelled = true, content = {}, stop_reason = "cancelled" })
@@ -1726,7 +1726,7 @@ return function(req, ctx)
       "-w", "%{stderr}\nSTRAPS_HTTP_STATUS:%{http_code}\n",
       "--data-binary", "@-",
     })
-    local ok_spawn, spawned = pcall(vim.system, argv, { stdin = payload, stdout = on_stdout }, function(res)
+    local ok_spawn, spawned = pcall(require("straps.provider_transport").system, argv, { stdin = payload, stdout = on_stdout }, function(res)
       watchdog_close()
       if ctx.cancelled() then
         resolve({ ok = true, cancelled = true, content = {}, stop_reason = "cancelled" })
@@ -2439,7 +2439,7 @@ return function(form, cb, opts)
     "--data-binary", "@-",
     "-w", "\nSTRAPS_HTTP_STATUS:%{http_code}\n",
   }
-  local ok, err = pcall(vim.system, argv, { stdin = form, text = true }, vim.schedule_wrap(function(res)
+  local ok, err = pcall(require("straps.provider_transport").system, argv, { stdin = form, text = true }, vim.schedule_wrap(function(res)
     local out = res.stdout or ""
     local status = tonumber(out:match("STRAPS_HTTP_STATUS:(%d+)"))
     out = out:gsub("%s*STRAPS_HTTP_STATUS:%d+%s*$", "")
@@ -3423,6 +3423,23 @@ and vanish when the session closes — experiment freely, you cannot
 pollute other sessions. Pass scope:"global" only when the user asks for
 a change to every session in this Neovim.
 
+The lua category covers structurally valid session-local tool/hook/fn
+registry_define requests and calls to session-scoped tools without explicit
+trusted capability metadata. Session skills use the permission-free read
+category, although defining one changes the session registry. Direct global
+or malformed/unclassified definitions, and definitions of hook.confirm,
+fn.capability, fn.readonly_policy, tool.registry_define, hook.guard and
+hook.guard.*, use define and require confirmation. registry_define has no
+blanket Always this tool approval or tool-name grant bypass. Invoking a
+session shadow of tool.registry_define remains define. Unknown global tools
+remain agent_tool. A lua-enabled restricted child may use ordinary session
+extensions; a readonly child may define session skills. A bare
+allow={"registry_define"} is denied. Contextual dispatch retains ancestor
+ceilings and definition identities. These rules classify dispatched direct
+requests; arbitrary Lua retains process privileges and is not sandboxed.
+Transcript excision permissions are unchanged. Manual combined approval for
+defining and using an extension is deferred.
+
 Redefinition is immediate: the very next call uses the new code, even
 mid-run. The tool list sent to the API is rebuilt from the registry on
 every request, so a tool you define now is callable on your next turn.
@@ -3523,8 +3540,10 @@ prompting, except send_message{to="parent"}, which is allowed so you can
 report a blocker to the session that spawned you (it is appended there if
 that session is idle, and read at its next turn if it is running, ending a
 spawn_wait it is blocked in), and watch_agent / unwatch_agent for any agent.
-Watches may wake this session to audit another agent.
-Investigate and report; do not attempt writes or workarounds, and mark
+Watches may wake this session to audit another agent. Session skill definitions
+through registry_define are classified read and are also permitted, although
+they change the session registry. Investigate and report; do not attempt other
+writes or workarounds, and mark
 conclusions you could not verify empirically as such.]]
     end
     if type(opts.tools) == "table" and #opts.tools > 0 then

@@ -65,6 +65,10 @@ local function resources_restored()
   check(vim.api.nvim_get_current_win() == fixture.user_win, "user window focus restored")
 end
 
+local function session_id(id, bufnr)
+  return type(id) == "string" and id:match("^straps/[^/:%c]+/" .. bufnr .. "$") ~= nil
+end
+
 local function start(cancel_first, draw_error)
   fixture.cancel_first = cancel_first
   fixture.input = {
@@ -81,9 +85,10 @@ local function start(cancel_first, draw_error)
     end
   end
   loop.start(fixture.buf)
-  check(fixture.ctx ~= nil and loop.running(fixture.buf), "admitted loop suspended in actual ctx.await")
+  check(fixture.ctx ~= nil and loop.running(fixture.buf) == not cancel_first,
+    cancel_first and "cancelled call refused before awaiting" or "admitted loop suspended in actual ctx.await")
   fixture.id = (fixture.sent[1] or ""):match("^\27%]7501;app=straps:id=([^:]+):state=working\27\\$")
-  check(fixture.id ~= nil and fixture.id:match("^straps/%d+%-%d+/" .. fixture.buf .. "$") ~= nil,
+  check(session_id(fixture.id, fixture.buf),
     "initial working report identifies the admitted session buffer")
 end
 
@@ -141,6 +146,20 @@ after_each(function()
   _G.straps_terminal_options_fixture = nil
 end)
 
+it("accepts a scientific-format process nonce while checking the session buffer", function()
+  local hrtime = vim.uv.hrtime
+  vim.uv.hrtime = function() return 1e20 end
+  local ok, isolated = pcall(dofile, root .. "/lua/straps/attention.lua")
+  vim.uv.hrtime = hrtime
+  check(ok, "isolated attention module loaded")
+  isolated.start(fixture.buf, {})
+  local id = (fixture.sent[1] or ""):match("^\27%]7501;app=straps:id=([^:]+):state=working\27\\$")
+  check(id == "straps/" .. vim.uv.os_getpid() .. "-1e+20/" .. fixture.buf, "scientific-format nonce preserved")
+  check(session_id(id, fixture.buf), "scientific-format ID accepted for the session")
+  check(not session_id(id, fixture.buf + 1), "another session buffer rejected")
+  check(not session_id("straps//" .. fixture.buf, fixture.buf), "empty process nonce rejected")
+end)
+
 it("releases options selection in the installed callback before loop resume", function()
   start()
   blocked()
@@ -175,12 +194,17 @@ it("dismisses initial draw failure without publishing a question wait", function
   finished(dismissed, false, { "working", "done" })
 end)
 
-it("dismisses options with an already-cancelled actual loop context", function()
-  start(true)
+it("refuses options with an already-cancelled actual loop context before the body", function()
+  start(true, true)
   check(fixture.ctx.cancelled(), "provider cancelled admitted run before question")
-  check(fixture.result == nil, "already-cancelled dismissal awaits scheduled resume")
-  reports({ "working" })
-  finished(dismissed, true, { "working", "idle" })
+  check(fixture.result == nil, "cancelled gate produced no question result")
+  check(vim.b[fixture.buf].straps_run_reason == "error", "cancelled gate ends provider call with an error")
+  check(vim.tbl_contains(vim.api.nvim_buf_get_lines(fixture.buf, 0, -1, false),
+    "straps: run error: execution cancelled"), "exact cancellation error recorded in transcript")
+  check(fixture.notification == nil, "cancelled gate emitted no question notification")
+  check(fixture.draw_failed == nil, "cancelled gate never attempted options draw")
+  reports({ "working", "idle" })
+  resources_restored()
 end)
 
 it("releases other selection before entering a distinct free-text wait", function()

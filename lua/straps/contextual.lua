@@ -31,12 +31,13 @@ local function classify_defaults(registry, controller)
       "show_terminal", "set_findings", "ask_user" },
     edit = { "write_file", "edit_file", "patch_file", "bulk_replace", "format", "rename_symbol", "move_file", "move_files" },
     delete = { "delete_file", "delete_files" }, exec = { "bash", "run_in_terminal", "run_quickfix" },
-    lua = { "eval_lua" }, net = { "fetch_url" }, define = { "registry_define" },
+    lua = { "eval_lua" }, net = { "fetch_url" },
     spawn = { "spawn", "spawn_wait", "send_message", "watch_agent", "unwatch_agent" },
   }
   for category, names in pairs(groups) do
     for _, name in ipairs(names) do categories["tool." .. name] = category end
   end
+  categories["tool.registry_define"] = require("straps.extension_policy").definition_category
   categories["tool.code_action"] = function(input)
     return type(input) ~= "table" and "read" or input.index == nil and "read" or "edit"
   end

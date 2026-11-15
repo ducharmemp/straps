@@ -3,9 +3,6 @@
 -- every call site, so redefining an entry takes effect on the very next call.
 --
 -- Storage is private to this module. Callers see read-only copies of entries
--- (never the compiled fn), and every tool execution passes gate_tool, so the
--- guard chain (hook.guard.*) and hook.confirm sit in front of every tool call
--- regardless of who makes it.
 
 local M = {}
 
@@ -573,11 +570,43 @@ data_copy = function(value, seen)
   return out
 end
 
+local execution_bindings = setmetatable({}, { __mode = "k" })
+
+local function bound_call(binding, fn, ...)
+  local co, previous, scope_before = current_co(), execution_bindings[current_co()], active
+  execution_bindings[co] = binding
+  if binding then active = binding.session end
+  local result = { pcall(fn, ...) }
+  execution_bindings[co], active = previous, scope_before
+  if not result[1] then error(result[2], 0) end
+  return unpack(result, 2, table.maxn(result))
+end
+
+local function inherited_binding(ctx)
+  local binding = execution_bindings[current_co()]
+  if binding then return binding end
+  for co, candidate in pairs(execution_bindings) do
+    if candidate.session == active and (not ctx or co == "main" or coroutine.status(co) == "normal") then
+      if binding and binding.cancelled ~= candidate.cancelled then
+        return nil, "ambiguous execution context"
+      end
+      binding = candidate
+    end
+  end
+  return binding
+end
+
 local function immediate(fn, ...)
-  local co = coroutine.create(fn)
+  local binding = execution_bindings[current_co()]
+  local co = coroutine.create(function(...) return bound_call(binding, fn, ...) end)
+  local scope_before = active
   local ok, result, reason = coroutine.resume(co, ...)
+  active = scope_before
   if not ok then return false, tostring(result) end
-  if coroutine.status(co) ~= "dead" then return false, "execution validation must not yield" end
+  if coroutine.status(co) ~= "dead" then
+    execution_bindings[co] = nil
+    return false, "execution validation must not yield"
+  end
   return result, reason
 end
 
@@ -614,7 +643,34 @@ local function preflight_tool_input(input)
 end
 M.preflight_tool_input = preflight_tool_input
 
-function M.gate_tool(name, input, ctx, opts)
+function M.child_permission(name, input, ctx)
+  local session = ctx and ctx.bufnr
+  local allowed = session and grants[session]
+  if not allowed or not allowed["spawn:gated"] then return true end
+  local detached = data_copy(input)
+  local previous = active
+  active = session
+  local binding = execution_bindings[current_co()]
+  if binding and binding.checking_capability then active = previous return false, "capability check reentrancy" end
+  if binding then binding.checking_capability = true end
+  local ok, cap, why = pcall(immediate, function() return M.try_call("fn.capability", name, detached) end)
+  if binding then binding.checking_capability = nil end
+  local key = M.tool_grant_key(name)
+  active = previous
+  if not ok then return false, tostring(cap) end
+  if cap == false then return false, why end
+  if not vim.deep_equal(detached, input) then return false, "capability mutated tool input" end
+  if cap == "read" or (cap and allowed["cap:" .. tostring(cap)]) or allowed[key] then return true end
+  if cap == "spawn" and (name == "watch_agent" or name == "unwatch_agent") then return true end
+  if name == "send_message" and type(input) == "table" and input.to == "parent" then return true end
+  local names = {}
+  for key in pairs(allowed) do if key ~= "spawn:gated" then names[#names + 1] = key end end
+  if #names == 0 then return false, "readonly subagent: " .. tostring(name) .. " is not allowed" end
+  table.sort(names)
+  return false, "subagent: " .. tostring(name) .. " is not covered by this child's grants (" .. table.concat(names, ", ") .. ")"
+end
+
+local function gate_tool(name, input, ctx, opts)
   local full = "tool." .. name
   local bounded, reason = preflight_tool_input(input)
   if not bounded then return false, reason end
@@ -653,16 +709,20 @@ function M.gate_tool(name, input, ctx, opts)
   end
   local function valid(run_ctx, executing)
     if used and not executing then return false, "gate result already used" end
-    if not authorization then return true end
-    if ctx and (families[ctx] ~= family_handle or ctx.bufnr ~= gate_ctx.bufnr or ctx.cancelled ~= gate_ctx.cancelled) then return false, "execution context changed" end
+    local permitted, permission_reason = M.child_permission(name, frozen, gate_ctx)
+    if not permitted then return false, permission_reason end
+    if ctx and (ctx.bufnr ~= gate_ctx.bufnr or ctx.cancelled ~= gate_ctx.cancelled) then return false, "execution context changed" end
     if gate_ctx and gate_ctx.cancelled and gate_ctx.cancelled() then return false, "execution cancelled" end
-    if family.cancelled or (run_ctx and run_ctx.cancelled and run_ctx.cancelled()) then return false, "execution cancelled" end
+    if (family and family.cancelled) or (run_ctx and run_ctx.cancelled and run_ctx.cancelled()) then return false, "execution cancelled" end
     if vim.fn.getcwd() ~= gate_cwd then return false, "execution directory changed" end
-    if run_ctx and (families[run_ctx] ~= family_handle or run_ctx.bufnr ~= session) then return false, "execution context changed" end
+    if run_ctx and (run_ctx.bufnr ~= session or run_ctx.cancelled ~= (gate_ctx and gate_ctx.cancelled)) then return false, "execution context changed" end
+    if authorization and ctx and families[ctx] ~= family_handle then return false, "execution context changed" end
+    if authorization and run_ctx and families[run_ctx] ~= family_handle then return false, "execution context changed" end
     if resolve_in(scope, full) ~= entry then return false, "tool definition changed" end
     for _, link in ipairs(scope_chain) do
       if scopes[link[1]] ~= link[2] or scopes[link[1]].parent ~= link[3] then return false, "resolution scope changed" end
     end
+    if not authorization then return true end
     if authorization.ceilings.revision(session) ~= ceiling_revision then return false, "capability ceiling changed" end
     local ceiling_ok, why = authorization.ceilings.check(session, view(entry), frozen)
     if not ceiling_ok then return false, why end
@@ -687,6 +747,8 @@ function M.gate_tool(name, input, ctx, opts)
   -- Guards and confirm may raise (reentrancy, a broken confirm); the active
   -- scope must be restored on that path too, so run them under pcall.
   local ok, refused, reason = pcall(function()
+    local permitted, permission_reason = M.child_permission(name, frozen, gate_ctx)
+    if not permitted then return true, permission_reason end
     local block = run_guards("before", name, frozen, ctx)
     if block then return true, block end
     if authorization then
@@ -761,6 +823,35 @@ function M.gate_tool(name, input, ctx, opts)
   return true, nil, run
 end
 
+function M.gate_tool(name, input, ctx, opts)
+  local inherited, reason = inherited_binding(ctx)
+  if reason then return false, reason end
+  if inherited then
+    if inherited.ctx and (inherited.ctx.bufnr ~= inherited.session or inherited.ctx.cancelled ~= inherited.cancelled) then
+      return false, "execution context changed"
+    end
+    if inherited.cancelled and inherited.cancelled() then return false, "execution cancelled" end
+    if ctx and (ctx.bufnr ~= inherited.session or ctx.cancelled ~= inherited.cancelled) then
+      return false, "execution context changed"
+    end
+    ctx = ctx or inherited.ctx
+  elseif not ctx and active and grants[active] and grants[active]["spawn:gated"] then
+    return false, "session tool call requires execution context"
+  end
+  local binding = inherited or { session = ctx and ctx.bufnr or active, ctx = ctx, cancelled = ctx and ctx.cancelled }
+  local allowed, why, run = bound_call(binding, gate_tool, name, input, ctx, opts)
+  if not allowed then return false, why end
+  return true, nil, function(run_ctx)
+    local current, inherited_reason = inherited_binding(run_ctx)
+    if inherited_reason then return false, inherited_reason end
+    if current and (current.session ~= binding.session or current.cancelled ~= binding.cancelled) then
+      return false, "execution context changed"
+    end
+    local body_binding = { session = binding.session, ctx = run_ctx or ctx, cancelled = binding.cancelled }
+    return bound_call(body_binding, run, run_ctx)
+  end
+end
+
 --- The after-stage of the pipeline: every guard sees (name, input, result,
 --- ok, ctx) in seq order; false blocks, a string replaces the result.
 --- Returns result, ok.
@@ -777,10 +868,6 @@ function M.after_guards(name, input, result, ok, ctx)
   return replaced, ok
 end
 
--- Direct tool execution (hook bodies, tests, eval_lua): before-guards, no
--- confirm, no after-stage (no ctx/truncation to speak of). Raises with the
--- original error value on tool failure so pcall callers see what they see
--- today; level 0 keeps a second position prefix off string errors.
 local function call_tool(name, ...)
   local input, ctx = ...
   local allowed, reason, run = M.gate_tool(name, input, ctx)
@@ -791,7 +878,6 @@ local function call_tool(name, ...)
 end
 
 --- Call an entry, looking it up at call time. Errors clearly if missing.
---- tool.* names go through the gate (before-guards); hook.*/fn.* are direct.
 --- hook.guard.* is refused: guards run only inside the gate.
 function M.call(name, ...)
   if type(name) == "string" and name:sub(1, 5) == "tool." then
@@ -970,15 +1056,13 @@ function M.grant(bufnr, key)
   set[key] = true
 end
 
---- Remove every grant on bufnr whose key starts with prefix ("" = all).
---- Returns the removed keys, sorted.
 function M.clear_grants(bufnr, prefix)
   prefix = prefix or ""
   local set = grants[bufnr]
   local removed = {}
   if not set then return removed end
   for k in pairs(set) do
-    if k:sub(1, #prefix) == prefix then
+    if k ~= "spawn:gated" and k:sub(1, #prefix) == prefix then
       removed[#removed + 1] = k
       set[k] = nil
     end

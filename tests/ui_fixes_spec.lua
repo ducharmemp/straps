@@ -202,6 +202,85 @@ it("22: show_session keeps the user's foldlevel on a window already showing the 
   assert.are.equal(5, vim.wo[0].foldlevel)
 end)
 
+it("native session redisplay configures folds and preserves other windows' fold choices", function()
+  only_window()
+  local source = vim.api.nvim_get_current_buf()
+  vim.wo[0][0].foldmethod = "manual"
+  vim.wo[0][0].foldexpr = "0"
+  local b = state.new_session()
+  vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+    "%%[straps:tool_use]%%", "{}", "%%[straps:tool_result]%%", "first",
+    "%%[straps:user]%%", "hi", "%%[straps:tool_use]%%", "{}",
+    "%%[straps:tool_result]%%", "second", "%%[straps:user]%%", "bye",
+  })
+  ui.show_session(b)
+  local original = vim.api.nvim_get_current_win()
+  vim.wo[0][0].foldlevel = 1
+  vim.cmd("normal! zR")
+  vim.cmd("7foldclose")
+  vim.wo[0][0].foldlevel = 0
+  vim.cmd("1foldopen")
+  local function check_choices()
+    assert.are.equal(0, vim.wo[original].foldlevel)
+    vim.api.nvim_win_call(original, function()
+      assert.are.equal(-1, vim.fn.foldclosed(2))
+      assert.are.equal(7, vim.fn.foldclosed(8))
+    end)
+  end
+  vim.cmd("wincmd p")
+  vim.cmd("vsplit")
+  local target = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(target, b)
+  assert.are.equal("expr", vim.wo[target].foldmethod)
+  assert.are.equal("v:lua.require'straps.ui'.foldexpr(v:lnum)", vim.wo[target].foldexpr)
+  assert.are.equal("v:lua.require'straps.ui'.foldtext()", vim.wo[target].foldtext)
+  assert.are.equal(1, vim.fn.foldlevel(2))
+  vim.cmd("normal! zM")
+  assert.are.equal(1, vim.fn.foldclosed(2))
+  check_choices()
+  vim.api.nvim_set_current_win(original)
+  check_choices()
+  vim.api.nvim_set_current_win(target)
+  vim.api.nvim_win_set_buf(target, source)
+  assert.are.equal("manual", vim.wo[target].foldmethod)
+  assert.are.equal("0", vim.wo[target].foldexpr)
+  vim.api.nvim_win_set_buf(target, b)
+  assert.are.equal(1, vim.fn.foldlevel(2))
+  check_choices()
+  vim.cmd("vsplit")
+  assert.are.equal(1, vim.fn.foldlevel(2))
+  check_choices()
+end)
+
+it("native session redisplay installs folds without setup", function()
+  local script = vim.fn.tempname() .. ".lua"
+  vim.fn.writefile(vim.split(([[
+vim.opt.runtimepath:prepend(ROOT)
+vim.cmd("filetype plugin on")
+local source = vim.api.nvim_get_current_buf()
+vim.wo[0][0].foldmethod = "manual"
+vim.wo[0][0].foldexpr = "0"
+local b = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+  "%%[straps:tool_use]%%", "{}", "%%[straps:tool_result]%%", "result", "%%[straps:user]%%", "hi",
+})
+vim.api.nvim_win_set_buf(0, b)
+vim.bo[b].filetype = "straps"
+vim.cmd("vsplit")
+vim.api.nvim_win_set_buf(0, source)
+vim.cmd("vsplit")
+vim.api.nvim_win_set_buf(0, b)
+assert(vim.fn.foldlevel(2) == 1)
+vim.cmd("normal! zM")
+assert(vim.fn.foldclosed(2) == 1)
+io.stdout:write("folds restored")
+]]):gsub("ROOT", string.format("%q", root)), "\n"), script)
+  local res = vim.system({ vim.v.progpath, "--headless", "-u", "NONE", "-l", script }, { text = true }):wait(20000)
+  vim.fn.delete(script)
+  assert.are.equal(0, res.code, res.stderr)
+  assert.are.equal("folds restored", res.stdout)
+end)
+
 it("6: gf fallback failure is reported, not swallowed", function()
   local b = session_in_split()
   vim.api.nvim_buf_set_lines(b, -1, -1, false, { "no_such_file_qq.txt" })

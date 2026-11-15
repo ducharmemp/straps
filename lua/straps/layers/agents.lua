@@ -234,9 +234,6 @@ local function spawn(input, ctx, transaction)
           .. " is not a grantable category (" .. table.concat(grantable, ", ")
           .. ") or an existing tool", 0)
       end
-      -- A tool-name grant of a define-category tool (registry_define) would
-      -- let the child shadow its own hook.confirm — an everything grant. The
-      -- category ceiling must hold for name grants too.
       if registry.try_call("fn.capability", entry) == "define" then
         error("spawn: allow entry " .. vim.inspect(entry)
           .. " is in the define category, which is never grantable", 0)
@@ -366,33 +363,7 @@ local function spawn(input, ctx, transaction)
         .. " readonly uses an empty grant set.",
       source = [[
 return function(name, tin, tctx)
-  local reg = require("straps.registry")
-  local cap = reg.try_call("fn.capability", name, tin)
-  if cap == "read" then return true end
-  local allowed
-  pcall(function()
-    allowed = tctx and tctx.bufnr and reg.granted(tctx.bufnr) or nil
-  end)
-  if type(allowed) == "table" then
-    if cap and allowed["cap:" .. tostring(cap)] then return true end
-    if allowed[reg.tool_grant_key(name)] then return true end
-  end
-  if cap == "spawn" and (name == "watch_agent" or name == "unwatch_agent") then return true end
-  if name == "send_message" and type(tin) == "table" and tin.to == "parent" then
-    return true
-  end
-  local names = {}
-  if type(allowed) == "table" then
-    for k in pairs(allowed) do
-      if k ~= "spawn:gated" then names[#names + 1] = k end
-    end
-  end
-  if #names == 0 then
-    return false, "readonly subagent: " .. tostring(name) .. " is not allowed"
-  end
-  table.sort(names)
-  return false, "subagent: " .. tostring(name) .. " is not covered by this child's grants ("
-    .. table.concat(names, ", ") .. ")"
+  return require("straps.registry").child_permission(name, tin, tctx)
 end
 ]],
     }, { scope = child })

@@ -81,8 +81,8 @@ return function() return { stop_reason = "end_turn", content = { { type = "text"
   local ok, err = pcall(function()
     for _, name in ipairs({ "watch_agent", "unwatch_agent" }) do
       local input = { to = tostring(parent) }
-      assert(registry.get("tool." .. name).scope == parent and registry.call("fn.capability", name, input) == "agent_tool",
-        name .. " replacement must resolve from the parent and classify as agent_tool")
+      assert(registry.get("tool." .. name).scope == parent and registry.call("fn.capability", name, input) == "lua",
+        name .. " replacement must resolve from the parent and classify as lua")
       local allowed, reason = registry.call("hook.confirm", name, input, { bufnr = child })
       assert(allowed == false and tostring(reason):find("readonly subagent", 1, true),
         name .. " inherited replacement must be denied by the readonly gate")

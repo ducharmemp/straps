@@ -39,7 +39,7 @@ vim.fn.writefile({ codex_jwt("acct-2") }, tmp .. "/access2")
 local fake = ([[#!/usr/bin/env bash
 D=%q
 N=$(cat "$D/n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/n"
-printf '%%s\n' "$*" >> "$D/argv"
+printf '%%s\n' "$(for arg in "$@"; do case "$arg" in @/*) tr '\n' ' ' < "${arg#@}";; esac; done) $*" >> "$D/argv"
 BODY=$(cat)
 printf '%%s' "$BODY" > "$D/stdin.$N"
 case "$*" in
@@ -68,7 +68,7 @@ case "$*" in
     ;;
   *codex/responses*|*v1/responses*)
     MODE=$(cat "$D/resp_mode" 2>/dev/null || echo ok)
-    if printf '%%s' "$*" | grep -q 'Bearer stale-access'; then
+    if for arg in "$@"; do case "$arg" in @/*) cat "${arg#@}";; esac; done | grep -q 'Bearer stale-access'; then
       printf '{"error":{"message":"expired"}}'
       echo "STRAPS_HTTP_STATUS:401" >&2
     elif [ "$MODE" = usage ]; then

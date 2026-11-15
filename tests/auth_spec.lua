@@ -32,6 +32,7 @@ vim.fn.mkdir(tmp .. "/bin", "p")
 local fake = ([[#!/usr/bin/env bash
 D=%q
 printf '%%s\n' "$*" >> "$D/argv"
+for arg in "$@"; do case "$arg" in @/*) cat "${arg#@}" >> "$D/argv";; esac; done
 cat > /dev/null
 case "$*" in
   */v1/models*)

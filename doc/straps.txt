@@ -887,10 +887,13 @@ hook.confirm(name, input, ctx) -> allowed, reason, source
 		`edit` call, including bulk_replace, rename_symbol, format,
 		move_file(s), undo_edit and code_action with an index; those
 		tools also offer it. delete_file/delete_files offer only
-		Yes / No and warn that deletion is not undo-reversible. Grants
-		persist via `registry.grant`; "Always this tool" stores
-		`registry.tool_grant_key(name)` (`<name>@v<version>[@<bufnr>]`), so a
-		redefinition or session shadow of the tool prompts again.
+		Yes / No and warn that deletion is not undo-reversible.
+		registry_define also offers no "Always this tool" option
+		and ignores tool-name grants. Grants persist via
+		`registry.grant`; "Always this tool" stores
+		`registry.tool_grant_key(name)` (`<name>@v<version>[@<bufnr>]`).
+		A redefinition or session shadow invalidates that name grant;
+		a category grant may still permit the revised tool.
 		Never loosen this on the agent's initiative. See
 		|straps-auto|. In a batch, every call of a segment is
 		confirmed before the first one runs; for a second edit to the
@@ -1296,10 +1299,11 @@ fn.capability(name, input) -> category
 				`read` (auto-allowed), `edit`, `delete`, `exec`,
 				`lua`, `net`, `define`, `spawn` (spawn, spawn_wait,
 				send_message, watch_agent and unwatch_agent), or
-				`agent_tool` (an unknown
-				tool, or any tool resolved from a session scope
-				without a trusted `capability` field). Called
-				with no arguments it returns the grantable list
+				`agent_tool` (an unknown global tool). Session tools
+				without trusted `capability` metadata use `lua`,
+				except a shadow of `tool.registry_define`, which
+				remains `define`. See |straps-auto| for definitions.
+				Called with no arguments it returns the grantable list
 				({edit, delete, exec, lua, net, spawn}); `read`
 				needs no grant, and `define`/`agent_tool` are never
 				grantable. |hook.confirm|, |fn.readonly_policy|,
@@ -1807,8 +1811,11 @@ investigation so the parent transcript keeps only the conclusion. Without a
 `spawn` takes `allow` (an array of strings) to grant the child permission
 categories. Each entry is a grantable category (see |fn.capability|) or a
 specific tool name; an unknown entry errors at spawn time, and so does any
-entry in the `define` category (`"define"` or `registry_define`). A tool-name
-grant covers exactly that tool even when its category is not granted. The
+bare entry in the `define` category (`"define"` or `registry_define`).
+`allow={"lua"}` permits ordinary session extensions; readonly children may
+define session skills. Restricted children deny direct global or protected
+definitions. A tool-name grant covers exactly that tool even when its
+category is not granted.
 child gets a confirm shadow: read-only calls, granted categories/tools,
 builtin watch/unwatch calls on any agent, and messages to `"parent"` run
 unprompted. Every other call is denied without a dialog. `readonly = true`
@@ -1973,6 +1980,23 @@ category. The grantable categories are `edit`, `delete`, `exec`, `lua`, `net`,
 and `spawn`. The `read` category is always auto-allowed. The `define` and
 `agent_tool` categories are never grantable.
 
+The `lua` category also covers structurally valid session-local
+`registry_define` requests for tools, hooks, and functions, plus calls to
+session-scoped tools without explicit trusted capability metadata. The grant
+covers their later revisions. Session skill definitions use `read`, although
+they mutate the session registry. Direct global definitions, malformed or
+unclassified definition requests, and protected definitions use `define`.
+Protected names are `hook.confirm`, `fn.capability`, `fn.readonly_policy`,
+`tool.registry_define`, `hook.guard`, and `hook.guard.*`. A session shadow of
+`tool.registry_define` remains `define` when invoked. These direct requests
+require confirmation, with no blanket "Always this tool" approval or
+registry_define tool-name grant bypass. Unknown global tools remain
+`agent_tool`. Manual combined define-and-use approval is deferred.
+
+These rules classify dispatched direct requests. Arbitrary Lua retains
+Neovim process privileges; the rules do not sandbox it. Contextual dispatch
+retains ancestor ceiling checks and definition identities. Transcript
+excision permissions are unchanged.
 Grant categories to the current session with |:StrapsAuto|: >vim
 	:StrapsAuto edit,exec   " allow edits and shell commands
 	:StrapsAuto             " choose grants with Snacks, else report grants

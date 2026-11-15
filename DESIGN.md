@@ -125,18 +125,35 @@ end
   before redefining it); `call` cannot substitute there because `define` runs
   the chunk before installing the entry. Refuses `tool.*`.
 - `call(name, ...) -> ...` — looks up at call time, errors clearly if missing.
-  For `tool.*` names: before-guards, then the fn; a block or a tool error is
+  For `tool.*` names: `gate_tool`, then the returned runner; a block or a tool error is
   re-raised with `error(x, 0)` so the caller sees the original value (no
-  added position prefix, table errors intact). Never confirmed.
+  added position prefix, table errors intact). No ordinary manual confirmation callback is added;
+  child permissions and any contextual authorization still apply.
 - `try_call(name, ...) -> nil | ...` — returns nil (no error) if the entry does
   not exist; used for optional hooks. Errors inside the fn still propagate;
   `tool.*` names follow `call`.
 - `gate_tool(name, input, ctx, opts) -> allowed, reason, run` — the gate every
-  tool execution passes: re-asserts the active scope from `ctx.bufnr`, runs the
-  before-guards, then `opts.confirm(name, input, ctx)` if given (the loop passes
+  tool execution passes: binds the execution context, checks `child_permission`, runs the
+  before-guards, performs contextual authorization when enabled, then calls
+  `opts.confirm(name, input, ctx)` if given (the loop passes
   `hook.confirm` + the `hook.before_tool` fan-out). On `allowed`, `run(ctx) ->
-  ok, raw` executes the entry resolved at gate time exactly once (`pcall`'d;
-  a second call raises). On refusal `run` is nil.
+  ok, raw` revalidates the call and checks `child_permission` before executing the entry
+  resolved at gate time exactly once (`pcall`'d; a second call raises). On refusal `run` is nil.
+  Ordinary gates bind the session and cancellation-function identity, retain the original context
+  and detect changes to its `bufnr` or `cancelled` fields, and recheck the working directory,
+  tool definition, and resolution-scope chain. A supplied execution context must match the bound
+  session and cancellation function. Private per-coroutine bindings cover the entire gate and body;
+  nested calls without a context inherit the original context. A new coroutine, including
+  `coroutine.wrap`, may inherit an unambiguous in-flight binding matching the active session.
+  Conflicting bindings or supplied context mismatches reject the call. A context-free call in a
+  gated scope without an inherited binding refuses; trusted context-free calls outside gated scopes
+  remain available. Arbitrary Lua manipulation of `set_active_scope` and independent asynchronous
+  escapes remain deferred. These dispatch checks do not provide a Lua sandbox.
+- `child_permission(name, input, ctx) -> allowed, reason` — shared restricted-child policy used
+  before guards, before tool execution, and by the child-scope `hook.confirm` delegate. Sessions
+  without `spawn:gated` pass. Restricted children permit read-category calls, granted categories or
+  definition-bound tool keys, watch/unwatch in the `spawn` category, and messages to `"parent"`.
+  Other calls deny without a dialog.
 - `after_guards(name, input, result, ok, ctx) -> result, ok` — the after fold.
 - `names(kind?) -> string[]` — sorted. `names_by_seq(kind?)` — registration
   order. Both include `hook.guard.*`.
@@ -157,7 +174,8 @@ end
   is the active session AND a tool body is executing on this coroutine, so a
   tool (eval_lua) cannot award its own session a grant; `hook.confirm`'s
   remember-grant (runs in the gate), `:StrapsAuto` (no run) and spawn (grants
-  the child) are unaffected.
+  the child) are unaffected. `clear_grants` preserves `spawn:gated` for every prefix,
+  including an omitted prefix, `""`, `"spawn:"`, and `"spawn:gated"`; session disposal removes it.
 - `tool_grant_key(name) -> string` — the key a tool-name grant is written and
   read under: `<name>@v<version>` of the `tool.<name>` entry the active scope
   resolves, with `@<bufnr>` appended for a session-scoped entry (the bare name
@@ -247,20 +265,22 @@ a string (`define` errors otherwise) and is carried onto the entry as
 `input_schema`, before the `source` long-bracket block) so `registry_get` /
 `dump()` / `.straps.lua` persistence round-trip it. `fn.capability`
 (layers/permissions.lua)
-consults it FIRST: `registry.get("tool." .. name)` — if the entry has a
-`capability` field, that value wins over the hardcoded classification.
+consults `registry.get("tool." .. name)`: an explicit `capability` field
+wins over ordinary tool classification. `registry_define` dispatch uses its
+protected, input-dependent classification before capability metadata.
 `tool.registry_define` deliberately does NOT accept a `capability` field (its
 input schema has no such property), so an agent-defined tool can never
 self-declare a category like `"read"`; only a trusted definition path —
 `register()`, user config, a trusted `.straps.lua`, or `registry.define`
 called directly from `eval_lua` — can set it. (`eval_lua` is NOT a trusted
 path for `hook.guard.*`: those are frozen before any run.) Without the field,
-an entry resolved from a session scope is classified `agent_tool` whatever its
-name, so a session shadow of `bash` or `read_file` is gated as an agent-defined
-tool instead of inheriting the builtin's category: no `cap:` grant covers it,
-and a tool-name grant does not either, because name grants are keyed to the
-entry version (`tool_grant_key`) and the shadow has a new one. The copy `get()`
-returns carries `capability` but writing it is inert.
+an entry resolved from a session scope is classified `lua` whatever its
+name, except a shadow of `tool.registry_define`, which remains `define`.
+A session shadow of `bash` or `read_file` therefore uses the `lua` category
+instead of inheriting the builtin's category. A `lua` grant covers later
+revisions too; tool-name grants remain version-bound (`tool_grant_key`).
+Unknown global tools remain `agent_tool`. The copy `get()` returns carries
+`capability` but writing it is inert.
 
 ### Hook fan-out (multi-subscriber hooks)
 
@@ -517,7 +537,7 @@ relative age — a preview-capable fuzzy backend when one is present
 (`ui._pick_session_rich`), else `vim.ui.select`.
 
 **ftdetect** — `ftdetect/straps.vim` (or an autocmd): `*.straps` → setf straps,
-so a file opened with `:e` gets folding via ui.setup's FileType autocmd.
+so a file opened with `:e` gets folding through the ftplugin, with ui.setup's FileType autocmd covering setups without ftplugins. The first fold configuration registers window-entry handling for subsequent native buffer switches and splits.
 
 **config (init.lua)** — add `session_dir = nil` (nil → computed default);
 document.
@@ -611,9 +631,10 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
       1. Gate run. For consecutive blocks, in order:
          `allowed, reason, run = registry.gate_tool(name, input, ctx, { confirm = cb })`
          where `cb` runs `hook.confirm` then the `hook.before_tool` fan-out.
-         Inside the gate the before-guards (`hook.guard.*`, op `"before"`) run
-         first; any `false` blocks with `"blocked by <guard>: <reason>"` and
-         confirm is never reached. Then confirm: not allowed →
+         Inside the gate `registry.child_permission` runs before the before-guards
+         (`hook.guard.*`, op `"before"`). A child-policy denial skips guards and confirmation.
+         A guard's `false` blocks with `"blocked by <guard>: <reason>"` and
+         confirm is never reached. After any contextual authorization, confirm: not allowed →
          `"user denied: " .. (reason or "")`, or `"blocked by hook.confirm: " ..
          (reason or "")` when confirm returns `false, reason, "hook"` (a policy
          veto). A refusal becomes that block's `is_error` result. The gate run
@@ -652,9 +673,9 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
       before its segment (plus the preview above); `hook.before_tool` fires
       for a whole gate run before any of it executes; results land in the
       transcript when their segment ends; a batch with `eval_lua`,
-      `registry_define` or an `agent_tool` call (any tool without a declared
-      `capability` that `fn.capability` does not list, plugin tools included)
-      still prompts around those calls one segment at a time. Cancel: blocks
+      executable `registry_define` requests or an `agent_tool` call still gates
+      those calls one segment at a time. Session skill definitions use `read`
+      and do not execute source. Cancel: blocks
       not executed get "run cancelled before this tool executed"; executed
       blocks keep their real results. A raise that escapes the segment loop
       (a raising `hook.confirm`, say) reaches `M.start`'s pcall, which first
@@ -1352,10 +1373,7 @@ second backend.
 - **Secrets.** Form bodies go to curl on stdin (`fn.openai_oauth_post`), never
   argv. A failed token request reports the HTTP status and the full response
   body (capped at 2000 bytes), with any request form value of 8 or more
-  characters that the server echoes replaced by `[redacted]`. Request headers,
-  including `Authorization: Bearer` for every provider and the Codex
-  `chatgpt-account-id`, are curl arguments, so another local user can read
-  them with `ps` while a request runs.
+  characters that the server echoes replaced by `[redacted]`. `provider_transport.system` removes authentication headers (`Authorization`, `x-api-key`, and `chatgpt-account-id`) from subprocess arguments and writes them to an exclusively created mode-600 temporary file read by curl with `--header @path`. Exit, cancellation, wait, and spawn-failure paths remove the file. Request bodies retain stdin, including compressed binary payloads. Provider curl and compression subprocesses exclude the four standard provider API-key variables from their environments; Neovim's environment remains unchanged. Curl runs with default config disabled. The contextual adapter uses the same transport with its captured process launcher and empty environment. Root, same-user file access, memory inspection, and files remaining after abrupt Neovim termination are outside this protection.
 
 ### Codex login (`fn.openai_codex_*`, `lua/straps/oauth.lua`)
 
@@ -1860,7 +1878,7 @@ API names (registry names prefixed `tool.`):
 - `registry_list {kind?}` — names + kind + doc + version, one per line; kind is
   tool, hook, fn or skill.
 - `registry_get {name}` — returns `registry.render(name)` (full definition).
-- `registry_define {name, kind, doc?, input_schema?, source}` — calls
+- `registry_define {name, kind, doc?, input_schema?, source, scope?}` — calls
   `registry.define`; `input_schema` arrives as a JSON **string** (schema-of-
   schemas is a tarpit) and is decoded before define. Returns
   "defined <name> v<version>", plus a warning when tool, hook or fn source
@@ -1876,9 +1894,10 @@ API names (registry names prefixed `tool.`):
   (array of strings) grants the child permission categories: each entry is a
   grantable category (validated against `fn.capability()`'s grantable list) or
   a specific tool api name; an unknown entry errors at spawn time, and so does
-  any entry the classifier puts in the `define` category (`"define"` itself or
-  a tool name like `registry_define`) — a define grant could shadow the
-  child's hook.confirm, so the category ceiling holds for name grants too.
+  any bare entry the classifier puts in the `define` category (`"define"`
+  itself or `registry_define`). `allow={"lua"}` permits ordinary session
+  extensions; readonly children may define session skills. Direct global and
+  protected definitions remain denied by restricted child gates.
   A tool-name grant otherwise bypasses category ceilings by design
   (`allow={"eval_lua"}` grants exactly that tool's current definition,
   unprompted; a child that shadows `eval_lua` in its own scope is denied, and
@@ -1887,8 +1906,9 @@ API names (registry names prefixed `tool.`):
   Grants are seeded via `registry.grant(child, key)` as `cap:<category>` /
   `<toolname>@v<version>[@<bufnr>]` (`registry.tool_grant_key`) keys BEFORE the child's loop starts (granting the CHILD from
   the parent's tool body is permitted; only self-grants are refused). The child gets a
-  child-scope `hook.confirm` shadow with unified semantics: read-category
-  calls, granted categories/tools, builtin watch/unwatch on any agent, and
+  child-scope `hook.confirm` shadow delegating to `registry.child_permission`. The registry
+  also enforces that policy before guards and before execution, including direct tool calls.
+  Read-category calls, granted categories/tools, builtin watch/unwatch on any agent, and
   messages to `"parent"` run unprompted. Every other call is denied with a
   reason naming the child's grants, without a dialog. `readonly=true` is now equivalent
   to `allow = {}` (same shadow; its grant-less deny message is unchanged:
@@ -1896,7 +1916,8 @@ API names (registry names prefixed `tool.`):
   together error (mutually exclusive). Every readonly/allow child also holds
   the registry grant `spawn:gated`; allow validation refuses it as an entry
   and a tool body cannot grant its own session, so a child cannot forge or
-  shed it through spawn. That marker makes the child a **permission ceiling**
+  shed it through spawn. Every `clear_grants` prefix preserves the marker until session disposal.
+  That marker makes the child a **permission ceiling**
   for its own children when nesting is enabled. Each `allow` entry it passes
   must be within its own grants: a category it holds (`cap:<cat>`), a tool
   name it holds, or a tool whose worst-case category it holds
@@ -2067,7 +2088,7 @@ table written to `vim.b` reads back as a list.
   by `:StrapsStop` and the dashboard `x` key, sets the pause; cascade and
   timeout stops call `loop.stop` and do not. A draft in the trailing prompt is
   never sent by a wake.
-- **Permissions.** Both tools remain in the `spawn` category for top-level confirmation. Readonly and allow-gated children may watch any agent, including with automatic wakes, and remove their own subscriptions without a grant. Their confirmation hooks permit both tools for any target.
+- **Permissions.** Both tools remain in the `spawn` category for top-level confirmation. Readonly and allow-gated children may watch any agent, including with automatic wakes, and remove their own subscriptions without a grant. The shared child-permission check and its confirmation-hook delegate permit both tools for any target.
 - A parent that watches its own child gets both the watch notice and the
   completion notice; only the watch starts an idle parent.
 - `transcript_excise {session?, blocks?, range?, note?}` — **context surgery**:
@@ -2123,19 +2144,24 @@ Default hooks registered here:
   rename_symbol, move_file, move_files, code_action/fix_diagnostic WITH an
   index, undo_edit non-history); `delete` (delete_file, delete_files —
   deletion is not undo-reversible, so it is its own category); `exec` (bash,
-  run_in_terminal, run_quickfix); `lua` (eval_lua); `net` (fetch_url);
-  `define` (registry_define); `spawn` (spawn, spawn_wait, send_message); `agent_tool` (any
-  unknown tool, and any tool resolved from a session scope without a trusted
-  `capability` field — a session shadow of `bash` is classified `agent_tool`, not
-  `exec`). Called with NO arguments it returns the
-  GRANTABLE list `{edit, delete, exec, lua, net, spawn}`. `read` needs no
-  grant. `define` and `agent_tool` are NEVER grantable — a `define` grant would
-  let the agent shadow `hook.confirm` (an everything grant), and agent-defined
-  tools cannot be classified by name.
+  run_in_terminal, run_quickfix); `lua` (eval_lua, structurally valid
+  session-local tool/hook/fn `registry_define` requests, and session-scoped
+  tool calls without explicit trusted capability metadata); `net` (fetch_url);
+  `define` (direct global definitions, malformed/unclassified definition
+  requests, and protected definitions); `spawn` (spawn, spawn_wait,
+  send_message); `agent_tool` (unknown global tools). Session skill definitions
+  use `read`, although they mutate the session registry. Protected names are
+  `hook.confirm`, `fn.capability`, `fn.readonly_policy`, `tool.registry_define`,
+  `hook.guard` and `hook.guard.*`. Invoking a session shadow of
+  `tool.registry_define` also remains `define`. Called with NO arguments the
+  classifier returns the GRANTABLE list `{edit, delete, exec, lua, net, spawn}`.
+  `read` needs no grant; `define` and `agent_tool` are never grantable categories.
+  These exceptions govern dispatched direct requests, not arbitrary Lua,
+  which retains process privileges. Contextual dispatch retains ancestor
+  ceiling checks and definition identities. Transcript excision is unchanged.
 - `fn.readonly_policy(name, input) -> boolean` — now a thin wrapper:
-  `capability(name, input) == "read"`. Same behavior as before; the
-  classification lives in `fn.capability`. Both `hook.confirm` and spawn's
-  child gate consult these, so they cannot drift.
+  `capability(name, input) == "read"`. Both `hook.confirm` and spawn's child
+  gate consult the shared classification, including session skill definitions.
 - `hook.confirm(name, input, ctx) -> allowed, reason` — auto-allow the
   read-only tools (via `fn.readonly_policy`); honor category grants — a key
   of the form `cap:<category>` in the per-session grant set
@@ -2145,7 +2171,11 @@ Default hooks registered here:
   `vim.fn.confirm("straps: allow <name>?\n<preview of input>", ...)`
   — "Always this tool" adds `registry.tool_grant_key(name)` (`<name>@v<version>[@<bufnr>]`)
   to the grant set via `registry.grant(ctx.bufnr, key)`, and the lookup reads the
-  same key, so a later redefinition or session shadow of that tool prompts again. File edits
+  same key, so a later redefinition or session shadow invalidates that grant.
+  A category grant can still permit the revised tool. `registry_define`
+  ignores tool-name grants and offers no "Always this tool" option; direct
+  `define` requests require confirmation. Manual combined approval for
+  defining and using an extension is deferred. File edits
   (write_file/edit_file/patch_file) get path-scoped grants instead of a
   per-tool toggle: "Always in <parent dir>" stores `editdir:<dir>`
   (matched as a realpath prefix, so it covers the subtree), "Always in
@@ -2173,17 +2203,18 @@ with none installed behavior is identical to a build without the mechanism.
   ctx, info)`, `("define", spec, opts, info)`, `("remove", name, opts, info)`.
   `info = { active = bufnr|nil, executing = toolname|nil, frozen = bool }`.
   `active == nil` is common and legitimate (`:lua`, autocmds, tests, deferred
-  callbacks) and is not by itself grounds for a policy. `ctx` is nil on the
-  direct `registry.call("tool.*")` path and for define/remove; a guard that
-  awaits there raises and so blocks.
+  callbacks) and is not by itself grounds for a policy. Direct `registry.call("tool.*")`
+  calls may receive an explicit or inherited `ctx`; trusted context-free calls have nil `ctx`.
+  Define/remove guards have no context argument. A guard that attempts to await without an
+  await-capable context raises and so blocks.
 - `false` blocks: tool_result `is_error=true`, text
   `"blocked by <guard>: <reason>"` (distinct from `"user denied: ..."`, so the
   model can tell policy from the user); for define/remove, `error()` with the
   same text. For `"after"` a string return replaces the result. Anything else
-  passes. `true` never skips `hook.confirm` — a guard is a floor, not a grant
-  (spawn's readonly enforcement IS a child-scope confirm shadow; an allow
-  verdict would elevate past it).
-- Every guard runs, in seq order, even after a block (complete verdict log);
+  passes. `true` never skips a supplied confirmation callback or the shared child-permission
+  check. Child permissions run before the before-guard chain and again before execution;
+  replacing or omitting a child confirmation hook does not remove those checks.
+- Once the chain is reached, every guard runs, in seq order, even after a block (complete verdict log);
   the first block's reason wins. A raising guard blocks with
   `"guard <name> raised: <err>"`. Each guard call logs
   `{ ev = "guard", op, name, guard, verdict = pass|block|replace|error, ms }`
@@ -3198,12 +3229,11 @@ carried no sender and was a no-op on an idle peer.
   (it writes into another agent's session: the same blast-radius class as
   starting one), so a top-level session without `:StrapsAuto spawn` confirms
   each send. Gated children get two rules, neither a seeded grant: the
-  per-child `hook.confirm` that `tool.spawn` defines auto-allows
-  `send_message` with `to == "parent"` (a research child must always be able
-  to report up; a grandchild inherits the hook through scope chaining), and
+  shared `registry.child_permission` check, also called by the per-child `hook.confirm`, allows
+  `send_message` with `to == "parent"` without a grant, and
   the tool body refuses any target outside a gated sender's family (its
   parent, its own children, or immediate siblings sharing a valid session
-  parent), because a name grant passes the hook for every
+  parent), because a name grant passes the shared permission check for every
   input. The `readonly subagent: X is not allowed` wording is untouched. A
   gated child holding `lua` could still reach `loop.steer` through `eval_lua`;
   that reach predates send_message and is unchanged. A continuation line of a

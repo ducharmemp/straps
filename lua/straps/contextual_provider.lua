@@ -196,7 +196,7 @@ local function new(config)
         if proc and not killed then killed = true; pcall(proc.kill, proc, 9) end
         finish({ failed = true })
       end
-      local ok, value = pcall(system, argv, { stdin = payload, clear_env = true, env = {}, timeout = held.timeout_ms,
+      local ok, value = pcall(function(command, options, done) return require("straps.provider_transport").system(command, options, done, system) end, argv, { stdin = payload, clear_env = true, env = {}, timeout = held.timeout_ms,
         stdout = function(err, data)
           if settled then return end
           if err then abort(); return end

@@ -62,7 +62,7 @@ end
 write_exec(tmp .. "/scripted/curl", ([[#!/usr/bin/env bash
 D=%q
 N=$(cat "$D/n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/n"
-printf '%%s\n' "$*" >> "$D/argv"
+printf '%%s\n' "$* $(for arg in "$@"; do case "$arg" in @/*) cat "${arg#@}";; esac; done)" >> "$D/argv"
 cat > "$D/body.$N"
 echo "STRAPS_HTTP_STATUS:200" >&2
 if [ "$N" = 1 ]; then
@@ -1187,7 +1187,7 @@ step(function()
   vim.fn.mkdir(tmp .. "/models", "p")
   write_exec(tmp .. "/models/curl", ([[#!/usr/bin/env bash
 D=%q
-printf '%%s\n' "$*" >> "$D/models_argv"
+printf '%%s\n' "$* $(for arg in "$@"; do case "$arg" in @/*) cat "${arg#@}";; esac; done)" >> "$D/models_argv"
 cat <<'EOF'
 {"data":[
   {"type":"model","id":"claude-sonnet-5","display_name":"Claude Sonnet 5","max_tokens":128000,"max_input_tokens":1000000,
@@ -1305,7 +1305,7 @@ step(function()
   vim.fn.mkdir(tmp .. "/models_openai", "p")
   write_exec(tmp .. "/models_openai/curl", ([[#!/usr/bin/env bash
 D=%q
-printf '%%s\n' "$*" >> "$D/models_openai_argv"
+printf '%%s\n' "$* $(for arg in "$@"; do case "$arg" in @/*) cat "${arg#@}";; esac; done)" >> "$D/models_openai_argv"
 cat <<'EOF'
 {"object":"list","data":[
   {"id":"gpt-5","object":"model","owned_by":"openai"},
@@ -1430,7 +1430,7 @@ step(function()
   write_exec(tmp .. "/openai/curl", ([[#!/usr/bin/env bash
 D=%q
 N=$(cat "$D/oai_n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/oai_n"
-printf '%%s\n' "$*" >> "$D/oai_argv"
+printf '%%s\n' "$* $(for arg in "$@"; do case "$arg" in @/*) cat "${arg#@}";; esac; done)" >> "$D/oai_argv"
 cat > "$D/oai_body.$N"
 echo "STRAPS_HTTP_STATUS:200" >&2
 if grep -q trigger-stream-error "$D/oai_body.$N"; then
@@ -2711,7 +2711,7 @@ do
     write_exec(ld .. "/curl", ([[#!/usr/bin/env bash
 D=%q
 N=$(cat "$D/n" 2>/dev/null || echo 0); N=$((N+1)); echo $N > "$D/n"
-printf '%%s\n' "$*" >> "$D/argv"
+printf '%%s\n' "$* $(for arg in "$@"; do case "$arg" in @/*) cat "${arg#@}";; esac; done)" >> "$D/argv"
 cat > "$D/body.$N"
 if [ -f "$D/fail" ]; then
   echo "STRAPS_HTTP_STATUS:400" >&2
@@ -3071,7 +3071,7 @@ do
     vim.fn.mkdir(md, "p")
     write_exec(md .. "/curl", ([[#!/usr/bin/env bash
 D=%q
-printf '%%s\n' "$*" >> "$D/argv"
+printf '%%s\n' "$* $(for arg in "$@"; do case "$arg" in @/*) cat "${arg#@}";; esac; done)" >> "$D/argv"
 cat <<'EOF'
 {"object":"list","data":[
   {"id":"qwen-dense","object":"model","owned_by":"llamacpp","status":{"value":"loaded"},"meta":{"n_ctx":131072}},

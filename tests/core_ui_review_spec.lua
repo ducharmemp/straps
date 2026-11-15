@@ -112,7 +112,8 @@ for _, kind in ipairs({ "oauth", "codex" }) do
       assert(real_wait(2000, function() return got ~= nil end, 10))
       assert.are.equal("catalog-test", got[1] and got[1][1].id, tostring(got[2]))
       assert.are.equal(1, #requests)
-      assert.truthy(table.concat(requests[1], " "):find("Bearer new", 1, true))
+      assert.is_nil(table.concat(requests[1], " "):find("Bearer new", 1, true))
+      assert.truthy(vim.tbl_contains(requests[1], "--header"))
     end)
     vim.system, vim.wait = real_system, real_wait
     for i = #restores, 1, -1 do restores[i]() end

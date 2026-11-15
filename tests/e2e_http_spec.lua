@@ -135,6 +135,7 @@ end)
 
 it("the request body that crossed the wire is complete, valid JSON", function()
   assert(got_body and #got_body > 0, "server captured no request body")
+  assert(got_headers:find("x-api-key: test-key-not-real", 1, true), "authentication missing from request")
   -- With gzip on PATH the provider compresses the body (config.gzip default
   -- on), so the wire bytes must be valid gzip of the JSON and the header must
   -- say so; without gzip it falls back to plain JSON with no header.

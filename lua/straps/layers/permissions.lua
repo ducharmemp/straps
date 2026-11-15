@@ -21,15 +21,15 @@ function M.register()
     doc = "Classify a tool call (name, input) into a permission category, the"
       .. " single source of truth every permission check consults. Categories:"
       .. " read (view/list, always auto-allowed), edit (file writes), delete"
-      .. " (not undo-reversible, its own category), exec (shell), lua (eval_lua),"
-      .. " net (fetch_url), define (registry_define — never grantable, a define"
-      .. " grant could shadow hook.confirm), spawn (subagents, send_message and watch_agent), and agent_tool"
-      .. " (agent-defined tools, including session shadows of builtin names — never grantable). Called with no args it"
+      .. " (not undo-reversible, its own category), exec (shell), lua (eval_lua and session executable extensions),"
+      .. " net (fetch_url), define (global, protected or unclassified definitions; never grantable),"
+      .. " spawn (subagents, send_message and watch_agent), and agent_tool"
+      .. " (unknown global tools and operations requiring confirmation; never grantable). Session skills use read. Called with no args it"
       .. " returns the array of GRANTABLE categories { edit, delete, exec, lua,"
       .. " net, spawn }. Redefine it to add custom categories — e.g. classify"
       .. " bash inputs matching ^git%s into a \"vcs\" category. A tool.* entry's"
       .. " own capability field (settable only via registry.define, not"
-      .. " tool.registry_define) takes precedence over this classification.",
+      .. " tool.registry_define) takes precedence except for registry_define and protected session shadows.",
     source = [==[
 return function(name, input)
   local grantable = { "edit", "delete", "exec", "lua", "net", "spawn" }
@@ -40,8 +40,11 @@ return function(name, input)
   -- deliberately does not accept the field, so an agent-defined tool cannot
   -- self-declare "read").
   local e = require("straps.registry").get("tool." .. tostring(name))
+  local extensions = require("straps.extension_policy")
+  if e and e.scope ~= nil and extensions.protected(e.name) then return "define" end
+  if name == "registry_define" then return extensions.definition_category(input) end
   if e and type(e.capability) == "string" then return e.capability end
-  if e and e.scope ~= nil then return "agent_tool" end
+  if e and e.scope ~= nil then return extensions.tool_category(e) end
 
   local read = {
     read_file = true, glob = true, tree = true, path_info = true, grep = true,
@@ -105,9 +108,6 @@ return function(name, input)
   end
   if name == "eval_lua" then return "lua" end
   if name == "fetch_url" then return "net" end
-  -- registry_define can shadow hook.confirm, so a define grant would be an
-  -- everything grant: it is a category of its own and never grantable.
-  if name == "registry_define" then return "define" end
   -- send_message writes into another agent's session, and a watch can start
   -- this session's run: the same blast-radius class as starting one, so they
   -- share the spawn grant.
@@ -116,7 +116,6 @@ return function(name, input)
     return "spawn"
   end
 
-  -- Agent-defined tools: unknown, never grantable.
   return "agent_tool"
 end
 ]==],
@@ -147,7 +146,7 @@ end
     name = "fn.readonly_policy",
     kind = "fn",
     doc = "Return true if the tool call (name, input) is read-only: it opens"
-      .. " views or lists things but changes no files. Classification itself"
+      .. " views, lists things, or defines a session skill, but changes no files. Classification itself"
       .. " lives in fn.capability (read-only == the \"read\" category); this is"
       .. " the boolean wrapper used by the default hook.confirm. Child gates"
       .. " also allow lifecycle watches and parent-directed messages.",
@@ -194,6 +193,7 @@ end
       .. " and a field-per-line preview of their input (bulk_replace shows its pattern,"
       .. " replacement and the findings-list entry and file counts). delete_file/delete_files"
       .. " get Yes / No only, with a warning that deletion is not undo-reversible."
+      .. " registry_define and define-category calls get Yes / No and ignore tool-name grants."
       .. " Other tools get Yes / No / 'Always this tool', scoped to the tool's current definition"
       .. " (registry.tool_grant_key: <name>@v<version>[@<bufnr>], so a redefinition or session shadow prompts again). All"
       .. " grants persist in the registry's per-session grant set (registry.granted). A cap:<category> key"
@@ -219,6 +219,7 @@ return function(name, input, ctx)
   local category = require("straps.registry").try_call("fn.capability", name, input)
   local is_edit_cap = category == "edit" and not is_edit
   local is_delete = category == "delete"
+  local is_definition = name == "registry_define" or category == "define"
 
   local function parent_dir(path)
     local p = vim.fn.fnamemodify(path, ":p:h")
@@ -293,7 +294,7 @@ return function(name, input, ctx)
       end
     end
   else
-    if have_allowed and allowed[require("straps.registry").tool_grant_key(name)] then
+    if not is_definition and have_allowed and allowed[require("straps.registry").tool_grant_key(name)] then
       return true
     end
   end
@@ -411,7 +412,7 @@ return function(name, input, ctx)
     idx = idx + 1
     all_choice_idx = idx
     choices = choices .. "\nAlways &all edits"
-  elseif is_delete then
+  elseif is_delete or is_definition then
     choices = "&Yes\n&No"
   elseif is_edit_cap then
     choices = "&Yes\n&No\n&Always this tool\nAlways a&ll edits"
@@ -453,7 +454,7 @@ return function(name, input, ctx)
     grant("editfiles:*")
     return true
   end
-  if not is_edit and not is_delete and choice == 3 then
+  if not is_edit and not is_delete and not is_definition and choice == 3 then
     grant(require("straps.registry").tool_grant_key(name))
     return true
   end

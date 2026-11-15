@@ -2543,6 +2543,23 @@ function M.map_navigation(bufnr)
   end, { buffer = bufnr, desc = "straps: outline the transcript" })
 end
 
+local fold_lifecycle = false
+
+local function register_fold_lifecycle()
+  if fold_lifecycle then return end
+  fold_lifecycle = true
+  local group = vim.api.nvim_create_augroup("StrapsFoldOptions", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufWinEnter", "WinEnter" }, {
+    group = group,
+    callback = function(ev)
+      local win = vim.api.nvim_get_current_win()
+      if vim.api.nvim_win_get_buf(win) == ev.buf and vim.bo[ev.buf].filetype == "straps" then
+        M.apply_fold_opts(ev.buf)
+      end
+    end,
+  })
+end
+
 --- Apply the straps fold options (foldmethod=expr + foldexpr + foldtext +
 --- foldlevel from config.tools_expanded) to every window currently showing
 --- bufnr. foldlevel is set only the first time a window gets the straps
@@ -2552,10 +2569,9 @@ end
 --- actually displayed — `vim.opt_local` from a FileType autocmd that fires
 --- before the buffer is ever windowed (state.new_session/open_session_file
 --- set filetype=straps on a still-hidden buffer) has no lasting effect, since
---- there is no window to attach the options to yet. Called both from the
---- FileType autocmd (covers `:e some.straps`, where the buffer is already
---- current when it fires) and from open_session_buffer (covers the common
---- new/resume-session path where filetype was set while hidden).
+--- there is no window to attach the options to yet. The ftplugin, FileType
+--- autocmd, and session presentation initialize folding. Window-entry events
+--- configure subsequent native buffer switches and splits.
 ---
 --- Every assignment uses the `vim.wo[win][0]` (`:setlocal`) form, and must.
 --- A window option carries two values: a per-(window, buffer) one and a
@@ -2565,15 +2581,17 @@ end
 --- by the straps foldexpr on the user's own source. `[0]` writes only
 --- per-(window, buffer), which is exactly the scope the transcript needs.
 function M.apply_fold_opts(bufnr)
+  register_fold_lifecycle()
   local ok, straps = pcall(require, "straps")
   local expanded = ok and type(straps) == "table" and straps.config
     and straps.config.tools_expanded
   local expr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
   for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
     local first = vim.wo[win].foldexpr ~= expr
-    vim.wo[win][0].foldmethod = "expr"
-    vim.wo[win][0].foldexpr = expr
-    vim.wo[win][0].foldtext = "v:lua.require'straps.ui'.foldtext()"
+    if vim.wo[win].foldmethod ~= "expr" then vim.wo[win][0].foldmethod = "expr" end
+    if first then vim.wo[win][0].foldexpr = expr end
+    local text = "v:lua.require'straps.ui'.foldtext()"
+    if vim.wo[win].foldtext ~= text then vim.wo[win][0].foldtext = text end
     if first then
       vim.wo[win][0].foldlevel = expanded and 99 or 0
     end
@@ -2817,12 +2835,6 @@ function M.setup()
     group = group,
     pattern = "straps",
     callback = function(ev)
-      -- Only takes effect if ev.buf is showing in the current window (see
-      -- apply_fold_opts). A session buffer's filetype is usually set before
-      -- it is ever displayed (state.new_session/open_session_file), so
-      -- open_session_buffer calls apply_fold_opts again once the buffer is
-      -- actually in a window; this autocmd covers `:e some.straps` instead,
-      -- where FileType fires with the buffer already current.
       M.apply_fold_opts(ev.buf)
       M.apply_file_ref_match(ev.buf)
     end,

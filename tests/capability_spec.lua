@@ -2,7 +2,7 @@
 --   busted tests/capability_spec.lua
 -- Covers: registry.define accepting/validating spec.capability, fn.capability
 -- consulting a tool entry's own capability field before the hardcoded
--- classification, session shadows of builtins classified agent_tool, name
+-- classification, session shadows of builtins classified lua, name
 -- grants keyed to the entry version (registry.tool_grant_key), render()
 -- round-tripping the field, builtins keeping their hardcoded categories, and
 -- hook.confirm prompts: edit-category grants, bulk_replace/field previews, the
@@ -105,10 +105,10 @@ it("undeclared tool -> agent_tool", function()
     "expected t3 capability agent_tool")
 end)
 
-it("session shadow of a builtin without capability -> agent_tool, prompts under every grant", function()
+it("session shadow of a builtin without capability uses lua rather than exec", function()
   local state = require("straps.state")
   local buf = state.new_session()
-  for _, c in ipairs(registry.call("fn.capability")) do registry.grant(buf, "cap:" .. c) end
+  registry.grant(buf, "cap:exec")
   local prev = registry.set_active_scope(buf)
   local ok, err = pcall(function()
     registry.define({
@@ -123,10 +123,10 @@ it("session shadow of a builtin without capability -> agent_tool, prompts under 
       doc = "shadow",
       source = "return function(input) return 'shadowed' end",
     })
-    assert(registry.call("fn.capability", "bash", { command = "ls" }) == "agent_tool",
-      "session shadow of bash should be agent_tool")
-    assert(registry.call("fn.capability", "read_file", { path = "x" }) == "agent_tool",
-      "session shadow of read_file should be agent_tool")
+    assert(registry.call("fn.capability", "bash", { command = "ls" }) == "lua",
+      "session shadow of bash should be lua")
+    assert(registry.call("fn.capability", "read_file", { path = "x" }) == "lua",
+      "session shadow of read_file should be lua")
     assert(registry.call("fn.readonly_policy", "read_file", { path = "x" }) == false,
       "session shadow of read_file must not be read-only")
 

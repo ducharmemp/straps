@@ -473,16 +473,28 @@ after_write_diagnostics_ms (number) 800. The longest |fn.write_diagnostics|
 			wait runs once, for every file the batch wrote.
 terminal_status		(boolean) true. OSC 7501 terminal attention reports on
 			Neovim >= 0.12 through nvim_ui_send. setup() with false
-			clears owned IDs and suppresses reports. Each session
-			has its own ID: working at run start, done for success,
-			idle for cancellation, error for other run endings.
+			clears active IDs and the pane report, then suppresses
+			reports. Active sessions have distinct IDs; completion
+			clears their named records. The pane report is blocked
+			while any prompt waits (newest wait selects its kind),
+			or working while any run remains active. After all work
+			ends, the latest remaining completion determines the
+			pane status: done for success, idle for cancellation,
+			error for other endings. Earlier failures cannot override
+			active work or later success. Transcripts retain outcomes.
 			Built-in agent permission/question prompts report
 			blocked; API key entry and logout confirmation use
 			temporary IDs. Unload (:bdelete, :bwipeout, :bunload)
 			and shutdown clear owned statuses. Unload does not
 			cancel an active run; late callbacks cannot republish
 			its cleared task. Hiding or renaming a loaded session
-			preserves its ID. UI attachment replays current records. Reports contain
+			preserves its ID. Unload removes its retained outcome
+			from the pane calculation. UI attachment replays the
+			pane report and active named records. Straps owns the
+			pane-level OSC 7501 record while enabled; another
+			reporter in that pane can replace it. Clearing the pane
+			report also clears other reporters' named OSC 7501
+			tasks in that pane. Reports contain
 			no prompt text, secrets, error details or percentages.
 			No reports before 0.12; headless has no terminal
 			recipient. All attached stdout_tty UIs receive reports.

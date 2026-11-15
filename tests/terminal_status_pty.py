@@ -69,9 +69,40 @@ with tempfile.TemporaryDirectory() as directory:
             process.wait()
         os.close(master)
     messages = re.findall(rb'\x1b\]7501;([^\x1b]*)\x1b\\', output)
-    states = [message.split(b':state=')[1] for message in messages]
-    check(states == [b'working', b'blocked:kind=permission', b'working', b'done', b'clear'], states)
-    ids = [message.split(b':id=')[1].split(b':state=')[0] for message in messages]
-    check(len(set(ids)) == 1 and ids[0].startswith(b'straps/'), ids)
-    check(all(message.startswith(b'app=straps:id=') for message in messages), messages)
-    print('Actual terminal OSC 7501 output passed: lifecycle, blocked state, task identity, shutdown clear')
+    reports = []
+    for message in messages:
+        match = re.fullmatch(rb'app=straps(?::id=([^:]+))?:state=([^:]+)(?::kind=([a-z]+))?', message)
+        check(match is not None, message)
+        reports.append(match.groups())
+    ids = {report[0] for report in reports if report[0] is not None}
+    check(len(ids) == 1, ids)
+    task_id = next(iter(ids))
+    check(task_id.startswith(b'straps/'), task_id)
+    check(reports == [
+        (task_id, b'working', None), (None, b'working', None),
+        (task_id, b'blocked', b'permission'), (None, b'blocked', b'permission'),
+        (task_id, b'working', None), (None, b'working', None),
+        (task_id, b'clear', None), (None, b'done', None), (None, b'clear', None),
+    ], reports)
+    tasks = {}
+    root_state = None
+    expected = [None, b'working', b'blocked', b'blocked', b'blocked', b'working', b'working', b'done', None]
+    for (identity, state, kind), effective in zip(reports, expected):
+        if state == b'clear':
+            if identity is None:
+                tasks.clear()
+                root_state = None
+            else:
+                tasks.pop(identity, None)
+        elif identity is None:
+            root_state = state
+        else:
+            tasks[identity] = state
+        consumer_state = root_state
+        for task_state in tasks.values():
+            if task_state == b'blocked' or (task_state == b'error' and consumer_state != b'blocked'):
+                consumer_state = task_state
+        check(consumer_state == effective, (consumer_state, effective))
+    check(tasks == {}, tasks)
+    check(root_state is None, root_state)
+    print(f'Actual terminal OSC 7501 output passed; terminal status assertions: {assertion_count}')

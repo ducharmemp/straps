@@ -38,7 +38,9 @@ local fixture
 local function reports(expected)
   local want = {}
   for _, item in ipairs(expected) do
-    want[#want + 1] = "\27]7501;app=straps:id=" .. fixture.id .. ":state=" .. item .. "\27\\"
+    local terminal = item == "done" or item == "idle" or item == "error"
+    want[#want + 1] = "\27]7501;app=straps:id=" .. fixture.id .. ":state=" .. (terminal and "clear" or item) .. "\27\\"
+    want[#want + 1] = "\27]7501;app=straps:state=" .. item .. "\27\\"
   end
   check(vim.deep_equal(fixture.sent, want), "exact task ID, state, kind and report order: " .. vim.inspect(fixture.sent))
 end

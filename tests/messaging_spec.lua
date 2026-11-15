@@ -313,9 +313,84 @@ it("a gated child with a send_message grant still cannot leave its family", func
       child = b
     end
   end
-  assert(child and text_of(child):find("may message only its parent or its own children", 1, true),
+  assert(child and text_of(child):find("may message only its parent, its own children, or its immediate siblings", 1, true),
     "the tool body should refuse the out-of-family target")
 end)
+
+for _, case in ipairs({
+  { name = "name grant", options = { allow = { "send_message" } }, allowed = true },
+  { name = "spawn category", options = { allow = { "spawn" } }, allowed = true },
+  { name = "readonly", options = { readonly = true }, allowed = false },
+}) do
+  it("a real child with " .. case.name .. " observes the sibling messaging boundary", function()
+    define("fn.provider", "fn", "test: sibling recipient finishes", [[
+return function(req, ctx)
+  ctx.emit({ type = "text_delta", text = "recipient-done" })
+  return { stop_reason = "end_turn", content = { { type = "text", text = "recipient-done" } } }
+end]])
+    local parent = state.new_session()
+    local recipient = drive(parent, function(ctx)
+      local started = registry.call("tool.spawn", { task = "SIBLING-RECIPIENT", readonly = true }, ctx)
+      return tonumber(started:match("buffer (%d+)"))
+    end)
+    wait_idle(recipient)
+    gated_provider(recipient)
+    local sender = drive(parent, function(ctx)
+      local input = vim.deepcopy(case.options)
+      input.task = "SIBLING-SENDER"
+      local started = registry.call("tool.spawn", input, ctx)
+      return tonumber(started:match("buffer (%d+)"))
+    end)
+    wait_idle(sender)
+    assert(vim.b[sender].straps_parent == parent and vim.b[recipient].straps_parent == parent,
+      "both real children must share the same parent")
+    assert(text_of(sender):find("gated-done", 1, true), "sender did not finish")
+    assert(text_of(parent):find("GATED-UP", 1, true), "parent exception must remain available")
+    if case.allowed then
+      assert(text_of(recipient):find("GATED-OUT", 1, true), "granted child must reach its immediate sibling")
+      local framed = text_of(recipient):match("%[straps%] from agent [^\n]*GATED%-OUT")
+      local notice = state.notice_of(framed)
+      assert(notice and notice.from == "agent" and notice.bufnr == sender, "sibling message must identify its sender")
+      assert(text_of(sender):find("run was not started", 1, true), "sender must receive the idle delivery result")
+      assert(not loop.running(recipient), "sibling delivery must leave the recipient idle")
+    else
+      assert(not text_of(recipient):find("GATED-OUT", 1, true), "readonly child must not reach its sibling")
+      assert(text_of(sender):find("readonly subagent: send_message is not allowed", 1, true),
+        "readonly sibling denial must come from the child confirm hook")
+    end
+  end)
+end
+
+for _, relationship in ipairs({ "nil parent", "invalid parent", "non-session parent", "cousin", "ancestor", "descendant" }) do
+  it("the gated send_message body denies a " .. relationship .. " target", function()
+    local sender, target = state.new_session(), state.new_session()
+    registry.grant(sender, "spawn:gated")
+    if relationship == "invalid parent" or relationship == "non-session parent" then
+      local shared = vim.api.nvim_create_buf(true, false)
+      if relationship == "invalid parent" then vim.api.nvim_buf_delete(shared, { force = true }) end
+      vim.b[sender].straps_parent = shared
+      vim.b[target].straps_parent = shared
+    elseif relationship == "cousin" then
+      local root = state.new_session()
+      local left, right = state.new_session(), state.new_session()
+      vim.b[left].straps_parent, vim.b[right].straps_parent = root, root
+      vim.b[sender].straps_parent, vim.b[target].straps_parent = left, right
+    elseif relationship == "ancestor" then
+      local middle = state.new_session()
+      vim.b[middle].straps_parent, vim.b[sender].straps_parent = target, middle
+    elseif relationship == "descendant" then
+      local middle = state.new_session()
+      vim.b[middle].straps_parent, vim.b[target].straps_parent = sender, middle
+    end
+    local before = text_of(target)
+    local ok, err = pcall(send, sender, { to = tostring(target), text = "BODY-BOUNDARY" })
+    assert(not ok, relationship .. " target must be denied")
+    assert(tostring(err):find(
+      "send_message: a permission-gated session may message only its parent, its own children, or its immediate siblings",
+      1, true), "expected family boundary error: " .. tostring(err))
+    assert(text_of(target) == before, "denied body call must leave the target unchanged")
+  end)
+end
 
 it("a depth-2 gated grandchild reaches its own parent; a gated spawner reaches its child, not a peer", function()
   local prev_depth = straps.config.max_spawn_depth
@@ -398,7 +473,7 @@ end]]):format(stranger, stranger))
     assert(gtxt:find("MIDDLE-DOWN", 1, true), "a gated spawner should reach its own child:\n" .. gtxt:sub(-800))
     assert(gtxt:find("readonly subagent: send_message is not allowed", 1, true),
       "the grandchild's peer send should be denied by its inherited hook")
-    assert(mtxt:find("may message only its parent or its own children", 1, true),
+    assert(mtxt:find("may message only its parent, its own children, or its immediate siblings", 1, true),
       "the middle's peer send should be refused in the tool body:\n" .. mtxt:sub(-800))
     local stxt = text_of(stranger)
     assert(not stxt:find("GRAND-OUT", 1, true) and not stxt:find("MIDDLE-OUT", 1, true),

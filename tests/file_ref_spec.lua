@@ -32,10 +32,10 @@ it("path:line opens the file at the line", function()
 end)
 
 it("path:line:col also sets the column", function()
-  at("see lua/straps/ui.lua:10:5", 5)
+  at("see lua/straps/ui.lua:1:5", 5)
   assert(ui.open_file_ref() == true, "should open")
   local pos = vim.api.nvim_win_get_cursor(0)
-  assert(pos[1] == 10 and pos[2] == 4, "wrong pos: " .. pos[1] .. ":" .. pos[2])
+  assert(pos[1] == 1 and pos[2] == 4, "wrong pos: " .. pos[1] .. ":" .. pos[2])
 end)
 
 it("cursor off the reference returns false", function()

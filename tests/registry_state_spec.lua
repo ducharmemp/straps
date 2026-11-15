@@ -542,6 +542,7 @@ end)
 
 it("setup{} with both layers left at their default registers editor + openai", function()
   require("straps").setup({})
+  require("straps").setup({})
   assert(registry.get("tool.definition"), "tool.definition should be present (editor layer default ON)")
   assert(registry.get("fn.provider_openai"), "fn.provider_openai should be present (openai layer default ON)")
 end)

@@ -6,6 +6,13 @@ if vim.g.loaded_straps then
 end
 vim.g.loaded_straps = true
 
+if require("straps.contextual_human").attached("plugin") then
+  return
+end
+
+local human
+require("straps.contextual_human").attach("plugin", function(callbacks) human = callbacks end)
+
 local function resolve_session()
   return require("straps.ui").require_session(vim.api.nvim_get_current_buf())
 end
@@ -77,7 +84,8 @@ end
 
 command("Straps", function(opts)
   local cats, instruction = parse_straps_args(opts.args)
-  require("straps.ui").open_session(split_cmd_of(opts.smods), {
+  local open = human and human.open or require("straps.ui").open_session
+  open(split_cmd_of(opts.smods), {
     grants = cats,
     instruction = instruction,
     send = opts.bang,
@@ -158,11 +166,11 @@ command("StrapsSend", function()
   if loop.running(bufnr) then
     vim.ui.input({ prompt = "steer: " }, function(txt)
       if txt and txt ~= "" then
-        require("straps.loop").steer(bufnr, txt)
+        if human then human.steer(bufnr, txt) else require("straps.loop").steer(bufnr, txt) end
       end
     end)
   else
-    loop.start(bufnr)
+    if human then human.send(bufnr) else loop.start(bufnr) end
   end
 end, { desc = "straps: send the trailing user block (or steer if a run is active)" })
 
@@ -172,12 +180,40 @@ command("StrapsSteer", function(opts)
     return
   end
   local text = opts.args
+  if human then return human.steer(bufnr, text) end
   if not require("straps.loop").steer(bufnr, text) then
     require("straps.state").add_to_trailing_user(bufnr, text)
     vim.notify("straps: no active run; added the text to the trailing user block (send it with :StrapsSend)",
       vim.log.levels.WARN)
   end
 end, { nargs = "+", desc = "straps: queue a steering message for the active run" })
+
+command("StrapsContextPreview", function(opts)
+  local bufnr = resolve_session()
+  if bufnr then require("straps.context_ui").preview(bufnr, opts) end
+end, { nargs = "?", bang = true, complete = function() return { "summary" } end,
+  desc = "straps: preview configured context reduction (! permits bounded summary generation)" })
+
+command("StrapsContextApply", function()
+  local bufnr = resolve_session()
+  if bufnr then require("straps.context_ui").apply(bufnr) end
+end, { desc = "straps: apply the exact prepared context preview" })
+
+command("StrapsContextPin", function(opts)
+  local bufnr = resolve_session()
+  if bufnr then
+    if bufnr ~= vim.api.nvim_get_current_buf() then
+      vim.notify("straps: select the transcript range in the session buffer", vim.log.levels.WARN)
+      return
+    end
+    require("straps.context_ui").pin(bufnr, opts.line1, opts.line2)
+  end
+end, { range = true, desc = "straps: pin transcript blocks intersecting this line range" })
+
+command("StrapsContextUnpin", function()
+  local bufnr = resolve_session()
+  if bufnr then require("straps.context_ui").unpin(bufnr) end
+end, { desc = "straps: clear this session's context pins" })
 
 command("StrapsStop", function()
   local bufnr = resolve_session()
@@ -187,10 +223,6 @@ command("StrapsStop", function()
   require("straps.loop").user_stop(bufnr)
 end, { desc = "straps: cancel the active run in this session" })
 
--- Continuing a STOPPED run, as opposed to :StrapsResume, which reopens a saved
--- transcript from disk. Nothing to restore: :StrapsStop already leaves the
--- transcript sendable (every tool_use paired). Appending a user block is the
--- whole mechanism — the buffer IS the run state.
 command("StrapsContinue", function(opts)
   local bufnr = resolve_session()
   if not bufnr then
@@ -202,10 +234,26 @@ command("StrapsContinue", function(opts)
       vim.log.levels.WARN)
     return
   end
+  if human then return human.continue(bufnr, opts.args) end
   require("straps.state").append(bufnr, "user", nil,
     opts.args ~= "" and opts.args or "[straps] Continue where you left off.")
   loop.start(bufnr)
 end, { nargs = "?", desc = "straps: continue a stopped/interrupted run (optional instruction)" })
+
+command("StrapsAdopt", function(opts)
+  local bufnr = resolve_session()
+  if bufnr and human then human.adopt(bufnr, opts.args) end
+end, { nargs = "*", desc = "straps: review and adopt exact current task text and standing instructions" })
+
+command("StrapsAuthorization", function(opts)
+  local bufnr = resolve_session()
+  if bufnr and human then human.authorization(bufnr, opts.args, opts.bang) end
+end, { nargs = 1, bang = true, desc = "straps: inspect a decision; ! requests a fresh authorization review" })
+
+command("StrapsTaskReset", function()
+  local bufnr = resolve_session()
+  if bufnr and human then human.reset(bufnr) end
+end, { desc = "straps: invalidate the current authorization task" })
 
 command("StrapsCompact", function()
   local bufnr = resolve_session()

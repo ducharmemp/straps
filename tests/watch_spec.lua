@@ -3,7 +3,6 @@
 -- No network: fn.provider is scripted per case. Covers waking an idle watcher
 -- on run_end, wake=false, one-shot watches, closed after :bdelete and
 -- :bwipeout, no delivery for a cancelled run, a draft blocking the wake, the
--- gated-family rule, the wake cap and its reset by user activity, the
 -- :StrapsStop pause, and a watch notice waking a watcher blocked in spawn_wait.
 
 local here = debug.getinfo(1, "S").source:sub(2)
@@ -334,7 +333,7 @@ it("unwatch_agent removes the watch", function()
   assert(not text_of(watcher):find("[straps] watched agent", 1, true), "an unwatched target must not notify")
 end)
 
-it("a gated child may watch its parent but not a stranger", function()
+it("a readonly child may watch its parent and a stranger", function()
   local stranger = state.new_session()
   define("fn.provider", "fn", ([[
 return function(req, ctx)
@@ -355,10 +354,11 @@ end]]):format(stranger))
   assert(out:find("gated-done", 1, true), out)
   local pw = vim.b[parent].straps_watchers
   assert(type(pw) == "table" and next(pw) ~= nil, "the gated child's watch on its parent should be stored")
-  assert(vim.b[stranger].straps_watchers == nil, "a gated child must not watch a stranger")
+  local sw = vim.b[stranger].straps_watchers
+  assert(type(sw) == "table" and next(sw) == next(pw), "the readonly child's stranger watch should be stored")
 end)
 
-it("a gated child granted watch_agent by name still cannot watch outside its family", function()
+it("a gated child granted watch_agent by name may watch a stranger", function()
   local stranger = state.new_session()
   define("fn.provider", "fn", ([[
 return function(req, ctx)
@@ -377,9 +377,79 @@ end]]):format(stranger))
     child = tonumber(started:match("buffer (%d+)"))
     return registry.call("tool.spawn_wait", { buffers = { child } }, ctx)
   end)
-  assert(vim.b[stranger].straps_watchers == nil, "a name grant must not reach a stranger")
-  assert(text_of(child):find("may watch only its parent or its own children", 1, true),
-    "the tool body should refuse the out-of-family target")
+  local watchers = vim.b[stranger].straps_watchers
+  assert(type(watchers) == "table" and watchers[tostring(child)], "a name-granted child's stranger watch should be stored")
+end)
+
+it("an unrelated target wakes a readonly spawned auditor", function()
+  local target = target_session()
+  _G.readonly_watch_notice = nil
+  define("fn.provider", "fn", ([[
+return function(req, ctx)
+  local first = req.messages[1].content[1].text or ""
+  if not first:find("TARGET", 1, true) then
+    local last = req.messages[#req.messages]
+    for _, p in ipairs(last.content) do
+      if p.type == "text" and p.text:find("[straps] watched agent", 1, true) then
+        _G.readonly_watch_notice = p.text
+      end
+    end
+    if #req.messages == 1 then
+      return { stop_reason = "tool_use", content = {
+        { type = "tool_use", id = "audit-watch", name = "watch_agent", input = { to = "%d", wake = true } } } }
+    end
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "audit-done" } } }
+end]]):format(target))
+  local parent = state.new_session()
+  local child
+  drive(parent, function(ctx)
+    local started = registry.call("tool.spawn", { task = "AUDITOR", readonly = true }, ctx)
+    child = tonumber(started:match("buffer (%d+)"))
+    return registry.call("tool.spawn_wait", { buffers = { child } }, ctx)
+  end)
+  local watchers = vim.b[target].straps_watchers
+  assert(type(watchers) == "table" and watchers[tostring(child)] and watchers[tostring(child)].wake == true,
+    "the readonly auditor must register an unrelated wake=true watch")
+  run_target(target)
+  wait_idle(child)
+  assert(_G.readonly_watch_notice and _G.readonly_watch_notice:find("run_end (ok)", 1, true),
+    "the readonly auditor's resumed request must contain the unrelated run_end notice")
+  assert(vim.b[child].straps_watch_wakes == 1, "the readonly auditor must wake once")
+end)
+
+it("a readonly spawned child unwatch preserves another unrelated watcher", function()
+  provider()
+  local target = target_session()
+  local other = state.new_session()
+  watch(other, { to = tostring(target), wake = false })
+  define("fn.provider", "fn", ([[
+return function(req, ctx)
+  if #req.messages == 1 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "own-watch", name = "watch_agent", input = { to = "%d", wake = false } } } }
+  elseif #req.messages == 3 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "own-unwatch", name = "unwatch_agent", input = { to = "%d" } } } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "unwatch-done" } } }
+end]]):format(target, target))
+  local parent = state.new_session()
+  local child
+  drive(parent, function(ctx)
+    local started = registry.call("tool.spawn", { task = "UNWATCH-AUDITOR", readonly = true }, ctx)
+    child = tonumber(started:match("buffer (%d+)"))
+    return registry.call("tool.spawn_wait", { buffers = { child } }, ctx)
+  end)
+  assert(text_of(child):find("stopped watching buffer " .. target, 1, true),
+    "readonly unwatch must remove its own existing unrelated subscription")
+  local watchers = vim.b[target].straps_watchers
+  assert(type(watchers) == "table" and watchers[tostring(child)] == nil and watchers[tostring(other)],
+    "unwatch must remove only the caller's subscription")
+  provider()
+  run_target(target)
+  assert(text_of(other):find("[straps] watched agent", 1, true), "the other watcher must still receive the event")
+  assert(not text_of(child):find("[straps] watched agent", 1, true), "the removed watcher must receive no event")
 end)
 
 it("a watch notice wakes a watcher blocked in spawn_wait", function()

@@ -3,6 +3,11 @@
 -- (straps://registry/<name>); :w re-executes them, which re-runs define.
 
 local M = {}
+local human
+require("straps.contextual_human").attach("ui", function(callbacks)
+  human = callbacks
+  return function(split_cmd, opts) return M.open_session(split_cmd, opts, callbacks) end
+end)
 
 local AUGROUP = "StrapsUI"
 local REG_AUGROUP = "StrapsRegistryBuf" -- never cleared: holds per-buffer autocmds
@@ -192,7 +197,7 @@ local function role_overlay(role)
 end
 
 -- The block kinds that are conversation turns: the units the outline lists
--- and the `]]`/`[[` motions land on (turns themselves never fold).
+-- and the `]]`/`[[` motions land on.
 local TURN_KIND = { user = true, assistant = true }
 
 -- First content line of a block, trimmed and truncated to `max` display cells —
@@ -283,9 +288,6 @@ local function paired_result(blocks, idx, id)
   return nil
 end
 
---- Build the colored fold-summary chunk list for the fold starting at
---- start_lnum (a system, tool_use or tool_result marker line — turns never
---- fold). Exposed for headless tests: it needs no window or real fold.
 --- Returns {{text, hl}, ...}: a tool_use folds to `▸ <verb> <args>   ✓|✗`
 --- (command-style via fn.tool_display — StrapsTool verb, dim StrapsRule
 --- args); a dangling tool_result keeps `▸ ⚙ result …`.
@@ -299,8 +301,19 @@ function M._fold_summary(bufnr, start_lnum)
       break
     end
   end
-  -- The system block folds to a plain labelled summary (no ⚙/status), since it
-  -- is a long, rarely-re-read prompt rather than a tool call.
+  if blk and blk.kind == "user" then
+    local role = role_for(bufnr, blk)
+    if role.hl == "StrapsRoleNotice" then
+      local headline = block_headline(bufnr, blk, math.huge)
+      headline = headline:gsub("^%[straps%] from agent .- %(buffer %d+%): ", ""):gsub("^%[straps%] ", "")
+      if vim.fn.strdisplaywidth(headline) > 60 then headline = vim.fn.strcharpart(headline, 0, 59) .. "…" end
+      return {
+        { "▸ ", "StrapsRule" },
+        { role.label, role.hl },
+        { "   " .. headline, "StrapsRule" },
+      }
+    end
+  end
   if blk and blk.kind == "system" then
     local nlines = math.max(0, (blk.last_lnum or blk.first_lnum) - blk.first_lnum + 1)
     return {
@@ -802,7 +815,7 @@ end
 ---   the seed and that buffer is wiped, and the session takes over the
 ---   startup window instead of splitting when that window shows the stdin
 ---   buffer or the empty [No Name] buffer.
-function M.open_session(split_cmd, opts)
+function M.open_session(split_cmd, opts, captured)
   opts = opts or {}
   local grants = opts.grants or {}
   if #grants > 0 then
@@ -820,22 +833,25 @@ function M.open_session(split_cmd, opts)
     stdin_buf = nil
   end
   local seed = opts.instruction or ""
+  local data = ""
   if stdin_buf then
     local piped = table.concat(vim.api.nvim_buf_get_lines(stdin_buf, 0, -1, false), "\n")
     if piped:match("%S") then
+      data = piped
       seed = seed ~= "" and (seed .. "\n\n" .. piped) or piped
     end
     vim.g.straps_stdin_buf = nil
   end
 
   load_registries()
-  local bufnr = state.new_session()
+  local bufnr = captured == human and human and human.construct({}) or state.new_session()
   for _, c in ipairs(grants) do
     registry.grant(bufnr, "cap:" .. c)
   end
   if seed ~= "" then
     state.seed_user(bufnr, seed)
   end
+  if captured == human and human then human.draft(bufnr, opts.instruction, data, state.last_user_text(bufnr)) end
 
   local cur = vim.api.nvim_get_current_buf()
   local reuse = starting and not opts.explicit_split and (
@@ -854,7 +870,7 @@ function M.open_session(split_cmd, opts)
 
   if opts.send then
     if (state.last_user_text(bufnr) or "") ~= "" then
-      require("straps.loop").start(bufnr)
+      if captured == human and human then human.send(bufnr) else require("straps.loop").start(bufnr) end
     else
       vim.notify("straps: nothing to send — give :Straps! an instruction after `--` or pipe stdin",
         vim.log.levels.WARN)
@@ -880,6 +896,7 @@ function M.resume_session(path, split_cmd)
     path = sessions[1].path
   end
   local bufnr = state.open_session_file(path)
+  if human then human.resume(bufnr) end
   -- A session whose Neovim died mid-tool is on disk with an unpaired tool_use,
   -- which the API rejects; pair it up so the resumed transcript can be sent.
   local healed = state.heal_interrupted(bufnr)
@@ -2354,18 +2371,23 @@ function M.auto(arg)
   vim.notify("straps: auto grants: " .. (grants_list() or "none"), vim.log.levels.INFO)
 end
 
--- Only the MACHINERY folds: each tool_use fold swallows its following
--- tool_result, so one call collapses to a single colored summary line, and
--- the system block (long and rarely re-read) folds the same way. The
--- conversation itself — user/assistant turns — never folds, so closing one
--- tool call never hides the exchange around it. The default foldlevel of 0
--- starts every tool call collapsed.
 function M.foldexpr(lnum)
   local kind = vim.fn.getline(lnum):match("^%%%%%[straps:([%w_]+)%]%%%%")
   if kind == "tool_use" or kind == "system" then
     return ">1"
   elseif kind == "tool_result" then
     return "1"
+  elseif kind == "user" then
+    local bufnr = vim.api.nvim_get_current_buf()
+    local last = lnum
+    for line = lnum + 1, vim.api.nvim_buf_line_count(bufnr) do
+      local text = vim.fn.getline(line)
+      if text:match("^%%%%%[straps:[%w_]+%]%%%%") then break end
+      last = line
+      if not text:match("^%s*$") then break end
+    end
+    local blk = { kind = kind, marker_lnum = lnum, first_lnum = lnum + 1, last_lnum = last }
+    return role_for(bufnr, blk).hl == "StrapsRoleNotice" and ">1" or 0
   elseif kind then
     return 0
   end
@@ -2488,11 +2510,11 @@ function M.map_session_keys(bufnr)
     if loop.running(bufnr) then
       vim.ui.input({ prompt = "steer: " }, function(txt)
         if txt and txt ~= "" then
-          require("straps.loop").steer(bufnr, txt)
+          if human then human.steer(bufnr, txt) else require("straps.loop").steer(bufnr, txt) end
         end
       end)
     else
-      loop.start(bufnr)
+      if human then human.send(bufnr) else loop.start(bufnr) end
     end
   end, { buffer = bufnr, desc = "straps: send / steer" })
   M.map_file_refs(bufnr)
@@ -2524,8 +2546,7 @@ end
 --- Apply the straps fold options (foldmethod=expr + foldexpr + foldtext +
 --- foldlevel from config.tools_expanded) to every window currently showing
 --- bufnr. foldlevel is set only the first time a window gets the straps
---- foldexpr, so re-showing a session keeps the level the user chose (zR/zM). The default foldlevel is 0: tool calls and the system prompt
---- collapsed (`tools_expanded` opens them); conversation turns never fold.
+--- foldexpr, so re-showing a session keeps the level the user chose (zR/zM).
 ---
 --- Folding is window-local, so this must run once the buffer is
 --- actually displayed — `vim.opt_local` from a FileType autocmd that fires

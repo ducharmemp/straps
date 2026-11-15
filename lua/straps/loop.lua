@@ -10,9 +10,97 @@ local unpack = unpack or table.unpack
 -- Captured once: the gate every tool call passes must not be swappable by
 -- a later package.loaded / require substitution made from inside a run.
 local registry = require("straps.registry")
+local preflight_tool_input = registry.preflight_tool_input
+local rejected_tool_inputs = setmetatable({}, { __mode = "k" })
 
 -- bufnr -> { cancelled, cancel_fns, await_seq, done }
 local runs = {}
+local operations, owned_contexts = {}, setmetatable({}, { __mode = "k" })
+local contextual, human_installed
+local operation, replay
+local replay_serial = 0
+local replay_reservations = {}
+local transaction_faults = {}
+local context_reservations, context_consumer, context_schedule = {}, nil, nil
+
+local function transaction_fault(bufnr, run, status)
+  transaction_faults[bufnr] = status
+  local main = runs[bufnr]
+  local affected, handlers = { [run] = true }, {}
+  if main then affected[main] = true end
+  for active in pairs(operations[bufnr] or {}) do affected[active] = true end
+  for active in pairs(affected) do
+    active.transaction_terminal = true
+    active.pending_emissions = nil
+    active.done, active.cancelled = true, true
+    active.await_seq = active.await_seq + 1
+    for _, fn in ipairs(active.cancel_fns) do handlers[#handlers + 1] = fn end
+    active.cancel_fns = {}
+    if active.ctx then owned_contexts[active.ctx] = nil end
+  end
+  runs[bufnr], operations[bufnr], replay_reservations[bufnr], context_reservations[bufnr] = nil, nil, nil, nil
+  for active in pairs(affected) do
+    if active.diag_teardown then pcall(active.diag_teardown) end
+    if active.family then
+      local family = active.family
+      active.family = nil
+      pcall(contextual.finish, family)
+    end
+  end
+  for _, fn in ipairs(handlers) do pcall(fn) end
+  if main then pcall(function() require("straps.attention").finish(bufnr, main, "error") end) end
+  pcall(function() require("straps.ui").progress(bufnr, { type = "done" }) end)
+  pcall(function()
+    vim.b[bufnr].straps_status = "idle"
+    vim.b[bufnr].straps_run_reason = "error"
+  end)
+  error("straps: context transaction stopped: " .. tostring(status.error or status.status), 0)
+end
+
+local function checked_transaction(bufnr, run, fn, ...)
+  local ok, status = pcall(fn, ...)
+  if not ok or type(status) ~= "table" or (status.status ~= "committed_live" and status.status ~= "error")
+    or type(status.terminal) ~= "boolean" then
+    status = { terminal = true, status = "ambiguous", error = tostring(status) }
+  end
+  if status.terminal then transaction_fault(bufnr, run, status) end
+  return status
+end
+
+function M.install_contextual(adapter)
+  assert(not contextual and registry.trusted_setup_allowed(), "contextual loop setup sealed")
+  local captured = {}
+  for _, name in ipairs({ "begin", "bind", "finish", "stop", "close" }) do
+    assert(type(adapter[name]) == "function", "missing contextual loop callback: " .. name)
+    captured[name] = adapter[name]
+  end
+  contextual = captured
+end
+
+function M.install_human_operations(consumer)
+  assert(not human_installed and registry.trusted_setup_allowed(), "human operation setup sealed")
+  assert(type(consumer) == "function", "human operation consumer required")
+  human_installed = true
+  consumer(function(...) return operation(...) end, function(...) return replay(...) end)
+end
+
+function M.install_context_operations(consumer)
+  assert(type(consumer) == "function", "context operation consumer required")
+  if consumer ~= context_consumer then
+    assert(not context_consumer and registry.trusted_setup_allowed(), "context operation setup sealed")
+    context_consumer = consumer
+    context_schedule = function(bufnr, fn) return operation(bufnr, fn, false, true) end
+  end
+  consumer(context_schedule)
+end
+
+local function finish_family(run)
+  if run.family then
+    local family = run.family
+    run.family = nil
+    contextual.finish(family)
+  end
+end
 
 -- Config is read lazily per run so tests can run without init.lua/setup().
 local function get_config()
@@ -82,6 +170,7 @@ end
 -- Progress must never break a run: hook errors are swallowed, and the phase
 -- mirror (vim.b straps_phase) is best-effort. phase == nil means "no change".
 local function progress(bufnr, ctx, ev, phase)
+  if transaction_faults[bufnr] then return end
   pcall(registry.try_call, "hook.on_progress", ev, ctx)
   if phase ~= nil then
     pcall(function() vim.b[bufnr].straps_phase = phase end)
@@ -101,6 +190,7 @@ local function log(bufnr, ev)
 end
 
 local function finish_events(bufnr, reason, run)
+  if transaction_faults[bufnr] then return end
   require("straps.attention").finish(bufnr, run, reason)
   pcall(function() vim.b[bufnr].straps_status = "idle" end)
   pcall(function() vim.b[bufnr].straps_run_reason = reason end)
@@ -113,10 +203,23 @@ end
 local pair_turn
 
 local function crashed(bufnr, run, err)
+  if run and run.fail then return run.fail(err) end
+  if run then
+    run.done = true
+    finish_family(run)
+    if run.ctx then owned_contexts[run.ctx] = nil end
+  end
   runs[bufnr] = nil
   if run then pcall(pair_turn, bufnr, run) end
   finish_events(bufnr, "error", run or {})
   vim.notify("straps: run crashed: " .. tostring(err), vim.log.levels.ERROR)
+end
+
+local function flush_emissions(bufnr, run)
+  local pending = run.pending_emissions
+  run.pending_emissions = nil
+  if transaction_faults[bufnr] or run.cancelled or not vim.api.nvim_buf_is_valid(bufnr) then return end
+  for _, text in ipairs(pending or {}) do require("straps.state").append_text(bufnr, text) end
 end
 
 local function new_ctx(bufnr, run)
@@ -156,6 +259,7 @@ local function new_ctx(bufnr, run)
       end)
       local ret = pack(coroutine.yield())
       run.cancel_fns = {} -- handlers are cleared after each await completes
+      if transaction_faults[bufnr] then error("straps: context transaction stopped", 0) end
       return unpack(ret, 1, ret.n)
     end,
 
@@ -163,12 +267,12 @@ local function new_ctx(bufnr, run)
     -- (assistant) block; buffer mutation is scheduled onto the main loop.
     -- vim.schedule is FIFO, so deltas emitted before resolve land first.
     emit = function(ev)
+      if run.done or run.cancelled or transaction_faults[bufnr] then return end
+      if type(ev) == "table" then run.provider_emitted = true end
       if type(ev) == "table" and ev.type == "text_delta" and ev.text and ev.text ~= "" then
-        vim.schedule(function()
-          if vim.api.nvim_buf_is_valid(bufnr) then
-            require("straps.state").append_text(bufnr, ev.text)
-          end
-        end)
+        run.pending_emissions = run.pending_emissions or {}
+        run.pending_emissions[#run.pending_emissions + 1] = ev.text
+        vim.schedule(function() flush_emissions(bufnr, run) end)
       end
     end,
 
@@ -215,6 +319,7 @@ end
 -- Stage 1 of a tool_use block: before-guards -> confirm -> before_tool.
 -- Returns allowed, reason, run (run executes the gated entry exactly once).
 local function gate_tool(ctx, block)
+  if rejected_tool_inputs[block] then return false, rejected_tool_inputs[block] end
   return registry.gate_tool(block.name, block.input or {}, ctx, { confirm = confirm_then_before_tool })
 end
 
@@ -267,6 +372,26 @@ local function finish_tool(ctx, block, cfg, run)
 end
 
 local function append_tool_result(bufnr, block, ok, result, run)
+  if transaction_faults[bufnr] then return end
+  local management = require("straps.context_management")
+  if block.name == "context_retrieve" then
+    if ok then
+      local called, status = pcall(management.append_result, bufnr,
+        { id = block.id, is_error = false }, tostring(result), run and run.ctx)
+      if not called or type(status) ~= "table" or (status.status ~= "committed_live" and status.status ~= "error"
+        and status.status ~= "conflict" and status.status ~= "ambiguous") or type(status.terminal) ~= "boolean" then
+        status = { terminal = true, status = "ambiguous", error = tostring(status) }
+      end
+      if status.appended and run and run.turn_appended then run.turn_appended[block] = true end
+      if status.terminal or status.status == "conflict" or status.status == "ambiguous" then transaction_fault(bufnr, run, status) end
+      if status.status == "committed_live" and status.appended == true then return end
+      if status.status == "committed_live" then
+        transaction_fault(bufnr, run, { status = "ambiguous", error = "retrieval append was not confirmed", terminal = true })
+      end
+      ok, result = false, status.error or "retrieval result could not be persisted"
+    end
+    management.release(bufnr)
+  end
   require("straps.state").append(bufnr, "tool_result",
     { id = block.id, is_error = not ok }, tostring(result))
   if run and run.turn_appended then run.turn_appended[block] = true end
@@ -275,6 +400,7 @@ end
 pair_turn = function(bufnr, run)
   if run.diag_teardown then pcall(run.diag_teardown) end
   if run.ctx then run.ctx.batch_preview = nil end
+  if transaction_faults[bufnr] then return end
   local blocks = run.turn_blocks
   run.turn_blocks = nil
   if not blocks then return end
@@ -290,6 +416,108 @@ pair_turn = function(bufnr, run)
       pcall(append_tool_result, bufnr, block, false, text, run)
     end
   end
+end
+
+local function cancel_operation(run)
+  if run.done or run.cancelled then return end
+  run.cancelled = true
+  finish_family(run)
+  local handlers = run.cancel_fns
+  run.cancel_fns = {}
+  for _, fn in ipairs(handlers) do pcall(fn) end
+  vim.schedule(function()
+    if run.done or coroutine.status(run.co) ~= "suspended" then return end
+    run.await_seq = run.await_seq + 1
+    local previous = registry.set_active_scope(run.ctx.bufnr)
+    local ok, err = coroutine.resume(run.co)
+    registry.set_active_scope(previous)
+    if not ok then run.fail(err) end
+  end)
+end
+
+operation = function(bufnr, fn, reserve_replay, reserve_context)
+  if context_reservations[bufnr] then return false, "a context operation is active" end
+  if reserve_context and (runs[bufnr] or operations[bufnr] or replay_reservations[bufnr]) then
+    return false, "context controls require an idle session with no human operations"
+  end
+  if transaction_faults[bufnr] then return false, "context transaction requires reconciliation" end
+  if type(fn) ~= "function" or not vim.api.nvim_buf_is_valid(bufnr) then return false, "invalid human operation" end
+  registry.ensure_scope(bufnr)
+  registry.freeze_guards()
+  local run = { cancelled = false, cancel_fns = {}, await_seq = 0, done = false, seen_calls = {} }
+  local ctx = new_ctx(bufnr, run)
+  run.ctx = ctx
+  operations[bufnr] = operations[bufnr] or {}
+  operations[bufnr][run] = true
+  owned_contexts[ctx] = run
+  if reserve_replay then replay_reservations[bufnr] = run end
+  if reserve_context then context_reservations[bufnr] = run end
+  local function done(err)
+    if run.done then return end
+    if reserve_context then
+      local status = require("straps.context_management").transaction_status(bufnr)
+      if status and status.terminal then transaction_fault(bufnr, run, status) end
+    end
+    flush_emissions(bufnr, run)
+    run.done = true
+    finish_family(run)
+    owned_contexts[ctx] = nil
+    if replay_reservations[bufnr] == run then replay_reservations[bufnr] = nil end
+    if context_reservations[bufnr] == run then context_reservations[bufnr] = nil end
+    local active = operations[bufnr]
+    if active then
+      active[run] = nil
+      if not next(active) then operations[bufnr] = nil end
+    end
+    if err then
+      pcall(pair_turn, bufnr, run)
+      vim.notify("straps: human operation failed: " .. tostring(err), vim.log.levels.ERROR)
+    end
+  end
+  run.fail = done
+  run.co = coroutine.create(function()
+    if contextual then run.family = contextual.begin(ctx) end
+    fn(ctx)
+    done()
+  end)
+  local previous = registry.set_active_scope(bufnr)
+  local ok, err = coroutine.resume(run.co)
+  registry.set_active_scope(previous)
+  if not ok then done(err) end
+  return true, function() cancel_operation(run) end
+end
+
+replay = function(description, current_ctx, fresh_gate)
+  if current_ctx and (runs[current_ctx.bufnr] or replay_reservations[current_ctx.bufnr]) then
+    return false, "replay requires an idle actor"
+  end
+  local owner = owned_contexts[current_ctx]
+  if not owner or owner.done or owner.cancelled or type(description) ~= "table"
+    or description.terminal ~= true or description.execution_started ~= false
+    or type(description.binding) ~= "table" or description.binding.session ~= current_ctx.bufnr
+    or type(fresh_gate) ~= "function" then return false, "invalid replay context or decision" end
+  local binding = vim.deepcopy(description.binding)
+  local name = binding.definition and binding.definition.name
+  if type(name) ~= "string" or name:sub(1, 5) ~= "tool." then return false, "invalid replay tool" end
+  replay_serial = replay_serial + 1
+  local block = { id = "straps-replay-" .. current_ctx.bufnr .. "-" .. replay_serial,
+    name = name:sub(6), input = binding.input or {} }
+  return operation(current_ctx.bufnr, function(ctx)
+    local run = owned_contexts[ctx]
+    ctx.await(function(resolve) resolve() end)
+    if run.cancelled or owner.cancelled or runs[ctx.bufnr]
+      or replay_reservations[ctx.bufnr] ~= run or not vim.api.nvim_buf_is_valid(ctx.bufnr) then return end
+    require("straps.state").append(ctx.bufnr, "tool_use", { id = block.id, name = block.name }, pretty_json(block.input))
+    run.turn_blocks, run.turn_items, run.turn_appended = { block }, {}, {}
+    local allowed, reason, execute = fresh_gate(confirm_then_before_tool, ctx)
+    local ok, result = false, reason or "replay denied"
+    if allowed and not run.cancelled then
+      ok, result = finish_tool(ctx, block, get_config(), execute)
+      run.turn_items[block] = { executed = true }
+    elseif run.cancelled then result = "replay cancelled before execution" end
+    append_tool_result(ctx.bufnr, block, ok, result, run)
+    run.turn_blocks = nil
+  end, true)
 end
 
 -- Builtin read-only tools whose effects are safe to overlap when the model
@@ -455,6 +683,7 @@ local function run_segments(bufnr, ctx, run, cfg, blocks)
       progress(bufnr, ctx, { type = "gate", name = block.name }, "gate: " .. tostring(block.name))
       local t0 = vim.uv.hrtime()
       local allowed, reason, gated = gate_tool(ctx, block)
+      if transaction_faults[bufnr] then error("straps: context transaction stopped", 0) end
       log(bufnr, { ev = "gate", name = block.name, ms = math.floor((vim.uv.hrtime() - t0) / 1e6), allowed = allowed })
       if allowed then
         item.run = gated
@@ -530,6 +759,7 @@ end
 --- User activity on a session re-arms watch wakes: the wake count returns to
 --- zero and a :StrapsStop pause is lifted.
 function M.note_user_activity(bufnr)
+  if transaction_faults[bufnr] then return end
   pcall(function()
     vim.b[bufnr].straps_watch_wakes = 0
     vim.b[bufnr].straps_watch_paused = nil
@@ -540,6 +770,8 @@ end
 --- until the user sends to it again. Cascaded and timeout stops call M.stop.
 function M.user_stop(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if transaction_faults[bufnr] then return end
+  pcall(function() require("straps.context_ui").cancel(bufnr) end)
   pcall(function() vim.b[bufnr].straps_watch_paused = true end)
   return M.stop(bufnr)
 end
@@ -619,6 +851,7 @@ local function run_turns(bufnr, ctx, run)
 
   for turn = 1, max_turns do
     run.turns = turn
+    run.provider_emitted = false
     drain_steering(bufnr) -- queued steering becomes user blocks before parse
     -- Per-turn seam, before the parse that builds this turn's request: the
     -- default notice tells the agent which model/effort it is running on and
@@ -630,7 +863,9 @@ local function run_turns(bufnr, ctx, run)
     -- from the first edit onward (tools+system survive) — so it must be COARSE:
     -- a growth guard stops it re-firing every turn (which would blow the cache
     -- every turn) when keep_turns content alone already sits above the limit.
-    if type(cfg.auto_compact_tokens) == "number" or type(cfg.auto_compact_bytes) == "number" then
+    if not require("straps.context_management").enabled(bufnr)
+      and not require("straps.context_management").has_pending(bufnr)
+      and (type(cfg.auto_compact_tokens) == "number" or type(cfg.auto_compact_bytes) == "number") then
       local bytes = vim.api.nvim_buf_get_offset(bufnr, vim.api.nvim_buf_line_count(bufnr))
       -- Prefer the REAL context fill the API reported last turn (input_tokens
       -- is the whole replayed prompt the model just saw) over a byte guess.
@@ -685,14 +920,63 @@ local function run_turns(bufnr, ctx, run)
 
     -- Empty assistant marker first: the provider streams text_delta events
     -- into it via ctx.emit/state.append_text. Empty text is dropped by parse.
+    local request = { system = system, messages = parsed.messages, tools = tools }
+    local allowance = {}
+    if require("straps.context_management").enabled(bufnr) then
+      local manager = require("straps.context_management")
+      local ok_boundary, result = pcall(manager.boundary, bufnr, ctx, run, tools, note, allowance)
+      local terminal = manager.transaction_status(bufnr)
+      if terminal then transaction_fault(bufnr, run, terminal) end
+      if not ok_boundary then error(result, 0) end
+      request = result
+    end
+    local management = require("straps.context_management")
+    local captured_ok, capture, capture_status = true, nil, nil
+    if management.has_pending(bufnr) then
+      captured_ok, capture, capture_status = pcall(management.snapshot_pending, bufnr)
+    end
+    if not captured_ok then
+      transaction_fault(bufnr, run, { status = "ambiguous", error = tostring(capture), terminal = true })
+    end
+    if capture_status then
+      if capture_status.terminal then transaction_fault(bufnr, run, capture_status) end
+      error(capture_status.error or "could not capture pending retrieval", 0)
+    end
     state.append(bufnr, "assistant", nil, "")
+    local recovery
+    if management.enabled(bufnr) then
+      recovery = management.capture_recovery(bufnr, ctx, tools, note, allowance)
+    end
     progress(bufnr, ctx, { type = "thinking", turn = turn, max = max_turns }, "thinking")
-    local resp = registry.call("fn.provider",
-      { system = system, messages = parsed.messages, tools = tools }, ctx)
+    local dispatched, resp = pcall(registry.call, "fn.provider", request, ctx)
+    if not dispatched and recovery and not run.cancelled and not run.provider_emitted
+      and type(resp) == "table" and rawget(resp, "kind") == "context_overflow"
+      and rawget(resp, "rejected") == true and rawget(resp, "response_started") == false
+      and type(rawget(resp, "provider")) == "string" and type(rawget(resp, "route")) == "string"
+      and rawget(resp, "status") == 400 and type(rawget(resp, "code")) == "string"
+      and type(rawget(resp, "message")) == "string" then
+      local recovered, result, validate_retry = pcall(management.recover, recovery, ctx)
+      local terminal = management.transaction_status(bufnr)
+      if terminal then transaction_fault(bufnr, run, terminal) end
+      if not recovered then error(result, 0) end
+      request = result
+      capture, capture_status = management.snapshot_pending(bufnr)
+      if capture_status then
+        if capture_status.terminal then transaction_fault(bufnr, run, capture_status) end
+        error(capture_status.error or "could not recapture pending retrieval", 0)
+      end
+      validate_retry()
+      if run.provider_emitted then error("context management: output appeared during overflow recovery", 0) end
+      dispatched, resp = pcall(registry.call, "fn.provider", request, ctx)
+    end
+    if not dispatched then error(resp, 0) end
     if run.cancelled then
       return cancelled_note()
     end
     assert(type(resp) == "table", "straps: fn.provider must return a table")
+    if capture and resp.complete ~= false and (resp.stop_reason == "end_turn" or resp.stop_reason == "tool_use") then
+      checked_transaction(bufnr, run, management.consume_pending, capture, ctx)
+    end
 
     -- Thread token usage back into buffer state. The provider captures it per
     -- response; accumulate it on the run and mirror it to vim.b so the winbar
@@ -729,6 +1013,11 @@ local function run_turns(bufnr, ctx, run)
     run.turn_blocks, run.turn_items, run.turn_appended = tool_blocks, {}, {}
     for _, block in ipairs(resp.content or {}) do
       if block.type == "tool_use" then
+        local bounded, reason = preflight_tool_input(block.input or {})
+        if not bounded then
+          block = { type = "tool_use", id = block.id, name = block.name, input = {} }
+          rejected_tool_inputs[block] = reason
+        end
         state.append(bufnr, "tool_use",
           { id = block.id, name = block.name }, pretty_json(block.input or {}))
         tool_blocks[#tool_blocks + 1] = block
@@ -780,6 +1069,7 @@ local function run_turns(bufnr, ctx, run)
           end
           local co = coroutine.create(function()
             local cctx = child_ctx(ctx, bufnr, finish, run)
+            if run.family then contextual.bind(run.family, cctx) end
             finish(finish_tool(cctx, block, cfg, job.run))
             if run.turn_items then run.turn_items[block] = { executed = true } end
           end)
@@ -919,7 +1209,19 @@ end
 --- watch wake); a user start re-arms watch wakes.
 function M.start(bufnr, opts)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if transaction_faults[bufnr] then
+    vim.notify("straps: context transaction requires reconciliation", vim.log.levels.ERROR)
+    return
+  end
+  if context_reservations[bufnr] then
+    vim.notify("straps: a context operation is active for this buffer", vim.log.levels.WARN)
+    return
+  end
   local source = type(opts) == "table" and opts.source or "user"
+  if replay_reservations[bufnr] then
+    vim.notify("straps: a replay operation is active for this buffer", vim.log.levels.WARN)
+    return
+  end
   if runs[bufnr] then
     vim.notify("straps: a run is already active for this buffer", vim.log.levels.WARN)
     return
@@ -941,6 +1243,16 @@ function M.start(bufnr, opts)
 
   local run = { cancelled = false, cancel_fns = {}, await_seq = 0, done = false, turns = 0 }
   runs[bufnr] = run
+  local ctx = new_ctx(bufnr, run)
+  run.ctx = ctx
+  owned_contexts[ctx] = run
+  if contextual then
+    local previous = registry.set_active_scope(bufnr)
+    local ok, family = pcall(contextual.begin, ctx)
+    registry.set_active_scope(previous)
+    if not ok then crashed(bufnr, run, family); return end
+    run.family = family
+  end
   require("straps.attention").start(bufnr, run)
   pcall(function() vim.b[bufnr].straps_status = "running" end)
   pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "StrapsRunStart", data = { bufnr = bufnr } })
@@ -949,11 +1261,19 @@ function M.start(bufnr, opts)
   -- all windows: a subagent run changes the parent's agent count
   pcall(function() require("straps.ui").redraw_status(true) end)
 
-  local ctx = new_ctx(bufnr, run)
-  run.ctx = ctx
   local co = coroutine.create(function()
     local ok, ret = pcall(run_turns, bufnr, ctx, run)
+    flush_emissions(bufnr, run)
     run.done = true
+    finish_family(run)
+    owned_contexts[ctx] = nil
+    if transaction_faults[bufnr] then
+      if run.diag_teardown then pcall(run.diag_teardown) end
+      runs[bufnr] = nil
+      log(bufnr, { ev = "context_transaction_failure", err = tostring(ret) })
+      vim.notify("straps: " .. tostring(ret), vim.log.levels.ERROR)
+      return
+    end
     if not ok then
       pcall(pair_turn, bufnr, run)
       pcall(state.append, bufnr, "assistant", nil, "straps: run error: " .. tostring(ret))
@@ -990,8 +1310,7 @@ function M.start(bufnr, opts)
   local ok, err = coroutine.resume(co)
   registry.set_active_scope(prev_scope)
   if not ok then
-    runs[bufnr] = nil
-    finish_events(bufnr, "error", run)
+    crashed(bufnr, run, err)
     error(err)
   end
 end
@@ -1000,8 +1319,17 @@ end
 --- The run notices between turns / tool calls and ends with a note.
 function M.stop(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if transaction_faults[bufnr] then return end
   local run = runs[bufnr]
+  local pending = operations[bufnr]
+  if contextual then contextual.stop(bufnr) end
+  if pending then
+    local snapshot = {}
+    for active in pairs(pending) do snapshot[#snapshot + 1] = active end
+    for _, active in ipairs(snapshot) do cancel_operation(active) end
+  end
   if not run then
+    if pending then return true end
     vim.notify("straps: no active run for this buffer", vim.log.levels.WARN)
     return
   end
@@ -1077,8 +1405,21 @@ vim.api.nvim_create_autocmd("VimLeavePre", {
   group = vim.api.nvim_create_augroup("straps_loop_exit", { clear = true }),
   callback = function()
     require("straps.attention").shutdown()
+    local buffers = {}
+    for bufnr in pairs(runs) do buffers[bufnr] = true end
+    for bufnr in pairs(operations) do buffers[bufnr] = true end
+    for bufnr in pairs(buffers) do if contextual then contextual.stop(bufnr) end end
+    for _, pending in pairs(operations) do
+      for run in pairs(pending) do
+        run.cancelled = true
+        finish_family(run)
+        for _, fn in ipairs(run.cancel_fns) do pcall(fn) end
+        run.cancel_fns = {}
+      end
+    end
     for _, run in pairs(runs) do
       run.cancelled = true
+      finish_family(run)
       for _, fn in ipairs(run.cancel_fns) do
         pcall(fn)
       end
@@ -1097,6 +1438,7 @@ vim.api.nvim_create_autocmd("VimLeavePre", {
 --- quiet, and a quiet legacy caller is the harness.
 function M.steer(bufnr, text, opts)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if transaction_faults[bufnr] then return false end
   local quiet, source
   if type(opts) == "table" then
     quiet, source = opts.quiet, opts.source or "user"
@@ -1139,5 +1481,13 @@ function M.running_sessions()
   table.sort(out)
   return out
 end
+
+vim.api.nvim_create_autocmd("BufWipeout", {
+  group = vim.api.nvim_create_augroup("straps_loop_close", { clear = true }),
+  callback = function(event)
+    if runs[event.buf] or operations[event.buf] then M.stop(event.buf) end
+    if contextual then contextual.close(event.buf) end
+  end,
+})
 
 return M

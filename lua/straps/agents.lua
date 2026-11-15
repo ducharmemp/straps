@@ -1,4 +1,7 @@
 local M = {}
+local human
+local human_key = {}
+require("straps.contextual_human").attach("agents", function(callbacks) human = callbacks end)
 local ns = vim.api.nvim_create_namespace("straps_agents")
 local dashboards = {}
 local name = "straps://agents"
@@ -343,7 +346,7 @@ local function selected(buf)
   return entry
 end
 
-function M.key(buf, key)
+function M.key(buf, key, origin)
   if key == "R" then require("straps.state").clear_session_summary_cache(); render(buf); return end
   if key == "help" then vim.cmd("help straps-agents"); return end
   if key == "p" or key == "P" then
@@ -363,12 +366,17 @@ function M.key(buf, key)
       else ui().resume_session(entry.path, "none"); return end
     end
     if key == "cr" then ui().show_session(entry.bufnr, "none")
-    elseif not require("straps.loop").running(entry.bufnr) then require("straps.loop").start(entry.bufnr) end
+    elseif not require("straps.loop").running(entry.bufnr) then
+      if human and origin == human_key then human.send(entry.bufnr) else require("straps.loop").start(entry.bufnr) end
+    end
     M.refresh()
   elseif key == "i" and entry.bufnr then
     local target = entry.bufnr
     vim.ui.input({ prompt = "Message " .. fit(title(target), 60) .. ": " }, function(text)
-      if text and text:match("%S") then require("straps.registry").try_call("fn.session_notify", target, text, { source = "user" }); M.refresh() end
+      if text and text:match("%S") then
+        local function enqueue() require("straps.registry").try_call("fn.session_notify", target, text, { source = "user" }); M.refresh() end
+        if human and origin == human_key then human.steer(target, text, enqueue) else enqueue() end
+      end
     end)
   elseif key == "r" then
     if entry.bufnr then ui().rename_session(entry.bufnr)
@@ -406,7 +414,7 @@ function M.open(split)
     vim.bo[buf].bufhidden, vim.bo[buf].filetype, vim.bo[buf].modifiable = "hide", "strapsagents", false
     data(buf)
     for lhs, key in pairs({ ["<CR>"] = "cr", ["g<CR>"] = "gcr", x = "x", i = "i", r = "r", R = "R", p = "p", P = "P", ["<F1>"] = "help" }) do
-      vim.keymap.set("n", lhs, function() M.key(buf, key) end, { buffer = buf, silent = true, nowait = true })
+      vim.keymap.set("n", lhs, function() M.key(buf, key, human_key) end, { buffer = buf, silent = true, nowait = true })
     end
     local group = vim.api.nvim_create_augroup("StrapsAgentsBuf" .. buf, { clear = true })
     vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, { group = group, buffer = buf, callback = M.refresh })

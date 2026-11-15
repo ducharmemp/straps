@@ -13,6 +13,7 @@ local M = {}
 -- This is the GLOBAL scope. scope on an entry is the owning bufnr, or nil
 -- for global entries.
 local entries = {}
+local default_tools = {}
 
 -- Session overlays, vim's :set/:setlocal split applied to the registry:
 -- bufnr -> { entries = {}, parent = bufnr|nil }. Lookups made while a
@@ -165,15 +166,12 @@ local function merged_entries()
   return out
 end
 
-local COPY_FIELDS = { "name", "kind", "doc", "input_schema", "capability", "segment_break", "source", "version", "seq", "scope" }
+local COPY_FIELDS = { "name", "kind", "doc", "input_schema", "capability", "segment_break", "source", "version", "seq", "scope", "identity" }
 
--- Read-only view: a shallow copy of the public fields. The compiled fn is
--- deliberately absent — handing it out would be a way to run a tool without
--- passing gate_tool.
 local function view(e)
   if not e then return nil end
   local out = {}
-  for _, k in ipairs(COPY_FIELDS) do out[k] = e[k] end
+  for _, k in ipairs(COPY_FIELDS) do out[k] = vim.deepcopy(e[k]) end
   return out
 end
 
@@ -186,6 +184,7 @@ local KINDS = { tool = true, hook = true, fn = true, skill = true }
 -- A scoped SHADOW of an existing name reuses the shadowed entry's seq, so
 -- shadowing never reorders the tool list either.
 local next_seq = 0
+local next_identity = 0
 
 -- ------------------------------------------------------------------- guards
 
@@ -227,7 +226,11 @@ local function run_guards(op, a, b, c, d, e)
     in_guard[co] = true
     local ok, verdict, reason
     if op == "before" then
-      ok, verdict, reason = pcall(g.fn, "before", a, b, c, info)
+      local detached = vim.deepcopy(b)
+      ok, verdict, reason = pcall(g.fn, "before", a, detached, c, vim.deepcopy(info))
+      if not vim.deep_equal(detached, b) then
+        ok, verdict = false, "guard mutated tool input"
+      end
     elseif op == "after" then
       ok, verdict, reason = pcall(g.fn, "after", a, b, result, d, e, info)
     else
@@ -377,11 +380,13 @@ function M.define(spec, opts)
     next_seq = next_seq + 1
     seq = next_seq
   end
+  next_identity = next_identity + 1
   local entry = {
+    identity = next_identity,
     name = spec.name,
     kind = spec.kind,
     doc = spec.doc,
-    input_schema = spec.input_schema,
+    input_schema = vim.deepcopy(spec.input_schema),
     source = spec.source,
     capability = spec.capability,
     segment_break = spec.segment_break,
@@ -408,7 +413,18 @@ function M.define_default(spec)
   if entries[spec.name] then
     return view(entries[spec.name])
   end
-  return M.define(spec, { scope = "global" })
+  local definition = M.define(spec, { scope = "global" })
+  if definition.kind == "tool" then default_tools[definition.name] = definition.identity end
+  return definition
+end
+
+function M.trusted_default_tools()
+  assert(M.trusted_setup_allowed(), "trusted defaults require setup")
+  local definitions = {}
+  for name, identity in pairs(default_tools) do
+    if entries[name] and entries[name].identity == identity then definitions[#definitions + 1] = view(entries[name]) end
+  end
+  return definitions
 end
 
 --- Resolve name through the active scope chain, falling back to global.
@@ -439,8 +455,186 @@ end
 --- Returns allowed, reason, run. On allowed, `run(ctx) -> ok, raw` executes
 --- the entry resolved HERE exactly once (pcall'd; never raises for a tool
 --- error). On refusal, run is nil.
+local authorization
+local families = setmetatable({}, { __mode = "k" })
+local family_records = setmetatable({}, { __mode = "k" })
+local body_families = setmetatable({}, { __mode = "k" })
+local calls = setmetatable({}, { __mode = "k" })
+local next_call = 0
+local executing_calls = setmetatable({}, { __mode = "k" })
+local data_copy
+
+function M.any_tool_executing()
+  for _, set in pairs(executing_for) do if next(set) then return true end end
+  return next(executing_name) ~= nil
+end
+
+function M.trusted_setup_allowed()
+  return not M.any_tool_executing() and not guards_frozen and next(scopes) == nil
+end
+
+function M.setup_authorization(config)
+  assert(not authorization and M.trusted_setup_allowed(), "authorization setup must precede sessions and guard freeze")
+  for _, key in ipairs({ "assess", "execution_stamp", "validate_stamp" }) do
+    assert(type(config[key]) == "function", "missing authorization callback: " .. key)
+  end
+  local ceilings = require("straps.ceilings").new(resolve_in)
+  authorization = {
+    assess = config.assess, execution_stamp = config.execution_stamp, validate_stamp = config.validate_stamp,
+    invalidate = config.invalidate, consume = config.consume, ceilings = ceilings, input_limits = config.input_limits,
+  }
+  local controller = {}
+  function controller.begin_family(ctx)
+    assert(type(ctx) == "table" and type(ctx.bufnr) == "number", "family requires session context")
+    M.ensure_scope(ctx.bufnr)
+    local handle = {}
+    family_records[handle] = { session = ctx.bufnr, cancelled = false }
+    families[ctx] = handle
+    return handle
+  end
+  function controller.bind_context(handle, ctx)
+    local family = family_records[handle]
+    assert(family and not family.cancelled and ctx.bufnr == family.session, "invalid execution family")
+    families[ctx] = handle
+  end
+  function controller.cancel_family(handle)
+    assert(family_records[handle], "invalid execution family").cancelled = true
+    local pending = {}
+    for call_handle, call in pairs(calls) do if call.family == handle then pending[#pending + 1] = call_handle end end
+    for _, call_handle in ipairs(pending) do
+      if authorization.invalidate then pcall(authorization.invalidate, call_handle, "execution family cancelled") end
+      calls[call_handle] = nil
+    end
+  end
+  for _, key in ipairs({ "install", "narrow", "classify", "subset", "retire" }) do
+    local operation = ceilings[key]
+    controller[key .. "_ceiling"] = function(...)
+      return operation(...)
+    end
+  end
+  function controller.describe(handle)
+    local call = calls[handle]
+    return call and vim.deepcopy(call.description) or nil
+  end
+  function controller.validate(handle, binding)
+    local call = calls[handle]
+    if not call or not vim.deep_equal(binding, call.description) then return false end
+    return call.validate()
+  end
+  controller.describe_call = controller.describe
+  controller.current_call = controller.validate
+  local child_plans = setmetatable({}, { __mode = "k" })
+  function controller.prepare_child(action, source, normalized_opts)
+    local call = executing_calls[current_co()]
+    assert(call and (action == "fork" or action == "spawn") and call.name == action and call.session == source,
+      "child action requires exact executing call")
+    assert(call.valid(), "child action call is stale")
+    local expected = data_copy(call.input)
+    expected.readonly = expected.readonly and true or nil
+    if action == "fork" then
+      expected.relation, expected.focus = "child", false
+      expected.split = expected.show and "botright vsplit" or nil
+      expected.show = nil
+    end
+    assert(vim.deep_equal(data_copy(normalized_opts), expected), "child action options differ from approved input")
+    local plan = {}
+    child_plans[plan] = { call = call, options = expected }
+    return plan
+  end
+  function controller.attach_child(plan, child)
+    local pending = child_plans[plan]
+    assert(pending and pending.call == executing_calls[current_co()], "invalid child action plan")
+    child_plans[plan] = nil
+    assert(pending.call.valid(), "child action call is stale")
+    assert(type(child) == "number" and child ~= pending.call.session, "invalid child session")
+    M.ensure_scope(child, pending.call.session)
+    ceilings.install(child, { parent = pending.call.session, readonly = pending.options.readonly,
+      allow = pending.options.allow }, pending.call.session)
+    return true
+  end
+  return controller
+end
+
+data_copy = function(value, seen)
+  local kind = type(value)
+  if kind == "nil" or kind == "string" or kind == "boolean" then return value end
+  if kind == "number" and value == value and value ~= math.huge and value ~= -math.huge then return value end
+  local metatable = kind == "table" and getmetatable(value) or nil
+  if kind ~= "table" or (metatable ~= nil and metatable ~= getmetatable(vim.empty_dict())) then error("tool input must be data-only", 0) end
+  seen = seen or {}
+  if seen[value] then error("tool input must be acyclic", 0) end
+  seen[value] = true
+  local out = {}
+  for key, item in pairs(value) do
+    if type(key) ~= "string" and type(key) ~= "number" then error("invalid tool input key", 0) end
+    out[data_copy(key)] = data_copy(item, seen)
+  end
+  seen[value] = nil
+  return out
+end
+
+local function immediate(fn, ...)
+  local co = coroutine.create(fn)
+  local ok, result, reason = coroutine.resume(co, ...)
+  if not ok then return false, tostring(result) end
+  if coroutine.status(co) ~= "dead" then return false, "execution validation must not yield" end
+  return result, reason
+end
+
+local function bounded_input(value, limits)
+  if not limits then return true end
+  local bytes, items, active = 0, 0, {}
+  local function visit(item, depth)
+    items = items + 1
+    if items > limits.max_items or depth > limits.max_depth then error("tool input structural overflow", 0) end
+    local kind = type(item)
+    if kind == "string" then
+      if #item > limits.max_bytes then error("tool input byte overflow", 0) end
+      bytes = bytes + #vim.json.encode(item)
+    elseif kind == "table" then
+      if active[item] then error("tool input must be acyclic", 0) end
+      active[item] = true
+      bytes = bytes + 2
+      for key, child in pairs(item) do visit(key, depth + 1); visit(child, depth + 1); bytes = bytes + 2 end
+      active[item] = nil
+    elseif kind == "number" or kind == "boolean" or kind == "nil" then bytes = bytes + #tostring(item)
+    else error("tool input must be data-only", 0) end
+    if bytes > limits.max_bytes then error("tool input byte overflow", 0) end
+  end
+  visit(value, 1)
+  return true
+end
+
+local function preflight_tool_input(input)
+  if authorization and authorization.input_limits then
+    local bounded, reason = pcall(bounded_input, input, authorization.input_limits)
+    if not bounded then return false, reason end
+  end
+  return true
+end
+M.preflight_tool_input = preflight_tool_input
+
 function M.gate_tool(name, input, ctx, opts)
   local full = "tool." .. name
+  local bounded, reason = preflight_tool_input(input)
+  if not bounded then return false, reason end
+  local copied, frozen = pcall(data_copy, input)
+  if not copied then return false, frozen end
+  local inherited = body_families[current_co()]
+  local family_handle = (ctx and families[ctx]) or inherited
+  local family = family_handle and family_records[family_handle]
+  if authorization and (not family or family.cancelled or (ctx and ctx.bufnr ~= family.session)) then
+    return false, "authorization requires a trusted execution family"
+  end
+  local session = family and family.session or (ctx and ctx.bufnr)
+  local scope = session or active
+  local scope_chain = {}
+  local cursor = scope
+  while cursor and scopes[cursor] do
+    scope_chain[#scope_chain + 1] = { cursor, scopes[cursor], scopes[cursor].parent }
+    cursor = scopes[cursor].parent
+  end
+  local handle, stamp, ceiling_revision
   local prev_active = active
   if ctx and ctx.bufnr then active = ctx.bufnr end
   local entry = resolve(full)
@@ -449,13 +643,68 @@ function M.gate_tool(name, input, ctx, opts)
     return false, ("straps.registry: no entry named %q"):format(full)
   end
 
+  local gate_cwd = vim.fn.getcwd()
+  local gate_ctx = ctx and { bufnr = ctx.bufnr, cancelled = ctx.cancelled } or nil
+  local used = false
+  local function invalidate(reason)
+    used = true
+    if authorization and handle and authorization.invalidate then pcall(authorization.invalidate, handle, reason) end
+    if handle then calls[handle] = nil end
+  end
+  local function valid(run_ctx, executing)
+    if used and not executing then return false, "gate result already used" end
+    if not authorization then return true end
+    if ctx and (families[ctx] ~= family_handle or ctx.bufnr ~= gate_ctx.bufnr or ctx.cancelled ~= gate_ctx.cancelled) then return false, "execution context changed" end
+    if gate_ctx and gate_ctx.cancelled and gate_ctx.cancelled() then return false, "execution cancelled" end
+    if family.cancelled or (run_ctx and run_ctx.cancelled and run_ctx.cancelled()) then return false, "execution cancelled" end
+    if vim.fn.getcwd() ~= gate_cwd then return false, "execution directory changed" end
+    if run_ctx and (families[run_ctx] ~= family_handle or run_ctx.bufnr ~= session) then return false, "execution context changed" end
+    if resolve_in(scope, full) ~= entry then return false, "tool definition changed" end
+    for _, link in ipairs(scope_chain) do
+      if scopes[link[1]] ~= link[2] or scopes[link[1]].parent ~= link[3] then return false, "resolution scope changed" end
+    end
+    if authorization.ceilings.revision(session) ~= ceiling_revision then return false, "capability ceiling changed" end
+    local ceiling_ok, why = authorization.ceilings.check(session, view(entry), frozen)
+    if not ceiling_ok then return false, why end
+    return immediate(authorization.validate_stamp, session, vim.deepcopy(stamp))
+  end
+  if authorization then
+    handle = {}
+    next_call = next_call + 1
+    local stamp_ok, value = pcall(authorization.execution_stamp, session)
+    if not stamp_ok or type(value) ~= "table" then active = prev_active return false, "authorization stamp unavailable" end
+    stamp = data_copy(value)
+    ceiling_revision = authorization.ceilings.revision(session)
+    calls[handle] = {
+      family = family_handle,
+      description = { call_id = next_call, session = session, session_id = stamp.session_id, task_id = stamp.task_id,
+        epoch = stamp.epoch, scope = scope, cwd = gate_cwd, input = vim.deepcopy(frozen),
+        definition = view(entry), stamp = vim.deepcopy(stamp), ceiling_revision = ceiling_revision },
+      validate = function() return valid(ctx) end,
+    }
+  end
+
   -- Guards and confirm may raise (reentrancy, a broken confirm); the active
   -- scope must be restored on that path too, so run them under pcall.
   local ok, refused, reason = pcall(function()
-    local block = run_guards("before", name, input, ctx)
+    local block = run_guards("before", name, frozen, ctx)
     if block then return true, block end
+    if authorization then
+      local allowed, why = valid(ctx)
+      if not allowed then return true, why end
+      local description = vim.deepcopy(calls[handle].description)
+      local decision = authorization.assess(handle, description, ctx)
+      local current_call = calls[handle]
+      if not current_call then return true, "execution family cancelled" end
+      if not vim.deep_equal(description, current_call.description) then return true, "assessment mutated call" end
+      if type(decision) ~= "table" or decision.decision ~= "allow" then
+        return true, type(decision) == "table" and type(decision.reason) == "string" and decision.reason or "contextual authorization denied"
+      end
+    end
     if opts and opts.confirm then
-      local allowed, why, source = opts.confirm(name, input, ctx)
+      local detached = vim.deepcopy(frozen)
+      local allowed, why, source = opts.confirm(name, detached, ctx)
+      if not vim.deep_equal(detached, frozen) then return true, "confirmation mutated tool input" end
       if not allowed then
         local prefix = source == "hook" and "blocked by hook.confirm: " or "user denied: "
         return true, prefix .. (why or "")
@@ -464,15 +713,23 @@ function M.gate_tool(name, input, ctx, opts)
     return false
   end)
   active = prev_active
-  if not ok then error(refused, 0) end
-  if refused then return false, reason end
+  if not ok then invalidate(refused) error(refused, 0) end
+  if refused then invalidate(reason) return false, reason end
 
-  local used = false
-  local session = ctx and ctx.bufnr or nil
   local function run(run_ctx)
     if used then error("straps.registry: gate result already used", 0) end
+    local valid_ok, valid_reason = immediate(valid, run_ctx)
+    if not valid_ok then used = true invalidate(valid_reason) return false, valid_reason end
+    if authorization and authorization.consume then
+      local consumed, why = immediate(authorization.consume, handle)
+      if not consumed then used = true invalidate(why) return false, why or "consent unavailable" end
+      local still_valid, changed = immediate(valid, run_ctx)
+      if not still_valid then used = true invalidate(changed) return false, changed end
+    end
     used = true
     local co = current_co()
+    local outer_family = body_families[co]
+    body_families[co] = family_handle
     local outer = executing_name[co]
     executing_name[co] = name
     local set
@@ -485,14 +742,20 @@ function M.gate_tool(name, input, ctx, opts)
       set[co] = (set[co] or 0) + 1
     end
     local scope_before = active
-    if run_ctx and run_ctx.bufnr then active = run_ctx.bufnr end
-    local ok_run, raw = pcall(entry.fn, input, run_ctx)
+    if session then active = session end
+    local outer_call = executing_calls[co]
+    executing_calls[co] = authorization and { name = name, session = session, input = data_copy(frozen),
+      valid = function() return valid(run_ctx, true) end } or nil
+    local ok_run, raw = pcall(entry.fn, frozen, run_ctx or ctx)
+    executing_calls[co] = outer_call
+    body_families[co] = outer_family
     active = scope_before
     if set then
       set[co] = set[co] - 1
       if set[co] == 0 then set[co] = nil end
     end
     executing_name[co] = outer
+    if handle then calls[handle] = nil end
     return ok_run, raw
   end
   return true, nil, run

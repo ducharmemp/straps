@@ -392,6 +392,86 @@ it("foldexpr merges a tool_use/tool_result pair into one fold", function()
   vim.api.nvim_win_close(win, true)
 end)
 
+describe("notice folds", function()
+  local b, w
+  before_each(function()
+    b = vim.api.nvim_create_buf(false, true)
+    vim.cmd("split")
+    w = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(w, b)
+    vim.wo[w][0].foldexpr = "0"
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      "%%[straps:user]%%", "[straps] status", "details",
+      "%%[straps:user]%%", "[straps] from agent peer (buffer 42): hello", "more",
+      "%%[straps:user]%%", "ordinary", "%%[straps:assistant]%%", "reply",
+    })
+    ui.apply_fold_opts(b)
+    vim.cmd("normal! zX")
+  end)
+  after_each(function()
+    straps.config.tools_expanded = false
+    vim.api.nvim_win_close(w, true)
+    vim.api.nvim_buf_delete(b, { force = true })
+  end)
+  it("closes adjacent harness and agent messages without folding ordinary turns", function()
+    assert.equals(1, vim.fn.foldclosed(2))
+    assert.equals(3, vim.fn.foldclosedend(1))
+    assert.equals(4, vim.fn.foldclosed(5))
+    assert.equals(6, vim.fn.foldclosedend(4))
+    assert.equals(-1, vim.fn.foldclosed(8))
+    assert.equals(-1, vim.fn.foldclosed(10))
+  end)
+  it("labels notice summaries with their source and headline", function()
+    local harness = ui._fold_summary(b, 1)
+    local agent = ui._fold_summary(b, 4)
+    assert.same({ "harness", "StrapsRoleNotice" }, harness[2])
+    assert.equals("   status", harness[3][1])
+    assert.same({ "agent 42", "StrapsRoleNotice" }, agent[2])
+    assert.equals("   hello", agent[3][1])
+    vim.api.nvim_buf_set_lines(b, 4, 5, false, {
+      "[straps] from agent 20261115-141132-476.straps (buffer 2263): message payload",
+    })
+    assert.equals("   message payload", ui._fold_summary(b, 4)[3][1])
+  end)
+  it("preserves manual opening when fold options are reapplied", function()
+    vim.api.nvim_win_set_cursor(w, { 1, 0 })
+    vim.cmd("normal! zo")
+    ui.apply_fold_opts(b)
+    assert.equals(-1, vim.fn.foldclosed(2))
+    assert.equals(4, vim.fn.foldclosed(5))
+  end)
+  it("honors tools_expanded in a fresh window configuration", function()
+    straps.config.tools_expanded = true
+    vim.wo[w][0].foldexpr = "0"
+    ui.apply_fold_opts(b)
+    vim.cmd("normal! zX")
+    assert.equals(99, vim.wo[w].foldlevel)
+    assert.equals(-1, vim.fn.foldclosed(2))
+    assert.equals(-1, vim.fn.foldclosed(5))
+  end)
+  it("reclassifies notices after edits", function()
+    vim.api.nvim_buf_set_lines(b, 1, 2, false, { "ordinary now" })
+    vim.api.nvim_buf_set_lines(b, 7, 8, false, { "[straps] new status" })
+    assert.equals(-1, vim.fn.foldclosed(2))
+    assert.equals(7, vim.fn.foldclosed(8))
+  end)
+  it("uses raw first nonblank content and marker-line content", function()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      "%%[straps:user]%%", "", "[straps] status", "body",
+      "%%[straps:user]%% [straps] marker status", "body",
+      "%%[straps:user]%%", " [straps] indented", "body",
+      "%%[straps:user]%%", "ordinary first", "[straps] later",
+      "%%[straps:assistant]%%", "[straps] assistant text",
+    })
+    vim.cmd("normal! zX")
+    assert.equals(1, vim.fn.foldclosed(3))
+    assert.equals(5, vim.fn.foldclosed(6))
+    assert.equals(-1, vim.fn.foldclosed(8))
+    assert.equals(-1, vim.fn.foldclosed(12))
+    assert.equals(-1, vim.fn.foldclosed(14))
+  end)
+end)
+
 it("outline headline prefers text typed on the marker line itself", function()
   -- block_headline feeds M.outline (gO); turns no longer fold, so assert the
   -- marker-line preference through the outline's loclist text.

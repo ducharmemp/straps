@@ -368,15 +368,22 @@ it("glob raises a prefixed error for an unbalanced brace and supports {a,b}", fu
   assert.truthy(out:find("loop.lua", 1, true) and out:find("state.lua", 1, true), out)
 end)
 
-it("run_in_terminal and run_quickfix run in Neovim's global working directory", function()
+it("run_quickfix runs in Neovim's global working directory", function()
   local dir = vim.uv.fs_realpath(vim.fn.tempname():match("^(.*)/"))
   local saved = vim.fn.getcwd
   local seen = {}
-  vim.fn.getcwd = function(...) seen[#seen + 1] = select("#", ...); return dir end
-  local out = call_tool("run_quickfix", { command = "pwd -P | sed 's|$|:1:1: here|'", errorformat = "%f:%l:%c: %m" })
+  vim.fn.getcwd = function(...)
+    local args = { n = select("#", ...), ... }
+    if args.n > 0 then seen[#seen + 1] = args end
+    if args.n == 2 and args[1] == -1 and args[2] == -1 then return dir end
+    return saved(...)
+  end
+  local ok, out = pcall(call_tool, "run_quickfix", { command = "pwd -P | sed 's|$|:1:1: here|'", errorformat = "%f:%l:%c: %m" })
   vim.fn.getcwd = saved
+  assert(ok, out)
   assert.truthy(out:find(vim.fn.fnamemodify(dir, ":.") .. ":1:1: here", 1, true), out)
-  assert.are.same({ 2 }, seen)
+  assert.is_true(#seen > 0)
+  for _, args in ipairs(seen) do assert.are.same({ n = 2, -1, -1 }, args) end
 end)
 
 for _, stream in ipairs({ "stdout", "stderr" }) do

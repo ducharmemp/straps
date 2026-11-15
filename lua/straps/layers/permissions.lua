@@ -143,17 +143,14 @@ end
 
   -- -------------------------------------------------------- fn.readonly_policy
 
-  -- Thin wrapper over fn.capability: read-only == the "read" category. Both the
-  -- default hook.confirm (to auto-allow them without a prompt) and spawn's
-  -- readonly-child hook (to permit only these) consult it, so the policy
-  -- cannot drift. Called as (name, input) -> boolean.
   define({
     name = "fn.readonly_policy",
     kind = "fn",
     doc = "Return true if the tool call (name, input) is read-only: it opens"
       .. " views or lists things but changes no files. Classification itself"
       .. " lives in fn.capability (read-only == the \"read\" category); this is"
-      .. " the boolean wrapper hook.confirm and spawn's readonly-child gate use.",
+      .. " the boolean wrapper used by the default hook.confirm. Child gates"
+      .. " also allow lifecycle watches and parent-directed messages.",
     source = [==[
 return function(name, input)
   return require("straps.registry").try_call("fn.capability", name, input) == "read"

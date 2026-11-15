@@ -131,11 +131,11 @@ function M.register_spawn()
       .. " standing instructions, prepended to the task; provider (optional) —"
       .. " child backend, inherited from this session/global default when unset; tools (optional array"
       .. " of tool names) — the child sees only these tools (an unknown name is an error); readonly (optional"
-      .. " boolean) — the child may use only auto-allowed read-only tools,"
-      .. " every write is denied without prompting (equivalent to allow={});"
+      .. " boolean) — the child may read, watch/unwatch any agent, and message its"
+      .. " parent without grants; other writes are denied (equivalent to allow={});"
       .. " allow (optional array) — grant these permission categories (edit,"
       .. " delete, exec, lua, net, spawn) or specific tool names to the child:"
-      .. " granted calls run without prompting, everything else is DENIED"
+      .. " granted calls and readonly exceptions run without prompting; other calls are denied"
       .. " (no prompt); a tool-name grant covers the tool's current definition, so"
       .. " a child that shadows that tool, or any redefinition of it, is denied under it;"
       .. " readonly and allow are mutually exclusive — a session"
@@ -151,6 +151,7 @@ function M.register_spawn()
       type = "object",
       properties = {
         task = { type = "string", description = "Complete, self-contained instructions for the subagent." },
+        delegation = require("straps.contextual_children").delegation_schema(),
         system = { type = "string", description = "Extra standing instructions for the child." },
         provider = { type = "string", enum = require("straps.provider").provider_names(), description = "Provider for the child (default: this session's provider/global default)." },
         tools = {
@@ -158,11 +159,11 @@ function M.register_spawn()
           items = { type = "string" },
           description = "Restrict the child to these tool names (each must be a registered tool).",
         },
-        readonly = { type = "boolean", description = "Read-only child: every write tool is denied." },
+        readonly = { type = "boolean", description = "Allow reads, watch/unwatch on any agent and parent messaging; deny other writes." },
         allow = {
           type = "array",
           items = { type = "string" },
-          description = "Grant these permission categories (edit, delete, exec, lua, net, spawn) or specific tool names to the child: granted calls run without prompting; everything else is DENIED (no prompt). readonly=true is equivalent to allow={}.",
+          description = "Grant these permission categories (edit, delete, exec, lua, net, spawn) or specific tool names to the child: granted calls and readonly exceptions run without prompting; other calls are denied. readonly=true is equivalent to allow={}.",
         },
         show = { type = "boolean", description = "Open the child's transcript buffer in a split." },
         max_turns = { type = "integer", description = "Child turn budget (default 24)." },
@@ -173,7 +174,7 @@ function M.register_spawn()
       required = { "task" },
     },
     source = [==[
-return function(input, ctx)
+local function spawn(input, ctx, transaction)
   local task = input.task
   if type(task) ~= "string" or task == "" then
     error("spawn: task must be a non-empty string", 0)
@@ -287,12 +288,13 @@ return function(input, ctx)
       if e == "spawn" then child_may_spawn = true end
     end
   end
-  local child = state.new_session({
+  local child_options = {
     subagent = true,
     can_spawn = (depth + 1 < max_depth and child_may_spawn) or nil,
     readonly = input.readonly and true or nil,
     tools = (type(input.tools) == "table" and #input.tools > 0) and input.tools or nil,
-  })
+  }
+  local child = transaction and transaction.construct(child_options) or state.new_session(child_options)
   vim.b[child].straps_spawn_depth = depth + 1
   vim.b[child].straps_max_turns = math.floor(tonumber(input.max_turns) or 24)
   -- Timeout is stored for spawn_wait to enforce (spawn itself returns at once).
@@ -359,9 +361,9 @@ return function(input, ctx)
     registry.define({
       name = "hook.confirm",
       kind = "hook",
-      doc = "spawn: readonly/allow child — auto-allow read-only calls plus the"
-        .. " granted categories/tools, deny everything else without a prompt."
-        .. " readonly is this with an empty grant set (only reads pass).",
+      doc = "spawn: readonly/allow child — permit reads, granted calls, builtin"
+        .. " watch/unwatch on any agent and parent messaging; deny other calls."
+        .. " readonly uses an empty grant set.",
       source = [[
 return function(name, tin, tctx)
   local reg = require("straps.registry")
@@ -375,11 +377,8 @@ return function(name, tin, tctx)
     if cap and allowed["cap:" .. tostring(cap)] then return true end
     if allowed[reg.tool_grant_key(name)] then return true end
   end
-  -- A gated child can always report to (and watch) its parent: the parent-only
-  -- shape is the one message a research child must be able to send, and the tool body
-  -- confines a gated sender to its own family on every other target.
-  if (name == "send_message" or name == "watch_agent" or name == "unwatch_agent")
-    and type(tin) == "table" and tin.to == "parent" then
+  if cap == "spawn" and (name == "watch_agent" or name == "unwatch_agent") then return true end
+  if name == "send_message" and type(tin) == "table" and tin.to == "parent" then
     return true
   end
   local names = {}
@@ -405,6 +404,7 @@ end
   end
   state.append_text(child, header)
 
+  if transaction then transaction.attach(child) end
   loop.start(child, { source = "agent" })
   -- If the parent run is cancelled before the matching spawn_wait, nothing
   -- else would stop this child; register a cancel handler so it is not
@@ -440,6 +440,9 @@ end
       .. " pass allow={...} within your own grants to delegate writes"
   end
   return out
+end
+return function(input, ctx)
+  return require("straps.contextual_children").spawn(input, ctx, spawn)
 end
 ]==],
   })
@@ -865,9 +868,9 @@ end
       .. " whatever the user has half-typed in the trailing prompt. Parameters:"
       .. " to (required) — the recipient's buffer number as digits, or the"
       .. " word \"parent\"; text (required) — the message, at most 4000 bytes."
-      .. " A readonly/allow-gated session may message only its parent (or its"
-      .. " own children when granted); messaging to=\"parent\" is always"
-      .. " allowed for a gated child.",
+      .. " A readonly/allow-gated session may message its parent, its own children,"
+      .. " or immediate siblings sharing a valid session parent when granted;"
+      .. " messaging to=\"parent\" is always allowed for a gated child.",
     input_schema = {
       type = "object",
       properties = {
@@ -928,13 +931,11 @@ return function(input, ctx)
     error("send_message: that is this session", 0)
   end
 
-  -- A gated session (readonly/allow child) stays inside its own family: its
-  -- confirm hook let the call through on a name grant or the to="parent"
-  -- exception, and neither should reach an unrelated session.
   local gated = false
   pcall(function() gated = registry.granted(me)["spawn:gated"] == true end)
-  if gated and target ~= my_parent and bvar(target, "straps_parent") ~= me then
-    error("send_message: a permission-gated session may message only its parent or its own children", 0)
+  local sibling = is_session(my_parent) and bvar(target, "straps_parent") == my_parent
+  if gated and target ~= my_parent and bvar(target, "straps_parent") ~= me and not sibling then
+    error("send_message: a permission-gated session may message only its parent, its own children, or its immediate siblings", 0)
   end
 
   local label = "buffer " .. tostring(me)
@@ -975,9 +976,8 @@ end
       .. " in its prompt; the notice is then appended without starting a run."
       .. " Parameters: to (required) — the session's buffer number as digits,"
       .. " or \"parent\"; events (optional) — any of run_start, run_end, closed"
-      .. " (default run_end and closed); wake (optional, default true). A"
-      .. " readonly/allow-gated session may watch only its parent or its own"
-      .. " children.",
+      .. " (default run_end and closed); wake (optional, default true). Readonly"
+      .. " and allow-gated sessions may watch any agent without a grant.",
     input_schema = {
       type = "object",
       properties = {
@@ -1021,11 +1021,6 @@ return function(input, ctx)
     end
   end
   if target == me then error("watch_agent: that is this session", 0) end
-  local gated = false
-  pcall(function() gated = registry.granted(me)["spawn:gated"] == true end)
-  if gated and target ~= my_parent and bvar(target, "straps_parent") ~= me then
-    error("watch_agent: a permission-gated session may watch only its parent or its own children", 0)
-  end
 
   local known = { run_start = true, run_end = true, closed = true }
   local events = input.events
@@ -1064,7 +1059,8 @@ end
     kind = "tool",
     doc = "Remove this session's watch_agent subscription on another session."
       .. " Parameters: to (required) — the watched session's buffer number as"
-      .. " digits, or \"parent\".",
+      .. " digits, or \"parent\". Readonly and allow-gated sessions may remove"
+      .. " their own subscriptions on any agent without a grant.",
     input_schema = {
       type = "object",
       properties = {

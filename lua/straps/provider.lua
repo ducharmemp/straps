@@ -620,7 +620,13 @@ return function()
   local tools = {}
   for _, name in ipairs(registry.names_by_seq("tool")) do
     local api_name = name:match("^tool%.(.+)$")
-    if api_name then
+    local context_cfg = require("straps").config.context_management or {}
+    local scope = registry.active_scope()
+    local local_cfg = scope and vim.b[scope].straps_context_management
+    local context_enabled
+    if type(local_cfg) == "table" then context_enabled = local_cfg.enabled end
+    if context_enabled == nil then context_enabled = context_cfg.enabled end
+    if api_name and (api_name ~= "context_retrieve" or context_enabled == true) then
       local entry = registry.get(name)
       -- Empty-table pitfall: a Lua {} for `properties` JSON-encodes as []
       -- (an array), and the API rejects the whole request ("properties:
@@ -919,6 +925,23 @@ return function(req, ctx, opts)
       end
     end
   end
+  if req.context_max_output then
+    body.max_tokens = req.context_max_output
+    if ctx and ctx.context_isolated then
+      body.thinking, body.output_config = nil, nil
+    elseif body.thinking and body.thinking.type == "enabled" then
+      assert(body.max_tokens > body.thinking.budget_tokens, "context output cap must exceed thinking budget")
+    end
+  end
+  local prepared = { body = body, provider = effort_provider, model = model_id, model_entry = model_entry,
+    output_reserve = body.max_tokens, route = effort_provider }
+  local calibration = require("straps.context_management").enabled(ctx and ctx.bufnr)
+    and not (ctx and ctx.context_isolated) and require("straps.context_calibration") or nil
+  if calibration then
+    prepared.calibration_identity = calibration.identity(prepared, base_url .. "/v1/messages", table.concat(auth_headers, "\n"))
+  end
+  if ctx and ctx.context_prepare then return prepared end
+  require("straps.context_management").check(prepared, ctx)
   local payload = require("straps.state").utf8_scrub(vim.json.encode(body))
 
   -- Request-body compression (config.gzip, default on): the replayed
@@ -940,7 +963,7 @@ return function(req, ctx, opts)
       ctx.on_cancel(function() pcall(function() p:kill(9) end) end)
     end)
     if ctx.cancelled() then
-      return { content = {}, stop_reason = "cancelled" }
+      return { content = {}, stop_reason = "cancelled", complete = false }
     end
     if type(gz) == "table" and gz.code == 0 and type(gz.stdout) == "string" and gz.stdout ~= "" then
       wire = gz.stdout
@@ -955,6 +978,7 @@ return function(req, ctx, opts)
   -- streamed_text records that a text delta reached the transcript; a retry
   -- after that would write the same text again, so it ends the retries.
   local streamed_text = false
+  local response_started = false
   local function start_request(resolve)
     local content = {}    -- finished blocks, in stream order
     local blocks = {}     -- index -> in-flight block state
@@ -972,6 +996,7 @@ return function(req, ctx, opts)
     local line_buf = ""   -- partial-line buffering for the stdout stream
     local event = nil     -- current SSE event name
     local raw, raw_len = {}, 0
+    local raw_complete = true
 
     -- Idle watchdog: a stream that stays OPEN but silent (stalled proxy,
     -- local model with no ping events, dead network) would otherwise hang
@@ -982,6 +1007,10 @@ return function(req, ctx, opts)
     local watchdog = vim.uv.new_timer()
     local watchdog_dead = false
     local function on_stall()
+      local raw_body = table.concat(raw)
+      if not raw_complete or raw_body:find("%S") or require("straps.state").utf8_scrub(raw_body) ~= raw_body then
+        response_started = true
+      end
       stalled = true
       if proc then
         pcall(function() proc:kill(9) end)
@@ -1071,7 +1100,10 @@ return function(req, ctx, opts)
         end
         merge_usage(msg.usage) -- output_tokens arrives here
       elseif etype == "message_stop" then
-        resolve({ ok = true, content = content, stop_reason = stop_reason, usage = usage })
+        local terminal = stop_reason == "end_turn" or stop_reason == "tool_use"
+          or stop_reason == "stop_sequence" or stop_reason == "refusal"
+        resolve({ ok = true, content = content, stop_reason = stop_reason, usage = usage,
+          complete = terminal and next(blocks) == nil })
       elseif etype == "error" then
         resolve({ ok = false, err = msg.error or msg })
       end
@@ -1079,6 +1111,7 @@ return function(req, ctx, opts)
     end
 
     local function on_line(line)
+      if line:match("^%a[%w_-]*:") or line:match("^:") then response_started = true end
       local ev = line:match("^event:%s*(%S+)")
       if ev then
         event = ev
@@ -1094,6 +1127,7 @@ return function(req, ctx, opts)
     end
 
     local function on_stdout(err, chunk)
+      if err or (stalled and type(chunk) == "string" and chunk:find("%S")) then response_started = true end
       if err or not chunk then
         return
       end
@@ -1102,9 +1136,14 @@ return function(req, ctx, opts)
       -- an omitted-thinking event, a text delta) marks the stream alive so the
       -- progress UI can show "receiving" rather than a bare ticking clock.
       if ctx.activity then ctx.activity() end
-      if raw_len < 65536 then -- keep the body around for error reporting
-        raw[#raw + 1] = chunk
-        raw_len = raw_len + #chunk
+      if #chunk > 65536 - raw_len then
+        raw_complete = false
+        response_started = true
+      end
+      if raw_len < 65536 then
+        local kept = chunk:sub(1, 65536 - raw_len)
+        raw[#raw + 1] = kept
+        raw_len = raw_len + #kept
       end
       line_buf = line_buf .. chunk
       while true do
@@ -1152,9 +1191,18 @@ return function(req, ctx, opts)
       -- (resolve is honored once). Reaching it means curl failed, HTTP was
       -- non-2xx (body is plain JSON, not SSE -- it is sitting in `raw`), or
       -- the stream died before message_stop.
+      local raw_body = table.concat(raw)
+      if not raw_complete then response_started = true end
+      if require("straps.state").utf8_scrub(raw_body) ~= raw_body then response_started = true end
+      if raw_body:find("%S") then
+        local valid, decoded = pcall(vim.json.decode, raw_body)
+        if not raw_complete or not valid or type(decoded) ~= "table" then response_started = true end
+      end
       resolve({
         ok = false,
         status = status,
+        curl_success = res.code == 0,
+        raw_complete = raw_complete,
         body = table.concat(raw),
         err = res.code ~= 0
           and ("curl exited with code " .. res.code .. ": "
@@ -1184,6 +1232,8 @@ return function(req, ctx, opts)
     -- config.log_file is set, and both calls are pcall-wrapped anyway.
     pcall(registry.try_call, "fn.log",
       { ev = "request", bytes = #payload, wire_bytes = #wire, model = body.model, buf = ctx.bufnr })
+    local sent = calibration and vim.deepcopy(prepared) or nil
+    if sent then sent.body = vim.json.decode(payload) end
     local t0 = vim.uv.hrtime()
     local res = ctx.await(start_request)
     local u = type(res.usage) == "table" and res.usage or {}
@@ -1203,10 +1253,27 @@ return function(req, ctx, opts)
       buf = ctx.bufnr,
     })
     if res.cancelled or ctx.cancelled() then
-      return { content = {}, stop_reason = "cancelled" }
+      return { content = {}, stop_reason = "cancelled", complete = false }
     end
     if res.ok then
-      return { content = res.content, stop_reason = res.stop_reason, usage = res.usage, model = body.model }
+      if sent then calibration.observe(ctx.bufnr, sent, res.usage, sent.calibration_identity) end
+      return { content = res.content, stop_reason = res.stop_reason, usage = res.usage, model = body.model,
+        complete = res.complete == true }
+    end
+
+    if require("straps.context_management").enabled(ctx and ctx.bufnr) and effort_provider == "anthropic" and opts.label ~= "llamacpp"
+      and res.status == 400 and res.curl_success and res.raw_complete and not response_started then
+      local valid, parsed = pcall(vim.json.decode, res.body or "")
+      local e = valid and type(parsed) == "table" and parsed.error
+      local message = type(e) == "table" and e.message
+      local n, maximum
+      if type(message) == "string" then n, maximum = message:match("^prompt is too long: (%d+) tokens > (%d+) maximum$") end
+      if type(parsed) == "table" and parsed.type == "error" and type(e) == "table" and e.type == "invalid_request_error"
+        and n and tonumber(n) > tonumber(maximum) then
+        error(setmetatable({ kind = "context_overflow", rejected = true, response_started = false,
+          provider = "anthropic", route = prepared.route, status = 400, code = e.type, message = message },
+          { __tostring = function(value) return value.message end }), 0)
+      end
     end
 
     -- Failure. Pull a structured error out of a plain-JSON error body.
@@ -1236,7 +1303,7 @@ return function(req, ctx, opts)
         ctx.on_cancel(function() resolve() end)
       end)
       if ctx.cancelled() then
-        return { content = {}, stop_reason = "cancelled" }
+        return { content = {}, stop_reason = "cancelled", complete = false }
       end
     else
       local detail
@@ -1282,7 +1349,7 @@ return function(req, ctx)
   local api_key, key_source, account_id = registry.call(require("straps.provider").provider_slot("openai").key_fn,
     { ctx = ctx, base_url = base_url })
   if ctx.cancelled() or (api_key == nil and key_source == "cancelled") then
-    return { content = {}, stop_reason = "cancelled" }
+    return { content = {}, stop_reason = "cancelled", complete = false }
   end
   local codex = key_source == "codex"
   local label = codex and "openai (codex)" or "openai"
@@ -1421,12 +1488,24 @@ return function(req, ctx)
     return headers
   end
   local extra_headers = codex and codex_request() or {}
+  if req.context_max_output and not codex then body.max_output_tokens = req.context_max_output end
+  local prepared = { body = body, provider = "openai", model = model_id, model_entry = model_entry,
+    output_reserve = body.max_output_tokens, route = key_source }
+  local calibration = require("straps.context_management").enabled(ctx and ctx.bufnr)
+    and not (ctx and ctx.context_isolated) and require("straps.context_calibration") or nil
+  local function calibration_identity()
+    return calibration and calibration.identity(prepared, request_url, account_id or api_key)
+  end
+  prepared.calibration_identity = calibration_identity()
+  if ctx and ctx.context_prepare then return prepared end
+  require("straps.context_management").check(prepared, ctx)
 
   local payload = require("straps.state").utf8_scrub(vim.json.encode(body))
 
   -- streamed_text records that a text delta reached the transcript; a retry
   -- after that would write the same text again, so it ends the retries.
   local streamed_text = false
+  local response_started = false
   local function start_request(resolve)
     -- Built per attempt (the 401 retry replaces api_key) and before the
     -- watchdog timer, so a refused key raises with nothing to close.
@@ -1439,6 +1518,7 @@ return function(req, ctx)
     local tool_order = {}     -- preserves first-seen order of function_call items
     local usage = nil
     local finalized = false
+    local incomplete_output = false
     local function merge_usage(u)
       if type(u) ~= "table" then return end
       usage = usage or {}
@@ -1454,6 +1534,7 @@ return function(req, ctx)
     end
     local line_buf = ""
     local raw, raw_len = {}, 0
+    local raw_complete = true
 
     local proc = nil
     local idle_ms = tonumber(config.request_timeout_ms) or 300000
@@ -1461,6 +1542,10 @@ return function(req, ctx)
     local watchdog = vim.uv.new_timer()
     local watchdog_dead = false
     local function on_stall()
+      local raw_body = table.concat(raw)
+      if not raw_complete or raw_body:find("%S") or require("straps.state").utf8_scrub(raw_body) ~= raw_body then
+        response_started = true
+      end
       stalled = true
       if proc then pcall(function() proc:kill(9) end) end
       resolve({
@@ -1504,7 +1589,7 @@ return function(req, ctx)
       return slot
     end
 
-    local function finalize(stop_reason, completed_only)
+    local function finalize(stop_reason, completed_only, complete)
       if finalized then return end
       finalized = true
       -- Text first (one assistant text block), then tools in output order. A
@@ -1516,6 +1601,7 @@ return function(req, ctx)
       local tools = 0
       for _, idx in ipairs(tool_order) do
         local b = tool_blocks[idx]
+        if not b.done then complete = false end
         if b.done or not completed_only then
           local ok, input = pcall(vim.json.decode, b.partial ~= "" and b.partial or "{}")
           b.input = (ok and type(input) == "table") and input or vim.empty_dict()
@@ -1525,7 +1611,7 @@ return function(req, ctx)
         end
       end
       if tools > 0 then stop_reason = "tool_use" end
-      resolve({ ok = true, content = content, stop_reason = stop_reason, usage = usage })
+      resolve({ ok = true, content = content, stop_reason = stop_reason, usage = usage, complete = complete == true and not incomplete_output })
     end
 
     -- Stream-level failures whose code means "try again" retry like HTTP 429/5xx,
@@ -1561,6 +1647,7 @@ return function(req, ctx)
       if t == "response.output_text.delta" or t == "response.refusal.delta" then
         append_text(ev)
       elseif t == "response.output_item.added" or t == "response.output_item.done" then
+        if type(ev.item) == "table" and ev.item.status == "incomplete" then incomplete_output = true end
         if type(ev.item) == "table" and ev.item.type == "function_call" then
           local slot = tool_slot(ev.output_index or 0, ev.item)
           if t == "response.output_item.done" and ev.item.status ~= "incomplete" then slot.done = true end
@@ -1576,7 +1663,12 @@ return function(req, ctx)
         handle_event({ type = "response.failed", response = ev.response })
       elseif t == "response.completed" or t == "response.done" then
         merge_usage(type(ev.response) == "table" and ev.response.usage)
-        finalize("end_turn", false)
+        local status = type(ev.response) == "table" and ev.response.status
+        local output = type(ev.response) == "table" and ev.response.output
+        for _, item in ipairs(type(output) == "table" and output or {}) do
+          if type(item) == "table" and item.status == "incomplete" then incomplete_output = true end
+        end
+        finalize("end_turn", false, status == "completed" or (t == "response.completed" and status == nil))
       elseif t == "response.incomplete" then
         local r = type(ev.response) == "table" and ev.response or {}
         merge_usage(r.usage)
@@ -1598,17 +1690,24 @@ return function(req, ctx)
     end
 
     local function on_line(line)
+      if line:match("^%a[%w_-]*:") or line:match("^:") then response_started = true end
       local data = line:match("^data:%s*(.+)")
       if data then on_data(data) end
     end
 
     local function on_stdout(err, chunk)
+      if err or (stalled and type(chunk) == "string" and chunk:find("%S")) then response_started = true end
       if err or not chunk then return end
       watchdog_reset()
       if ctx.activity then ctx.activity() end
+      if #chunk > 65536 - raw_len then
+        raw_complete = false
+        response_started = true
+      end
       if raw_len < 65536 then
-        raw[#raw + 1] = chunk
-        raw_len = raw_len + #chunk
+        local kept = chunk:sub(1, 65536 - raw_len)
+        raw[#raw + 1] = kept
+        raw_len = raw_len + #kept
       end
       line_buf = line_buf .. chunk
       while true do
@@ -1640,9 +1739,18 @@ return function(req, ctx)
       -- On a clean stream this loses the race with response.completed/finalize
       -- and is a no-op. Reaching it live means curl failed, HTTP was non-2xx (the
       -- body is plain JSON in `raw`), or the stream died before a terminal event.
+      local raw_body = table.concat(raw)
+      if not raw_complete then response_started = true end
+      if require("straps.state").utf8_scrub(raw_body) ~= raw_body then response_started = true end
+      if raw_body:find("%S") then
+        local valid, decoded = pcall(vim.json.decode, raw_body)
+        if not raw_complete or not valid or type(decoded) ~= "table" then response_started = true end
+      end
       resolve({
         ok = false,
         status = status,
+        curl_success = res.code == 0,
+        raw_complete = raw_complete,
         body = table.concat(raw),
         err = res.code ~= 0
           and ("curl exited with code " .. res.code .. ": "
@@ -1665,8 +1773,11 @@ return function(req, ctx)
 
   local attempt, refreshed = 1, false
   while attempt <= 3 do
+    if calibration then prepared.calibration_identity = calibration_identity() end
     pcall(registry.try_call, "fn.log",
       { ev = "request", bytes = #payload, wire_bytes = #payload, model = body.model, buf = ctx.bufnr })
+    local sent = calibration and vim.deepcopy(prepared) or nil
+    if sent then sent.body = vim.json.decode(payload) end
     local t0 = vim.uv.hrtime()
     local res = ctx.await(start_request)
     local u = type(res.usage) == "table" and res.usage or {}
@@ -1683,10 +1794,24 @@ return function(req, ctx)
       buf = ctx.bufnr,
     })
     if res.cancelled or ctx.cancelled() then
-      return { content = {}, stop_reason = "cancelled" }
+      return { content = {}, stop_reason = "cancelled", complete = false }
     end
     if res.ok then
-      return { content = res.content, stop_reason = res.stop_reason, usage = res.usage, model = model_id }
+      if sent then calibration.observe(ctx.bufnr, sent, res.usage, sent.calibration_identity) end
+      return { content = res.content, stop_reason = res.stop_reason, usage = res.usage, model = model_id,
+        complete = res.complete == true }
+    end
+
+    if require("straps.context_management").enabled(ctx and ctx.bufnr)
+      and res.status == 400 and res.curl_success and res.raw_complete and not response_started then
+      local valid, parsed = pcall(vim.json.decode, res.body or "")
+      local e = valid and type(parsed) == "table" and parsed.error
+      if type(e) == "table" and e.code == "context_length_exceeded" then
+        error(setmetatable({ kind = "context_overflow", rejected = true, response_started = false,
+          provider = "openai", route = prepared.route, status = 400, code = e.code,
+          message = type(e.message) == "string" and e.message or e.code },
+          { __tostring = function(value) return value.message end }), 0)
+      end
     end
 
     if type(res.err) ~= "table" and res.body and res.body ~= "" then
@@ -1713,7 +1838,7 @@ return function(req, ctx)
         ctx.on_cancel(function() resolve(nil, "cancelled") end)
       end)
       if ctx.cancelled() or (cred == nil and (rerr == nil or rerr == "cancelled")) then
-        return { content = {}, stop_reason = "cancelled" }
+        return { content = {}, stop_reason = "cancelled", complete = false }
       end
       if not cred then
         error("straps provider (" .. label .. "): HTTP 401 and " .. tostring(rerr), 0)
@@ -1734,7 +1859,7 @@ return function(req, ctx)
         ctx.on_cancel(function() resolve() end)
       end)
       if ctx.cancelled() then
-        return { content = {}, stop_reason = "cancelled" }
+        return { content = {}, stop_reason = "cancelled", complete = false }
       end
       attempt = attempt + 1
     else
@@ -1828,7 +1953,7 @@ return function(req, ctx)
   local entry = providers.model_entry(provider, model, config)
   -- An entry found only through the model pref goes into the model list, so
   -- the session keeps it after a later global pick changes the pref.
-  providers.merge_model_entry(provider, entry, config)
+  if not (ctx and ctx.context_isolated) then providers.merge_model_entry(provider, entry, config) end
   local backend_ctx = setmetatable({
     provider = provider,
     model = model,
@@ -1836,7 +1961,8 @@ return function(req, ctx)
   }, { __index = ctx })
 
   local result = registry.call(backend, req, backend_ctx)
-  if bufnr and type(result) == "table" and result.stop_reason ~= "cancelled" then
+  if bufnr and not (ctx and (ctx.context_prepare or ctx.context_isolated))
+    and type(result) == "table" and result.stop_reason ~= "cancelled" then
     local now_provider, now_model = buffer_state()
     if now_provider == dispatched_provider and now_model == dispatched_model then
       local sent = (type(result.model) == "string" and result.model ~= "") and result.model or model
@@ -2865,6 +2991,16 @@ return function(body, ctx, account_id)
 end
 ]==]
 
+local CONTEXT_PLAN_SRC = [==[
+return function(input, ctx)
+  local selections = {}
+  for _, interval in ipairs(input.eligible) do
+    selections[#selections + 1] = interval.index
+  end
+  return { version = 1, snapshot_id = input.snapshot_id, selections = selections }
+end
+]==]
+
 local COMPACT_SRC = [==[
 -- Default mechanical compaction: (bufnr, opts?) -> summary string.
 -- Free and deterministic -- no LLM call. Shrinks the CONTENTS of old
@@ -2879,6 +3015,45 @@ return function(bufnr, opts)
   local keep_turns = (opts and opts.keep_turns) or config.compact_keep_turns or 2
 
   local blocks = require("straps.state").list_blocks(bufnr)
+  local owners, pending_turns, protected, open_uses = {}, {}, {}, {}
+  local owner, role, orphaned = 0, nil, false
+  local function push(next_role, i)
+    if next_role == "assistant" and role ~= next_role then
+      owner, open_uses = i, {}
+    end
+    role = next_role
+  end
+  for i, block in ipairs(blocks) do
+    if block.kind ~= "tool_result" and orphaned then
+      push("user", i)
+      orphaned = false
+    end
+    local attrs = block.attrs or {}
+    if block.kind == "assistant" or block.kind == "user" then
+      local lines = vim.api.nvim_buf_get_lines(bufnr, block.marker_lnum - 1, block.last_lnum, false)
+      lines[1] = (lines[1] or ""):gsub("^%%%%%[straps:[a-z_]+%]%%%%%s?", "")
+      if table.concat(lines, "\n"):find("%S") then push(block.kind, i) end
+      if block.kind == "assistant" then owners[i] = owner end
+    elseif block.kind == "tool_use" and attrs.id and attrs.name then
+      push("assistant", i)
+      owners[i], open_uses[attrs.id] = owner, owner
+    elseif block.kind == "tool_result" then
+      local paired = attrs.id and open_uses[attrs.id]
+      if paired then
+        owners[i], open_uses[attrs.id] = paired, nil
+        push("user", i)
+      elseif attrs.id then
+        orphaned = true
+      end
+      if attrs.context_pending == true then
+        protected[i] = true
+        if paired then pending_turns[paired] = true end
+      end
+    end
+  end
+  for i in ipairs(blocks) do
+    if pending_turns[owners[i]] then protected[i] = true end
+  end
 
   -- Cutoff: index of the keep_turns-th assistant block from the end. Every
   -- tool_use/tool_result block BEFORE it is eligible; everything at or after
@@ -2915,7 +3090,7 @@ return function(bufnr, opts)
   -- Bottom-up so earlier blocks' line numbers stay valid across replacements.
   for i = cutoff - 1, 1, -1 do
     local b = blocks[i]
-    if (b.kind == "tool_result" or b.kind == "tool_use") and b.first_lnum <= b.last_lnum then
+    if not protected[i] and (b.kind == "tool_result" or b.kind == "tool_use") and b.first_lnum <= b.last_lnum then
       local lines = vim.api.nvim_buf_get_lines(bufnr, b.first_lnum - 1, b.last_lnum, false)
       local bytes = #table.concat(lines, "\n")
       local repl
@@ -3102,10 +3277,11 @@ your tool calls and streamed text live as you work.
 - The child sees NONE of this conversation: write the task complete and
   self-contained, including every path, constraint, and the exact shape
   of the answer you want back.
-- readonly=true for pure research (all writes denied without prompting);
+- readonly=true for research: reads, builtin watch/unwatch on any agent,
+  and send_message{to="parent"} are allowed; other writes are denied.
   allow={"edit",...} instead grants the child those permission categories
-  (edit/delete/exec/lua/net/spawn) — granted calls run unprompted, ungranted
-  ones are denied, so use allow for a child that must edit but not run
+  (edit/delete/exec/lua/net/spawn) — granted calls and the readonly exceptions
+  run unprompted, other calls are denied, so use allow for a child that must edit but not run
   commands; tools=[...] to focus it; show=true when the user should watch it work.
 - A child's CAPABILITY is yours to choose: spawn takes model and effort,
   and omitting them silently copies your own — which is not a default to
@@ -3346,7 +3522,8 @@ your grants, and a child spawned without allow is read-only.]]
 prompting, except send_message{to="parent"}, which is allowed so you can
 report a blocker to the session that spawned you (it is appended there if
 that session is idle, and read at its next turn if it is running, ending a
-spawn_wait it is blocked in), and watch_agent{to="parent"}.
+spawn_wait it is blocked in), and watch_agent / unwatch_agent for any agent.
+Watches may wake this session to audit another agent.
 Investigate and report; do not attempt writes or workarounds, and mark
 conclusions you could not verify empirically as such.]]
     end
@@ -3471,8 +3648,9 @@ Handing off, when you genuinely need a peer to do something:
   user next sends. Write it as an instruction or a fact the peer can act on.
 - In an ungated session each send goes through the confirm gate unless the
   spawn category is granted. A readonly/allow-gated session may message only
-  its parent (and its own children when granted); for such a session
-  to="parent" always goes through.
+  its parent, its own children, or immediate siblings sharing a valid session
+  parent when granted; to="parent" always goes through. Readonly and
+  allow-gated sessions may watch and unwatch any agent without a grant.
 - Do not message a peer to work around your own failed edit. Fix your edit.
 
 Report collisions to the user in your reply. "I dropped this change because
@@ -3579,78 +3757,8 @@ end
 ]==]
 
 local SYSTEM_PROMPT_PROJECT_SRC = [==[
--- Project layer of the system prompt: LAYERED memory files, ordered
--- general -> specific so the nearest file has the last word. Discovery,
--- furthest first:
---   1. global tier: <stdpath('config')>/straps/ then $HOME — AGENTS.md
---      and CLAUDE.md (broad, cross-project rules);
---   2. every AGENTS.md / CLAUDE.md found walking UPWARD from cwd, farthest
---      ancestor first and the nearest one last (project- and subdir-level);
---   3. config.instructions_files verbatim, last of all.
--- Each distinct file is fenced under a "## <absolute path>" header and
--- included whole; a path seen twice (e.g. $HOME == an ancestor) is
--- included once, at its first (most general) position. Unreadable/missing
--- files are skipped silently. Returns "" when nothing is found.
 return function()
-  local ok_straps, straps = pcall(require, "straps")
-  local config = (ok_straps and type(straps) == "table" and rawget(straps, "config")) or {}
-  local cwd = vim.fn.getcwd()
-  local NAMES = { "AGENTS.md", "CLAUDE.md" }
-
-  local paths, seen = {}, {}
-  local function add(path)
-    if type(path) ~= "string" or path == "" then
-      return
-    end
-    local abs = vim.fn.fnamemodify(path, ":p")
-    if not seen[abs] then
-      seen[abs] = true
-      paths[#paths + 1] = abs
-    end
-  end
-
-  -- Global tier (lowest precedence): XDG config dir, then $HOME.
-  local globals = {}
-  local cfg = vim.fn.stdpath("config")
-  if type(cfg) == "string" and cfg ~= "" then
-    globals[#globals + 1] = cfg .. "/straps"
-  end
-  local home = vim.loop.os_homedir()
-  if type(home) == "string" and home ~= "" then
-    globals[#globals + 1] = home
-  end
-  for _, dir in ipairs(globals) do
-    for _, name in ipairs(NAMES) do
-      add(dir .. "/" .. name)
-    end
-  end
-
-  -- Upward walk from cwd: vim.fs.find returns nearest first, so reverse to
-  -- add the farthest ancestor first and let the nearest file win.
-  for _, name in ipairs(NAMES) do
-    local found = vim.fs.find(name, { upward = true, path = cwd, type = "file", limit = math.huge })
-    for i = #found, 1, -1 do
-      add(found[i])
-    end
-  end
-
-  local extras = type(config.instructions_files) == "table" and config.instructions_files or {}
-  for _, p in ipairs(extras) do
-    add(p)
-  end
-
-  local sections = {}
-  for _, path in ipairs(paths) do
-    local f = io.open(path, "r")
-    if f then
-      local content = f:read("*a")
-      f:close()
-      if type(content) == "string" and content ~= "" then
-        sections[#sections + 1] = "## " .. path .. "\n" .. content
-      end
-    end
-  end
-  return table.concat(sections, "\n\n")
+  return require("straps.provider").project_prompt()
 end
 ]==]
 
@@ -3763,9 +3871,298 @@ return function(opts)
 end
 ]==]
 
+local prompt_capture
+local prompt_receipts = {}
+local prompt_shapes = {}
+local prompt_receipts_installed = false
+
+function M.project_prompt()
+  local snapshot = require("straps.instructions").discover()
+  if prompt_capture then
+    prompt_capture.count = prompt_capture.count + 1
+    prompt_capture.standing = vim.deepcopy(snapshot)
+  end
+  return snapshot.presentation
+end
+
+local prompt_expected_sources
+local prompt_divergent
+
+function M.install_divergent()
+  local registry = require("straps.registry")
+  assert(registry.trusted_setup_allowed(), "divergent prompt attestation requires trusted setup")
+  local divergent = package.loaded["straps-divergent"]
+  if divergent and type(divergent.install_contextual) == "function" then
+    divergent.install_contextual(function(validate) prompt_divergent = validate end)
+  end
+end
+
+local function prompt_default_sources()
+  local registry = require("straps.registry")
+  local defaults = {
+      ["fn.system_prompt"] = SYSTEM_PROMPT_SRC,
+      ["fn.system_prompt_project"] = SYSTEM_PROMPT_PROJECT_SRC,
+      ["fn.system_prompt_core"] = SYSTEM_PROMPT_CORE_SRC,
+      ["fn.system_prompt_env"] = SYSTEM_PROMPT_ENV_SRC,
+      ["fn.system_prompt_skills"] = SYSTEM_PROMPT_SKILLS_SRC,
+      ["fn.system_prompt_layer.core"] = SYSTEM_PROMPT_LAYER_CORE_SRC,
+      ["fn.system_prompt_layer.env"] = SYSTEM_PROMPT_LAYER_ENV_SRC,
+      ["fn.system_prompt_layer.skills"] = SYSTEM_PROMPT_LAYER_SKILLS_SRC,
+      ["fn.system_prompt_layer.project"] = SYSTEM_PROMPT_LAYER_PROJECT_SRC,
+    }
+    for _, dependency in ipairs({ { "selfext", "register", "fn.discover_skills" }, { "agents", "register_spawn", "fn.spawn_depth_limit" } }) do
+      local builtin = require("straps.layers." .. dependency[1])
+      local filename = debug.getinfo(builtin[dependency[2]], "S").source:sub(2)
+      local chunk = assert(loadfile(filename))
+      local expected
+      setfenv(chunk, setmetatable({ require = function(name)
+        if name ~= "straps.registry" then return require(name) end
+        return { define_default = function(spec)
+          if spec.name == dependency[3] then expected = spec.source end
+        end }
+      end }, { __index = _G }))
+      chunk()[dependency[2]]()
+      defaults[dependency[3]] = assert(expected)
+    end
+    for _, layer in ipairs({ "files", "search", "exec", "selfext", "net", "agents", "permissions", "session", "editor" }) do
+      local name = "fn.system_prompt_layer." .. layer
+      if registry.get(name) then defaults[name] = 'return function() return "" end' end
+    end
+  return defaults
+end
+
+local function prompt_definitions(scope)
+  local registry = require("straps.registry")
+  local previous = registry.set_active_scope(scope)
+  local ok, result, reason = pcall(function()
+    local defaults = assert(prompt_expected_sources, "prompt receipts not installed")
+    local identities, layers = {}, {}
+    local divergent = prompt_divergent and prompt_divergent()
+    if divergent then
+      identities["fn.system_prompt_layer.divergent"] = divergent["fn.system_prompt_layer.divergent"]
+      identities["fn.fork"] = divergent["fn.fork"]
+      identities["fn.fork_section"] = divergent["fn.fork_section"]
+    end
+    for name, source in pairs(defaults) do
+      local entry = registry.get(name)
+      if not entry or entry.source ~= source then return nil, "unattested prompt definition: " .. name end
+      identities[name] = { identity = entry.identity, source = entry.source, scope = entry.scope }
+    end
+    for _, name in ipairs(registry.names_by_seq("fn")) do
+      if name:match("^fn%.system_prompt_layer%.") then
+        if not defaults[name] and not identities[name] then return nil, "unattested prompt layer: " .. name end
+        layers[#layers + 1] = name
+      end
+    end
+    return { definitions = identities, layers = layers }
+  end)
+  registry.set_active_scope(previous)
+  if not ok then return nil, "prompt definitions unavailable: " .. tostring(result) end
+  return result, reason
+end
+
+local function prompt_immediate(fn, ...)
+  local co = coroutine.create(fn)
+  local ok, value, reason = coroutine.resume(co, ...)
+  if not ok or coroutine.status(co) ~= "dead" then return nil, "prompt operation failed or yielded" end
+  return value, reason
+end
+
+local function prompt_hash(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then return nil end
+  local ok, parsed = pcall(require("straps.state").parse, bufnr)
+  return ok and type(parsed.system) == "string" and vim.fn.sha256(parsed.system) or nil
+end
+
+local function prompt_record_current(record, scope, standing)
+  if prompt_hash(record.bufnr) ~= record.hash then return false, "stored system prompt changed" end
+  if not vim.deep_equal(record.standing, standing)
+      or not vim.deep_equal(standing, require("straps.instructions").discover()) then
+    return false, "standing instructions changed"
+  end
+  local definitions = prompt_definitions(scope)
+  if not definitions or not vim.deep_equal(definitions, record.definitions) then return false, "prompt definitions changed" end
+  return true
+end
+
+function M.contextual_composition_identity(bufnr)
+  local record = prompt_receipts[bufnr]
+  if not record or not prompt_record_current(record, bufnr, record.standing) then return nil end
+  return vim.deepcopy({ definitions = record.definitions, options = record.options, hash = record.hash })
+end
+
+function M.contextual_validate_prompt(bufnr, standing)
+  local record = prompt_receipts[bufnr]
+  if not record then return false, "trusted prompt receipt unavailable" end
+  return prompt_immediate(prompt_record_current, record, bufnr, standing)
+end
+
+function M.install_prompt_receipts(consumer)
+  local registry = require("straps.registry")
+  assert(not prompt_receipts_installed and registry.trusted_setup_allowed(), "prompt receipts require trusted setup")
+  assert(type(consumer) == "function", "prompt receipt consumer required")
+  M.install_divergent()
+  prompt_expected_sources = prompt_default_sources()
+  prompt_receipts_installed = true
+  local pending, adoptions = {}, {}
+  local function generate(options, scope, construct)
+    local definitions, why = prompt_definitions(scope)
+    if not definitions then return nil, why end
+    local previous = registry.set_active_scope(scope)
+    local capture = { count = 0 }
+    local outer = prompt_capture
+    prompt_capture = capture
+    local result, reason = prompt_immediate(construct, vim.deepcopy(options))
+    prompt_capture = outer
+    registry.set_active_scope(previous)
+    if result == nil then return nil, reason end
+    if capture.count ~= 1 or not vim.deep_equal(definitions, prompt_definitions(scope)) then
+      return nil, "prompt generation was not attested"
+    end
+    return { result = result, standing = capture.standing, definitions = definitions, options = vim.deepcopy(options) }
+  end
+  local callbacks = {}
+  function callbacks.discard_adoption(token)
+    local existed = adoptions[token] ~= nil
+    adoptions[token] = nil
+    return existed
+  end
+  function callbacks.discard_construction(token)
+    local existed = pending[token] ~= nil
+    pending[token] = nil
+    return existed
+  end
+  function callbacks.close(bufnr)
+    prompt_receipts[bufnr] = nil
+    prompt_shapes[bufnr] = nil
+    for token, record in pairs(pending) do if record.bufnr == bufnr then pending[token] = nil end end
+    for token, record in pairs(adoptions) do if record.bufnr == bufnr then adoptions[token] = nil end end
+  end
+  function callbacks.construct_fork(opts, scope, fork)
+    local definitions, why = prompt_definitions(scope)
+    if not definitions then return nil, why end
+    if not definitions.definitions["fn.fork_section"] then return nil, "unattested fork section" end
+    if type(fork) ~= "table" or fork.source ~= scope then return nil, "invalid fork composition" end
+    local child = require("straps.state").new_session(opts)
+    prompt_shapes[child] = { options = vim.deepcopy(opts), fork = vim.deepcopy(fork),
+      section = vim.deepcopy(definitions.definitions["fn.fork_section"]) }
+    return child
+  end
+  function callbacks.construct(opts, scope)
+    local record, why = generate(opts, scope, require("straps.state").new_session)
+    if not record then return nil, why end
+    record.bufnr, record.result = record.result, nil
+    record.hash = prompt_hash(record.bufnr)
+    record.scope = scope
+    local token = {}
+    pending[token] = record
+    return record.bufnr, token
+  end
+  function callbacks.commit(token, final_scope)
+    local record = pending[token]
+    pending[token] = nil
+    if not record or final_scope ~= record.bufnr then return false, "invalid prompt construction token or final scope" end
+    local valid, why = prompt_immediate(prompt_record_current, record, final_scope, record.standing)
+    if not valid then return false, why end
+    prompt_receipts[record.bufnr] = record
+    return true
+  end
+  callbacks.identity = M.contextual_composition_identity
+  callbacks.validate = M.contextual_validate_prompt
+  function callbacks.prepare_adoption(bufnr, opts, scope)
+    for token, record in pairs(adoptions) do if record.bufnr == bufnr then adoptions[token] = nil end end
+    if not vim.api.nvim_buf_is_valid(bufnr) then return nil, "session unavailable" end
+    local original = prompt_receipts[bufnr]
+    local shape = prompt_shapes[bufnr]
+    if shape then opts = shape.options elseif original then opts = original.options end
+    local record, why = generate(opts, scope, function(options)
+      local system = registry.call("fn.system_prompt", options)
+      if shape then
+        local definitions = prompt_definitions(scope)
+        if not definitions or not vim.deep_equal(shape.section, definitions.definitions["fn.fork_section"]) then
+          return nil, "fork section definition changed"
+        end
+        system = system .. "\n\n" .. registry.call("fn.fork_section", shape.fork.source, bufnr, shape.fork.upto,
+          { relation = shape.fork.relation, depth = shape.fork.depth })
+      end
+      return system
+    end)
+    if not record then return nil, why end
+    record.bufnr, record.scope = bufnr, scope
+    record.lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    record.tick = vim.api.nvim_buf_get_changedtick(bufnr)
+    record.blocks = vim.deepcopy(require("straps.state").list_blocks(bufnr))
+    if not record.blocks[1] or record.blocks[1].kind ~= "system" then return nil, "system block unavailable" end
+    record.view = { bufnr = bufnr, options = vim.deepcopy(opts), scope = scope, standing = vim.deepcopy(record.standing),
+      definitions = vim.deepcopy(record.definitions), transcript = table.concat(record.lines, "\n"), system = record.result }
+    local token = {}
+    adoptions[token] = record
+    return vim.deepcopy(record.view), token
+  end
+  function callbacks.adopt(token, validate_current)
+    local record = adoptions[token]
+    adoptions[token] = nil
+    if not record or type(validate_current) ~= "function" then return false, "invalid prompt adoption token" end
+    return prompt_immediate(function()
+      local function unchanged()
+        return vim.api.nvim_buf_is_valid(record.bufnr) and vim.api.nvim_buf_get_changedtick(record.bufnr) == record.tick
+          and vim.deep_equal(record.lines, vim.api.nvim_buf_get_lines(record.bufnr, 0, -1, false))
+          and vim.deep_equal(record.standing, require("straps.instructions").discover())
+          and vim.deep_equal(record.definitions, prompt_definitions(record.scope))
+      end
+      if not unchanged() then return false, "displayed prompt adoption changed" end
+      if prompt_immediate(validate_current, vim.deepcopy(record.view)) ~= true or not unchanged() then
+        return false, "displayed task adoption changed"
+      end
+      local block = record.blocks[1]
+      local normalized = vim.split(record.result, "\n", { plain = true })
+      while #normalized > 0 and normalized[1]:match("^%s*$") do table.remove(normalized, 1) end
+      while #normalized > 0 and normalized[#normalized]:match("^%s*$") do table.remove(normalized) end
+      local expected_hash = vim.fn.sha256(table.concat(normalized, "\n"))
+      local lines = { "%%[straps:system]%%" }
+      for _, line in ipairs(normalized) do lines[#lines + 1] = require("straps.state").escape_line(line) end
+      lines[#lines + 1] = ""
+      local expected_lines = vim.list_slice(record.lines, 1, block.marker_lnum - 1)
+      vim.list_extend(expected_lines, lines)
+      vim.list_extend(expected_lines, vim.list_slice(record.lines, block.last_lnum + 1))
+      vim.api.nvim_buf_set_lines(record.bufnr, block.marker_lnum - 1, block.last_lnum, false, lines)
+      if prompt_hash(record.bufnr) ~= expected_hash
+          or not vim.deep_equal(expected_lines, vim.api.nvim_buf_get_lines(record.bufnr, 0, -1, false))
+          or not vim.deep_equal(record.standing, require("straps.instructions").discover())
+          or not vim.deep_equal(record.definitions, prompt_definitions(record.scope)) then
+        prompt_receipts[record.bufnr] = nil
+        return false, "adopted prompt changed during replacement"
+      end
+      record.hash = expected_hash
+      record.result, record.lines, record.blocks, record.view = nil, nil, nil, nil
+      prompt_receipts[record.bufnr] = record
+      return true
+    end)
+  end
+  consumer(callbacks)
+end
+
 --- Register the provider-side defaults. Uses define_default so re-running
 --- setup() never clobbers a user's (or the agent's) redefinitions.
 function M.register()
+  M.contextual_auth_sources = {
+    ["fn.openai_api_key"] = OPENAI_API_KEY_SRC,
+    ["fn.openai_oauth_credential"] = OPENAI_OAUTH_CREDENTIAL_SRC,
+    ["fn.openai_codex_credential"] = OPENAI_CODEX_CREDENTIAL_SRC,
+    ["fn.api_key_store"] = API_KEY_STORE_SRC,
+  }
+  M.context_sources = {
+    ["fn.provider"] = PROVIDER_SRC, ["fn.provider_anthropic"] = PROVIDER_ANTHROPIC_SRC,
+    ["fn.provider_openai"] = PROVIDER_OPENAI_SRC, ["fn.provider_llamacpp"] = PROVIDER_LLAMACPP_SRC,
+    ["fn.anthropic_messages"] = ANTHROPIC_MESSAGES_SRC,
+  }
+  local context_registry = require("straps.registry")
+  context_registry.define_default({ name = "fn.context_budget", kind = "fn",
+    doc = "Count a prepared provider request with explicit uncertainty and effective input allowance.",
+    source = 'return function(prepared, ctx) return require("straps.context_management").account(prepared, ctx) end' })
+  context_registry.define_default({ name = "fn.context_summarize", kind = "fn",
+    doc = "Generate an isolated bounded summary without tools or transcript streaming.",
+    source = 'return function(req, ctx) return require("straps.context_management").summarize(req, ctx) end' })
   local registry = require("straps.registry")
   local define = registry.define_default or registry.define
 
@@ -3970,6 +4367,12 @@ function M.register()
     kind = "fn",
     doc = "Append a structured single-line JSON event to config.log_file (no-op when unset).",
     source = LOG_SRC,
+  })
+  define({
+    name = "fn.context_plan",
+    kind = "fn",
+    doc = "(input, ctx) -> {version=1, snapshot_id=input.snapshot_id, selections={eligible indices}}. Input is detached version-1 proposal data: snapshot_id, reason, mode, before, target_tokens, eligible={{index, first_block, last_block, mode, sources?}, ...}. Default proposes every eligible interval in supplied order without mutation or generation. Core validation and application are separate.",
+    source = CONTEXT_PLAN_SRC,
   })
   define({
     name = "fn.compact",

@@ -143,6 +143,7 @@ M.config = {
   session_dir = nil,
   auto_compact_tokens = nil,
   auto_compact_bytes = nil,
+  context_management = { enabled = false },
 
   -- Transcript rendering (fn.render): a display-only layer over the raw
   -- %%[straps:KIND]%% marker buffer — conceal + extmarks + folds give each
@@ -172,7 +173,7 @@ M.config = {
   -- context?, max_output? }. `max_output` is the model's maximum response
   -- tokens (Anthropic's /v1/models max_tokens); fn.anthropic_messages uses it
   -- as the default max_tokens when config.max_tokens is nil. `context` is the
-  -- input window (winbar fill only). `thinking` tags which extended-thinking
+  -- input window for display and opt-in budgeting. `thinking` tags which extended-thinking
   -- mechanism the model speaks (inferred from Anthropic's /v1/models
   -- capabilities.thinking.types):
   --   "adaptive" — thinking={type="adaptive"} + output_config={effort=...}
@@ -201,9 +202,8 @@ M.config = {
   -- /v1/models (`context` comes from a loaded model's n_ctx).
   llamacpp_models = {},
   -- Fallback context window (tokens) for a model not found in the active
-  -- provider's model list with a `context` field — used only to render the
-  -- winbar's context-fill percentage (nothing is sent to the API). nil hides
-  -- the percentage for unknown models.
+  -- provider's model list with a `context` field, for the winbar percentage.
+  -- nil disables the fallback.
   -- Not applied to llamacpp models, whose window depends on the server's -c.
   context_window = 200000,
 
@@ -419,6 +419,8 @@ function M.load_project_registry(opts)
   return true, "loaded: " .. path
 end
 
+require("straps.context_ui").capture()
+
 --- Merge user opts into M.config and register all defaults.
 --- Safe to call more than once: define_default skips existing entries,
 --- so runtime redefinitions (yours or the agent's) survive.
@@ -426,6 +428,7 @@ function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
   require("straps.attention").setup(M.config.terminal_status)
   require("straps.provider").register()
+  require("straps.context_ui").setup()
   require("straps.tools").register()
   -- layers.editor = false skips the LSP/tree-sitter tool group (see the
   -- config comment above); nil-safe so callers that skip setup() and call

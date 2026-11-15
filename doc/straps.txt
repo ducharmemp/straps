@@ -193,7 +193,93 @@ resolution, and make a global pick when no session resolves.
 			|:StrapsResume|, which reopens a saved transcript from
 			disk.
 
-							*:StrapsLogin*
+									*straps-contextual-authorization*
+Contextual authorization is experimental and disabled by default. Configure
+straps_classifier.setup with an explicit contextual options table after core
+setup and before sessions/guard freeze; see |straps-classifier-contextual| and
+the classifier README for disclosure/route/limits/threshold configuration.
+Restart to change mode/configuration. Contextual setup bypasses only the legacy
+classifier chain. Ordinary confirmation, other guards, and child ceilings
+remain. Auto grants do not establish task authority.
+
+Core keeps private instruction events outside the editable transcript. Trusted
+human submission, steering, and full bound question answers revise authority
+before work queues run. Standing snapshots and private prompt construction
+receipts bind adoption to exact sources and the stored prompt. Transcript
+edits, user-role labels, notices, summaries, and copied text grant nothing.
+Changed standing instructions or prompt definitions require renewed adoption.
+Legacy/resumed sessions, piped data, and copied fork prompts need adoption,
+which can regenerate the prompt. Continue without text retains the task;
+supplied text revises it. Stop cancels run tickets and retains task identity and
+rejected-family suppression. Question answers record selected-option identity or
+free-text origin; typing an option label remains free text.
+
+Use |:StrapsAdopt| to review task text/standing sources; |:StrapsTaskReset|
+invalidates the task and pending decisions. |:StrapsAuthorization| inspects a
+known decision ID. With !, it requests a fresh review through the human
+scheduler. Exact-call consent binds input, tool definition, task revisions and
+target assumptions, and consumes once at execution. Changed input or context
+invalidates approval. Rejected decision families remain suppressed until human
+reopening. A fresh review does not invoke the original denied closure or retry
+an unknown execution outcome. Execution-started receipts retain metadata only;
+retained denied decisions support exact-call inspection and fresh reopening.
+Classifier consent cannot bypass other guards
+or enlarge readonly/allow ceilings. Children receive only validated explicit
+subset delegation; copied conversation and archive access confer no authority.
+In contextual mode, generic human :StrapsFork/fn.fork calls are unavailable:
+they lack a trusted exact invocation. Agent fork without delegation creates an
+inactive copy requiring human adoption before starting. Explicit fork delegation
+is rejected because the copied prompt has no valid private construction receipt.
+
+An adopted session can remain pending without a synthesized task specification.
+Automatic authorization stays denied when disclosure, synthesis, assessment, or
+integration is unavailable. Human reopening can approve the displayed exact call
+despite that unavailability or displayed classifier objections. The approval does
+not synthesize or activate a task. Independent guards, ordinary confirmation,
+readonly/allow ceilings, fresh call and target checks, and consumption once at
+execution still apply.
+
+Missing disclosure, failed synthesis/assessment, and unavailable dependencies
+deny automatic authorization as unassessed, without repeated consent prompts. Current
+bootstrap call inputs and observed evidence have unknown sensitivity;
+validation refuses unknown even if an allowed-class map names it. Production
+per-call provider requests remain blocked pending approved sensitivity and
+disclosure policy and implementation. Arbitrary inputs are not certified free
+of secrets. The contextual adapter supports the default OpenAI endpoint with
+API-key or existing OAuth credentials; other providers, custom routes, and
+Codex remain unavailable.
+
+Contextual ceilings trust private classification of exact shipped definition
+identities. Public capability metadata and fn.capability replacements do not grant
+trusted categories to custom tools; exact-definition assessment and independent
+ceilings remain required.
+
+Target revalidation cannot eliminate filesystem races after a check or enforce
+shell/executable behavior. Same-process Lua is no operating-system boundary.
+Disclosure, numeric calibration/acceptance, default enablement, and locked-core
+compatibility remain parked. Offline tests do not establish completed
+integration or live calibration.
+
+			*:StrapsAdopt*
+:StrapsAdopt [{text}]
+			In contextual mode, review and adopt exact task text and
+			standing instructions. Without {text}, use the trailing
+			request, or retained events when no request is present.
+			Adoption can regenerate the prompt. See
+			|straps-contextual-authorization|.
+
+			*:StrapsAuthorization*
+:StrapsAuthorization[!] {id}
+			In contextual mode, inspect the named decision for this
+			session. With !, request a fresh authorization review
+			through the human scheduler. This does not execute the
+			original denied closure or repeat an unknown outcome.
+
+			*:StrapsTaskReset*
+:StrapsTaskReset		In contextual mode, invalidate the authorization task
+			and pending decisions. This does not erase the transcript.
+
+			*:StrapsLogin*
 :StrapsLogin [{provider} [key]]
 			Store a key for {provider} (default: the current
 			buffer's provider; for openai the bare form is the
@@ -558,8 +644,8 @@ llamacpp_models		(list) {}. The |:StrapsModel| llama.cpp cache, filled
 			`n_ctx` becomes its `context`.
 context_window		(number|nil) 200000. Fallback token window for a model
 			with no `context` in the active provider's model list,
-			used only to render the winbar's context-fill percentage.
-			nil hides the %. Not applied to llama.cpp models, whose
+			used for the winbar percentage. nil disables the fallback
+			and hides the %. Not applied to llama.cpp models, whose
 			window depends on the server's -c.
 effort			(string) "off". Name of the active |:StrapsEffort|
 			entry.
@@ -1283,6 +1369,304 @@ fn.autocmd_bridge(spec)		Bridge a Neovim autocmd back into a session as
 				a user/steering message — the "editor talks to
 				the agent" seam.
 
+						*straps-context-management*
+OPT-IN CONTEXT MANAGEMENT~
+
+`context_management = { enabled = false }` leaves the legacy compaction path
+active. Pending retrieved results remain protected even when disabled.
+Enable it with `enabled = true` and choose `mode = "mechanical"` or
+`mode = "summary"`. Override settings per session with
+`b:straps_context_management`. |:StrapsCompact| continues to call |fn.compact|.
+
+The default budget counter estimates the serialized provider request with
+`bytes_per_token = 3`, `safety_margin = 1.3`, and 64 extra tokens. The estimate
+includes tools and system text and is not an exact token count or a guarantee
+of provider acceptance. Set `input_limit` when model metadata is unknown or a
+custom provider is installed. `context_limit` describes a combined window and
+requires an effective `output_reserve`. The default `reserve_tokens = 4096`
+leaves room for protected archive evidence.
+
+Controls inside the `context_management` table:
+  trigger           0.85: pressure fraction of the available input allowance.
+  target            0.7: required post-compaction fraction.
+  keep_turns        2: recent assistant turns to preserve.
+  minimum_savings   128: minimum estimated tokens recovered.
+  idle_compaction   false: enable compaction after idle eligibility.
+  idle_seconds      300: idle interval when idle compaction is enabled.
+  retry             true explicitly retries a failed summary source/config.
+  summary           Bounded generation settings; see below.
+
+Mechanical mode archives old eligible tool results and replaces them with
+`[straps-context:<id>]` receipts. It preserves user and assistant prose.
+Summary mode may replace older completed assistant/tool intervals with
+attributed summaries between preserved original user/system blocks. Summary
+requests have no tools. Generation makes provider requests; structural tests
+do not establish fidelity. Codex per-request output-cap support is not
+established; the summary integration refuses that route without probing it.
+The standalone tests/context_quality_eval.lua runner has offline self-test and
+dry-run modes and a separately gated live mode. Offline modes do not measure
+model quality. See the README for the live gate, runfile, transport logging,
+artifact sanitization limits, and usage limitations. Summary compaction uses one shared bounded attempt across
+selected spans, recounts aggregate replacements, and stops at the target.
+No span is adopted when a required later span fails. Enabled context management
+permits one retry after a typed pre-output HTTP 400 context-overflow rejection.
+Core captures live/disk source, protections, effective configuration, tools and
+model note before dispatch. Recovery forces recount/reduction despite the soft
+trigger, requires minimum savings and a fitting target, and shares the normal
+boundary's summary attempt allowance. It recaptures pending results and retries
+in the same turn without rerunning tools or adding an assistant placeholder.
+Only the exact unchanged empty placeholder is excluded from retained-turn counts.
+Cancellation, emitted events including queued streaming output, edits, changed
+configuration/protection, ordinary errors, insufficient reduction and a second
+rejection prevent another retry. Failed recovery retains pending evidence.
+
+Summary settings default to `max_input_tokens = 8192`,
+`max_output_tokens = 1024`, `max_total_tokens = 65536`, `max_calls = 32`,
+`max_depth = 4`, and `max_retries = 0`. The summary module's fallback accounting
+uses serialized byte counts as conservative token estimates. Bounded splitting
+and merges retain original source references and child records. Exhausted
+budgets or incomplete responses leave the transcript unchanged.
+
+Archives and trusted grants persist in the private `.context-archive` subtree
+under `session_dir`. Ephemeral transcripts also require persistent archives;
+the archives do not make ephemeral transcripts resumable. Failed archive
+persistence prevents adoption. Checked transcript persistence uses a native
+nonforced noautocmd write, verifies saved bytes, and synchronizes the file and
+parent directory. The writer does not provide controlled temporary-file/rename
+atomicity. A failure after the native write begins reports an ambiguous disk
+outcome. Compaction attempts live rollback; pending-result transactions restore
+live text only when unchanged disk and source identity remain verified.
+Archives have no automatic deletion. Grant updates use a per-session exclusive
+lock and merge current durable grants. A busy lock fails without waiting. After
+a crashed writer, confirm that no writer remains before removing its reported
+`.lock` file; never remove a lock held by another process.
+Fork integration inherits only
+trusted references within the copied transcript cutoff; pasted IDs grant no
+access. File-backed archive grants use the session's absolute pathname. Renaming
+or using `:saveas` on a compacted transcript does not migrate those grants;
+retain the original session path for recovery. Use a supported fork to copy
+archive access to another session.
+
+Lua preview/apply calls require the target session's registry scope and a
+scheduler-owned asynchronous context across yields. Use the Ex controls for
+interactive work; passing a buffer number alone does not install its scope.
+
+Lua controls: `require("straps.context_management").pin(bufnr, first, last)`
+protects finite integer block endpoints; `unpin(bufnr)` clears pins. Pins capture
+the exact marker-inclusive prefix through the last pinned block. Appends preserve
+disjoint pins, including a final block's appended blank separator. Changed captured
+prefixes or boundaries conservatively prevent compaction until unpinning.
+`preview(bufnr, ctx, opts)` returns detached data without adoption or executable
+functions. Summary preview returns `needs_generation = true` unless
+`opts.generate = true`; that flag permits potentially paid generation. Supply
+continuation inputs through `opts.tools` and `opts.note`; preview captures copies
+along with source/disk identity and effective configuration before generation.
+`apply(bufnr, ctx, report, tools?, note?)` applies only the exact unchanged report
+with the same buffer/context. Every attempt consumes the report before validation
+or replaceable work. Apply rejects fabricated, copied, modified, stale, and used
+reports. Omitted tools/note use captured copies; supplied values must equal those
+copies and remain unchanged through accounting and prewrite checks. Apply rechecks
+source, disk, configuration, protections, cancellation, and budget. Applying a
+generated report never generates again, even when another generation is suppressed.
+Closing or replacing a generated preview discards its candidate but retains the
+source/configuration generation-suppression key. Preparing it again requires an
+explicit `context_management.retry = true` override or a relevant source/configuration
+change; retry can spend tokens again. Apply the existing preview before closing it.
+Refusal/failure may retain orphan archives and creator grants for evidence retrieval;
+these grants confer no instruction authority. `b:straps_context_compaction` records
+status/reason, before/after count reports, archives, first_block/last_block, and
+earliest_line.
+
+:StrapsContextPreview[!] [summary]                  *:StrapsContextPreview*
+Requires enabled context management and uses its configured mode. The optional
+summary argument requires summary mode. Without ! no summary provider request
+runs; ! permits bounded generation. A read-only nofile split shows the proposed
+transcript, count source, uncertainty, budget, interval, earliest changed line,
+and unknown accounting/cache values.
+
+:StrapsContextApply                               *:StrapsContextApply*
+Consumes the exact private per-session preview without regeneration. Current
+continuation tools and model note must still equal the captured inputs.
+
+:[range]StrapsContextPin                          *:StrapsContextPin*
+Pins every transcript block intersecting the selected line range, including
+marker lines. Select the range in the transcript buffer.
+
+:StrapsContextUnpin                               *:StrapsContextUnpin*
+Clears every pin for the resolved session. Commands use the current or sole
+visible session and never enable context management. Context operations reserve
+the session against runs and ordinary human operations until async completion.
+Closing the preview, wiping the session, or :StrapsStop cancels pending work.
+b:straps_context_control records status and reasons.
+Only explicit `fallback = "mechanical"` permits fallback after typed generation
+or budget failure or aggregate fit failure. Core revalidates source, protections,
+configuration and cancellation, recomputes original mechanical eligibility, and
+invokes the same captured policy in mechanical mode. Fallback spends no further
+summary requests. Invalid policy, stale source, cancellation, transaction and
+archive failures never enable fallback. Usage observations can calibrate later
+append-only requests; see |fn.context_budget|.
+
+                                                *fn.context_plan*
+fn.context_plan(input, ctx) -> proposal
+The late-bound registry interface accepts detached core-eligible proposal data.
+Core validates selections before generation or mutation. Input fields:
+  version = 1
+  snapshot_id = opaque snapshot identity
+  reason = "pressure" | "idle" | "overflow" | "explicit"
+  mode = "mechanical" | "summary"
+  before = {tokens, limit, source, exact}
+  target_tokens = desired continuation token limit
+  eligible = {{index, first_block, last_block, mode, sources?}, ...}
+Each interval's index equals its array position. The default returns
+{version = 1, snapshot_id = input.snapshot_id, selections = {indices...}}
+in eligible order without changing history or generating summaries. Custom
+policies return the same proposal schema. An explicit adapter override is: >lua
+  require("straps.registry").define({
+    name = "fn.context_plan", kind = "fn", source = [[
+      return function(input, ctx)
+        return require("straps.registry").call("fn.compact", nil, {context_plan = input})
+      end
+    ]],
+  })
+<
+Only a custom fn.compact that handles `if opts and opts.context_plan then ... end`
+and returns the proposal schema from that branch supports this adapter. Existing
+string-returning overrides remain manual-only. Default fn.compact has no proposal
+branch. Core captures the policy function and policy/adapter source identities.
+Results require version 1, the exact snapshot and a dense ordered array of unique
+known eligible indices. Input mutation, overlap and mode mismatch refuse.
+Core owns eligibility and protections; policies cannot expand the eligible set.
+
+Overflow errors use a trusted provider protocol: >lua
+  error({kind = "context_overflow", rejected = true, response_started = false,
+    provider = "...", route = "...", status = 400, code = "...", message = "..."}, 0)
+<
+Built-in backends classify complete successful-transport HTTP rejection bodies
+before output: OpenAI context_length_exceeded or Anthropic's exact
+invalid_request_error prompt-too-long shape. Custom same-process providers may
+raise the same table. Raw-field and emitted-event checks supply no unforgeable
+classifier proof. Failed recovery reports its current reduction/validation
+error; ordinary and second provider failures report their provider error.
+Compaction/control buffer variables record their operation diagnostics.
+context_management.transaction_status(bufnr) exposes terminal transaction state.
+
+A retrieval transaction conflict or uncertain outcome stops later internal loop
+writes and callbacks and blocks further runs for that buffer. Terminal cleanup
+releases reservations and resources and invokes registered ctx.on_cancel handlers.
+Those arbitrary trusted Lua handlers may have their own effects; the stop does
+not sandbox them. Compare live and disk
+transcripts without saving over either version. Preserve divergent versions,
+reconcile the intended transcript, then wipe and reopen it before continuing.
+There is no reset command. Reopening reconstructs remaining pending markers.
+
+						*context_retrieve*
+context_retrieve({id, source_index?, offset?, limit?})
+        Read a bounded archive page authorized for the calling session.
+        Requires enabled context management and a current continuation budget.
+        Omit source_index to list source roles, byte sizes, and child IDs.
+        Include source_index to retrieve original source text with its role.
+        Both forms include recorded tool name/id/error status and block
+        coordinates. Only attrs.name, attrs.id and attrs.is_error are exposed;
+        unrelated attributes are omitted. Identity strings have a 256-byte
+        limit each; oversized metadata refuses rather than truncates identity.
+        Encoded metadata and evidence labels count toward the byte allowance.
+        offset starts at 1: listing entries or original text bytes.
+        limit defaults to 20 entries or 4096 bytes; hard caps are 100 entries
+        and 16384 bytes. The available continuation reserve can reduce a page.
+        Read next_offset for the next page. Sources precede children in the
+        combined listing. Only one page is permitted until a successful
+        continuation consumes the protected result. Repeat calls refuse.
+        Successful results store context_pending=true in tool-result attrs.
+        The loop clears only unchanged results captured in the final request
+        after a complete, noncancelled end_turn or tool_use response. Provider
+        failure and partial responses retain protection. Reopen and fork infer
+        protection from the transcript; disabled legacy compaction, manual
+        compaction, and excision also preserve pending results. Editing away
+        the attribute releases protection without proving consumption.
+        Pending markers grant no archive access or instruction authority.
+        Originals are labeled untrusted archived evidence. Archived roles
+        describe provenance and do not give the text new authority. The tool
+        has trusted capability="read", including for read-only children;
+        session ownership still restricts which archives the child may read.
+
+						*fn.context_budget*
+fn.context_budget(prepared, ctx) -> budget
+        prepared = {body, provider, model?, model_entry?, output_reserve?,
+                    route, calibration_identity?}
+        Built-in body is final provider JSON, including system text and tools.
+        model_entry supplies input_limit/context_limit/context metadata.
+        Custom-provider preparation uses {body = req, provider = "custom",
+        route = "custom", output_reserve?}; configure conservative input_limit.
+        Accounting cannot inspect a custom provider's eventual wire request.
+
+        Default result = {tokens, limit, source, exact = false, safety_margin,
+          provider, model?, route, output_reserve?, fingerprint,
+          cache = {configured_retention?, observed = "unknown", expiry = "unknown"}}
+        fingerprint hashes the UTF-8-scrubbed serialized body. Calibration adds
+        observed_input, delta_bytes, calibration_identity, and changes source
+        to "observed input + wire-byte delta estimate". Replacement counters
+        must return nonnegative numeric tokens and positive finite limit;
+        retain source/exact for diagnostics and policy input.
+
+        Enabled file-backed sessions record successful noncancelled built-in
+        usage observations. Input totals sum normalized input_tokens and
+        optional cache_read_input_tokens/cache_creation_input_tokens.
+        OpenAI normalization subtracts cached tokens from inclusive input
+        before exposing the cache-read component; Anthropic-compatible usage
+        separates uncached input and cache components. Each is added once.
+        Invalid or missing input usage supplies no observation.
+        Reuse requires matching provider/model/route, hashed endpoint/account
+        identity, provider/auth source identities, identical nonmessage fields,
+        and an exact ordered message prefix with optional final-content extension.
+        Earlier edits, compaction, changed tools/system/settings or identities
+        prevent reuse and restore wire-byte accounting until a compatible
+        observation exists. Added bytes use the configured rate/margin plus
+        64 tokens. exact remains false; acceptance is not guaranteed.
+        Isolated summaries neither observe nor use session calibration.
+        Observations remain in memory until buffer wipe and measure neither
+        cache residency nor expiry.
+						*fn.context_summarize*
+fn.context_summarize(req, ctx) -> result
+        req = {system, sources, tools = {}, tool_choice = "none",
+               max_output_tokens, phase = "leaf" or "merge"}
+        Leaf sources carry ref, kind, text, optional id/attrs/block coordinates,
+        source_index, start_byte/end_byte, and continuation =
+        {before, after, total_bytes}. Merge sources carry ref, kind = "summary",
+        text, depth, and original_ranges.
+
+        result = {summary, complete = true, source_refs,
+                  stop_reason = "end_turn" or "stop", truncated?, tool_calls?, usage?}
+        summary must contain nonblank text. source_refs must match every supplied
+        ref once in order. truncated=true and nonempty tool_calls refuse.
+        Optional usage requires nonnegative integer input_tokens/output_tokens
+        and optional cache_read_input_tokens/cache_creation_input_tokens.
+        Total input and output must fit their reservations.
+        The default uses the configured provider with no tools or transcript
+        streaming and decodes response text as JSON. Custom implementations
+        must honor limits and the source contract and raise on provider failure.
+        context_summary.new_attempt/generate convert failures to
+        nil, message, {kind = "invalid", "budget", "cancelled", "generation",
+        or "internal"}. The registry function does not return that tuple.
+
+        Configure bounded summary mode and an explicit override after setup: >lua
+  require("straps").setup({context_management = {
+    enabled = true, mode = "summary", input_limit = 100000,
+    summary = {max_input_tokens = 8192, max_output_tokens = 1024,
+      max_total_tokens = 65536, max_calls = 32, max_depth = 4, max_retries = 0},
+  }})
+  require("straps.registry").define({
+    name = "fn.context_summarize", kind = "fn", source = [[
+      return function(req, ctx)
+        return require("straps.context_management").summarize(req, ctx)
+      end
+    ]],
+  })
+<
+        The example delegates to the default generator. Replace the delegation
+        with a generator satisfying the same contract. Selecting summary mode
+        permits provider spending at automatic boundaries; setup alone does
+        not generate a summary.
+
 						*straps-subprocesses*
 SUBPROCESS GATE~
 
@@ -1425,10 +1809,11 @@ categories. Each entry is a grantable category (see |fn.capability|) or a
 specific tool name; an unknown entry errors at spawn time, and so does any
 entry in the `define` category (`"define"` or `registry_define`). A tool-name
 grant covers exactly that tool even when its category is not granted. The
-child gets a confirm shadow: read-only calls and granted categories/tools run
-unprompted, and every other call is DENIED at once — a subagent runs
-unattended, so it never waits on a dialog. `readonly = true` is the same as
-`allow = {}` (read-only calls only). `readonly` and `allow` together error.
+child gets a confirm shadow: read-only calls, granted categories/tools,
+builtin watch/unwatch calls on any agent, and messages to `"parent"` run
+unprompted. Every other call is denied without a dialog. `readonly = true`
+is the same as `allow = {}`, including those watch and messaging exceptions.
+`readonly` and `allow` together error.
 See |straps-auto|.
 
 Subagents nest as deep as `max_spawn_depth` allows (default 1: children
@@ -1538,7 +1923,8 @@ send_message	Tool. Send a message to another session in this Neovim:
 		(|fn.capability|): a top-level session confirms each send
 		unless `:StrapsAuto spawn` is set. A readonly/allow-gated
 		child may always send `to="parent"`; any other target needs
-		a grant and must be its parent or one of its own children.
+		a grant and must be its parent, one of its own children, or
+		an immediate sibling sharing a valid session parent.
 
 					*straps-watch-agent-tool* *watch_agent*
 watch_agent	Tool. Subscribe to another session's lifecycle: `to` is its
@@ -1563,10 +1949,11 @@ watch_agent	Tool. Subscribe to another session's lifecycle: `to` is its
 		A parent watching its own child receives both the watch
 		notice and the subagent completion notice; only the watch
 		starts an idle parent.
-		Permissions match |send_message|: the `spawn` category; a
-		gated child may always watch `"parent"`; any other target
-		needs a grant and must be in its family.
-unwatch_agent	Tool. Remove this session's watch on `to`.
+		Both tools use the `spawn` category for top-level confirmation.
+		Readonly and allow-gated children may watch any agent without
+		a grant, including with automatic wakes.
+unwatch_agent	Tool. Remove only this session's watch on `to`. Readonly and
+		allow-gated children may remove their watches on any agent.
 Harness notices use the same mechanism: a user block beginning `[straps] `
 (the multiplayer notice, a subagent completion notice) renders as `harness`.
 The prefix is a content convention, so a block you type yourself starting

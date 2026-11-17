@@ -1953,7 +1953,7 @@ return function(req, ctx)
   local entry = providers.model_entry(provider, model, config)
   -- An entry found only through the model pref goes into the model list, so
   -- the session keeps it after a later global pick changes the pref.
-  if not (ctx and ctx.context_isolated) then providers.merge_model_entry(provider, entry, config) end
+  if not (ctx and (ctx.context_prepare or ctx.context_isolated)) then providers.merge_model_entry(provider, entry, config) end
   local backend_ctx = setmetatable({
     provider = provider,
     model = model,

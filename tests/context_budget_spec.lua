@@ -214,6 +214,21 @@ it("prepares Anthropic wire accounting after thinking raises the response cap", 
   assert.is_truthy(p.body.system)
 end)
 
+it("counts a model known only through the model preference without changing the model list", function()
+  registry.define(saved_provider)
+  local old_pref = registry.get("fn.model_pref")
+  define("fn.anthropic_api_key", "return function() return 'synthetic-key' end")
+  define("fn.model_pref", "return function() return 'pref-model', { id = 'pref-model', context = 40000 } end")
+  straps.config.provider, straps.config.model, straps.config.models = "anthropic", nil, {}
+  straps.config.context_management.input_limit, straps.config.context_management.trigger = nil, 1
+  local b = fixture()
+  local ok, err = pcall(management.boundary, b, ctx(b), {}, {}, nil)
+  registry.define(old_pref)
+  assert.is_true(ok, tostring(err))
+  assert.same({}, straps.config.models)
+  assert.are.equal("pref-model", vim.b[b].straps_context_budget.model)
+end)
+
 it("prepares Codex after its wire mutation without inventing an output cap", function()
   registry.define(saved_provider)
   define("fn.openai_api_key", "return function() return 'synthetic-key', 'codex', 'synthetic-account' end")

@@ -41,11 +41,19 @@
           install -Dm755 ${pkgs.tree-sitter-grammars.tree-sitter-json}/parser $out/parser/json.so
         '';
       };
+
+      mkTrynix = pkgs: pkgs.wrapNeovimUnstable pkgs.neovim-unwrapped {
+        plugins = [ (mkStraps pkgs) ];
+        waylandSupport = false;
+        luaRcContent = ''require("straps").setup({})'';
+        wrapperArgs = [ "--prefix" "PATH" ":" (nixpkgs.lib.makeBinPath [ pkgs.curl pkgs.ripgrep ]) ];
+      };
     in
     {
       packages = forAllSystems (pkgs: rec {
         straps-nvim = mkStraps pkgs;
         tree-sitter-straps = mkGrammar pkgs;
+        trynix = mkTrynix pkgs;
         default = straps-nvim;
       });
 

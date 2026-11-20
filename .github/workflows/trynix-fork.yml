@@ -1,0 +1,96 @@
+name: trynix (on request)
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: trynix-fork-${{ github.event.issue.number }}
+
+jobs:
+  preview:
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/trynix') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require write access and a reviewed commit
+        id: request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          permission=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$ACTOR/permission" --jq .permission)
+          case "$permission" in
+            admin | write) ;;
+            *) echo "::error::$ACTOR has $permission access, not write"; exit 1 ;;
+          esac
+          sha=$(printf '%s\n' "$BODY" | head -n1 | awk '$1 == "/trynix" { print $2 }')
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{7,40}$'; then
+            echo "::error::comment must be '/trynix <commit sha>' naming the commit you reviewed"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Acknowledge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method POST "repos/$GITHUB_REPOSITORY/issues/comments/${{ github.event.comment.id }}/reactions" -f content=eyes > /dev/null
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+          persist-credentials: false
+
+      - name: Build only the reviewed commit
+        id: commit
+        env:
+          REVIEWED: ${{ steps.request.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD)
+          case "$head" in
+            "$REVIEWED"*) echo "sha=$head" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::pull request head is $head, not the reviewed $REVIEWED"; exit 1 ;;
+          esac
+
+      - name: Look up the previews cache key
+        id: cache
+        run: |
+          set -euo pipefail
+          key=$(curl -fsS https://app.cachix.org/api/v1/cache/straps-previews | jq -er '.publicSigningKeys[0]')
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: straps-previews
+          authToken: ${{ secrets.CACHIX_PREVIEW_TOKEN }}
+          skipPush: true
+
+      - name: Build Neovim with the plugins installed
+        run: nix build .#trynix --print-build-logs
+
+      - name: Push the closure to cachix
+        run: cachix push straps-previews ./result
+
+      - uses: fzakaria/trynix@v1
+        with:
+          cache: https://straps-previews.cachix.org
+          publicKey: ${{ steps.cache.outputs.key }}
+          attrs: .#trynix
+          verify: fail
+          prNumber: ${{ github.event.issue.number }}
+          commit: ${{ steps.commit.outputs.sha }}

@@ -162,6 +162,7 @@ M.config = {
   -- ui.session_status() / ui.session_winbar() components stay available for a
   -- manual statusline either way.
   session_winbar = true,
+  session_dock = false,
   terminal_status = true,
 
   -- Agents-buffer winbar (:StrapsAgents): the keymap legend in a window-local

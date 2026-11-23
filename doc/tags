@@ -16,6 +16,7 @@
 :StrapsLogin	straps.txt	/*:StrapsLogin*
 :StrapsLogout	straps.txt	/*:StrapsLogout*
 :StrapsModel	straps.txt	/*:StrapsModel*
+:StrapsPermission	straps.txt	/*:StrapsPermission*
 :StrapsProvider	straps.txt	/*:StrapsProvider*
 :StrapsRegistry	straps.txt	/*:StrapsRegistry*
 :StrapsRename	straps.txt	/*:StrapsRename*

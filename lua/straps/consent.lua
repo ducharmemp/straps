@@ -175,9 +175,29 @@ function M.connect(options)
           record.display_revision = (record.display_revision or 0) + 1
           local revision = record.display_revision
           record.release_attention = require("straps.attention").wait(record.context, "consent")
-          local ok, dispose = pcall(show, view(record), function(choice)
-            if record.display_revision == revision then decide(record, choice) end
-          end)
+          local function present()
+            return show(view(record), function(choice)
+              if record.display_revision == revision then decide(record, choice) end
+            end)
+          end
+          local dock = require("straps.dock")
+          local bufnr = record.context and record.context.bufnr
+          local ok, dispose
+          if show == display and dock.visible(bufnr) then
+            local close
+            local release = dock.defer(bufnr, function()
+              refresh(record)
+              if active ~= record then pump(); return end
+              local shown, cleanup = pcall(present)
+              if shown then close = cleanup else terminal(record, "invalidated", "consent display failed"); pump() end
+            end)
+            ok, dispose = true, function()
+              release()
+              if close then close() end
+            end
+          else
+            ok, dispose = pcall(present)
+          end
           if ok and type(dispose) == "function" then
             if record.status == "displayed" then record.dispose = dispose else pcall(dispose) end
           end

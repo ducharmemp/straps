@@ -201,11 +201,6 @@ end
       .. " permits every call fn.capability puts in that category. Redefine to"
       .. " change the policy.",
     source = [==[
--- NOTE: this hook runs inside the loop coroutine. vim.fn.confirm must run on
--- the main loop; because the loop driver resumes the coroutine via
--- vim.schedule, every resume (and therefore this call) is already on the main
--- loop, so calling vim.fn.confirm directly here is safe — no extra await/
--- schedule wrapper is needed.
 return function(name, input, ctx)
   -- Read-only tool calls (the allowlist plus the list-mode exceptions) are
   -- auto-allowed. The policy lives in fn.readonly_policy so this hook and
@@ -302,9 +297,9 @@ return function(name, input, ctx)
   -- For file edits, render a real unified diff in a scratch split while the
   -- dialog is up — an informed approval instead of a raw JSON dump. Best
   -- effort: any failure just falls back to the plain input preview.
-  local preview_win
-  if is_edit then
-    pcall(function()
+  local function show_edit_preview()
+    if not is_edit then return end
+    local ok, win = pcall(function()
       local state = require("straps.state")
       local old
       if ctx and type(ctx.batch_preview) == "function" then
@@ -330,13 +325,12 @@ return function(name, input, ctx)
       vim.api.nvim_buf_set_lines(pbuf, 0, -1, false, dlines)
       vim.bo[pbuf].filetype = "diff"
       vim.bo[pbuf].bufhidden = "wipe"
-      local prev = vim.api.nvim_get_current_win()
-      vim.cmd("botright " .. math.min(#dlines + 1, 15) .. "split")
-      preview_win = vim.api.nvim_get_current_win()
-      vim.api.nvim_win_set_buf(preview_win, pbuf)
-      pcall(vim.api.nvim_set_current_win, prev)
+      local ok, win = pcall(vim.api.nvim_open_win, pbuf, false, { split = "below", win = -1, height = math.min(#dlines + 1, 15) })
+      if not ok then vim.api.nvim_buf_delete(pbuf, { force = true }); return end
       vim.cmd("redraw")
+      return win
     end)
+    return ok and win or nil
   end
 
   local function field_listing(t)
@@ -376,9 +370,6 @@ return function(name, input, ctx)
       :format(tostring(input.pattern), tostring(input.replacement), tostring(input.flags or "ge"),
         entries, entries == 1 and "y" or "ies", files, files == 1 and "" or "s")
     if input.dry_run then preview = preview .. "\ndry_run: no files will change" end
-  end
-  if preview_win then
-    preview = "diff preview shown in the split below"
   end
   if is_delete then
     preview = "Deletion is NOT undo-reversible: there is no buffer undo for a removed file.\n" .. preview
@@ -420,12 +411,14 @@ return function(name, input, ctx)
     choices = "&Yes\n&No\n&Always this tool"
   end
 
-  local choice = require("straps.attention").prompt(ctx, "permission", vim.fn.confirm,
-    "straps: allow " .. tostring(name) .. "?\n" .. preview, choices, 2)
-
-  if preview_win then
-    pcall(vim.api.nvim_win_close, preview_win, true)
-  end
+  local choice = require("straps.dock").confirm(ctx, function()
+    local preview_win = show_edit_preview()
+    local ok, answer = pcall(require("straps.attention").prompt, ctx, "permission", vim.fn.confirm,
+      "straps: allow " .. tostring(name) .. "?\n" .. (preview_win and "diff preview shown in the split below" or preview), choices, 2)
+    if preview_win then pcall(vim.api.nvim_win_close, preview_win, true) end
+    if not ok then error(answer, 0) end
+    return answer
+  end)
 
   if choice == 1 then
     return true

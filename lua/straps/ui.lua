@@ -87,7 +87,8 @@ end
 local function apply_winbar()
   local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
   local cfg = require("straps").config
-  local want = vim.b[buf].straps_session == true and cfg.session_winbar ~= false
+  local dock = cfg.session_dock and require("straps.dock").is_window(win, buf)
+  local want = vim.b[buf].straps_session == true and (dock or cfg.session_winbar ~= false)
     or vim.api.nvim_buf_get_name(buf) == "straps://agents" and cfg.agents_winbar ~= false
   local value = vim.api.nvim_get_option_value("winbar", { win = win, scope = "local" })
   if not want then
@@ -119,6 +120,7 @@ local function register_winbar_lifecycle()
     group = group,
     callback = function()
       local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+      if require("straps").config.session_dock and require("straps.dock").is_window(win, buf) then return end
       local saved = winbars[win]
       local value = vim.api.nvim_get_option_value("winbar", { win = win, scope = "local" })
       local ordinary = vim.b[buf].straps_session ~= true and vim.api.nvim_buf_get_name(buf) ~= "straps://agents"
@@ -699,13 +701,14 @@ function M.map_file_refs(bufnr)
   end, { buffer = bufnr, desc = "straps: open file[:line[:col]] under cursor" })
 end
 
-local function open_in_window(bufnr, split_cmd)
+local function open_in_window(bufnr, split_cmd, session)
   for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
     if vim.api.nvim_win_get_tabpage(win) == vim.api.nvim_get_current_tabpage() then
       vim.api.nvim_set_current_win(win)
       return true
     end
   end
+  if session and require("straps.dock").open(bufnr, split_cmd) then return false end
   if split_cmd == "none" then
     vim.cmd("buffer " .. bufnr)
   else
@@ -728,11 +731,11 @@ local function load_registries()
 end
 
 -- Open a loaded session transcript in a window with its <CR> keymap (send,
--- or prompt to steer if a run is active), idle status, folds and rendering.
+-- or open the steering split if a run is active), idle status, folds and rendering.
 -- Registry loading is the caller's job: open_session loads before
 -- state.new_session builds the system prompt, show_session loads here.
 local function present_session(bufnr, split_cmd)
-  open_in_window(bufnr, split_cmd)
+  open_in_window(bufnr, split_cmd, true)
   -- Don't stomp a live status: a running subagent brought on-screen by the
   -- agents picker is still "running".
   if vim.b[bufnr].straps_status == nil then
@@ -800,7 +803,7 @@ end
 
 --- Open a fresh session: a plain transcript buffer in a split, cursor on the
 --- trailing (empty) user block. <CR> in normal mode sends it; while a run is
---- active <CR> prompts to steer instead. Ordinary vim editing works
+--- active <CR> opens the steering split instead. Ordinary vim editing works
 --- throughout — including editing earlier history before sending.
 --- @param split_cmd string? split command to open the window with (see
 ---   M.show_session); nil/"" → horizontal "split".
@@ -1357,7 +1360,9 @@ function M._agents_winbar()
 end
 
 function M.winbar()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local win = tonumber(vim.g.statusline_winid)
+  if not win or not vim.api.nvim_win_is_valid(win) then win = vim.api.nvim_get_current_win() end
+  local bufnr = vim.api.nvim_win_get_buf(win)
   local ok_s, s = pcall(require, "straps")
   local cfg = (ok_s and type(s) == "table" and type(s.config) == "table") and s.config or {}
   if vim.api.nvim_buf_get_name(bufnr) == "straps://agents" then
@@ -1370,8 +1375,21 @@ function M.winbar()
     local ok, wb = pcall(require("straps.registry").try_call, "fn.agents_winbar")
     return (ok and type(wb) == "string") and wb or ""
   end
-  if vim.b[bufnr].straps_session == true and cfg.session_winbar ~= false then
-    return M.session_winbar(bufnr)
+  if vim.b[bufnr].straps_session == true then
+    local dock = cfg.session_dock and require("straps.dock").is_window(win, bufnr)
+    if not dock and cfg.session_winbar == false then return "" end
+    local bar = M.session_winbar(bufnr)
+    local ok, evidence = pcall(require, "straps.evidence")
+    local hint = ok and evidence.winbar_hint(win, bufnr) or ""
+    hint = hint:gsub("%%", "%%%%")
+    if hint ~= "" then bar = bar .. " " .. hint .. " " end
+    if dock then
+      local label = vim.fn.strtrans(M.session_label(bufnr)):gsub("%%", "%%%%")
+      local permission = require("straps.dock").has_permission(bufnr) and "Permission pending (:StrapsPermission)  " or ""
+      if cfg.session_winbar == false then return " " .. permission .. label .. (hint ~= "" and "  " .. hint or "") end
+      return " " .. permission .. label .. "  %<" .. bar
+    end
+    return bar
   end
   return ""
 end
@@ -1557,7 +1575,8 @@ local function progress_draw(bufnr)
   local live = liveness_segment(st.streaming, (now - (st.last_activity or st.start)) / 1e6)
   local text = ("%s · %ds%s · <CR> steer · :StrapsStop stop"):format(st.label, secs, live)
   vim.api.nvim_buf_clear_namespace(bufnr, progress_ns, 0, -1)
-  vim.api.nvim_buf_set_extmark(bufnr, progress_ns, vim.api.nvim_buf_line_count(bufnr) - 1, 0, {
+  local tail = require("straps.state").draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
+  vim.api.nvim_buf_set_extmark(bufnr, progress_ns, tail - 1, 0, {
     virt_text = { { text, "StrapsProgress" } },
     virt_text_pos = "eol",
   })
@@ -2506,16 +2525,7 @@ M.SESSION_KEYS = { "<CR>", "gf", "]]", "[[", "gO" }
 
 function M.map_session_keys(bufnr)
   vim.keymap.set("n", "<CR>", function()
-    local loop = require("straps.loop")
-    if loop.running(bufnr) then
-      vim.ui.input({ prompt = "steer: " }, function(txt)
-        if txt and txt ~= "" then
-          if human then human.steer(bufnr, txt) else require("straps.loop").steer(bufnr, txt) end
-        end
-      end)
-    else
-      if human then human.send(bufnr) else loop.start(bufnr) end
-    end
+    require("straps.steering").send(bufnr, human)
   end, { buffer = bufnr, desc = "straps: send / steer" })
   M.map_file_refs(bufnr)
   M.map_navigation(bufnr)

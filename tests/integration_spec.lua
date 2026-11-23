@@ -1012,7 +1012,7 @@ it("typing under the trailing user marker and <CR> starts a run", function()
   assert(_G.__it.turn == 3, "expected 3 provider turns, got " .. _G.__it.turn)
 end)
 
-it("<CR> while a run is active prompts to steer instead of starting a second run", function()
+it("<CR> opens a steering split and sends the draft into the active run", function()
   _G.__steer = { calls = 0, mid_turn = false }
   registry.define({
     name = "fn.provider",
@@ -1024,20 +1024,16 @@ return function(req, ctx)
   st.calls = st.calls + 1
   local n = st.calls
   return ctx.await(function(resolve)
-    vim.defer_fn(function()
-      if n == 1 then
-        st.mid_turn = true -- the test presses <CR> again now
-        vim.defer_fn(function()
-          ctx.emit({ type = "text_delta", text = "slow first reply" })
-          resolve({ stop_reason = "end_turn",
-            content = { { type = "text", text = "slow first reply" } } })
-        end, 100)
-      else
-        ctx.emit({ type = "text_delta", text = "steered second reply" })
-        resolve({ stop_reason = "end_turn",
-          content = { { type = "text", text = "steered second reply" } } })
-      end
-    end, 5)
+    local function reply(text)
+      ctx.emit({ type = "text_delta", text = text })
+      resolve({ stop_reason = "end_turn", content = { { type = "text", text = text } } })
+    end
+    if n == 1 then
+      st.mid_turn = true
+      st.finish_first = function() reply("slow first reply") end
+    else
+      vim.schedule(function() reply("steered second reply") end)
+    end
   end)
 end
 ]==],
@@ -1052,11 +1048,15 @@ end
     "provider never reached mid-turn")
   assert(loop.running(session), "run finished before the steering <CR>")
 
-  -- <CR> mid-run opens vim.ui.input({prompt="steer: "}); stub it.
-  local real_input = vim.ui.input
-  vim.ui.input = function(_, on_confirm) on_confirm("second message") end
+  local origin = vim.api.nvim_get_current_win()
   press_enter(session)
-  vim.ui.input = real_input
+  local composer = vim.api.nvim_get_current_win()
+  assert(composer ~= origin and vim.api.nvim_win_get_buf(composer) == session)
+  vim.api.nvim_set_current_line("second message")
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+  assert(vim.api.nvim_get_current_win() == origin)
+  assert(require("straps.state").draft_text(session) == nil, "queued draft was not cleared")
+  _G.__steer.finish_first()
 
   assert(vim.wait(10000, function() return not loop.running(session) end, 10),
     "run did not finish")

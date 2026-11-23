@@ -153,6 +153,7 @@ M.config = {
   -- also reachable per-window with :set conceallevel=0). tools_expanded =
   -- true folds tool_use/tool_result blocks OPEN by default.
   render = true,
+  turn_decoration = true,
   tools_expanded = false,
 
   -- Session-window winbar: a window-local status line on each session window

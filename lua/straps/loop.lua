@@ -49,6 +49,7 @@ local function transaction_fault(bufnr, run, status)
   end
   for _, fn in ipairs(handlers) do pcall(fn) end
   if main then pcall(function() require("straps.attention").finish(bufnr, main, "error") end) end
+  pcall(function() require("straps.turn_decoration").finish(bufnr) end)
   pcall(function() require("straps.ui").progress(bufnr, { type = "done" }) end)
   pcall(function()
     vim.b[bufnr].straps_status = "idle"
@@ -192,6 +193,7 @@ end
 local function finish_events(bufnr, reason, run)
   if transaction_faults[bufnr] then return end
   require("straps.attention").finish(bufnr, run, reason)
+  pcall(function() require("straps.turn_decoration").finish(bufnr) end)
   pcall(function() vim.b[bufnr].straps_status = "idle" end)
   pcall(function() vim.b[bufnr].straps_run_reason = reason end)
   pcall(vim.api.nvim_exec_autocmds, "User",
@@ -322,8 +324,8 @@ end
 
 -- The model-origin gate: hook.confirm, then the before_tool fan-out. Passed
 -- to registry.gate_tool as opts.confirm so it runs AFTER the before-guards.
-local function confirm_then_before_tool(name, input, ctx)
-  local allowed, reason, source = registry.call("hook.confirm", name, input, ctx)
+local function confirm_then_before_tool(name, input, ctx, call_id)
+  local allowed, reason, source = registry.call("hook.confirm", name, input, ctx, call_id)
   if not allowed then
     return false, reason, source
   end
@@ -335,7 +337,9 @@ end
 -- Returns allowed, reason, run (run executes the gated entry exactly once).
 local function gate_tool(ctx, block)
   if rejected_tool_inputs[block] then return false, rejected_tool_inputs[block] end
-  return registry.gate_tool(block.name, block.input or {}, ctx, { confirm = confirm_then_before_tool })
+  return registry.gate_tool(block.name, block.input or {}, ctx, {
+    confirm = function(name, input, gate_ctx) return confirm_then_before_tool(name, input, gate_ctx, block.id) end,
+  })
 end
 
 local function normalize_result(ok, result)
@@ -962,6 +966,10 @@ local function run_turns(bufnr, ctx, run)
       error(capture_status.error or "could not capture pending retrieval", 0)
     end
     state.append(bufnr, "assistant", nil, "")
+    pcall(function()
+      local row = (state.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)) - 1
+      require("straps.turn_decoration").begin(bufnr, row)
+    end)
     local recovery
     if management.enabled(bufnr) then
       recovery = management.capture_recovery(bufnr, ctx, tools, note, allowance)

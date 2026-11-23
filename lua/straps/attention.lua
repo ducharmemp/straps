@@ -85,6 +85,21 @@ function M.finish(bufnr, run, reason)
   publish(record)
 end
 
+function M.permission_wait(bufnr)
+  local record = records[bufnr]
+  if not record or not record.run then return end
+  for token in pairs(record.waits) do
+    if token.kind == "permission" or token.kind == "consent" then return true end
+  end
+  return false
+end
+
+local function redraw_permission(kind, bufnr)
+  if kind == "permission" or kind == "consent" then
+    pcall(function() require("straps.turn_decoration").redraw(bufnr) end)
+  end
+end
+
 function M.wait(ctx, kind)
   local key = ctx and ctx.bufnr
   local record = records[key]
@@ -94,10 +109,12 @@ function M.wait(ctx, kind)
   local token = { kind = kind, seq = serial }
   record.waits[token] = true
   publish(record)
+  redraw_permission(kind, key)
   return function()
     if records[key] ~= record or record.run ~= run or not record.waits[token] then return end
     record.waits[token] = nil
     publish(record)
+    redraw_permission(kind, key)
   end
 end
 

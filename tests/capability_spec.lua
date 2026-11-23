@@ -364,7 +364,7 @@ it("a denied edit_file prompt leaves no stray buffer for the previewed file", fu
     registry.call("hook.confirm", "edit_file", { path = path, old_string = "FOO", new_string = "BAR" },
       { bufnr = require("straps.state").new_session() })
   end)
-  assert.truthy(seen[1].msg:find("diff preview shown", 1, true), seen[1].msg)
+  assert.truthy(seen[1].msg:find("new_string: BAR", 1, true), seen[1].msg)
   assert.are.equal(-1, vim.fn.bufnr("^" .. vim.fn.fnameescape(path) .. "$"))
 end)
 

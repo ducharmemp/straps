@@ -13,9 +13,11 @@
 :StrapsEffort	straps.txt	/*:StrapsEffort*
 :StrapsEval	straps.txt	/*:StrapsEval*
 :StrapsHelp	straps.txt	/*:StrapsHelp*
+:StrapsInspect	straps.txt	/*:StrapsInspect*
 :StrapsLogin	straps.txt	/*:StrapsLogin*
 :StrapsLogout	straps.txt	/*:StrapsLogout*
 :StrapsModel	straps.txt	/*:StrapsModel*
+:StrapsOutline	straps.txt	/*:StrapsOutline*
 :StrapsPermission	straps.txt	/*:StrapsPermission*
 :StrapsProvider	straps.txt	/*:StrapsProvider*
 :StrapsRegistry	straps.txt	/*:StrapsRegistry*

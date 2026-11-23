@@ -8,8 +8,8 @@
 -- round-tripping output through a real windowless :terminal buffer, its
 -- per-session retention and show=true, and show_terminal opening it; ask_user's inline
 -- virt_lines question, its keymaps and live preview split; hook.confirm's new
--- auto-allows, code_action list-vs-apply gating, and the diff-preview split
--- being cleaned up after the dialog; fn.autocmd_bridge queueing a hook's
+-- auto-allows, code_action list-vs-apply gating, and direct confirmation
+-- without an automatic preview; fn.autocmd_bridge queueing a hook's
 -- string return onto a session buffer.
 
 local here = debug.getinfo(1, "S").source:sub(2)
@@ -584,41 +584,21 @@ it("new read-only tools are auto-allowed; code_action gates on index", function(
   end
 end)
 
-it("confirm shows a diff preview for edit_file and cleans up the split", function()
+it("a synchronous edit confirmation opens no preview and denies on dismissal", function()
   local path = vim.fn.tempname() .. ".txt"
   write_file(path, "keep\nFOO here\nkeep\n")
   local wins_before = #vim.api.nvim_list_wins()
-
-  -- Stub vim.fn.confirm to observe the moment the dialog is up: the preview
-  -- split must exist THEN (with a diff of the proposed change in it), and the
-  -- prompt must point at it instead of dumping JSON. Returns 0 (deny).
-  local seen = { prompt = nil, wins = 0, diff = nil }
-  local real_confirm = vim.fn.confirm
+  local seen, real_confirm = {}, vim.fn.confirm
   vim.fn.confirm = function(msg)
-    seen.prompt = msg
-    seen.wins = #vim.api.nvim_list_wins()
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
-      local b = vim.api.nvim_win_get_buf(win)
-      if vim.bo[b].filetype == "diff" then
-        seen.diff = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
-      end
-    end
+    seen.prompt, seen.wins = msg, #vim.api.nvim_list_wins()
     return 0
   end
   local ok, allowed = pcall(registry.call, "hook.confirm", "edit_file",
     { path = path, old_string = "FOO here", new_string = "BAR now" }, { bufnr = 0 })
   vim.fn.confirm = real_confirm
-  assert(ok, "hook.confirm errored: " .. tostring(allowed))
-
-  assert(allowed ~= true, "edit_file should be denied when confirm returns 0")
-  assert(seen.wins == wins_before + 1, "preview split missing while dialog was up")
-  assert(seen.prompt:find("diff preview shown in the split below", 1, true),
-    "prompt should reference the preview, got:\n" .. tostring(seen.prompt))
-  assert(seen.diff and seen.diff:find("-FOO here", 1, true)
-    and seen.diff:find("+BAR now", 1, true),
-    "preview is not a diff of the proposed change:\n" .. tostring(seen.diff))
-  assert(#vim.api.nvim_list_wins() == wins_before,
-    "diff preview split leaked: " .. #vim.api.nvim_list_wins() .. " wins")
+  assert(ok and allowed ~= true, tostring(allowed))
+  assert(seen.wins == wins_before, "direct confirmation must not open a preview")
+  assert(seen.prompt:find("new_string: BAR now", 1, true), seen.prompt)
 end)
 
 -- -------------------------------------------------------------------- ask_user

@@ -111,6 +111,11 @@ command("StrapsPermission", function()
   end
 end, { desc = "straps: review the session's pending permission request" })
 
+command("StrapsInspect", function()
+  local ok, reason = require("straps.workbench").inspect()
+  if not ok then vim.notify("straps: " .. reason, vim.log.levels.INFO) end
+end, { desc = "straps: inspect the pending edit from its transcript" })
+
 command("StrapsResume", function(opts)
   local ui = require("straps.ui")
   local arg = opts.args
@@ -163,6 +168,10 @@ end, { nargs = "?", desc = "straps: give this session a durable title (no arg = 
 command("StrapsSearch", function(opts)
   require("straps.ui").grep_sessions(opts.args)
 end, { nargs = "+", desc = "straps: full-text search across all saved session transcripts" })
+
+command("StrapsOutline", function()
+  require("straps.outline").toggle()
+end, { desc = "straps: toggle the session outline reading view" })
 
 command("StrapsSend", function()
   local bufnr = resolve_session()

@@ -473,8 +473,6 @@ describe("notice folds", function()
 end)
 
 it("outline headline prefers text typed on the marker line itself", function()
-  -- block_headline feeds M.outline (gO); turns no longer fold, so assert the
-  -- marker-line preference through the outline's loclist text.
   local b = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(b, 0, -1, false, {
     "%%[straps:user]%% typed on the marker", "body line",

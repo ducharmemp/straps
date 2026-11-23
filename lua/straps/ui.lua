@@ -35,6 +35,8 @@ local HL_LINKS = {
   StrapsCardBorder = "Comment",    -- the expanded-tool box art
   StrapsWinbar = "WinBar",         -- session-window winbar (model/effort/status)
   StrapsWinbarNC = "WinBarNC",     -- the same winbar in a non-current window
+  StrapsTurnAccent = "Identifier",
+  StrapsPermit = "DiagnosticWarn",
   StrapsProgress = "Comment",      -- the run-progress virtual text on the last line
   StrapsFileRef = "Underlined",    -- path:line[:col] under treesitter (apply_file_ref_match)
   -- Treesitter captures (queries/straps/highlights.scm). The targets must
@@ -375,7 +377,15 @@ end
 --- foldtext function for session buffers (Neovim >= 0.10 renders the returned
 --- chunk list with color). Reads v:foldstart in the current buffer.
 function M.foldtext()
-  return M._fold_summary(vim.api.nvim_get_current_buf(), vim.v.foldstart)
+  local buf = vim.api.nvim_get_current_buf()
+  local chunks = M._fold_summary(buf, vim.v.foldstart)
+  local decoration = require("straps.turn_decoration")
+  local first, last, permit = decoration.rows(buf)
+  local row = vim.v.foldstart - 1
+  if first and row >= first and row <= last then
+    return vim.list_extend(decoration.chunks(permit and permit >= row and permit < vim.v.foldend), chunks)
+  end
+  return chunks
 end
 
 -- Conceal the leading marker token on a marker line (display-only).
@@ -1383,12 +1393,14 @@ function M.winbar()
     local hint = ok and evidence.winbar_hint(win, bufnr) or ""
     hint = hint:gsub("%%", "%%%%")
     if hint ~= "" then bar = bar .. " " .. hint .. " " end
+    local dock_pending = dock and require("straps.dock").has_permission(bufnr)
+    local waiting = require("straps.turn_decoration").wait_label(bufnr, dock_pending)
     if dock then
       local label = vim.fn.strtrans(M.session_label(bufnr)):gsub("%%", "%%%%")
-      local permission = require("straps.dock").has_permission(bufnr) and "Permission pending (:StrapsPermission)  " or ""
-      if cfg.session_winbar == false then return " " .. permission .. label .. (hint ~= "" and "  " .. hint or "") end
-      return " " .. permission .. label .. "  %<" .. bar
+      if cfg.session_winbar == false then return " " .. waiting .. label .. (hint ~= "" and "  " .. hint or "") end
+      return " " .. waiting .. label .. "  %<" .. bar
     end
+    if waiting ~= "" then return " " .. waiting .. "%<" .. bar end
     return bar
   end
   return ""
@@ -2564,7 +2576,7 @@ local function register_fold_lifecycle()
     callback = function(ev)
       local win = vim.api.nvim_get_current_win()
       if vim.api.nvim_win_get_buf(win) == ev.buf and vim.bo[ev.buf].filetype == "straps" then
-        M.apply_fold_opts(ev.buf)
+        M.apply_fold_opts(ev.buf, win)
       end
     end,
   })
@@ -2590,20 +2602,23 @@ end
 --- the session window, or any file swapped into it (gf, :edit, <C-o>), folds
 --- by the straps foldexpr on the user's own source. `[0]` writes only
 --- per-(window, buffer), which is exactly the scope the transcript needs.
-function M.apply_fold_opts(bufnr)
+function M.apply_fold_opts(bufnr, target_win)
   register_fold_lifecycle()
   local ok, straps = pcall(require, "straps")
   local expanded = ok and type(straps) == "table" and straps.config
     and straps.config.tools_expanded
   local expr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
-  for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
-    local first = vim.wo[win].foldexpr ~= expr
-    if vim.wo[win].foldmethod ~= "expr" then vim.wo[win][0].foldmethod = "expr" end
-    if first then vim.wo[win][0].foldexpr = expr end
-    local text = "v:lua.require'straps.ui'.foldtext()"
-    if vim.wo[win].foldtext ~= text then vim.wo[win][0].foldtext = text end
-    if first then
-      vim.wo[win][0].foldlevel = expanded and 99 or 0
+  local outline = package.loaded["straps.outline"]
+  for _, win in ipairs(target_win and { target_win } or vim.fn.win_findbuf(bufnr)) do
+    if not (outline and outline.owns_folds(win, bufnr)) then
+      local first = vim.wo[win].foldexpr ~= expr
+      if vim.wo[win].foldmethod ~= "expr" then vim.wo[win][0].foldmethod = "expr" end
+      if first then vim.wo[win][0].foldexpr = expr end
+      local text = "v:lua.require'straps.ui'.foldtext()"
+      if vim.wo[win].foldtext ~= text then vim.wo[win][0].foldtext = text end
+      if first then
+        vim.wo[win][0].foldlevel = expanded and 99 or 0
+      end
     end
   end
 end
@@ -2840,6 +2855,7 @@ function M.setup()
     source = TOOL_DISPLAY_SRC,
   })
   M.apply_highlights()
+  require("straps.turn_decoration").setup()
   local group = vim.api.nvim_create_augroup(AUGROUP, { clear = true })
   vim.api.nvim_create_autocmd("FileType", {
     group = group,

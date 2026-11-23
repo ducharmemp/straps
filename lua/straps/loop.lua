@@ -239,6 +239,7 @@ end
 
 local function new_ctx(bufnr, run)
   local ctx
+  local across_awaits = {}
   ctx = {
     bufnr = bufnr,
 
@@ -273,7 +274,7 @@ local function new_ctx(bufnr, run)
         end)
       end)
       local ret = pack(coroutine.yield())
-      run.cancel_fns = {} -- handlers are cleared after each await completes
+      run.cancel_fns = next(across_awaits) and vim.tbl_filter(function(fn) return across_awaits[fn] end, run.cancel_fns) or {}
       if transaction_faults[bufnr] then error("straps: context transaction stopped", 0) end
       return unpack(ret, 1, ret.n)
     end,
@@ -291,12 +292,25 @@ local function new_ctx(bufnr, run)
       end
     end,
 
-    on_cancel = function(fn)
+    on_cancel = function(fn, keep_across_awaits)
       if run.cancelled then
         pcall(fn)
         return
       end
-      run.cancel_fns[#run.cancel_fns + 1] = fn
+      if not keep_across_awaits then
+        run.cancel_fns[#run.cancel_fns + 1] = fn
+        return
+      end
+      local function handler() fn() end
+      across_awaits[handler] = true
+      run.cancel_fns[#run.cancel_fns + 1] = handler
+      return function()
+        if not across_awaits[handler] then return end
+        across_awaits[handler] = nil
+        for i, registered in ipairs(run.cancel_fns) do
+          if registered == handler then table.remove(run.cancel_fns, i); break end
+        end
+      end
     end,
 
     cancelled = function()

@@ -274,77 +274,86 @@ return function(input, ctx)
   vim.bo[term_buf].bufhidden = "hide"
 
   local timed_out, finished = false, false
-  local show_err
-  local code, start_err = ctx.await(function(resolve)
-    local function on_exit(_, c)
-      finished = true
-      release()
-      resolve(c)
-    end
-    local job = 0
-    local cwd = vim.fn.getcwd(-1, -1)
-    vim.api.nvim_buf_call(term_buf, function()
-      local okj, j = pcall(vim.fn.jobstart, { "bash", "-lc", cmd },
-        { term = true, cwd = cwd, width = vim.o.columns, height = 15, on_exit = on_exit })
-      if okj and type(j) == "number" and j > 0 then
-        job = j
-      else
-        local okt, t = pcall(vim.fn.termopen, { "bash", "-lc", cmd }, { cwd = cwd, on_exit = on_exit })
-        if okt and type(t) == "number" and t > 0 then job = t end
-      end
-    end)
-    if job <= 0 then
-      release()
-      resolve(nil, "could not start the terminal job")
-      return
-    end
-    vim.b[term_buf].straps_terminal = { session = sid, command = cmd }
-    if sid then
-      drop_last(sid)
-      if vim.b[sid].straps_last_terminal == nil then
-        vim.api.nvim_create_autocmd("BufWipeout", {
-          buffer = sid,
-          once = true,
-          callback = function() drop_last(sid) end,
-        })
-      end
-      vim.b[sid].straps_last_terminal = term_buf
-    end
-    if input.show == true then
-      local ok_show, e = pcall(require("straps.registry").call, "tool.show_terminal", { buffer = term_buf }, ctx)
-      if not ok_show then show_err = tostring(e) end
-    end
-    vim.defer_fn(function()
-      if not finished then
-        timed_out = true
-        pcall(vim.fn.jobstop, job)
-        vim.defer_fn(function()
-          if not finished then
-            local ok_pid, pid = pcall(vim.fn.jobpid, job)
-            pid = ok_pid and tonumber(pid)
-            if pid then pcall(vim.uv.kill, -pid, 9) end
-          end
-        end, 2000)
-      end
-    end, timeout_ms)
-    if ctx.on_cancel then
-      ctx.on_cancel(function()
-        pcall(vim.fn.jobstop, job)
-        if not sid and vim.api.nvim_buf_is_valid(term_buf) then
-          if shown(term_buf) then
-            vim.bo[term_buf].bufhidden = "wipe"
-          else
-            vim.defer_fn(function()
-              if not shown(term_buf) then wipe(term_buf) end
-            end, 3000)
-          end
-        end
-      end)
+  local code, resolve_exit
+  local function on_exit(_, c)
+    finished, code = true, c
+    release()
+    if resolve_exit then resolve_exit(c) end
+  end
+  local job = 0
+  local cwd = vim.fn.getcwd(-1, -1)
+  vim.api.nvim_buf_call(term_buf, function()
+    local okj, j = pcall(vim.fn.jobstart, { "bash", "-lc", cmd },
+      { term = true, cwd = cwd, width = vim.o.columns, height = 15, on_exit = on_exit })
+    if okj and type(j) == "number" and j > 0 then
+      job = j
+    else
+      local okt, t = pcall(vim.fn.termopen, { "bash", "-lc", cmd }, { cwd = cwd, on_exit = on_exit })
+      if okt and type(t) == "number" and t > 0 then job = t end
     end
   end)
-  if start_err then
+  if job <= 0 then
+    release()
     wipe(term_buf)
-    error("run_in_terminal: " .. start_err, 0)
+    error("run_in_terminal: could not start the terminal job", 0)
+  end
+  vim.b[term_buf].straps_terminal = { session = sid, command = cmd }
+  if sid then
+    drop_last(sid)
+    if vim.b[sid].straps_last_terminal == nil then
+      vim.api.nvim_create_autocmd("BufWipeout", {
+        buffer = sid,
+        once = true,
+        callback = function() drop_last(sid) end,
+      })
+    end
+    vim.b[sid].straps_last_terminal = term_buf
+  end
+  vim.defer_fn(function()
+    if not finished then
+      timed_out = true
+      pcall(vim.fn.jobstop, job)
+      vim.defer_fn(function()
+        if not finished then
+          local ok_pid, pid = pcall(vim.fn.jobpid, job)
+          pid = ok_pid and tonumber(pid)
+          if pid then pcall(vim.uv.kill, -pid, 9) end
+        end
+      end, 2000)
+    end
+  end, timeout_ms)
+  local cancel_requested = false
+  local function cancel_job()
+    if cancel_requested then return end
+    cancel_requested = true
+    release()
+    if not finished then pcall(vim.fn.jobstop, job) end
+    if not sid and vim.api.nvim_buf_is_valid(term_buf) then
+      if shown(term_buf) then
+        vim.bo[term_buf].bufhidden = "wipe"
+      else
+        vim.defer_fn(function()
+          if not shown(term_buf) then wipe(term_buf) end
+        end, 3000)
+      end
+    end
+  end
+
+  local show_err
+  if input.show == true then
+    local remove_cancel = ctx.on_cancel and ctx.on_cancel(cancel_job, true)
+    local ok_show, e = pcall(require("straps.registry").call, "tool.show_terminal", { buffer = term_buf }, ctx)
+    if type(remove_cancel) == "function" then remove_cancel() end
+    if not ok_show then show_err = tostring(e) end
+  end
+  if not finished then
+    if ctx.cancelled and ctx.cancelled() then
+      error("run_in_terminal: cancelled", 0)
+    end
+    code = ctx.await(function(resolve)
+      resolve_exit = resolve
+      if ctx.on_cancel then ctx.on_cancel(cancel_job) end
+    end)
   end
 
   local out_lines = {}

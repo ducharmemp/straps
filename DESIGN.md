@@ -1841,10 +1841,13 @@ API names (registry names prefixed `tool.`):
   closing the window wipes it. A once BufWipeout autocmd on the session
   buffer applies the same rule to its last terminal. A caller with no session
   (`bufnr` 0) gets its buffer wiped at the end of the call, or, if a window
-  shows it, set to `bufhidden=wipe`. `show=true` calls `show_terminal` at job start so the user watches
-  live; a failure there is reported in the result, not raised. A job that
-  cannot start wipes the buffer and raises. Holds a subprocess slot for the
-  life of the job.
+  shows it, set to `bufhidden=wipe`. `show=true` calls the guarded `show_terminal`
+  at job start so the user can watch live. A display failure is reported in
+  the result. The job timeout and cancellation apply during display approval,
+  and the tool records the exit status if the job ends before display returns.
+  `ctx.on_cancel(fn, true)` keeps the job's cancellation handler across awaits
+  and returns a function to remove it. A job that cannot start wipes the buffer
+  and raises. Holds a subprocess slot for the life of the job.
 - `show_terminal {buffer?}` — opens a `run_in_terminal` buffer (default: the
   session's `b:straps_last_terminal`) in a `botright 15split` without moving
   focus, reusing a window tagged `w:straps_view = "terminal"` whose buffer is

@@ -55,6 +55,10 @@ return function(op, ...)
         resolve()
       end, G.a_async_ms or 30) end)
     end
+    if name == "show_terminal" and G.terminal_wait_ms then
+      ctx.await(function(resolve) vim.defer_fn(resolve, G.terminal_wait_ms) end)
+      if G.terminal_hold then ctx.await(function(resolve) G.terminal_continue = resolve end) end
+    end
     if G.a_hold and ctx then
       ctx.await(function(resolve) G.release = G.release or {}; table.insert(G.release, resolve) end)
     end
@@ -531,6 +535,85 @@ end
   for _, ev in ipairs(befores) do names[ev.name] = (names[ev.name] or 0) + 1 end
   assert(names.ping == 2 and names.read_file == 2, "each guard must run once per tool call: " .. vim.inspect(names))
   registry.remove("hook.after_tool.compose", { scope = "global" })
+end)
+
+it("run_in_terminal waits for exit after an async show_terminal guard", function()
+  reset()
+  _G.G.terminal_wait_ms = 30
+  local focus = vim.api.nvim_get_current_win()
+  local buf = state.new_session()
+  scripted({ { name = "run_in_terminal", input = {
+    command = "echo started; sleep 0.5; echo finished; exit 7", timeout_ms = 3000, show = true,
+  } } })
+  state.append_text(buf, "go")
+  loop.start(buf)
+  local shown_while_running = vim.wait(2000, function()
+    local term = vim.b[buf].straps_last_terminal
+    return loop.running(buf) and term and #vim.fn.win_findbuf(term) > 0
+  end, 10)
+  local focus_during = vim.api.nvim_get_current_win()
+  local completed = vim.wait(2200, function() return not loop.running(buf) end, 10)
+  if not completed then
+    loop.stop(buf)
+    vim.wait(5000, function() return not loop.running(buf) end, 10)
+  end
+  local r = results(buf)[1]
+  for _, win in ipairs(vim.fn.win_findbuf(vim.b[buf].straps_last_terminal)) do
+    vim.api.nvim_win_close(win, true)
+  end
+  assert(completed, "run hung after the terminal opened and the job exited: " .. vim.inspect(r))
+  assert(shown_while_running, "terminal was not shown during the run")
+  assert(focus_during == focus, "show=true moved focus")
+  assert(r and not r.is_error and r.content:find("exit code: 7", 1, true), vim.inspect(r))
+  assert(r.content:find("started\nfinished", 1, true), vim.inspect(r))
+end)
+
+it("run_in_terminal stops the job during a second show_terminal guard wait", function()
+  reset()
+  _G.G.terminal_wait_ms = 30
+  _G.G.terminal_hold = true
+  local buf = state.new_session()
+  scripted({ { name = "run_in_terminal", input = {
+    command = "sleep 30", timeout_ms = 10000, show = true,
+  } } })
+  state.append_text(buf, "go")
+  loop.start(buf)
+  assert(vim.wait(2000, function() return _G.G.terminal_continue ~= nil end, 10), "guard did not await twice")
+  local term = vim.b[buf].straps_last_terminal
+  local job = vim.bo[term].channel
+  loop.stop(buf)
+  local stopped = vim.wait(2000, function() return vim.fn.jobwait({ job }, 0)[1] ~= -1 end, 10)
+  if not stopped then vim.fn.jobstop(job) end
+  _G.G.terminal_continue()
+  assert(vim.wait(2000, function() return not loop.running(buf) end, 10), "cancelled run did not end")
+  assert(stopped, "Stop left the terminal job running during the second guard wait")
+  assert(#vim.fn.win_findbuf(term) == 0, "cancelled guard opened the terminal window")
+end)
+
+it("run_in_terminal times out even while the show_terminal guard is waiting", function()
+  reset()
+  _G.G.terminal_wait_ms = 30
+  _G.G.terminal_hold = true
+  local buf = state.new_session()
+  scripted({ { name = "run_in_terminal", input = {
+    command = "sleep 30", timeout_ms = 200, show = true,
+  } } })
+  state.append_text(buf, "go")
+  loop.start(buf)
+  assert(vim.wait(2000, function() return _G.G.terminal_continue ~= nil end, 10), "guard did not await twice")
+  local term = vim.b[buf].straps_last_terminal
+  local job = vim.bo[term].channel
+  local stopped = vim.wait(2000, function() return vim.fn.jobwait({ job }, 0)[1] ~= -1 end, 10)
+  if not stopped then vim.fn.jobstop(job) end
+  _G.G.terminal_continue()
+  if not vim.wait(2000, function() return not loop.running(buf) end, 10) then
+    loop.stop(buf)
+    vim.wait(5000, function() return not loop.running(buf) end, 10)
+  end
+  for _, win in ipairs(vim.fn.win_findbuf(term)) do vim.api.nvim_win_close(win, true) end
+  assert(stopped, "terminal did not time out while the guard was waiting")
+  local r = results(buf)[1]
+  assert(r and not r.is_error and r.content:match("exit code: %d+ %(stopped: exceeded timeout of 200 ms%)"), vim.inspect(r))
 end)
 
 it("guard log events: one per guard per op, with verdicts", function()

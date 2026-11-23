@@ -82,6 +82,49 @@ end
   return buf, data
 end
 
+it("renders the same composer role and muted label during and after a run", function()
+  local buf, data = slow_run()
+  local ns = api.nvim_create_namespace("straps_render")
+  local function display(label)
+    local row = state.draft_row(buf)
+    ui._render(buf)
+    local headings = {}
+    local history = {}
+    for _, mark in ipairs(api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
+      local details = mark[4]
+      for _, chunk in ipairs(details.virt_text or {}) do
+        if mark[2] >= row and (chunk[2] == "StrapsRoleUser" or chunk[1] == " · draft") then
+          headings[#headings + 1] = { mark[2] - row, details.virt_text_pos, chunk }
+        elseif mark[2] < row and chunk[1] == "you" and chunk[2] == "StrapsRoleUser" then
+          history[#history + 1] = api.nvim_buf_get_lines(buf, mark[2] + 1, mark[2] + 2, false)[1]
+        end
+      end
+    end
+    check(label .. "-history", history, { "initial request" })
+    check(label, headings, {
+      { 0, "overlay", { "──── ", "StrapsRoleUser" } },
+      { 0, "overlay", { "you", "StrapsRoleUser" } },
+      { 0, "overlay", { " · draft", "StrapsRule" } },
+    })
+  end
+  display("active-composer-style")
+  data.resume()
+  assert(vim.wait(1000, function() return not loop.running(buf) end))
+  display("idle-composer-style")
+end)
+
+it("Enter queues only the composer body during a run", function()
+  local buf, data = slow_run()
+  draft(buf, { "queued body" })
+  key("<CR>")
+  check("active-enter-clears-draft", state.draft_text(buf), "")
+  check("active-enter-waits-for-boundary", #data.requests, 1)
+  data.resume()
+  assert(vim.wait(1000, function() return not loop.running(buf) end))
+  local sent = data.requests[2][#data.requests[2]]
+  check("active-enter-sends-body", sent, { role = "user", content = { { type = "text", text = "queued body" } } })
+end)
+
 it("Shift-Enter waits for the old run, sends the snapshot once, and keeps newer text", function()
   local buf, data = slow_run()
   local win = api.nvim_get_current_win()

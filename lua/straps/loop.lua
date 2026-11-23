@@ -849,15 +849,15 @@ local function nothing_to_send(bufnr)
   local state = require("straps.state")
   local trailing = state.last_user_text(bufnr)
   if trailing ~= nil and vim.trim(trailing) == "" then
-    return "type your request under Draft · not sent"
+    return "type your request in the composer"
   end
   local messages = state.parse(bufnr).messages
   if #messages == 0 then
-    return "type your request under Draft · not sent"
+    return "type your request in the composer"
   end
   if messages[#messages].role ~= "user" then
     return "the transcript ends with an assistant message;"
-      .. " type your request under Draft · not sent"
+      .. " type your request in the composer"
   end
 end
 

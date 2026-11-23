@@ -190,13 +190,15 @@ end
 -- rule char differs per role (light ─ for you/system, heavy ━ for Cinch) so
 -- user and agent turns read apart at a glance; the trailing run stays dim
 -- StrapsRule.
-local function role_overlay(role)
+local function role_overlay(role, suffix)
+  local chunks = { { bar(4, role.bar) .. " ", role.hl }, { role.label, role.hl } }
   local trailing = RULE_WIDTH - 5 - #role.label - 1
-  return {
-    { bar(4, role.bar) .. " ", role.hl },
-    { role.label, role.hl },
-    { " " .. bar(trailing, role.bar), "StrapsRule" },
-  }
+  if suffix then
+    chunks[#chunks + 1] = { suffix, "StrapsRule" }
+    trailing = trailing - vim.fn.strdisplaywidth(suffix)
+  end
+  chunks[#chunks + 1] = { " " .. bar(trailing, role.bar), "StrapsRule" }
+  return chunks
 end
 
 -- The block kinds that are conversation turns: the units the outline lists
@@ -471,14 +473,30 @@ function M._render(bufnr)
     return
   end
   local state = require("straps.state")
-  for _, blk in ipairs(state.list_blocks(bufnr)) do
-    render_block(bufnr, blk)
-  end
+  local blocks = state.list_blocks(bufnr)
   local draft = state.draft_row(bufnr)
+  local last = blocks[#blocks]
+  local placeholder
+  if draft and last and last.kind == "user" then
+    local row = last.marker_lnum - 1
+    local lines = vim.api.nvim_buf_get_lines(bufnr, row, draft, false)
+    lines[1] = lines[1]:sub(marker_len(lines[1]) + 1)
+    if not table.concat(lines):find("%S") then
+      placeholder = last
+      vim.api.nvim_buf_set_extmark(bufnr, render_ns, row, 0, {
+        end_row = draft - 1,
+        end_col = #lines == 1 and 1 or 0,
+        conceal_lines = "",
+      })
+    end
+  end
+  for _, blk in ipairs(blocks) do
+    if blk ~= placeholder then render_block(bufnr, blk) end
+  end
   if draft then
     conceal_marker(bufnr, draft, vim.api.nvim_buf_get_lines(bufnr, draft, draft + 1, false)[1])
     vim.api.nvim_buf_set_extmark(bufnr, render_ns, draft, 0, {
-      virt_text = { { "── Draft · not sent ──", "StrapsRule" } },
+      virt_text = role_overlay(ROLE.user, " · draft"),
       virt_text_pos = "overlay",
       hl_mode = "combine",
     })

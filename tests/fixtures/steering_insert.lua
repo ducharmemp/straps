@@ -30,14 +30,15 @@ local function input(keys)
   later()
 end
 
-local function screen_has(win, text)
+local function screen_rows(win, text)
+  local rows = {}
   local top = api.nvim_win_get_position(win)[1] + 1
-  for row = top, top + api.nvim_win_get_height(win) do
+  for row = top, top + api.nvim_win_get_height(win) - 1 do
     local cells = {}
     for col = 1, vim.o.columns do cells[col] = vim.fn.screenstring(row, col) end
-    if table.concat(cells):find(text, 1, true) then return true end
+    if table.concat(cells):find(text, 1, true) then rows[#rows + 1] = row end
   end
-  return false
+  return rows
 end
 
 local run = coroutine.create(function()
@@ -109,15 +110,49 @@ local run = coroutine.create(function()
   input("!")
   check("Plan: keep tail\nnext!", 3, 5)
 
-  phase = "rendered composer"
-  await("draft header on the screen", function()
+  local function check_display()
+    ui._render(buf)
     vim.cmd.redraw()
-    return screen_has(draft, "── Draft · not sent ──")
-  end)
-  expect("concealed draft marker", screen_has(draft, "%%[straps:draft]%%"), false)
-  expect("rendered draft text", screen_has(draft, "next!"), true)
+    local header = screen_rows(draft, "──── you · draft")
+    expect("one composer heading", #header, 1)
+    expect("no duplicate you heading", screen_rows(draft, "──── you"), header)
+    expect("no old heading", #screen_rows(draft, "Draft · not sent"), 0)
+    expect("concealed draft marker", #screen_rows(draft, "%%[straps:draft]%%"), 0)
+    expect("editable text on next row", screen_rows(draft, "Plan: keep tail"), { header[1] + 1 })
+  end
+
+  phase = "rendered composer"
+  check_display()
   expect("draft not in transcript", table.concat(state.transcript_lines(buf), "\n"):find("Plan:", 1, true), nil)
   check("Plan: keep tail\nnext!", 3, 5)
+
+  phase = "trailing empty user block"
+  input("<Esc>")
+  state.ensure_trailing_user(buf)
+  check_display()
+
+  phase = "native editing"
+  input("A?<Esc>")
+  expect("native edit", state.draft_text(buf), "Plan: keep tail\nnext!?")
+  input("u")
+  expect("native undo", state.draft_text(buf), "Plan: keep tail\nnext!")
+  input("<C-r>")
+  expect("native redo", state.draft_text(buf), "Plan: keep tail\nnext!?")
+  input("ggGyk")
+  expect("native yank", vim.fn.getreg('"'), "Plan: keep tail\nnext!?\n")
+
+  phase = "placeholder with blank content"
+  local boundary = state.draft_row(buf)
+  api.nvim_buf_set_lines(buf, boundary, boundary, false, { "  ", "" })
+  check_display()
+
+  phase = "raw composer"
+  require("straps").config.render = false
+  ui._render(buf)
+  vim.cmd.redraw()
+  expect("raw boundary visible", #screen_rows(draft, "%%[straps:draft]%%"), 1)
+  expect("no virtual label", #screen_rows(draft, "──── you · draft"), 0)
+  expect("raw text unchanged", state.draft_text(buf), "Plan: keep tail\nnext!?")
 end)
 
 local function step()

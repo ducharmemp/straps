@@ -508,8 +508,9 @@ the view past it in a transcript reading window to clear it in all views.
 Editing in the composer leaves it in place. `render = false` disables it.
 
 								*straps-steering*
-Edit under `── Draft · not sent ──` at the end of the transcript. Streaming
-writes above the composer. The draft stays out of requests until sent.
+Edit below the `you · draft` header at the end of the transcript. The muted
+`draft` label is display-only. Streaming writes above the composer. The draft
+stays out of requests until sent.
 Press normal-mode <CR> to queue it for the next turn boundary during a run
 or start a turn when idle. Normal-mode <S-CR> (|:StrapsSendNow|) submits the
 text captured at the keypress after the active run ends. Edits made while

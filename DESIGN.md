@@ -759,9 +759,11 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
 - `:StrapsSteer {text}` submits the supplied text directly. Without arguments,
   `:StrapsSteer` moves to the composer in the transcript window.
 - `%%[straps:draft]%%` separates the editable composer from the conversation. An
-  extmark tracks the boundary; the renderer conceals the marker and overlays
-  `── Draft · not sent ──`. Streaming and context replacement write before the
-  boundary. Transcript parsing and context digests exclude the draft.
+  extmark tracks the boundary. The renderer conceals the marker, overlays the
+  `you` role header with a muted `draft` label on the same line, and hides the
+  empty trailing user placeholder if present. `render = false` shows the raw
+  markers. Streaming and context replacement write before the boundary.
+  Transcript parsing and context digests exclude the draft.
 - Normal-mode `<CR>` or `:StrapsSend` queues the draft during a run or submits
   it as the next turn when idle. `<S-CR>` or `:StrapsSendNow` requests a user
   stop and submits the captured text after the run ends. A tool that ran is

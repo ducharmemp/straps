@@ -631,7 +631,7 @@ return function() error("provider should not be reached for a trailing assistant
   assert.are.equal(before, buf_text(bufnr))
   assert.are.equal(1, #notes)
   assert.are.equal(vim.log.levels.WARN, notes[1].level)
-  assert.truthy(notes[1].msg:find("type your request under Draft · not sent", 1, true))
+  assert.truthy(notes[1].msg:find("type your request in the composer", 1, true))
 end)
 
 it("stop_reason tool_use with no tool blocks errors, not a resend or user-blaming message", function()

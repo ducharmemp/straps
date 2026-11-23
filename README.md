@@ -222,7 +222,7 @@ In a session buffer (or any `*.straps` file), normal-mode `<CR>` sends or steers
 
 Run `:StrapsOutline` from a transcript to open a reading tab showing the same buffer. Earlier turns fold under numbered first lines of their prompts. Use `zo` on a heading to reveal its prompt, response and tool output in place. The latest turn and any draft stay open. New turns stay unfolded until you reopen the reader. Run `:StrapsOutline` again or use `:close` to return to the prior view.
 
-Edit in the transcript under `── Draft · not sent ──` whether a run is active or idle. Streaming writes above the composer. The draft stays out of requests until submitted. Shift-Enter captures the text at the keypress; edits made while waiting for the run to stop stay in the composer.
+Edit below the `you · draft` header at the end of the transcript whether a run is active or idle. The muted `draft` label is display-only. Streaming writes above the composer. The draft stays out of requests until submitted. Shift-Enter captures the text at the keypress; edits made while waiting for the run to stop stay in the composer.
 
 ## Opt-in context management
 

@@ -83,7 +83,7 @@ end
 function M.clear_draft(bufnr)
   local row = M.draft_row(bufnr)
   if row then
-    vim.api.nvim_buf_set_lines(bufnr, row, -1, false, {})
+    vim.api.nvim_buf_set_lines(bufnr, row + 1, -1, false, { "" })
     M.persist(bufnr)
   end
 end
@@ -545,8 +545,7 @@ local function with_pin(bufnr, mutate)
   local last = M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
   local pinned = {}
   for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
-    if vim.w[win].straps_steer_origin ~= bufnr and vim.api.nvim_win_get_cursor(win)[1] == last
-      and since_you_left.follow(win, bufnr) then
+    if vim.api.nvim_win_get_cursor(win)[1] == last and since_you_left.follow(win, bufnr) then
       pinned[#pinned + 1] = win
     end
   end

@@ -979,10 +979,6 @@ it("default progress hook cleaned up its extmarks", function()
   assert(#marks == 0, "leftover progress extmarks: " .. #marks)
 end)
 
--- ui.open_session() is a single ordinary buffer now (no linked compose split):
--- type directly under the trailing %%[straps:user]%% marker and press <CR>
--- in normal mode. These cases drive the real keymap via nvim_feedkeys so the
--- wiring under test is exactly what a person at the keyboard exercises.
 local ui
 step(function()
   ui = require("straps.ui")
@@ -995,12 +991,12 @@ local function press_enter(bufnr)
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
 end
 
-it("typing under the trailing user marker and <CR> starts a run", function()
+it("submits the composer and starts a run with <CR>", function()
   local session = ui.open_session()
   assert(vim.b[session].straps_session, "opened buffer isn't a session")
 
   _G.__it.turn = 0 -- replay the scripted 3-turn provider
-  vim.api.nvim_buf_set_lines(session, -1, -1, false, { "line one of the ask", "line two of the ask" })
+  vim.api.nvim_buf_set_lines(session, -2, -1, false, { "line one of the ask", "line two of the ask" })
   press_enter(session)
 
   local t = table.concat(vim.api.nvim_buf_get_lines(session, 0, -1, false), "\n")
@@ -1012,7 +1008,7 @@ it("typing under the trailing user marker and <CR> starts a run", function()
   assert(_G.__it.turn == 3, "expected 3 provider turns, got " .. _G.__it.turn)
 end)
 
-it("<CR> opens a steering split and sends the draft into the active run", function()
+it("queues the composer into the active run with <CR>", function()
   _G.__steer = { calls = 0, mid_turn = false }
   registry.define({
     name = "fn.provider",
@@ -1040,7 +1036,7 @@ end
   })
 
   local session = ui.open_session()
-  vim.api.nvim_buf_set_lines(session, -1, -1, false, { "first message" })
+  vim.api.nvim_buf_set_lines(session, -2, -1, false, { "first message" })
   press_enter(session)
   assert(loop.running(session), "run did not start from <CR>")
 
@@ -1049,13 +1045,10 @@ end
   assert(loop.running(session), "run finished before the steering <CR>")
 
   local origin = vim.api.nvim_get_current_win()
-  press_enter(session)
-  local composer = vim.api.nvim_get_current_win()
-  assert(composer ~= origin and vim.api.nvim_win_get_buf(composer) == session)
   vim.api.nvim_set_current_line("second message")
-  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+  press_enter(session)
   assert(vim.api.nvim_get_current_win() == origin)
-  assert(require("straps.state").draft_text(session) == nil, "queued draft was not cleared")
+  assert(require("straps.state").draft_text(session) == "", "queued draft was not cleared")
   _G.__steer.finish_first()
 
   assert(vim.wait(10000, function() return not loop.running(session) end, 10),

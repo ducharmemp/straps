@@ -24,7 +24,8 @@ local function open()
   local buf = ui.open_session('none', { explicit_split = true })
   vim.wo.foldenable = false
   state.append(buf, 'user', nil, ('history\n'):rep(55) .. 'previous line')
-  vim.cmd('normal! Gzt')
+  api.nvim_win_set_cursor(0, { state.draft_row(buf), 0 })
+  vim.cmd('normal! zt')
   vim.cmd('redraw')
   return buf, api.nvim_get_current_win()
 end
@@ -50,7 +51,7 @@ it('anchors above the first new block, keeps the view, and clears on cursor pass
   state.append(buf, 'assistant', nil, 'while reading')
   check(1, #marks(buf) == 0)
   local before = elsewhere(win)
-  local tail = api.nvim_buf_line_count(buf)
+  local tail = state.draft_row(buf)
   state.append(buf, 'tool_result', { id = 'example' }, 'first result')
   local m = marks(buf)[1] or {}
   check(2, m[2] == tail + 1 and m[4].virt_lines_above and m[4].virt_lines[1][1][1] == '── since you left ──')
@@ -76,7 +77,7 @@ it('ignores draft edits and empty placeholders; anchors streaming on an existing
   state.append(buf, 'assistant', nil, '')
   state.append_text(buf, 'already read', true)
   elsewhere(win)
-  local row = api.nvim_buf_line_count(buf) - 1
+  local row = state.draft_row(buf) - 1
   state.open_draft(buf)
   api.nvim_buf_set_lines(buf, -2, -1, false, { 'draft insert', 'second draft line' })
   check(9, #marks(buf) == 0)
@@ -86,16 +87,16 @@ it('ignores draft edits and empty placeholders; anchors streaming on an existing
   check(11, #marks(buf) == 1 and marks(buf)[1][2] == row)
 end)
 
-it('marks output while editing in the steering split and keeps it on closing the split', function()
+it('marks output while composing and jumps to it within the same window', function()
   local buf, win = open()
   local steer = require('straps.steering').open(buf)
   api.nvim_buf_set_lines(buf, -2, -1, false, { 'unsent draft' })
-  check(21, #marks(buf) == 0 and api.nvim_get_current_win() == steer)
+  check(21, #marks(buf) == 0 and steer == win and api.nvim_get_current_win() == win)
   state.append(buf, 'assistant', nil, 'while steering')
   check(22, #marks(buf) == 1 and state.draft_text(buf) == 'unsent draft')
-  api.nvim_win_close(steer, false)
-  vim.wait(20, function() return false end)
-  check(23, api.nvim_get_current_win() == win and #marks(buf) == 1)
+  require('straps.since_you_left').jump(buf)
+  check(23, api.nvim_get_current_win() == win and #marks(buf) == 1
+    and api.nvim_win_get_cursor(win)[1] == marks(buf)[1][2] + 1)
 end)
 
 it('does not follow pending output from a returned cursor on the last line', function()
@@ -113,7 +114,8 @@ it('leaves a focused copy reading and does not follow in unfocused copies', func
   local buf, first = open()
   vim.cmd('vsplit')
   local second = api.nvim_get_current_win()
-  vim.cmd('normal! Gzt')
+  api.nvim_win_set_cursor(0, { state.draft_row(buf), 0 })
+  vim.cmd('normal! zt')
   local before = view(first)
   state.append(buf, 'assistant', nil, 'still reading')
   check(12, #marks(buf) == 0 and vim.deep_equal(before, view(first)))
@@ -122,12 +124,13 @@ it('leaves a focused copy reading and does not follow in unfocused copies', func
   state.append(buf, 'assistant', nil, '')
   check(13, #marks(buf) == 0)
   state.append_text(buf, 'starting a streamed response', true)
-  local row = api.nvim_buf_line_count(buf) - 1
+  local row = state.draft_row(buf) - 1
   check(14, (marks(buf)[1] or {})[2] == row)
   state.append_text(buf, '\n' .. ('later lines\n'):rep(55), true)
   api.nvim_set_current_win(first)
   vim.cmd('redraw')
-  vim.cmd('normal! Gzt')
+  api.nvim_win_set_cursor(0, { state.draft_row(buf), 0 })
+  vim.cmd('normal! zt')
   api.nvim_exec_autocmds('WinScrolled', { pattern = tostring(first) })
   check(15, #marks(buf) == 0)
 end)

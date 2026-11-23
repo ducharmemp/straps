@@ -346,7 +346,7 @@ end)
 
 it("18: every session-only command warns with one shared message off a session", function()
   only_window()
-  for _, cmd in ipairs({ "StrapsSend", "StrapsSteer x", "StrapsStop", "StrapsContinue", "StrapsCompact",
+  for _, cmd in ipairs({ "StrapsSend", "StrapsSendNow", "StrapsSteer x", "StrapsStop", "StrapsContinue", "StrapsCompact",
     "StrapsRename t", "StrapsAuto" }) do
     local notes = capture(function() vim.cmd(cmd) end)
     assert.are.equal(1, #notes, cmd)

@@ -81,7 +81,7 @@ yourself, before any command, to pass options.
 							*:Straps*
 :Straps[!] [{cats}] [-- {instruction}]
 			Open a new session buffer in a split and put the
-			cursor on the trailing user block. See
+			cursor on the composer at the end. See
 			|straps-session|. {cats} pre-grants permission
 			categories to the new session (comma or space
 			separated; `all` grants every grantable category), the
@@ -157,23 +157,28 @@ yourself, before any command, to pass options.
 			or |:close| there to return to the prior view.
 
 							*:StrapsSend*
-:StrapsSend		Send the current request. During a run or when a
-			nonblank steering draft exists, open the draft. In the
-			steering split, submit it (|straps-steering|). Also
-			bound to <CR> in a session buffer. Warns "nothing to
-			send" and starts no run if the trailing user block is
-			empty, or if the transcript ends on an assistant
-			message (unsupported prefill).
+:StrapsSend		Submit the draft: queue steering during a run, or start
+			a turn when idle. Also bound to normal-mode <CR>.
+
+							*:StrapsSendNow*
+:StrapsSendNow		Stop the active run and send the draft as the next turn
+			after the run ends. When idle, behaves like |:StrapsSend|.
+			Also bound to normal-mode <S-CR> where the terminal
+			distinguishes it. Tools that ran are not undone.
 
 							*:StrapsSteer*
-:StrapsSteer [text]	Without text, open a small split on the steering draft
-			at the end of the same session buffer. With text,
-			queue it for the active run (|straps-steering|). With
-			no active run, add it to the trailing user block and
-			send it with |:StrapsSend|.
+:StrapsSteer [text]	Without text, move to the composer in the transcript.
+			With text, queue it for the active run (|straps-steering|).
+			When idle, add supplied text to the trailing user block
+			for a separate |:StrapsSend|.
 
-Commands that act on a session (|:StrapsSend|, |:StrapsSteer|, |:StrapsStop|,
-|:StrapsPermission|, |:StrapsContinue|, |:StrapsCompact|, |:StrapsRename|,
+							*:StrapsJumpUnread*
+:StrapsJumpUnread	Jump to the first unread output in the transcript.
+			The divider stays until you move past it.
+
+Commands that act on a session (|:StrapsSend|, |:StrapsSendNow|, |:StrapsSteer|,
+|:StrapsJumpUnread|, |:StrapsStop|, |:StrapsPermission|, |:StrapsContinue|,
+|:StrapsCompact|, |:StrapsRename|,
 |:StrapsAuto|) act on the current buffer when it is a session, else on the
 sole distinct session buffer visible in the current tab. Otherwise they warn
 and do nothing.
@@ -466,7 +471,8 @@ hand-edited into an inconsistent state — that still fails loudly when sent.
 
 Buffer-local mappings (normal mode), set in session buffers and in any
 hand-opened `*.straps` file:
-	<CR>	Send or open the steering split (|:StrapsSend|).
+	<CR>	Submit the draft (|:StrapsSend|).
+	<S-CR>	Stop and send the draft (|:StrapsSendNow|).
 	gf	Open the `path:line[:col]` reference under the cursor; any
 		other text falls back to the built-in |gf|, and its error
 		is shown as a warning.
@@ -496,19 +502,18 @@ output. The bracket uses `StrapsCardBorder` and does not enter yanked text.
 Prose and tool inputs have no bracket prefix.
 
 The `── since you left ──` divider marks the first line affected by output
-while the transcript is unfocused, even when a split still shows it. Draft
-edits do not set the divider. Move the cursor or scroll the top of the view
-past it to clear it in all views. `render = false` disables the divider.
+while the transcript is unfocused, including when the draft has focus. Use
+|:StrapsJumpUnread| to go to the divider. Move the cursor or scroll the top of
+the view past it in a transcript reading window to clear it in all views.
+Editing in the composer leaves it in place. `render = false` disables it.
 
-							*straps-steering*
-Steering. A message sent while a run is active is queued (not started as a new
-run) and drained into the transcript at the next turn boundary, so the model
-acts on it mid-flight. |:StrapsSteer| without arguments opens a split below
-its originating window. Both views use the same session buffer. Draft text
-stays out of model requests until submitted. Use `:close` to keep the draft
-and `:StrapsSteer` to reopen it. Normal-mode <CR> or |:StrapsSend| in the
-split submits a nonblank draft and returns to the original view. If the run
-has ended, the text moves to the trailing user block for a separate send.
+								*straps-steering*
+Edit under `── Draft · not sent ──` at the end of the transcript. Streaming
+writes above the composer. The draft stays out of requests until sent.
+Press normal-mode <CR> to queue it for the next turn boundary during a run
+or start a turn when idle. Normal-mode <S-CR> (|:StrapsSendNow|) submits the
+text captured at the keypress after the active run ends. Edits made while
+waiting stay in the draft. This does not undo tools that ran.
 
 The harness steers through |fn.session_notify|: a subagent completion notice
 reaches a busy parent this way, without the

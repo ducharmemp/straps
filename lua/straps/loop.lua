@@ -38,6 +38,7 @@ local function transaction_fault(bufnr, run, status)
     active.cancel_fns = {}
     if active.ctx then owned_contexts[active.ctx] = nil end
   end
+  if main and main.after_stop then vim.schedule(main.after_stop.abort) end
   runs[bufnr], operations[bufnr], replay_reservations[bufnr], context_reservations[bufnr] = nil, nil, nil, nil
   for active in pairs(affected) do
     if active.diag_teardown then pcall(active.diag_teardown) end
@@ -198,6 +199,7 @@ local function finish_events(bufnr, reason, run)
     { pattern = "StrapsStatusChanged", data = { bufnr = bufnr, status = "idle" } })
   pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "StrapsRunEnd",
     data = { bufnr = bufnr, reason = reason, turns = run.turns, cancelled = run.cancelled == true } })
+  if run.after_stop then vim.schedule(run.after_stop.finish) end
 end
 
 local pair_turn
@@ -806,6 +808,18 @@ function M.user_stop(bufnr)
   pcall(function() vim.b[bufnr].straps_watch_paused = true end)
   return M.stop(bufnr)
 end
+function M.stop_then(bufnr, finish, abort)
+  local run = runs[bufnr]
+  if not run or run.after_stop or transaction_faults[bufnr] then return abort() end
+  run.after_stop = {
+    finish = function()
+      if runs[bufnr] or transaction_faults[bufnr] then return abort() end
+      finish()
+    end,
+    abort = abort,
+  }
+  M.user_stop(bufnr)
+end
 
 -- Drain the steering queue (vim.b straps_steering): append each queued entry's
 -- text as an ordinary user block and clear the queue. Returns true if anything
@@ -835,15 +849,15 @@ local function nothing_to_send(bufnr)
   local state = require("straps.state")
   local trailing = state.last_user_text(bufnr)
   if trailing ~= nil and vim.trim(trailing) == "" then
-    return "type your request under the trailing %%[straps:user]%% marker"
+    return "type your request under Draft · not sent"
   end
   local messages = state.parse(bufnr).messages
   if #messages == 0 then
-    return "type your request under the trailing %%[straps:user]%% marker"
+    return "type your request under Draft · not sent"
   end
   if messages[#messages].role ~= "user" then
     return "the transcript ends with an assistant message;"
-      .. " type your request under the trailing %%[straps:user]%% marker"
+      .. " type your request under Draft · not sent"
   end
 end
 
@@ -1339,8 +1353,7 @@ function M.start(bufnr, opts)
     -- Subscribers receive the ending reason, like the log and progress events
     -- above. The pcall covers RESOLUTION (hook_entries / the seq sort), which
     -- sits outside call_hooks' per-subscriber pcall: a raise there would skip
-    -- the cleanup below, leaving the session stamped "running" with no
-    -- trailing user block to type in.
+    -- the cleanup below, leaving the session stamped "running".
     local ok_hooks, results, errors = pcall(registry.call_hooks, "hook.on_run_end", ctx, reason)
     if not ok_hooks then
       log(bufnr, { ev = "run_end_hook_error", err = tostring(results) })

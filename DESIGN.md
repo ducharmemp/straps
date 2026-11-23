@@ -756,39 +756,33 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
      was drained, CONTINUE the loop (another provider call) instead of
      finishing — a message typed while the model streamed its final answer
      still gets acted on. `max_turns` still bounds total iterations.
-- `:StrapsSteer {text}` submits the supplied text directly. With no arguments,
-  `:StrapsSteer` opens or focuses a steering split, even when idle. During a
-  run or with a nonblank draft, `<CR>` and `:StrapsSend` open the same split.
-- The split shares the original session buffer and displays its tail. The
-  opening window keeps its reading position. Closing or submitting restores
-  its saved view when the window still displays the original buffer.
-- `%%[straps:draft]%%` separates the editable draft from the conversation. An
-  extmark tracks the boundary. Streaming and context replacement write before
-  it; transcript parsing and context digests exclude the draft. Closing the
-  split leaves the draft in the session file. Submitting a nonblank draft
-  closes the split and delivers it through the human submission path in
-  contextual mode. On delivery, an unchanged draft is cleared. If the run
-  has ended, delivery puts the text in the trailing user block without starting
-  a run. Blank submissions leave the split open.
+- `:StrapsSteer {text}` submits the supplied text directly. Without arguments,
+  `:StrapsSteer` moves to the composer in the transcript window.
+- `%%[straps:draft]%%` separates the editable composer from the conversation. An
+  extmark tracks the boundary; the renderer conceals the marker and overlays
+  `── Draft · not sent ──`. Streaming and context replacement write before the
+  boundary. Transcript parsing and context digests exclude the draft.
+- Normal-mode `<CR>` or `:StrapsSend` queues the draft during a run or submits
+  it as the next turn when idle. `<S-CR>` or `:StrapsSendNow` requests a user
+  stop and submits the captured text after the run ends. A tool that ran is
+  not undone. Submission goes through the contextual human adapter when
+  enabled. Delivery clears the draft if its text still matches the snapshot;
+  text edited while a submission is pending remains in the composer.
 
 ### One session buffer
-
-Ordinary requests are edited under the trailing `%%[straps:user]%%` marker.
-Both views share the editable transcript, including its undo history.
 
 - `ui.open_session(split_cmd?)` opens the transcript in a single split
   (the `split_cmd` string, default `"split"`; `:Straps` passes what the
   invocation's `<mods>` parsed to, so `:vertical Straps` is a vsplit), sets
   the `<CR>` keymap (send or steer), and puts the cursor at the end.
-- Without an active run or a nonblank steering draft, ordinary sending with
-  `<CR>` or `:StrapsSend` starts the run from the trailing user block.
-  empty trailing block makes `loop.start` warn "nothing to send" through
-  `vim.notify` and return without starting a run or touching the transcript,
+- When idle with a blank composer, sending can still submit a seeded or manually
+  edited trailing user block. An empty trailing block makes `loop.start` warn
+  "nothing to send" through `vim.notify` and return without starting a run or touching the transcript,
   including after a terminal harness note. It checks `state.last_user_text`
   before parsing merged messages, so a harness note cannot supply a request
   for an empty trailing user block. Queued steering counts as content.
   `:StrapsContinue` supplies an explicit continuation request.
-- Target resolution for `:StrapsSend`/`:StrapsSteer`/`:StrapsStop`/
+- Target resolution for `:StrapsSend`/`:StrapsSendNow`/`:StrapsSteer`/`:StrapsJumpUnread`/`:StrapsStop`/
   `:StrapsContinue`/`:StrapsCompact`/`:StrapsRename`/`:StrapsAuto`
   (`ui.require_session`): the current buffer when it is a session buffer
   (`vim.b.straps_session`), else the sole distinct session buffer visible
@@ -810,7 +804,7 @@ The session winbar reports pending approval while the reader scrolls through ear
 
 ### Since-you-left divider
 
-`since_you_left.lua` tracks focus and one unread divider per loaded session buffer. An unfocused session can receive a divider even with a split still visible. Transcript writers identify assistant and tool output and framed notices; the run loop identifies provider deltas. Draft writes, history edits, and empty assistant placeholders do not set a divider. A virtual line marks the first affected transcript line, including when streaming resumes on a line with existing text. The divider does not enter the transcript or persist across unloads. Later output leaves the extmark in place. Cursor movement or scrolling past the marked line in the focused transcript clears it for all views. `render = false` disables the feature.
+`since_you_left.lua` tracks focus and one unread divider per loaded session buffer. Focus in a draft window counts as away from the transcript. Transcript writers identify assistant and tool output and framed notices; the run loop identifies provider deltas. Draft writes, history edits, and empty assistant placeholders do not set a divider. A virtual line marks the first affected transcript line, including when streaming resumes on a line with existing text. The divider does not enter the transcript or persist across unloads. Later output leaves the extmark in place. The draft's winbar reads the same unread state. Sending and closing leave unread state unchanged. `:StrapsJumpUnread` focuses a reading window, opens any fold at the marked line and navigates there without clearing it. A forward cursor or viewport crossing in the focused reading window clears the divider for all views. Draft motions never clear it. `render = false` disables the feature.
 
 ### Session dock
 

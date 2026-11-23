@@ -20,15 +20,25 @@ end
 local function row_of(buf)
   if not marks[buf] then return nil end
   local pos = api.nvim_buf_get_extmark_by_id(buf, ns, marks[buf], { details = true })
-  if not rendering() or not pos[1] or pos[3].invalid then
-    clear(buf)
-    return nil
-  end
+  if not rendering() or not pos[1] or pos[3].invalid then return nil end
   return pos[1]
 end
 
-local function in_transcript(win, buf)
-  return api.nvim_win_get_buf(win) == buf and vim.w[win].straps_steer_draft ~= buf
+local function shows(win, buf)
+  return api.nvim_win_is_valid(win) and api.nvim_win_get_buf(win) == buf
+end
+
+function M.window(buf)
+  local current = api.nvim_get_current_win()
+  if shows(current, buf) then return current end
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if shows(win, buf) then return win end
+  end
+end
+
+local function composing(win, buf)
+  local row = require("straps.state").draft_row(buf)
+  return row and api.nvim_win_get_cursor(win)[1] > row
 end
 
 function M.preserve_view(buf)
@@ -36,11 +46,15 @@ function M.preserve_view(buf)
 end
 
 function M.wants_output(buf)
-  return rendering() and views[buf] ~= nil and not in_transcript(api.nvim_get_current_win(), buf) and row_of(buf) == nil
+  if not rendering() or row_of(buf) ~= nil then return false end
+  local win = api.nvim_get_current_win()
+  if shows(win, buf) then return composing(win, buf) end
+  return views[buf] ~= nil
 end
 
 function M.output(buf, row)
   if not M.wants_output(buf) then return end
+  clear(buf)
   marks[buf] = api.nvim_buf_set_extmark(buf, ns, row, 0, {
     end_row = row + 1,
     end_col = 0,
@@ -53,28 +67,62 @@ function M.output(buf, row)
 end
 
 function M.follow(win, buf)
+  local current = api.nvim_get_current_win()
+  if not shows(win, buf) then return false end
   return not rendering() or vim.b[buf].straps_session ~= true
-    or (win == api.nvim_get_current_win() and not M.preserve_view(buf))
+    or (win == current and not M.preserve_view(buf))
 end
 
 local function observe(entering, scrolling)
   local win = api.nvim_get_current_win()
   local buf = api.nvim_win_get_buf(win)
-  local row = in_transcript(win, buf) and row_of(buf)
+  local row = row_of(buf)
+  if row and composing(win, buf) and api.nvim_get_mode().mode:sub(1, 1) == "i" then
+    reading = nil
+    return
+  end
   if not row then
     reading = nil
     return
   end
   local cursor = api.nvim_win_get_cursor(win)[1]
   local top = vim.fn.line("w0")
-  if not entering and reading and reading.win == win and reading.buf == buf
-    and ((not scrolling and cursor > reading.cursor and cursor > row + 1)
-      or (scrolling and top > reading.top and top > row + 1)) then
-    clear(buf)
-    reading = nil
+  if entering or not reading or reading.win ~= win or reading.buf ~= buf then
+    reading = { win = win, buf = buf, cursor = cursor, top = top }
     return
   end
-  reading = { win = win, buf = buf, cursor = cursor, top = top }
+  local previous, current = reading.cursor, cursor
+  if scrolling then
+    previous, current = reading.top, top
+    reading.top = top
+  else
+    reading.cursor = cursor
+  end
+  if previous <= row + 1 and current > row + 1 then
+    clear(buf)
+    reading = nil
+  end
+end
+
+function M.reset_reading()
+  observe(true)
+end
+
+function M.jump(buf)
+  local row = row_of(buf)
+  if row == nil then
+    vim.notify("straps: no new output", vim.log.levels.INFO)
+    return
+  end
+  local win = M.window(buf)
+  if not win then
+    vim.notify("straps: open a transcript reading window to jump to new output", vim.log.levels.INFO)
+    return
+  end
+  api.nvim_set_current_win(win)
+  api.nvim_win_set_cursor(win, { row + 1, 0 })
+  vim.cmd("normal! zvzz")
+  M.reset_reading()
 end
 
 function M.setup(render)
@@ -89,9 +137,10 @@ function M.setup(render)
     group = group,
     callback = function(ev)
       local win = api.nvim_get_current_win()
-      if rendering() and vim.b[ev.buf].straps_session == true and in_transcript(win, ev.buf) then
+      if rendering() and vim.b[ev.buf].straps_session == true and shows(win, ev.buf) then
         views[ev.buf] = views[ev.buf] or {}
         views[ev.buf][win] = vim.fn.winsaveview()
+        views[ev.buf][win].draft = require("straps.state").draft_row(ev.buf)
       end
     end,
   })
@@ -100,7 +149,8 @@ function M.setup(render)
     callback = function(ev)
       local win = api.nvim_get_current_win()
       local saved = views[ev.buf] and views[ev.buf][win]
-      if ev.event == "BufEnter" and saved and in_transcript(win, ev.buf) and M.preserve_view(ev.buf) then
+      if ev.event == "BufEnter" and saved and shows(win, ev.buf) and M.preserve_view(ev.buf)
+          and not (saved.lnum > (saved.draft or math.huge)) then
         vim.fn.winrestview(saved)
       end
       observe(true)
@@ -108,7 +158,13 @@ function M.setup(render)
   })
   api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "WinScrolled" }, {
     group = group,
-    callback = function(ev) observe(false, ev.event == "WinScrolled") end,
+    callback = function(ev)
+      if ev.event == "WinScrolled" then
+        local win = tostring(api.nvim_get_current_win())
+        if ev.match ~= win and not vim.v.event[win] then return end
+      end
+      observe(false, ev.event == "WinScrolled")
+    end,
   })
   api.nvim_create_autocmd("WinClosed", {
     group = group,

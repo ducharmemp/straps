@@ -123,7 +123,7 @@ When the default confirmation hook is waiting on `write_file`, `edit_file`, or `
 
 The transcript is the session state. You can use normal Vim editing to revise history before the next request.
 
-When output arrives while you are away from a transcript, `── since you left ──` marks the first affected line. Return to the transcript to keep reading from your previous position. Later output leaves the divider in place until you move your cursor or scroll the top of the view past it. Draft edits do not create a divider. Set `render = false` to disable it.
+When output arrives while you are away from a transcript or at its composer, `── since you left ──` marks the first affected line. Return to the transcript to keep reading from your previous position, or run `:StrapsJumpUnread` to go to the divider. The divider stays until you move your cursor or scroll the top of a focused reading window past it. Set `render = false` to disable it.
 
 Straps renders the transcript as a conversation and folds tool calls, harness notices, and agent messages by default. Switching buffers or splits configures transcript folds in each window while preserving existing windows' open and closed folds. The underlying text remains visible with `:set conceallevel=0`.
 
@@ -184,8 +184,10 @@ A personal entries file saved with `registry.dump()` pins the entry sources it h
 | Command | Purpose |
 | --- | --- |
 | `:Straps[!] [{cats}] [-- {instruction}]` | Open a new session. `{cats}` pre-grants permission categories (`edit,exec`, `all`), `-- {instruction}` seeds the request, `!` sends it. |
-| `:StrapsSend` | Send the current request. During a run or when a nonblank steering draft exists, open the draft; from the steering split, submit it. |
-| `:StrapsSteer [text]` | Without text, open a small split on a draft at the end of the same session buffer. With text, queue it for the active run or add it to the trailing user block if idle. |
+| `:StrapsSend` | Submit the draft. Queue it as steering during a run, or start a turn when idle. |
+| `:StrapsSendNow` | Stop the active run and submit the draft as the next turn after it ends. Does not undo tools that ran. |
+| `:StrapsSteer [text]` | Without text, move to the composer. With text, queue it for the active run or add it to the trailing user block if idle. |
+| `:StrapsJumpUnread` | Jump to the first unread line in a transcript reading window. Leaves the divider in place until you move past it. |
 | `:StrapsStop` | Stop the active run. |
 | `:StrapsPermission` | Open the session's pending permission review. |
 | `:StrapsInspect` | Open the pending edit diff from its transcript without deciding. |
@@ -214,13 +216,13 @@ A personal entries file saved with `registry.dump()` pins the entry sources it h
 | `:StrapsEval` | Execute the current buffer as Lua. |
 | `:StrapsHelp [tag]` | Open the reference documentation. |
 
-Commands that act on a session (`:StrapsSend`, `:StrapsSteer`, `:StrapsStop`, `:StrapsPermission`, `:StrapsContinue`, `:StrapsCompact`, `:StrapsRename`, `:StrapsAuto`) also work from another window when exactly one session is visible in the tab. The model, effort and provider pickers use that session too; with no visible session or multiple visible sessions, they change global defaults. `:StrapsResume`, `:StrapsEdit`, `:StrapsRegistry` and `:StrapsAgents` accept window modifiers (`:vertical StrapsRegistry`).
+Commands that act on a session (`:StrapsSend`, `:StrapsSendNow`, `:StrapsSteer`, `:StrapsStop`, `:StrapsPermission`, `:StrapsContinue`, `:StrapsCompact`, `:StrapsRename`, `:StrapsAuto`) also work from another window when exactly one session is visible in the tab. The model, effort and provider pickers use that session too; with no visible session or multiple visible sessions, they change global defaults. `:StrapsResume`, `:StrapsEdit`, `:StrapsRegistry` and `:StrapsAgents` accept window modifiers (`:vertical StrapsRegistry`).
 
-In a session buffer (or any `*.straps` file), `<CR>` sends or steers, `gf` opens the `path:line` reference under the cursor, `]]` and `[[` move between conversation turns, and `gO` lists the turns in the location list.
+In a session buffer (or any `*.straps` file), normal-mode `<CR>` sends or steers and `<S-CR>` stops and sends. Use `:StrapsSendNow` if your terminal does not distinguish Shift-Enter. `gf` opens the `path:line` reference under the cursor, `]]` and `[[` move between conversation turns, and `gO` lists the turns in the location list.
 
 Run `:StrapsOutline` from a transcript to open a reading tab showing the same buffer. Earlier turns fold under numbered first lines of their prompts. Use `zo` on a heading to reveal its prompt, response and tool output in place. The latest turn and any draft stay open. New turns stay unfolded until you reopen the reader. Run `:StrapsOutline` again or use `:close` to return to the prior view.
 
-Run `:StrapsSteer` while reading an earlier passage. The second split shows the draft at the end of the transcript buffer. Edit it with normal Neovim commands. `:close` keeps the draft, and `:StrapsSteer` reopens it. Normal-mode `<CR>` or `:StrapsSend` in the split submits the draft and returns to your original view. If the run has ended, submission moves the text to the trailing user block without starting a run. Press `<CR>` from the transcript to send it.
+Edit in the transcript under `── Draft · not sent ──` whether a run is active or idle. Streaming writes above the composer. The draft stays out of requests until submitted. Shift-Enter captures the text at the keypress; edits made while waiting for the run to stop stay in the composer.
 
 ## Opt-in context management
 

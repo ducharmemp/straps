@@ -470,8 +470,18 @@ function M._render(bufnr)
   if ok and type(straps) == "table" and straps.config and straps.config.render == false then
     return
   end
-  for _, blk in ipairs(require("straps.state").list_blocks(bufnr)) do
+  local state = require("straps.state")
+  for _, blk in ipairs(state.list_blocks(bufnr)) do
     render_block(bufnr, blk)
+  end
+  local draft = state.draft_row(bufnr)
+  if draft then
+    conceal_marker(bufnr, draft, vim.api.nvim_buf_get_lines(bufnr, draft, draft + 1, false)[1])
+    vim.api.nvim_buf_set_extmark(bufnr, render_ns, draft, 0, {
+      virt_text = { { "── Draft · not sent ──", "StrapsRule" } },
+      virt_text_pos = "overlay",
+      hl_mode = "combine",
+    })
   end
 end
 
@@ -740,11 +750,10 @@ local function load_registries()
   pcall(require("straps").load_project_registry)
 end
 
--- Open a loaded session transcript in a window with its <CR> keymap (send,
--- or open the steering split if a run is active), idle status, folds and rendering.
 -- Registry loading is the caller's job: open_session loads before
 -- state.new_session builds the system prompt, show_session loads here.
 local function present_session(bufnr, split_cmd)
+  require("straps.state").open_draft(bufnr)
   open_in_window(bufnr, split_cmd, true)
   -- Don't stomp a live status: a running subagent brought on-screen by the
   -- agents picker is still "running".
@@ -813,10 +822,7 @@ local function validate_categories(tokens)
   return nil
 end
 
---- Open a fresh session: a plain transcript buffer in a split, cursor on the
---- trailing (empty) user block. <CR> in normal mode sends it; while a run is
---- active <CR> opens the steering split instead. Ordinary vim editing works
---- throughout — including editing earlier history before sending.
+--- Open a fresh session.
 --- @param split_cmd string? split command to open the window with (see
 ---   M.show_session); nil/"" → horizontal "split".
 --- @param opts table? launch options (the `:Straps [cats] [-- text]` form):
@@ -2535,12 +2541,15 @@ function M.outline(bufnr)
   return #items
 end
 
-M.SESSION_KEYS = { "<CR>", "gf", "]]", "[[", "gO" }
+M.SESSION_KEYS = { "<CR>", "<S-CR>", "gf", "]]", "[[", "gO" }
 
 function M.map_session_keys(bufnr)
   vim.keymap.set("n", "<CR>", function()
     require("straps.steering").send(bufnr, human)
   end, { buffer = bufnr, desc = "straps: send / steer" })
+  vim.keymap.set("n", "<S-CR>", function()
+    require("straps.steering").send(bufnr, human, true)
+  end, { buffer = bufnr, desc = "straps: stop and send now" })
   M.map_file_refs(bufnr)
   M.map_navigation(bufnr)
 end

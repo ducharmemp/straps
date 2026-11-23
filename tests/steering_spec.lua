@@ -3,90 +3,122 @@ local root = vim.fn.fnamemodify(script, ":p:h:h")
 vim.opt.runtimepath:prepend(root)
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
 
-require("straps").setup({ session_dir = vim.fn.tempname(), render = false })
-local state = require("straps.state")
-local ui = require("straps.ui")
-local loop = require("straps.loop")
+require("straps").setup({ session_dir = vim.fn.tempname(), render = true, stop_backstop_ms = 5000 })
+local state, ui, loop = require("straps.state"), require("straps.ui"), require("straps.loop")
 local api = vim.api
 vim.cmd.source(vim.fn.fnameescape(root .. "/plugin/straps.lua"))
 
-local function session()
-  vim.cmd("only!")
-  local buf = state.new_session()
-  state.seed_user(buf, table.concat(vim.fn.map(vim.fn.range(1, 60), "'passage ' . v:val"), "\n"))
-  ui.show_session(buf, "none")
-  vim.wo.foldenable = false
-  api.nvim_win_set_cursor(0, { state.list_blocks(buf)[2].first_lnum + 10, 4 })
-  vim.cmd("normal! zt")
-  return buf, api.nvim_get_current_win(), vim.fn.winsaveview()
+local function check(label, actual, expected)
+  if vim.env.STRAPS_STEERING_COUNTERFACTUAL == label then expected = {} end
+  assert(vim.deep_equal(actual, expected), label .. ": got " .. vim.inspect(actual))
 end
 
-local function set_draft(buf, lines)
+local function key(keys)
+  api.nvim_feedkeys(api.nvim_replace_termcodes(keys, true, false, true), "mx", false)
+end
+
+local function session()
+  local buf = state.new_session()
+  ui.show_session(buf, "none")
+  return buf
+end
+
+local function draft(buf, lines)
   api.nvim_buf_set_lines(buf, state.draft_row(buf) + 1, -1, false, lines)
 end
 
-local function view(win)
-  return api.nvim_win_call(win, vim.fn.winsaveview)
-end
-
-local function expect(actual, expected, dimension)
-  assert(vim.deep_equal(actual, expected), dimension .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual))
-end
-
-it("opens a native same-buffer split and restores the origin on close and send", function()
-  local buf, origin, saved = session()
-  local before = state.transcript_lines(buf)
+it("persists an unsent composer and excludes even marker-looking draft lines", function()
+  local buf = session()
+  state.seed_user(buf, "first request")
+  state.append(buf, "assistant", nil, "partial response")
+  local broker = state.parse(buf)
+  local win = api.nvim_get_current_win()
   vim.cmd.StrapsSteer()
-  local composer = api.nvim_get_current_win()
-  expect(vim.fn.winlayout(), { "col", { { "leaf", origin }, { "leaf", composer } } }, "native split below origin")
-  expect(api.nvim_get_current_buf(), buf, "same buffer")
-  expect(view(origin), saved, "origin while composing")
-  expect(api.nvim_win_get_cursor(composer)[1], api.nvim_buf_line_count(buf), "draft cursor")
-  vim.cmd.StrapsSteer()
-  expect(api.nvim_get_current_win(), composer, "idempotent open")
-  vim.cmd.StrapsSend()
-  expect(api.nvim_get_current_win(), composer, "blank send stays open")
-  set_draft(buf, { "draft first", "draft second" })
-  vim.cmd.close()
-  expect(api.nvim_get_current_win(), origin, "close focus")
-  assert(vim.wait(500, function() return vim.deep_equal(view(origin), saved) end), "close did not restore view")
-  expect(state.transcript_lines(buf), before, "close does not submit")
-  vim.cmd.StrapsSend()
-  expect(state.draft_text(buf), "draft first\ndraft second", "reopened draft")
-  composer = api.nvim_get_current_win()
-  vim.cmd.StrapsSend()
-  expect(api.nvim_win_is_valid(composer), false, "send closes composer")
-  expect({ api.nvim_get_current_win(), view(origin) }, { origin, saved }, "send restores focus and view")
-  expect(state.draft_text(buf), nil, "send clears draft")
-  expect(state.last_user_text(buf):match("draft first\ndraft second$"), "draft first\ndraft second", "idle delivery")
-  expect(loop.running(buf), false, "idle delivery does not start")
-end)
-
-it("keeps the draft outside the conversation through streaming and reload", function()
-  local buf, origin = session()
-  state.append(buf, "assistant", nil, nil)
-  local before = state.parse(buf)
-  vim.cmd.StrapsSteer()
-  local draft = { "  keep indentation", "%%[straps:user]%%", "", "last line" }
-  set_draft(buf, draft)
-  expect(state.parse(buf), before, "unsent draft excluded from provider input")
-  state.append_text(buf, "first streaming")
-  state.append_text(buf, " reply\nsecond line")
-  vim.cmd.close()
-  state.append_text(buf, " after close")
+  check("one-window", vim.fn.winlayout(), { "leaf", win })
+  local lines = { "  keep indentation", "%%[straps:user]%%", "", "last line" }
+  draft(buf, lines)
+  check("unsent", state.parse(buf), broker)
+  state.append_text(buf, " reply\nsecond line", true)
   state.ensure_trailing_user(buf)
-  expect(state.draft_text(buf), table.concat(draft, "\n"), "draft survives open and closed streaming")
   local parsed = state.parse(buf)
-  expect(parsed.messages[#parsed.messages].content[1].text,
-    "first streaming reply\nsecond line after close", "streaming goes to assistant")
+  check("stream", parsed.messages[#parsed.messages].content[1].text, "partial response reply\nsecond line")
   local path = api.nvim_buf_get_name(buf)
   vim.cmd.enew()
   api.nvim_buf_delete(buf, {})
   local resumed = state.open_session_file(path)
   ui.show_session(resumed, "none")
-  expect(api.nvim_get_current_win(), origin, "resume reuses origin")
-  vim.cmd.StrapsSteer()
-  expect(state.draft_text(resumed), table.concat(draft, "\n"), "draft survives file reload")
-  expect(state.parse(resumed), parsed, "reload still excludes draft")
-  vim.cmd.close()
+  check("reload-draft", state.draft_text(resumed), table.concat(lines, "\n"))
+  check("reload-transcript", state.parse(resumed), parsed)
+end)
+
+local function slow_run()
+  _G.__composer = { requests = {}, cancelled = 0, ended = {} }
+  require("straps.registry").define({ name = "fn.provider", kind = "fn", source = [[
+return function(req, ctx)
+  local data = _G.__composer
+  data.requests[#data.requests + 1] = req.messages
+  local function answer()
+    ctx.emit({ type = "text_delta", text = "response" })
+    return { stop_reason = "end_turn", content = { { type = "text", text = "response" } } }
+  end
+  if #data.requests == 1 then
+    ctx.await(function(resolve)
+      data.resume = resolve
+      ctx.on_cancel(function() data.cancelled = data.cancelled + 1 end)
+    end)
+  end
+  return answer()
+end
+]] })
+  local buf = session()
+  local data = _G.__composer
+  local group = api.nvim_create_augroup("ComposerLifecycleTest", { clear = true })
+  api.nvim_create_autocmd("User", { group = group, pattern = "StrapsRunEnd", callback = function(ev)
+    if ev.data.bufnr == buf then data.ended[#data.ended + 1] = ev.data.reason end
+  end })
+  draft(buf, { "initial request" })
+  key("<CR>")
+  assert(data.resume, "first provider request did not reach await")
+  return buf, data
+end
+
+it("Shift-Enter waits for the old run, sends the snapshot once, and keeps newer text", function()
+  local buf, data = slow_run()
+  local win = api.nvim_get_current_win()
+  key("<S-CR>")
+  check("blank-does-not-stop", data.cancelled, 0)
+  draft(buf, { "send now" })
+  key("<S-CR>")
+  vim.cmd.StrapsSendNow()
+  key("<CR>")
+  check("one-cancellation", data.cancelled, 1)
+  check("wait-for-stop", { loop.running(buf), #data.requests, #data.ended }, { true, 1, 0 })
+  check("snapshot-still-unsent", state.draft_text(buf), "send now")
+  draft(buf, { "new unsent text" })
+  api.nvim_win_set_cursor(win, { state.draft_row(buf) + 2, 6 })
+  data.resume()
+  assert(vim.wait(1000, function() return not loop.running(buf) and #data.ended == 2 end), "replacement run did not end")
+  check("actual-finish", data.ended, { "cancelled", "ok" })
+  check("one-replacement", #data.requests, 2)
+  local request = vim.json.encode(data.requests[2])
+  local _, occurrences = request:gsub("send now", "")
+  check("one-copy", occurrences, 1)
+  check("new-typing-not-sent", request:find("new unsent text", 1, true) ~= nil, false)
+  check("new-typing-kept", state.draft_text(buf), "new unsent text")
+  check("new-cursor-kept", api.nvim_win_get_cursor(win), { state.draft_row(buf) + 2, 6 })
+end)
+
+it("the command fallback starts after stop; an explicit Stop suppresses a pending restart", function()
+  local buf, data = slow_run()
+  draft(buf, { "pending" })
+  vim.cmd.StrapsSendNow()
+  check("fallback-cancellation", data.cancelled, 1)
+  vim.cmd.StrapsStop()
+  data.resume()
+  assert(vim.wait(1000, function() return not loop.running(buf) end))
+  vim.wait(20, function() return false end)
+  check("no-restart", #data.requests, 1)
+  check("stop-keeps-draft", state.draft_text(buf), "pending")
+  vim.cmd.StrapsSendNow()
+  check("fallback-idle-send", #data.requests, 2)
 end)

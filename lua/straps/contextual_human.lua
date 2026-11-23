@@ -43,21 +43,22 @@ function M.install(adapter, options)
       block_count = #state.list_blocks(bufnr) }
   end
   function callbacks.resume(bufnr) register(bufnr, true) end
-  function callbacks.send(bufnr)
+  function callbacks.send(bufnr, composed, enqueue)
     local text = state.last_user_text(bufnr)
     local draft = drafts[bufnr]
     if draft and #state.list_blocks(bufnr) > draft.block_count then drafts[bufnr], draft = nil, nil end
-    if draft and draft.data ~= "" and text ~= draft.displayed then
+    if draft and draft.data ~= "" and (composed or text ~= draft.displayed) then
       vim.notify("straps: review edited piped data with :StrapsAdopt before sending", vim.log.levels.WARN)
       return false
     end
     if draft and text == draft.displayed then text = draft.instruction end
+    text = composed or text
     if not text or not text:match("%S") then
       vim.notify("straps: adopt piped data with :StrapsAdopt before sending", vim.log.levels.WARN)
       return false
     end
     if not draft or draft.data == "" then drafts[bufnr] = nil end
-    return submit(bufnr, text, function() loop.start(bufnr) end)
+    return submit(bufnr, text, enqueue or function() loop.start(bufnr) end)
   end
   function callbacks.steer(bufnr, text, enqueue)
     return submit(bufnr, text, enqueue or function()

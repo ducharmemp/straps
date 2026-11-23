@@ -14,6 +14,7 @@
 :StrapsEval	straps.txt	/*:StrapsEval*
 :StrapsHelp	straps.txt	/*:StrapsHelp*
 :StrapsInspect	straps.txt	/*:StrapsInspect*
+:StrapsJumpUnread	straps.txt	/*:StrapsJumpUnread*
 :StrapsLogin	straps.txt	/*:StrapsLogin*
 :StrapsLogout	straps.txt	/*:StrapsLogout*
 :StrapsModel	straps.txt	/*:StrapsModel*
@@ -25,6 +26,7 @@
 :StrapsResume	straps.txt	/*:StrapsResume*
 :StrapsSearch	straps.txt	/*:StrapsSearch*
 :StrapsSend	straps.txt	/*:StrapsSend*
+:StrapsSendNow	straps.txt	/*:StrapsSendNow*
 :StrapsSteer	straps.txt	/*:StrapsSteer*
 :StrapsStop	straps.txt	/*:StrapsStop*
 :StrapsTaskReset	straps.txt	/*:StrapsTaskReset*

@@ -181,6 +181,10 @@ command("StrapsSend", function()
   require("straps.steering").send(bufnr, human)
 end, { desc = "straps: send the trailing user block (or steer if a run is active)" })
 
+command("StrapsSendNow", function()
+  local bufnr = resolve_session()
+  if bufnr then require("straps.steering").send(bufnr, human, true) end
+end, { desc = "straps: stop the active run, then send the draft as a new turn" })
 command("StrapsSteer", function(opts)
   local bufnr = resolve_session()
   if not bufnr then
@@ -194,7 +198,12 @@ command("StrapsSteer", function(opts)
     vim.notify("straps: no active run; added the text to the trailing user block (send it with :StrapsSend)",
       vim.log.levels.WARN)
   end
-end, { nargs = "*", desc = "straps: open a steering split or queue supplied text" })
+end, { nargs = "*", desc = "straps: go to the draft or queue supplied text" })
+
+command("StrapsJumpUnread", function()
+  local bufnr = resolve_session()
+  if bufnr then require("straps.since_you_left").jump(bufnr) end
+end, { desc = "straps: jump to the first unread output in the transcript" })
 
 command("StrapsContextPreview", function(opts)
   local bufnr = resolve_session()
@@ -228,6 +237,7 @@ command("StrapsStop", function()
   if not bufnr then
     return
   end
+  require("straps.steering").cancel(bufnr)
   require("straps.loop").user_stop(bufnr)
 end, { desc = "straps: cancel the active run in this session" })
 
@@ -260,7 +270,10 @@ end, { nargs = 1, bang = true, desc = "straps: inspect a decision; ! requests a 
 
 command("StrapsTaskReset", function()
   local bufnr = resolve_session()
-  if bufnr and human then human.reset(bufnr) end
+  if bufnr and human then
+    require("straps.steering").cancel(bufnr)
+    human.reset(bufnr)
+  end
 end, { desc = "straps: invalidate the current authorization task" })
 
 command("StrapsCompact", function()

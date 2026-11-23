@@ -153,6 +153,7 @@ M.config = {
   -- also reachable per-window with :set conceallevel=0). tools_expanded =
   -- true folds tool_use/tool_result blocks OPEN by default.
   render = true,
+  turn_decoration = true,
   tools_expanded = false,
 
   -- Session-window winbar: a window-local status line on each session window
@@ -162,6 +163,7 @@ M.config = {
   -- ui.session_status() / ui.session_winbar() components stay available for a
   -- manual statusline either way.
   session_winbar = true,
+  session_dock = false,
   terminal_status = true,
 
   -- Agents-buffer winbar (:StrapsAgents): the keymap legend in a window-local

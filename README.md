@@ -105,7 +105,15 @@ Neovim before 0.12 sends no reports. Headless instances have no terminal recipie
 
 ## Start a session
 
-Session windows show a model/status winbar. Leaving the buffer or window removes only the Straps expression and restores the prior local value. Returning to the session restores its winbar. Straps preserves the global winbar and user replacements; set `session_winbar = false` to disable the session bar.
+Session windows show a model/status winbar. Ordinary session windows restore the previous local value when you leave them. Straps preserves the global winbar and user replacements; set `session_winbar = false` to hide model and status.
+
+During a run, a thin accent rule marks the current model turn. A pending approval shows `◆ permit` beside its tool call when Straps can identify the call. The session winbar shows `◆ waiting` even when you scroll back. The rule and label leave the transcript and cursor unchanged. Set `turn_decoration = false` to remove these decorations; `render = false` also disables them. Workbench and dock commands remain available.
+
+Set `session_dock = true` in `require('straps').setup()` to open sessions in a shallow, full-width bottom split. The option defaults to `false`. The dock shows the editable transcript. Drag the separator or use `:resize` from the dock to see more history; shrinking the window keeps your draft. Placement modifiers such as `:vertical Straps` override the dock.
+
+The dock's winbar keeps the conversation name visible when you return to the source, including with `session_winbar = false`. When the default permission prompt or contextual consent dialog needs a decision, the dock shows `Permission pending` without taking focus. Run `:StrapsPermission` from the dock or from a source window with one visible session to open the review. Choose an outcome in the review itself. Use `:StrapsStop` to cancel a waiting run. Custom confirmation and consent interfaces control their own display. If you close the dock while a review is pending, reopen the session to review or stop the run.
+
+When the default confirmation hook is waiting on `write_file`, `edit_file`, or `patch_file`, run `:StrapsInspect` from the transcript to open the proposed unified diff. The adjoining split leaves focus and the cursor in the transcript. Closing the split leaves approval pending. Run `:StrapsPermission` to choose an outcome, or `:StrapsStop` to cancel. Contextual consent and custom hooks use their own interfaces.
 
 1. Run `:Straps`.
 2. Type a request in the session buffer.
@@ -116,6 +124,12 @@ Session windows show a model/status winbar. Leaving the buffer or window removes
 The transcript is the session state. You can use normal Vim editing to revise history before the next request.
 
 Straps renders the transcript as a conversation and folds tool calls, harness notices, and agent messages by default. Switching buffers or splits configures transcript folds in each window while preserving existing windows' open and closed folds. The underlying text remains visible with `:set conceallevel=0`.
+
+### Claim evidence
+
+When the assistant attaches a specific original tool-result quote to a claim, the session winbar shows `↳ gE evidence` while the cursor is on the claim. Press `gE` to open any enclosing fold and jump to the quote in the transcript. Press `Ctrl-O` to return to the claim. The reply contains no citation numbers, appended excerpts, or footnotes.
+
+Straps omits links without an explicit declaration and a unique text match. A link identifies the tool output the model cited; it does not certify that the output supports the claim. Links are local to the loaded buffer and do not survive reopening or forking it. Replaced or edited source text can invalidate a link.
 
 ### From the shell
 
@@ -165,9 +179,11 @@ A personal entries file saved with `registry.dump()` pins the entry sources it h
 | Command | Purpose |
 | --- | --- |
 | `:Straps[!] [{cats}] [-- {instruction}]` | Open a new session. `{cats}` pre-grants permission categories (`edit,exec`, `all`), `-- {instruction}` seeds the request, `!` sends it. |
-| `:StrapsSend` | Send the current request or steer an active run. |
-| `:StrapsSteer {text}` | Queue `{text}` as steering for the active run. With no run, add it to the trailing user block. |
+| `:StrapsSend` | Send the current request. During a run or when a nonblank steering draft exists, open the draft; from the steering split, submit it. |
+| `:StrapsSteer [text]` | Without text, open a small split on a draft at the end of the same session buffer. With text, queue it for the active run or add it to the trailing user block if idle. |
 | `:StrapsStop` | Stop the active run. |
+| `:StrapsPermission` | Open the session's pending permission review. |
+| `:StrapsInspect` | Open the pending edit diff from its transcript without deciding. |
 | `:StrapsAuto [off\|all\|{cats}]` | With no argument, choose category grants in a Snacks multi-select picker, or report grants without Snacks. Tab toggles; Enter applies the selection; Esc cancels. Explicit categories (or `all`) add grants; `off` clears category grants. |
 | `:StrapsContinue [instruction]` | Continue a stopped run. |
 | `:StrapsAdopt [text]` | In contextual mode, review and adopt exact task text and standing instructions. Without text, use the trailing request or retained events. |
@@ -181,6 +197,7 @@ A personal entries file saved with `registry.dump()` pins the entry sources it h
 | `:StrapsResume[!] [session]` | Resume a saved session. `!` opens a picker. |
 | `:StrapsRename [title]` | Give the current session a durable title for the resume picker. |
 | `:StrapsSearch {pattern}` | Search every saved transcript and load the matches into the quickfix list. |
+| `:StrapsOutline` | Open or close an outline reading tab for the current transcript. |
 | `:StrapsAgents` | Open the agent dashboard: session trees, status, details, and management actions. |
 | `:StrapsProvider` | Choose Anthropic, OpenAI or llama.cpp. In a session buffer or from another buffer with exactly one visible session in the tab, the choice affects that session. Elsewhere, it persists globally and applies to new sessions; a session keeps the provider and model of its first successful request, including after a restart. |
 | `:StrapsModel` | Choose a model for the active provider. In a session buffer or from another buffer with exactly one visible session in the tab, the choice affects that session and is kept after a restart. Elsewhere, it persists per provider and applies to new sessions; a model set in `setup()` wins over it. |
@@ -192,9 +209,13 @@ A personal entries file saved with `registry.dump()` pins the entry sources it h
 | `:StrapsEval` | Execute the current buffer as Lua. |
 | `:StrapsHelp [tag]` | Open the reference documentation. |
 
-Commands that act on a session (`:StrapsSend`, `:StrapsSteer`, `:StrapsStop`, `:StrapsContinue`, `:StrapsCompact`, `:StrapsRename`, `:StrapsAuto`) also work from another window when exactly one session is visible in the tab. The model, effort and provider pickers use that session too; with no visible session or multiple visible sessions, they change global defaults. `:StrapsResume`, `:StrapsEdit`, `:StrapsRegistry` and `:StrapsAgents` accept window modifiers (`:vertical StrapsRegistry`).
+Commands that act on a session (`:StrapsSend`, `:StrapsSteer`, `:StrapsStop`, `:StrapsPermission`, `:StrapsContinue`, `:StrapsCompact`, `:StrapsRename`, `:StrapsAuto`) also work from another window when exactly one session is visible in the tab. The model, effort and provider pickers use that session too; with no visible session or multiple visible sessions, they change global defaults. `:StrapsResume`, `:StrapsEdit`, `:StrapsRegistry` and `:StrapsAgents` accept window modifiers (`:vertical StrapsRegistry`).
 
 In a session buffer (or any `*.straps` file), `<CR>` sends or steers, `gf` opens the `path:line` reference under the cursor, `]]` and `[[` move between conversation turns, and `gO` lists the turns in the location list.
+
+Run `:StrapsOutline` from a transcript to open a reading tab showing the same buffer. Earlier turns fold under numbered first lines of their prompts. Use `zo` on a heading to reveal its prompt, response and tool output in place. The latest turn and any draft stay open. New turns stay unfolded until you reopen the reader. Run `:StrapsOutline` again or use `:close` to return to the prior view.
+
+Run `:StrapsSteer` while reading an earlier passage. The second split shows the draft at the end of the transcript buffer. Edit it with normal Neovim commands. `:close` keeps the draft, and `:StrapsSteer` reopens it. Normal-mode `<CR>` or `:StrapsSend` in the split submits the draft and returns to your original view. If the run has ended, submission moves the text to the trailing user block without starting a run. Press `<CR>` from the transcript to send it.
 
 ## Opt-in context management
 

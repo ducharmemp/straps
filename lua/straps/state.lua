@@ -17,6 +17,88 @@ local KINDS = {
   tool_use = true,
   tool_result = true,
 }
+local DRAFT_MARKER = "%%[straps:draft]%%"
+local draft_ns = vim.api.nvim_create_namespace("straps.draft")
+local draft_marks = {}
+
+vim.api.nvim_create_autocmd({ "BufReadPost", "BufUnload" }, {
+  callback = function(ev)
+    if draft_marks[ev.buf] then vim.api.nvim_buf_clear_namespace(ev.buf, draft_ns, 0, -1) end
+    draft_marks[ev.buf] = nil
+  end,
+})
+
+local function mark_draft(bufnr, row)
+  draft_marks[bufnr] = vim.api.nvim_buf_set_extmark(bufnr, draft_ns, row, 0, {
+    id = draft_marks[bufnr] or nil,
+    right_gravity = true,
+  })
+end
+
+function M.draft_row(bufnr)
+  local mark = draft_marks[bufnr]
+  if mark == nil then
+    draft_marks[bufnr] = false
+    for i, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)) do
+      if line == DRAFT_MARKER then
+        mark_draft(bufnr, i - 1)
+        return i - 1
+      end
+    end
+  elseif mark then
+    local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, draft_ns, mark, {})
+    if pos[1] and vim.api.nvim_buf_get_lines(bufnr, pos[1], pos[1] + 1, false)[1] == DRAFT_MARKER then
+      return pos[1]
+    end
+  end
+end
+
+function M.transcript_lines(bufnr)
+  return vim.api.nvim_buf_get_lines(bufnr, 0, M.draft_row(bufnr) or -1, false)
+end
+
+function M.transcript_bytes(bytes)
+  if type(bytes) ~= "string" then return nil end
+  local marker = bytes:find("\n" .. DRAFT_MARKER .. "\n", 1, true)
+  return marker and bytes:sub(1, marker) or bytes
+end
+
+function M.open_draft(bufnr)
+  local row = M.draft_row(bufnr)
+  if not row then
+    row = vim.api.nvim_buf_line_count(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, row, row, false, { DRAFT_MARKER, "" })
+    mark_draft(bufnr, row)
+  elseif row + 1 == vim.api.nvim_buf_line_count(bufnr) then
+    vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "" })
+  end
+end
+
+function M.draft_text(bufnr)
+  local row = M.draft_row(bufnr)
+  if row then return table.concat(vim.api.nvim_buf_get_lines(bufnr, row + 1, -1, false), "\n") end
+end
+
+function M.clear_draft(bufnr)
+  local row = M.draft_row(bufnr)
+  if row then
+    vim.api.nvim_buf_set_lines(bufnr, row, -1, false, {})
+    M.persist(bufnr)
+  end
+end
+
+function M.replace_transcript(bufnr, replacement)
+  local row = M.draft_row(bufnr)
+  if not row then return vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, replacement) end
+  local old = M.transcript_lines(bufnr)
+  local first, last, new_last = 1, #old, #replacement
+  while first <= last and first <= new_last and old[first] == replacement[first] do first = first + 1 end
+  while last >= first and new_last >= first and old[last] == replacement[new_last] do
+    last, new_last = last - 1, new_last - 1
+  end
+  vim.api.nvim_buf_set_lines(bufnr, first - 1, last, false, vim.list_slice(replacement, first, new_last))
+  mark_draft(bufnr, #replacement)
+end
 
 -- A content line that would read as a marker (or as an escape) gets the
 -- escape prefix prepended on append; parse strips exactly one prefix.
@@ -274,7 +356,7 @@ end
 local function parse_blocks(bufnr)
   local blocks = {}
   local cur = nil
-  for _, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)) do
+  for _, line in ipairs(M.transcript_lines(bufnr)) do
     local kind, attrs, inline = match_marker(line)
     if kind then
       cur = { kind = kind, attrs = attrs, lines = { inline } }
@@ -423,7 +505,7 @@ function M.list_blocks(bufnr)
         blocks_cache[b] = nil
       end
     end
-    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local lines = M.transcript_lines(bufnr)
     local blocks = {}
     for lnum, line in ipairs(lines) do
       local kind, attrs = match_marker(line)
@@ -461,22 +543,22 @@ end
 -- Windows showing bufnr with the cursor on the last line stay pinned to the
 -- new bottom after a mutation.
 local function with_pin(bufnr, mutate)
-  local last = vim.api.nvim_buf_line_count(bufnr)
+  local last = M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
   local pinned = {}
   for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
-    if vim.api.nvim_win_get_cursor(win)[1] == last then
+    if vim.w[win].straps_steer_origin ~= bufnr and vim.api.nvim_win_get_cursor(win)[1] == last then
       pinned[#pinned + 1] = win
     end
   end
   mutate()
-  local new_last = vim.api.nvim_buf_line_count(bufnr)
+  local new_last = M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
   for _, win in ipairs(pinned) do
     vim.api.nvim_win_set_cursor(win, { new_last, 0 })
   end
 end
 
 local function buffer_is_blank(bufnr)
-  return vim.api.nvim_buf_line_count(bufnr) == 1
+  return (M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)) == 1
     and vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1] == ""
 end
 
@@ -949,11 +1031,12 @@ function M.append(bufnr, kind, attrs, text)
     end
   end
   with_pin(bufnr, function()
+    local tail = M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
     if buffer_is_blank(bufnr) then
-      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+      vim.api.nvim_buf_set_lines(bufnr, 0, tail, false, lines)
     else
-      table.insert(lines, 1, "") -- one blank line before each marker
-      vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, lines)
+      table.insert(lines, 1, "")
+      vim.api.nvim_buf_set_lines(bufnr, tail, tail, false, lines)
     end
   end)
   -- Block boundary: persist a file-backed buffer (no-op on scratch buffers).
@@ -964,14 +1047,24 @@ end
 --- block); text may contain "\n".
 function M.append_text(bufnr, text)
   with_pin(bufnr, function()
-    local row = vim.api.nvim_buf_line_count(bufnr) - 1
+    local row = (M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)) - 1
     local tail = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ""
     local pieces = vim.split(text, "\n", { plain = true })
     local mk, _, minline = match_marker(tail)
     if mk and not minline then
-      -- current block is empty: never glue text onto a bare marker line
-      vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, pieces)
+      for i, piece in ipairs(pieces) do if piece == DRAFT_MARKER then pieces[i] = escape_line(piece) end end
+      vim.api.nvim_buf_set_lines(bufnr, row + 1, row + 1, false, pieces)
     else
+      for i, piece in ipairs(pieces) do
+        if (i == 1 and tail .. piece or piece) == DRAFT_MARKER then
+          if i == 1 then
+            pieces[1] = escape_line(tail .. piece)
+            vim.api.nvim_buf_set_text(bufnr, row, 0, row, #tail, pieces)
+            return
+          end
+          pieces[i] = escape_line(piece)
+        end
+      end
       vim.api.nvim_buf_set_text(bufnr, row, #tail, row, #tail, pieces)
     end
   end)
@@ -1003,7 +1096,8 @@ function M.seed_user(bufnr, text)
     lines[#lines + 1] = escape_line(l)
   end
   with_pin(bufnr, function()
-    vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, lines)
+    local tail = M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, tail, tail, false, lines)
   end)
   M.persist(bufnr)
 end
@@ -1020,7 +1114,8 @@ function M.add_to_trailing_user(bufnr, text)
     lines[#lines + 1] = escape_line(l)
   end
   with_pin(bufnr, function()
-    vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, lines)
+    local tail = M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, tail, tail, false, lines)
   end)
   M.persist(bufnr)
 end

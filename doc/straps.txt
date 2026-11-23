@@ -147,25 +147,36 @@ yourself, before any command, to pass options.
 			leaves the quickfix list unchanged; an rg failure or an
 			invalid pattern is reported as an error.
 
+							*:StrapsOutline*
+:StrapsOutline		From a transcript, open a reading tab showing the same
+			buffer. Earlier turns fold under numbered first lines
+			of their prompts. Press |zo| to reveal the original
+			prompt, response and tool output in place. The latest
+			turn and draft stay open. New turns remain unfolded
+			until you reopen the reading tab. Use :StrapsOutline
+			or |:close| there to return to the prior view.
+
 							*:StrapsSend*
-:StrapsSend		Send the current session buffer as-is. If a run is
-			already active, prompt for a steering message
-			(|straps-steering|) instead. Also bound to <CR> in a
-			session buffer. Warns "nothing to send" and starts
-			no run if the trailing user block is empty, or if the
-			transcript ends on an assistant message (unsupported
-			prefill).
+:StrapsSend		Send the current request. During a run or when a
+			nonblank steering draft exists, open the draft. In the
+			steering split, submit it (|straps-steering|). Also
+			bound to <CR> in a session buffer. Warns "nothing to
+			send" and starts no run if the trailing user block is
+			empty, or if the transcript ends on an assistant
+			message (unsupported prefill).
 
 							*:StrapsSteer*
-:StrapsSteer {text}	Queue {text} as a steering message on the active run
-			(|straps-steering|). With no active run, {text} is
-			added to the trailing user block (a warning says so);
+:StrapsSteer [text]	Without text, open a small split on the steering draft
+			at the end of the same session buffer. With text,
+			queue it for the active run (|straps-steering|). With
+			no active run, add it to the trailing user block and
 			send it with |:StrapsSend|.
 
 Commands that act on a session (|:StrapsSend|, |:StrapsSteer|, |:StrapsStop|,
-|:StrapsContinue|, |:StrapsCompact|, |:StrapsRename|, |:StrapsAuto|) act on
-the current buffer when it is a session, else on the session shown in the
-only session window of the current tab. Otherwise they warn and do nothing.
+|:StrapsPermission|, |:StrapsContinue|, |:StrapsCompact|, |:StrapsRename|,
+|:StrapsAuto|) act on the current buffer when it is a session, else on the
+sole distinct session buffer visible in the current tab. Otherwise they warn
+and do nothing.
 |:StrapsModel|, |:StrapsEffort| and |:StrapsProvider| use the same session
 resolution, and make a global pick when no session resolves.
 
@@ -177,6 +188,19 @@ resolution, and make a global pick when no session resolves.
 			appended to the transcript. To pick the work back up,
 			see |:StrapsContinue|.
 
+							*:StrapsPermission*
+:StrapsPermission	Open the session's pending permission review. Run it
+			from the session or from another window when exactly
+			one session is visible in the current tab. Choose an
+			outcome in the review itself, or use |:StrapsStop| to
+			cancel the waiting run.
+							*:StrapsInspect*
+:StrapsInspect		Open the pending file edit's unified diff from its
+			transcript. The split adjoins the transcript and leaves
+			its focus and cursor in place. Closing the diff leaves
+			approval pending. Use |:StrapsPermission| to decide.
+			Only the default confirmation hook for write_file,
+			edit_file and patch_file supports this action.
 							*:StrapsContinue*
 :StrapsContinue [{text}]
 			Continue a run that was stopped (|:StrapsStop|) or
@@ -442,13 +466,17 @@ hand-edited into an inconsistent state — that still fails loudly when sent.
 
 Buffer-local mappings (normal mode), set in session buffers and in any
 hand-opened `*.straps` file:
-	<CR>	Send, or prompt to steer if a run is active (|:StrapsSend|).
+	<CR>	Send or open the steering split (|:StrapsSend|).
 	gf	Open the `path:line[:col]` reference under the cursor; any
 		other text falls back to the built-in |gf|, and its error
 		is shown as a warning.
 	]]	Jump to the next conversation turn ([count] turns).
 	[[	Jump to the previous conversation turn ([count] turns).
 	gO	List the turns in the window's |location-list|.
+	gE	Jump to the original tool-result quote when the cursor is on
+		a claim and the session winbar shows the evidence hint.
+		Use |CTRL-O| to return. Evidence links are buffer-local and
+		do not persist when you reopen or fork the session.
 Changing 'filetype' away from straps removes these mappings and restores the
 fold and conceal options.
 
@@ -462,9 +490,15 @@ mutates the buffer text. `:set conceallevel=0` reveals the raw markers, and
 							*straps-steering*
 Steering. A message sent while a run is active is queued (not started as a new
 run) and drained into the transcript at the next turn boundary, so the model
-acts on it mid-flight. |:StrapsSteer| queues directly; <CR>/|:StrapsSend|
-prompt for the text. The harness steers too, through |fn.session_notify|: a
-subagent completion notice reaches a busy parent this way, without the
+acts on it mid-flight. |:StrapsSteer| without arguments opens a split below
+its originating window. Both views use the same session buffer. Draft text
+stays out of model requests until submitted. Use `:close` to keep the draft
+and `:StrapsSteer` to reopen it. Normal-mode <CR> or |:StrapsSend| in the
+split submits a nonblank draft and returns to the original view. If the run
+has ended, the text moves to the trailing user block for a separate send.
+
+The harness steers through |fn.session_notify|: a subagent completion notice
+reaches a busy parent this way, without the
 "steering queued" toast a message you typed produces. Each queued entry records
 its source: `user` (you), `harness` (a notice), or `agent` (|send_message|).
 Any queued entry ends a `spawn_wait` early, so a waiting agent reads it at
@@ -482,6 +516,13 @@ the context fill (e.g. 47.0k/200k (24%)) and cache hit rate, from
 Buffer/window leave removes only the Straps expression and restores the prior
 local value. Returning to the session reinstalls the expression. Global values
 and user replacements remain unchanged.
+
+Current turn. A thin accent rule marks the active model turn. When Straps
+can identify the tool call awaiting approval, its line shows `◆ permit`.
+The session winbar shows `◆ waiting` even when the action is out of view.
+Set `turn_decoration = false` to disable these decorations. `render = false`
+also disables them.
+The rule and label leave transcript text, cursor and focus unchanged.
 
 Own components. `ui.session_info(bufnr)` returns the session's RESOLVED state
 (provider, model, model_label, effort, overridden, status, parent, usage,
@@ -625,8 +666,19 @@ auto_compact_tokens	(number|nil) nil (off). Auto-compact when the estimated
 auto_compact_bytes	context passes this threshold. Both off by default.
 render			(boolean) true. Master switch for the |fn.render|
 			presentation layer.
+turn_decoration		(boolean) true. Show the current-turn rule and
+			approval decoration. Requires `render`.
 tools_expanded		(boolean) false. Fold tool blocks OPEN by default.
-session_winbar		(boolean) true. Window-local winbar on session windows.
+session_winbar		(boolean) true. Window-local model/status winbar on
+			session windows. The dock retains its identity and
+			permission labels when this is false.
+session_dock		(boolean) false. Open the session buffer in a shallow,
+			full-width bottom split. Use `:resize` or drag the
+			separator; resizing preserves the draft. Explicit
+			window placement overrides the dock. The default tool
+			confirmation and contextual consent dialog wait for
+			|:StrapsPermission|. Check the winbar for the session
+			name and `Permission pending` without switching focus.
 agents_winbar		(boolean) true. The agents buffer's keymap legend in a
 			window-local winbar; false = first buffer line instead.
 models			(list) 4 curated Anthropic entries { id, label?,
@@ -872,7 +924,7 @@ policy: every guard runs and a raising guard BLOCKS. NOT fanned out (single
 entry, called directly): |hook.confirm|, |hook.on_progress|, and
 `hook.on_define`.
 						*hook.confirm*
-hook.confirm(name, input, ctx) -> allowed, reason, source
+hook.confirm(name, input, ctx, call_id?) -> allowed, reason, source
 		A refusal with source `"hook"` is a policy veto and reads
 		`blocked by hook.confirm: <reason>`; any other refusal
 		reads `user denied: <reason>`. The permission gate, called for every tool the model requests,
@@ -882,7 +934,8 @@ hook.confirm(name, input, ctx) -> allowed, reason, source
 		`cap:<category>` key in the session's grant set, written by
 		|:StrapsAuto| or a subagent `allow`); otherwise prompt
 		(Yes / No / Always this tool / for edits, Always in <dir>
-		/ Always all edits), showing a diff for file edits.
+		/ Always all edits). For pending file edits, open the diff
+		with |:StrapsInspect| and decide with |:StrapsPermission|.
 		"Always all edits" (`editfiles:*`) covers every |fn.capability|
 		`edit` call, including bulk_replace, rename_symbol, format,
 		move_file(s), undo_edit and code_action with an index; those
@@ -2075,6 +2128,8 @@ follow your colorscheme; a user `hi link` wins and survives a re-apply.
 	StrapsCardBorder	Comment		expanded-tool box art
 	StrapsWinbar		WinBar		session-window winbar
 	StrapsWinbarNC		WinBarNC	that winbar in a non-current window
+	StrapsTurnAccent	Identifier	current-turn rule
+	StrapsPermit		DiagnosticWarn	pending approval
 	StrapsProgress		Comment		run-progress text on the last line
 	StrapsFileRef		Underlined	path:line references
 

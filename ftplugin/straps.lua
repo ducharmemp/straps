@@ -21,6 +21,8 @@ pcall(function()
   local ui = require("straps.ui")
   ui.apply_highlights()
   ui.map_session_keys(bufnr)
+  require("straps.evidence").map(bufnr)
+  undo[#undo + 1] = "silent! call nvim_buf_del_keymap(0, 'n', 'gE')"
   for _, lhs in ipairs(ui.SESSION_KEYS) do
     undo[#undo + 1] = ("silent! call nvim_buf_del_keymap(0, 'n', '%s')"):format(lhs)
   end

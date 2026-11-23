@@ -35,6 +35,8 @@ local HL_LINKS = {
   StrapsCardBorder = "Comment",    -- the expanded-tool box art
   StrapsWinbar = "WinBar",         -- session-window winbar (model/effort/status)
   StrapsWinbarNC = "WinBarNC",     -- the same winbar in a non-current window
+  StrapsTurnAccent = "Identifier",
+  StrapsPermit = "DiagnosticWarn",
   StrapsProgress = "Comment",      -- the run-progress virtual text on the last line
   StrapsFileRef = "Underlined",    -- path:line[:col] under treesitter (apply_file_ref_match)
   -- Treesitter captures (queries/straps/highlights.scm). The targets must
@@ -87,7 +89,8 @@ end
 local function apply_winbar()
   local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
   local cfg = require("straps").config
-  local want = vim.b[buf].straps_session == true and cfg.session_winbar ~= false
+  local dock = cfg.session_dock and require("straps.dock").is_window(win, buf)
+  local want = vim.b[buf].straps_session == true and (dock or cfg.session_winbar ~= false)
     or vim.api.nvim_buf_get_name(buf) == "straps://agents" and cfg.agents_winbar ~= false
   local value = vim.api.nvim_get_option_value("winbar", { win = win, scope = "local" })
   if not want then
@@ -119,6 +122,7 @@ local function register_winbar_lifecycle()
     group = group,
     callback = function()
       local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+      if require("straps").config.session_dock and require("straps.dock").is_window(win, buf) then return end
       local saved = winbars[win]
       local value = vim.api.nvim_get_option_value("winbar", { win = win, scope = "local" })
       local ordinary = vim.b[buf].straps_session ~= true and vim.api.nvim_buf_get_name(buf) ~= "straps://agents"
@@ -373,7 +377,15 @@ end
 --- foldtext function for session buffers (Neovim >= 0.10 renders the returned
 --- chunk list with color). Reads v:foldstart in the current buffer.
 function M.foldtext()
-  return M._fold_summary(vim.api.nvim_get_current_buf(), vim.v.foldstart)
+  local buf = vim.api.nvim_get_current_buf()
+  local chunks = M._fold_summary(buf, vim.v.foldstart)
+  local decoration = require("straps.turn_decoration")
+  local first, last, permit = decoration.rows(buf)
+  local row = vim.v.foldstart - 1
+  if first and row >= first and row <= last then
+    return vim.list_extend(decoration.chunks(permit and permit >= row and permit < vim.v.foldend), chunks)
+  end
+  return chunks
 end
 
 -- Conceal the leading marker token on a marker line (display-only).
@@ -699,13 +711,14 @@ function M.map_file_refs(bufnr)
   end, { buffer = bufnr, desc = "straps: open file[:line[:col]] under cursor" })
 end
 
-local function open_in_window(bufnr, split_cmd)
+local function open_in_window(bufnr, split_cmd, session)
   for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
     if vim.api.nvim_win_get_tabpage(win) == vim.api.nvim_get_current_tabpage() then
       vim.api.nvim_set_current_win(win)
       return true
     end
   end
+  if session and require("straps.dock").open(bufnr, split_cmd) then return false end
   if split_cmd == "none" then
     vim.cmd("buffer " .. bufnr)
   else
@@ -728,11 +741,11 @@ local function load_registries()
 end
 
 -- Open a loaded session transcript in a window with its <CR> keymap (send,
--- or prompt to steer if a run is active), idle status, folds and rendering.
+-- or open the steering split if a run is active), idle status, folds and rendering.
 -- Registry loading is the caller's job: open_session loads before
 -- state.new_session builds the system prompt, show_session loads here.
 local function present_session(bufnr, split_cmd)
-  open_in_window(bufnr, split_cmd)
+  open_in_window(bufnr, split_cmd, true)
   -- Don't stomp a live status: a running subagent brought on-screen by the
   -- agents picker is still "running".
   if vim.b[bufnr].straps_status == nil then
@@ -800,7 +813,7 @@ end
 
 --- Open a fresh session: a plain transcript buffer in a split, cursor on the
 --- trailing (empty) user block. <CR> in normal mode sends it; while a run is
---- active <CR> prompts to steer instead. Ordinary vim editing works
+--- active <CR> opens the steering split instead. Ordinary vim editing works
 --- throughout — including editing earlier history before sending.
 --- @param split_cmd string? split command to open the window with (see
 ---   M.show_session); nil/"" → horizontal "split".
@@ -1357,7 +1370,9 @@ function M._agents_winbar()
 end
 
 function M.winbar()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local win = tonumber(vim.g.statusline_winid)
+  if not win or not vim.api.nvim_win_is_valid(win) then win = vim.api.nvim_get_current_win() end
+  local bufnr = vim.api.nvim_win_get_buf(win)
   local ok_s, s = pcall(require, "straps")
   local cfg = (ok_s and type(s) == "table" and type(s.config) == "table") and s.config or {}
   if vim.api.nvim_buf_get_name(bufnr) == "straps://agents" then
@@ -1370,8 +1385,23 @@ function M.winbar()
     local ok, wb = pcall(require("straps.registry").try_call, "fn.agents_winbar")
     return (ok and type(wb) == "string") and wb or ""
   end
-  if vim.b[bufnr].straps_session == true and cfg.session_winbar ~= false then
-    return M.session_winbar(bufnr)
+  if vim.b[bufnr].straps_session == true then
+    local dock = cfg.session_dock and require("straps.dock").is_window(win, bufnr)
+    if not dock and cfg.session_winbar == false then return "" end
+    local bar = M.session_winbar(bufnr)
+    local ok, evidence = pcall(require, "straps.evidence")
+    local hint = ok and evidence.winbar_hint(win, bufnr) or ""
+    hint = hint:gsub("%%", "%%%%")
+    if hint ~= "" then bar = bar .. " " .. hint .. " " end
+    local dock_pending = dock and require("straps.dock").has_permission(bufnr)
+    local waiting = require("straps.turn_decoration").wait_label(bufnr, dock_pending)
+    if dock then
+      local label = vim.fn.strtrans(M.session_label(bufnr)):gsub("%%", "%%%%")
+      if cfg.session_winbar == false then return " " .. waiting .. label .. (hint ~= "" and "  " .. hint or "") end
+      return " " .. waiting .. label .. "  %<" .. bar
+    end
+    if waiting ~= "" then return " " .. waiting .. "%<" .. bar end
+    return bar
   end
   return ""
 end
@@ -1557,7 +1587,8 @@ local function progress_draw(bufnr)
   local live = liveness_segment(st.streaming, (now - (st.last_activity or st.start)) / 1e6)
   local text = ("%s · %ds%s · <CR> steer · :StrapsStop stop"):format(st.label, secs, live)
   vim.api.nvim_buf_clear_namespace(bufnr, progress_ns, 0, -1)
-  vim.api.nvim_buf_set_extmark(bufnr, progress_ns, vim.api.nvim_buf_line_count(bufnr) - 1, 0, {
+  local tail = require("straps.state").draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
+  vim.api.nvim_buf_set_extmark(bufnr, progress_ns, tail - 1, 0, {
     virt_text = { { text, "StrapsProgress" } },
     virt_text_pos = "eol",
   })
@@ -2506,16 +2537,7 @@ M.SESSION_KEYS = { "<CR>", "gf", "]]", "[[", "gO" }
 
 function M.map_session_keys(bufnr)
   vim.keymap.set("n", "<CR>", function()
-    local loop = require("straps.loop")
-    if loop.running(bufnr) then
-      vim.ui.input({ prompt = "steer: " }, function(txt)
-        if txt and txt ~= "" then
-          if human then human.steer(bufnr, txt) else require("straps.loop").steer(bufnr, txt) end
-        end
-      end)
-    else
-      if human then human.send(bufnr) else loop.start(bufnr) end
-    end
+    require("straps.steering").send(bufnr, human)
   end, { buffer = bufnr, desc = "straps: send / steer" })
   M.map_file_refs(bufnr)
   M.map_navigation(bufnr)
@@ -2554,7 +2576,7 @@ local function register_fold_lifecycle()
     callback = function(ev)
       local win = vim.api.nvim_get_current_win()
       if vim.api.nvim_win_get_buf(win) == ev.buf and vim.bo[ev.buf].filetype == "straps" then
-        M.apply_fold_opts(ev.buf)
+        M.apply_fold_opts(ev.buf, win)
       end
     end,
   })
@@ -2580,20 +2602,23 @@ end
 --- the session window, or any file swapped into it (gf, :edit, <C-o>), folds
 --- by the straps foldexpr on the user's own source. `[0]` writes only
 --- per-(window, buffer), which is exactly the scope the transcript needs.
-function M.apply_fold_opts(bufnr)
+function M.apply_fold_opts(bufnr, target_win)
   register_fold_lifecycle()
   local ok, straps = pcall(require, "straps")
   local expanded = ok and type(straps) == "table" and straps.config
     and straps.config.tools_expanded
   local expr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
-  for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
-    local first = vim.wo[win].foldexpr ~= expr
-    if vim.wo[win].foldmethod ~= "expr" then vim.wo[win][0].foldmethod = "expr" end
-    if first then vim.wo[win][0].foldexpr = expr end
-    local text = "v:lua.require'straps.ui'.foldtext()"
-    if vim.wo[win].foldtext ~= text then vim.wo[win][0].foldtext = text end
-    if first then
-      vim.wo[win][0].foldlevel = expanded and 99 or 0
+  local outline = package.loaded["straps.outline"]
+  for _, win in ipairs(target_win and { target_win } or vim.fn.win_findbuf(bufnr)) do
+    if not (outline and outline.owns_folds(win, bufnr)) then
+      local first = vim.wo[win].foldexpr ~= expr
+      if vim.wo[win].foldmethod ~= "expr" then vim.wo[win][0].foldmethod = "expr" end
+      if first then vim.wo[win][0].foldexpr = expr end
+      local text = "v:lua.require'straps.ui'.foldtext()"
+      if vim.wo[win].foldtext ~= text then vim.wo[win][0].foldtext = text end
+      if first then
+        vim.wo[win][0].foldlevel = expanded and 99 or 0
+      end
     end
   end
 end
@@ -2830,6 +2855,7 @@ function M.setup()
     source = TOOL_DISPLAY_SRC,
   })
   M.apply_highlights()
+  require("straps.turn_decoration").setup()
   local group = vim.api.nvim_create_augroup(AUGROUP, { clear = true })
   vim.api.nvim_create_autocmd("FileType", {
     group = group,

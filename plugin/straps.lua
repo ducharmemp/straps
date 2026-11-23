@@ -104,6 +104,18 @@ end, {
     .. " [categories] pre-grant permissions, `-- text` seeds the request, ! sends it",
 })
 
+command("StrapsPermission", function()
+  local bufnr = resolve_session()
+  if bufnr and not require("straps.dock").review_permission(bufnr) then
+    vim.notify("straps: no permission request to open for this session", vim.log.levels.INFO)
+  end
+end, { desc = "straps: review the session's pending permission request" })
+
+command("StrapsInspect", function()
+  local ok, reason = require("straps.workbench").inspect()
+  if not ok then vim.notify("straps: " .. reason, vim.log.levels.INFO) end
+end, { desc = "straps: inspect the pending edit from its transcript" })
+
 command("StrapsResume", function(opts)
   local ui = require("straps.ui")
   local arg = opts.args
@@ -157,21 +169,16 @@ command("StrapsSearch", function(opts)
   require("straps.ui").grep_sessions(opts.args)
 end, { nargs = "+", desc = "straps: full-text search across all saved session transcripts" })
 
+command("StrapsOutline", function()
+  require("straps.outline").toggle()
+end, { desc = "straps: toggle the session outline reading view" })
+
 command("StrapsSend", function()
   local bufnr = resolve_session()
   if not bufnr then
     return
   end
-  local loop = require("straps.loop")
-  if loop.running(bufnr) then
-    vim.ui.input({ prompt = "steer: " }, function(txt)
-      if txt and txt ~= "" then
-        if human then human.steer(bufnr, txt) else require("straps.loop").steer(bufnr, txt) end
-      end
-    end)
-  else
-    if human then human.send(bufnr) else loop.start(bufnr) end
-  end
+  require("straps.steering").send(bufnr, human)
 end, { desc = "straps: send the trailing user block (or steer if a run is active)" })
 
 command("StrapsSteer", function(opts)
@@ -180,13 +187,14 @@ command("StrapsSteer", function(opts)
     return
   end
   local text = opts.args
+  if text == "" then return require("straps.steering").open(bufnr) end
   if human then return human.steer(bufnr, text) end
   if not require("straps.loop").steer(bufnr, text) then
     require("straps.state").add_to_trailing_user(bufnr, text)
     vim.notify("straps: no active run; added the text to the trailing user block (send it with :StrapsSend)",
       vim.log.levels.WARN)
   end
-end, { nargs = "+", desc = "straps: queue a steering message for the active run" })
+end, { nargs = "*", desc = "straps: open a steering split or queue supplied text" })
 
 command("StrapsContextPreview", function(opts)
   local bufnr = resolve_session()

@@ -49,6 +49,7 @@ local function transaction_fault(bufnr, run, status)
   end
   for _, fn in ipairs(handlers) do pcall(fn) end
   if main then pcall(function() require("straps.attention").finish(bufnr, main, "error") end) end
+  pcall(function() require("straps.turn_decoration").finish(bufnr) end)
   pcall(function() require("straps.ui").progress(bufnr, { type = "done" }) end)
   pcall(function()
     vim.b[bufnr].straps_status = "idle"
@@ -192,6 +193,7 @@ end
 local function finish_events(bufnr, reason, run)
   if transaction_faults[bufnr] then return end
   require("straps.attention").finish(bufnr, run, reason)
+  pcall(function() require("straps.turn_decoration").finish(bufnr) end)
   pcall(function() vim.b[bufnr].straps_status = "idle" end)
   pcall(function() vim.b[bufnr].straps_run_reason = reason end)
   pcall(vim.api.nvim_exec_autocmds, "User",
@@ -215,11 +217,26 @@ local function crashed(bufnr, run, err)
   vim.notify("straps: run crashed: " .. tostring(err), vim.log.levels.ERROR)
 end
 
-local function flush_emissions(bufnr, run)
+local evidence = require("straps.evidence")
+
+local function flush_emissions(bufnr, run, finish)
   local pending = run.pending_emissions
   run.pending_emissions = nil
   if transaction_faults[bufnr] or run.cancelled or not vim.api.nvim_buf_is_valid(bufnr) then return end
-  for _, text in ipairs(pending or {}) do require("straps.state").append_text(bufnr, text) end
+  local stream = run.evidence_stream
+  if stream and stream.tick ~= vim.api.nvim_buf_get_changedtick(bufnr) then stream.stale = true end
+  local function append(text)
+    if text ~= "" then require("straps.state").append_text(bufnr, text) end
+    if stream then
+      if text:find("%S") then stream.visible = true end
+      stream.tick = vim.api.nvim_buf_get_changedtick(bufnr)
+    end
+  end
+  for _, text in ipairs(pending or {}) do
+    if stream then stream.emitted = true end
+    append(stream and evidence.filter(stream, text) or text)
+  end
+  if stream and finish then append(evidence.filter(stream, "", true)) end
 end
 
 local function new_ctx(bufnr, run)
@@ -307,8 +324,8 @@ end
 
 -- The model-origin gate: hook.confirm, then the before_tool fan-out. Passed
 -- to registry.gate_tool as opts.confirm so it runs AFTER the before-guards.
-local function confirm_then_before_tool(name, input, ctx)
-  local allowed, reason, source = registry.call("hook.confirm", name, input, ctx)
+local function confirm_then_before_tool(name, input, ctx, call_id)
+  local allowed, reason, source = registry.call("hook.confirm", name, input, ctx, call_id)
   if not allowed then
     return false, reason, source
   end
@@ -320,7 +337,9 @@ end
 -- Returns allowed, reason, run (run executes the gated entry exactly once).
 local function gate_tool(ctx, block)
   if rejected_tool_inputs[block] then return false, rejected_tool_inputs[block] end
-  return registry.gate_tool(block.name, block.input or {}, ctx, { confirm = confirm_then_before_tool })
+  return registry.gate_tool(block.name, block.input or {}, ctx, {
+    confirm = function(name, input, gate_ctx) return confirm_then_before_tool(name, input, gate_ctx, block.id) end,
+  })
 end
 
 local function normalize_result(ok, result)
@@ -913,6 +932,10 @@ local function run_turns(bufnr, ctx, run)
     -- buffer. pcall so a broken redefinition degrades to no note, not a
     -- failed run.
     local ok_note, note = pcall(registry.try_call, "fn.model_note", ctx)
+    if evidence.has_original_results(parsed) then
+      note = (ok_note and type(note) == "string" and note ~= "" and note .. "\n\n" or "") .. evidence.prompt
+      ok_note = true
+    end
     local system = parsed.system
     if ok_note and type(note) == "string" and note ~= "" then
       system = (system and system ~= "") and (system .. "\n\n" .. note) or note
@@ -943,11 +966,25 @@ local function run_turns(bufnr, ctx, run)
       error(capture_status.error or "could not capture pending retrieval", 0)
     end
     state.append(bufnr, "assistant", nil, "")
+    pcall(function()
+      local row = (state.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)) - 1
+      require("straps.turn_decoration").begin(bufnr, row)
+    end)
     local recovery
     if management.enabled(bufnr) then
       recovery = management.capture_recovery(bufnr, ctx, tools, note, allowance)
     end
     progress(bufnr, ctx, { type = "thinking", turn = turn, max = max_turns }, "thinking")
+    local function capture_evidence()
+      run.evidence_stream = nil
+      if not evidence.has_original_results(request) then return end
+      local stream = evidence.stream()
+      stream.marker = vim.api.nvim_buf_line_count(bufnr)
+      stream.tick = vim.api.nvim_buf_get_changedtick(bufnr)
+      run.evidence_stream = stream
+      stream.sources = evidence.sources(request)
+    end
+    capture_evidence()
     local dispatched, resp = pcall(registry.call, "fn.provider", request, ctx)
     if not dispatched and recovery and not run.cancelled and not run.provider_emitted
       and type(resp) == "table" and rawget(resp, "kind") == "context_overflow"
@@ -967,13 +1004,21 @@ local function run_turns(bufnr, ctx, run)
       end
       validate_retry()
       if run.provider_emitted then error("context management: output appeared during overflow recovery", 0) end
+      capture_evidence()
       dispatched, resp = pcall(registry.call, "fn.provider", request, ctx)
     end
+    flush_emissions(bufnr, run, true)
+    local stream = run.evidence_stream
+    run.evidence_stream = nil
     if not dispatched then error(resp, 0) end
     if run.cancelled then
       return cancelled_note()
     end
     assert(type(resp) == "table", "straps: fn.provider must return a table")
+    if stream and not stream.stale and resp.complete ~= false
+      and (resp.stop_reason == "end_turn" or resp.stop_reason == "tool_use") then
+      evidence.bind(bufnr, stream.sources, stream.marker, stream.declarations)
+    end
     if capture and resp.complete ~= false and (resp.stop_reason == "end_turn" or resp.stop_reason == "tool_use") then
       checked_transaction(bufnr, run, management.consume_pending, capture, ctx)
     end
@@ -1152,9 +1197,9 @@ local function run_turns(bufnr, ctx, run)
       -- A turn that ran tools THIS turn is not silent — it did visible work,
       -- even if the model reported end_turn without prose. Only a turn with no
       -- tool calls AND no visible text is the "returns silence" symptom.
-      local has_text = false
+      local has_text = stream and stream.visible or false
       for _, block in ipairs(resp.content or {}) do
-        local t = (block.type == "text" and block.text)
+        local t = (block.type == "text" and not (stream and stream.emitted) and block.text)
           or ((block.type == "thinking" or block.type == "redacted_thinking") and block.thinking)
         if type(t) == "string" and t:match("%S") then
           has_text = true
@@ -1263,7 +1308,7 @@ function M.start(bufnr, opts)
 
   local co = coroutine.create(function()
     local ok, ret = pcall(run_turns, bufnr, ctx, run)
-    flush_emissions(bufnr, run)
+    flush_emissions(bufnr, run, true)
     run.done = true
     finish_family(run)
     owned_contexts[ctx] = nil

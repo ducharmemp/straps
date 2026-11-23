@@ -22,7 +22,11 @@ local function cancelled(ctx)
 end
 
 local function lines(bufnr)
-  return vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  return state.transcript_lines(bufnr)
+end
+
+local function live_bytes(bufnr)
+  return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n") .. "\n"
 end
 
 local function fingerprint(value)
@@ -293,15 +297,15 @@ end
 function M.persist_checked(bufnr, previous_disk)
   if vim.bo[bufnr].buftype ~= "" or vim.api.nvim_buf_get_name(bufnr) == "" then return true, "ephemeral" end
   local path = vim.api.nvim_buf_get_name(bufnr)
-  local data, original = table.concat(lines(bufnr), "\n") .. "\n", lines(bufnr)
+  local data = live_bytes(bufnr)
   local fd, directory, attempted
   local ok, err = pcall(function()
     check_saved_source(bufnr)
     assert(disk(path) == previous_disk, "transcript file changed during compaction")
-    assert(vim.deep_equal(lines(bufnr), original), "live transcript changed before persistence")
+    assert(live_bytes(bufnr) == data, "live transcript changed before persistence")
     attempted = true
     vim.api.nvim_buf_call(bufnr, function() vim.cmd("silent noautocmd write") end)
-    assert(vim.deep_equal(lines(bufnr), original), "live transcript changed during persistence")
+    assert(live_bytes(bufnr) == data, "live transcript changed during persistence")
     assert(disk(path) == data, "transcript write verification failed")
     fd = assert(vim.uv.fs_open(path, "r", 0))
     assert(vim.uv.fs_fsync(fd))
@@ -389,7 +393,7 @@ local function transaction(source, final, ctx, appended)
   if not same then return outcome(err and "ambiguous" or "conflict", err or "transcript changed before mutation") end
   if not ok then return outcome("ambiguous", stop) end
   if stop then return outcome("error", "cancelled") end
-  local mutated, mutation_err = pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, final)
+  local mutated, mutation_err = pcall(state.replace_transcript, bufnr, final)
   if not mutated then
     same, err = source_matches(source, source.original)
     return outcome(same and "error" or "ambiguous", mutation_err)
@@ -401,7 +405,7 @@ local function transaction(source, final, ctx, appended)
       return outcome("conflict", "live transcript changed during persistence", appended)
     end
     local verified, saved = pcall(function()
-      return source.buftype ~= "" or source.path == "" or disk(source.path) == table.concat(final, "\n") .. "\n"
+      return source.buftype ~= "" or source.path == "" or disk(source.path) == live_bytes(bufnr)
     end)
     if not verified or not saved then return outcome("ambiguous", "cannot verify persisted transcript", appended) end
     return outcome("committed_live", nil, appended, persist_err)
@@ -411,7 +415,7 @@ local function transaction(source, final, ctx, appended)
   end
   same, err = source_matches(source, final)
   if not same then return outcome(err and "ambiguous" or "conflict", err or "transcript changed during failed persistence", appended) end
-  local restored, restore_err = pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, source.original)
+  local restored, restore_err = pcall(state.replace_transcript, bufnr, source.original)
   same, err = source_matches(source, source.original)
   if not restored or not same then return outcome("ambiguous", restore_err or err or "rollback could not be verified", appended) end
   return outcome("error", persist_err)
@@ -473,7 +477,8 @@ function M.consume_pending(capture, ctx)
   if source.buftype == "" and source.path ~= "" and source.disk ~= capture.disk then
     local current = table.concat(source.original, "\n") .. "\n"
     local sent = table.concat(capture.original, "\n") .. "\n"
-    if type(source.disk) ~= "string" or source.disk:sub(1, #sent) ~= sent or current:sub(1, #source.disk) ~= source.disk then
+    local saved = state.transcript_bytes(source.disk)
+    if not saved or saved:sub(1, #sent) ~= sent or current:sub(1, #saved) ~= saved then
       return outcome("conflict", "persisted transcript diverged during response")
     end
   end
@@ -917,10 +922,10 @@ function M.apply(bufnr, ctx, report, tools, note)
     final_budget = count(final_req, ctx, guard)
     assert(final_budget.tokens <= final_budget.limit, "context management: archived request exceeds input allowance")
     validate()
-    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, final)
+    state.replace_transcript(bufnr, final)
     local persisted, saved, err, persistence = pcall(M.persist_checked, bufnr, captured.source.disk)
     if not persisted or not saved then
-      local restored, restore_err = pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, candidate.original)
+      local restored, restore_err = pcall(state.replace_transcript, bufnr, candidate.original)
       local reason = persisted and err or saved
       local ambiguous = not persisted or persistence == "ambiguous"
       if ambiguous or not restored or disk_conflicts[bufnr] then

@@ -10,7 +10,7 @@ local function last(kind)
 end
 before_each(function()
   vim.cmd("only")
-  for _, name in ipairs({ "contextual_human", "ui", "agents", "registry", "state", "loop" }) do package.loaded["straps." .. name] = nil end
+  for _, name in ipairs({ "contextual_human", "ui", "agents", "registry", "state", "loop", "steering" }) do package.loaded["straps." .. name] = nil end
   vim.g.loaded_straps = nil
   if vim.env.STRAPS_HUMAN_MUTANT == "command_reason" then
     local source = table.concat(vim.fn.readfile(root .. "/lua/straps/registry.lua"), "\n")
@@ -176,6 +176,25 @@ it("captures steering before queue scheduling and keeps empty continue event-fre
   vim.cmd("StrapsContinue")
   assert.are.equal(count, #pending)
   assert.is_not_nil(last("start"))
+end)
+
+it("submits the steering draft through the contextual human adapter", function()
+  local buf = state.new_session()
+  require("straps.ui").show_session(buf, "none")
+  local origin = vim.api.nvim_get_current_win()
+  vim.cmd.StrapsSteer()
+  local draft = { "  exact draft", "second line  " }
+  local text = table.concat(draft, "\n")
+  vim.api.nvim_buf_set_lines(buf, state.draft_row(buf) + 1, -1, false, draft)
+  assert.is_nil(last("submit"))
+  vim.cmd.StrapsSend()
+  assert.are.equal(origin, vim.api.nvim_get_current_win())
+  assert.are.equal(text, last("submit")[3])
+  assert.is_nil(last("steer"))
+  assert.are.equal(text, state.draft_text(buf))
+  pending[1]()
+  assert.are.equal(text, last("steer")[3])
+  assert.is_nil(state.draft_text(buf))
 end)
 
 it("exact adoption displays bytes and rejection grants nothing", function()

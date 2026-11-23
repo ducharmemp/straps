@@ -163,7 +163,7 @@ end
     name = "hook.confirm",
     kind = "hook",
     doc = "Confirmation gate called before every tool execution as"
-      .. " (name, input, ctx) -> allowed, reason, source. source \"hook\" marks a policy veto: the"
+      .. " (name, input, ctx, call_id?) -> allowed, reason, source. source \"hook\" marks a policy veto: the"
       .. " tool result reads \"blocked by hook.confirm: <reason>\"; any other refusal reads"
       .. " \"user denied: <reason>\". Default behavior: auto-allow"
       .. " the read-only tools, i.e. every call fn.capability classifies as read (read_file, glob,"
@@ -174,11 +174,10 @@ end
       .. " show_buffer, show_terminal, set_findings, ask_user, code_action/fix_diagnostic in list mode i.e. without"
       .. " index, undo_edit in history mode, and transcript_excise in list mode"
       .. " i.e. without blocks/range);"
-      .. " otherwise prompt via vim.fn.confirm. For"
-      .. " file-editing tools (write_file, edit_file, patch_file) a unified diff of the"
-      .. " proposed change is shown in a scratch split while the dialog is up"
-      .. " (closed after; inside a batch it is computed against ctx.batch_preview(path),"
-      .. " the file as the segment's earlier edits leave it), and the prompt offers"
+      .. " otherwise prompt via vim.fn.confirm. For session file edits (write_file, edit_file, patch_file),"
+      .. " :StrapsInspect opens the proposed unified diff from the transcript on demand."
+      .. " Inside a batch it uses ctx.batch_preview(path) when available."
+      .. " :StrapsPermission opens the decision prompt, which offers"
       .. " Yes / No / 'Always in <parent dir>' / 'Always in this project <root>'"
       .. " (shown only when a project root marker — .jj/.git/.straps.lua/.hg/.svn —"
       .. " is found above the file, and not identical to the parent dir) /"
@@ -201,12 +200,7 @@ end
       .. " permits every call fn.capability puts in that category. Redefine to"
       .. " change the policy.",
     source = [==[
--- NOTE: this hook runs inside the loop coroutine. vim.fn.confirm must run on
--- the main loop; because the loop driver resumes the coroutine via
--- vim.schedule, every resume (and therefore this call) is already on the main
--- loop, so calling vim.fn.confirm directly here is safe — no extra await/
--- schedule wrapper is needed.
-return function(name, input, ctx)
+return function(name, input, ctx, call_id)
   -- Read-only tool calls (the allowlist plus the list-mode exceptions) are
   -- auto-allowed. The policy lives in fn.readonly_policy so this hook and
   -- spawn's readonly-child gate share one definition.
@@ -299,46 +293,6 @@ return function(name, input, ctx)
     end
   end
 
-  -- For file edits, render a real unified diff in a scratch split while the
-  -- dialog is up — an informed approval instead of a raw JSON dump. Best
-  -- effort: any failure just falls back to the plain input preview.
-  local preview_win
-  if is_edit then
-    pcall(function()
-      local state = require("straps.state")
-      local old
-      if ctx and type(ctx.batch_preview) == "function" then
-        pcall(function() old = ctx.batch_preview(input.path) end)
-      end
-      if type(old) ~= "string" then
-        old = ""
-        pcall(function() old = state.file_text(input.path) end)
-      end
-      local new = state.simulate_edit(name, input, old)
-      if new == nil then return end
-      local differ = (vim.text and vim.text.diff) or vim.diff
-      local diff = differ(old .. "\n", new .. "\n", { ctxlen = 3 })
-      if type(diff) ~= "string" or diff == "" then return end
-      local dlines = vim.split(diff, "\n", { plain = true })
-      if #dlines > 200 then
-        local capped = {}
-        for i = 1, 200 do capped[i] = dlines[i] end
-        capped[#capped + 1] = ("... (%d more diff lines)"):format(#dlines - 200)
-        dlines = capped
-      end
-      local pbuf = vim.api.nvim_create_buf(false, true)
-      vim.api.nvim_buf_set_lines(pbuf, 0, -1, false, dlines)
-      vim.bo[pbuf].filetype = "diff"
-      vim.bo[pbuf].bufhidden = "wipe"
-      local prev = vim.api.nvim_get_current_win()
-      vim.cmd("botright " .. math.min(#dlines + 1, 15) .. "split")
-      preview_win = vim.api.nvim_get_current_win()
-      vim.api.nvim_win_set_buf(preview_win, pbuf)
-      pcall(vim.api.nvim_set_current_win, prev)
-      vim.cmd("redraw")
-    end)
-  end
-
   local function field_listing(t)
     if type(t) ~= "table" then return vim.inspect(t) end
     local keys = vim.tbl_keys(t)
@@ -376,9 +330,6 @@ return function(name, input, ctx)
       :format(tostring(input.pattern), tostring(input.replacement), tostring(input.flags or "ge"),
         entries, entries == 1 and "y" or "ies", files, files == 1 and "" or "s")
     if input.dry_run then preview = preview .. "\ndry_run: no files will change" end
-  end
-  if preview_win then
-    preview = "diff preview shown in the split below"
   end
   if is_delete then
     preview = "Deletion is NOT undo-reversible: there is no buffer undo for a removed file.\n" .. preview
@@ -420,11 +371,15 @@ return function(name, input, ctx)
     choices = "&Yes\n&No\n&Always this tool"
   end
 
-  local choice = require("straps.attention").prompt(ctx, "permission", vim.fn.confirm,
-    "straps: allow " .. tostring(name) .. "?\n" .. preview, choices, 2)
-
-  if preview_win then
-    pcall(vim.api.nvim_win_close, preview_win, true)
+  local function present()
+    return require("straps.attention").prompt(ctx, "permission", vim.fn.confirm,
+      "straps: allow " .. tostring(name) .. "?\n" .. preview, choices, 2)
+  end
+  local choice
+  if is_edit then
+    choice = require("straps.workbench").confirm(name, input, ctx, call_id, present)
+  else
+    choice = require("straps.dock").confirm(ctx, present)
   end
 
   if choice == 1 then

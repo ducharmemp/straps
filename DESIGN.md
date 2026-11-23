@@ -756,31 +756,32 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
      was drained, CONTINUE the loop (another provider call) instead of
      finishing — a message typed while the model streamed its final answer
      still gets acted on. `max_turns` still bounds total iterations.
-- UI: `<CR>` / `:StrapsSend` on a session buffer with an active run prompt
-  via `vim.ui.input({prompt = "steer: "})` and call `loop.steer` (empty/nil
-  input = no-op). `:StrapsSteer {text}` (nargs=+) queues directly.
+- `:StrapsSteer {text}` submits the supplied text directly. With no arguments,
+  `:StrapsSteer` opens or focuses a steering split, even when idle. During a
+  run or with a nonblank draft, `<CR>` and `:StrapsSend` open the same split.
+- The split shares the original session buffer and displays its tail. The
+  opening window keeps its reading position. Closing or submitting restores
+  its saved view when the window still displays the original buffer.
+- `%%[straps:draft]%%` separates the editable draft from the conversation. An
+  extmark tracks the boundary. Streaming and context replacement write before
+  it; transcript parsing and context digests exclude the draft. Closing the
+  split leaves the draft in the session file. Submitting a nonblank draft
+  closes the split and delivers it through the human submission path in
+  contextual mode. On delivery, an unchanged draft is cleared. If the run
+  has ended, delivery puts the text in the trailing user block without starting
+  a run. Blank submissions leave the split open.
 
-### One buffer, no compose split
+### One session buffer
 
-The session is a single ordinary buffer — no second "compose" window. Message
-authoring happens directly under the trailing `%%[straps:user]%%` marker, the
-same buffer the loop reads and appends to. This keeps the whole interaction
-as close to normal vim as possible: no separate input mode, no synced pair of
-buffers to keep straight, and — deliberately — editing earlier history before
-you send is a first-class feature, not an accident of the buffer being
-mutable. It follows directly from invariant 1 (buffers are state): there is
-only one buffer, so there is only one place to look and only one place to
-edit.
+Ordinary requests are edited under the trailing `%%[straps:user]%%` marker.
+Both views share the editable transcript, including its undo history.
 
 - `ui.open_session(split_cmd?)` opens the transcript in a single split
   (the `split_cmd` string, default `"split"`; `:Straps` passes what the
   invocation's `<mods>` parsed to, so `:vertical Straps` is a vsplit), sets
-  the `<CR>` keymap (send, or prompt to steer if a run is active — see
-  above), and puts the cursor on the last line.
-- Sending (`<CR>` normal mode on the session buffer, or `:StrapsSend` there):
-  if a run is active, prompt via `vim.ui.input({prompt = "steer: "})` and
-  queue; otherwise `loop.start(bufnr)`, which parses the buffer as-is — the
-  trailing user block (or whatever the user left there) IS the message. An
+  the `<CR>` keymap (send or steer), and puts the cursor at the end.
+- Without an active run or a nonblank steering draft, ordinary sending with
+  `<CR>` or `:StrapsSend` starts the run from the trailing user block.
   empty trailing block makes `loop.start` warn "nothing to send" through
   `vim.notify` and return without starting a run or touching the transcript,
   including after a terminal harness note. It checks `state.last_user_text`
@@ -790,8 +791,8 @@ edit.
 - Target resolution for `:StrapsSend`/`:StrapsSteer`/`:StrapsStop`/
   `:StrapsContinue`/`:StrapsCompact`/`:StrapsRename`/`:StrapsAuto`
   (`ui.require_session`): the current buffer when it is a session buffer
-  (`vim.b.straps_session`), else the session shown in the only session window
-  of the current tab; otherwise one shared `ui.NOT_A_SESSION` WARN and nothing
+  (`vim.b.straps_session`), else the sole distinct session buffer visible
+  in the current tab; otherwise one shared `ui.NOT_A_SESSION` WARN and nothing
   happens.
 - `:StrapsContinue [text]` continues a stopped or interrupted run. It needs no
   saved run state — invariant 1 again: `loop.stop` already leaves a well-formed
@@ -802,6 +803,18 @@ edit.
   buffer. Run-scoped bookkeeping — turn budget, stall counter, blank nudges —
   starts over; the conversation does not. Distinct from `:StrapsResume`, which
   reopens a saved transcript from disk.
+
+### Current-turn decoration
+
+`turn_decoration` defaults to `true` and respects `render = false`. The loop sets an extmark on the assistant block at provider dispatch. The next provider turn replaces that extmark. Run termination and buffer unload clear it. Buffer-local extmarks add a one-cell rule to transcript lines from the anchor through the end of the turn, excluding the draft. Native fold summaries carry the same rule. The feature does not change buffer text or window options.
+
+The decoration reads Workbench pending metadata and the permission/consent wait state. Workbench identifies the action by provider tool-call ID when available. Without an ID, Straps marks the action only when one unresolved call matches in the current turn. The winbar reports pending approval even if the action is ambiguous or outside the viewport. A disabled or replaced winbar stays disabled or replaced. `StrapsTurnAccent` and `StrapsPermit` default-link to `Identifier` and `DiagnosticWarn` under the active colorscheme.
+
+### Session dock
+
+`session_dock` defaults to `false`. When enabled, default session opens request a native seven-line split at the bottom of the tab. Explicit placement modifiers override the dock. The split displays the session buffer, so Neovim controls scrolling, resizing, undo, and draft retention. The dock's winbar keeps the conversation name and permission state visible even if another window has focus or `session_winbar = false`.
+
+`dock.lua` tracks dock windows and pending presentations by session buffer. If a dock exists when a default tool confirmation or contextual consent request reaches presentation, the run waits and the winbar reports `Permission pending`. The default file-edit confirmation path also defers approval for ordinary transcript windows. `workbench.pending(bufnr)` returns detached metadata (`call_id` when supplied by the provider, `name`, and `path`) from arrival through decision or cancellation. `:StrapsInspect` opens one read-only unified diff beside the originating transcript without entering the split. Closing the split does not resolve the request. The preview uses the staged batch base when available, then falls back to the live file buffer or disk. It does not authorize or apply an edit. `:StrapsPermission` resolves a session through the ordinary session-command rules and presents its waiting request. The existing confirmation or consent code handles the decision. Cancellation removes the pending presentation. Custom confirmation and consent implementations retain their own presentation behavior.
 
 ### Terminal attention
 
@@ -2162,7 +2175,7 @@ Default hooks registered here:
 - `fn.readonly_policy(name, input) -> boolean` — now a thin wrapper:
   `capability(name, input) == "read"`. Both `hook.confirm` and spawn's child
   gate consult the shared classification, including session skill definitions.
-- `hook.confirm(name, input, ctx) -> allowed, reason` — auto-allow the
+- `hook.confirm(name, input, ctx, call_id?) -> allowed, reason, source` — auto-allow the
   read-only tools (via `fn.readonly_policy`); honor category grants — a key
   of the form `cap:<category>` in the per-session grant set
   (`registry.granted(ctx.bufnr)`) silently permits every call
@@ -2189,10 +2202,10 @@ Default hooks registered here:
   field-per-line preview of their input; bulk_replace's preview names its
   pattern, replacement and the findings-list entry and file counts.
   delete_file/delete_files prompt Yes / No only, with a warning that deletion
-  is not undo-reversible. The diff preview reads the file's loaded buffer, or
-  the file on disk when no buffer is loaded, so a denied prompt leaves no
-  buffer behind. Must be called on the main loop (wrap in a
-  scheduled await, since we're inside a coroutine driven from callbacks).
+  is not undo-reversible. The Workbench reads the file's loaded buffer or
+  disk without opening the target buffer. The decision or cancellation closes
+  the preview if it is still open. Synchronous callers get the decision prompt
+  without an inspect action.
 
 **Tool-call guards (`hook.guard.*`)** — the user-installed policy chain in
 front of and behind every tool call and every entry mutation. No guard ships;
@@ -2467,6 +2480,14 @@ Written for agent-ability and ecosystem norms; concise, imperative:
 - Project instructions from AGENTS.md/CLAUDE.md, when present, appear in a
   later section and take precedence over general guidance here.
 
+## Claim evidence
+
+The request note tells the model to emit `[[straps-evidence]] ` followed by a JSON object with `claim` and `quote` strings after prose when it can cite a specific result. The loop filters declaration lines before appending text to the transcript, including declarations split across provider deltas. No tool, permission grant, additional provider request, or transcript metadata is involved.
+
+For a completed response, the evidence module requires one exact claim occurrence in the assistant text and one exact quote occurrence across structured tool results in that request. It binds only to a unique earlier result block whose original body still matches the request. It rejects summaries, archive receipts, and overlapping claims. The model chooses what supports its claim; Straps validates location and identity, not entailment. Declarations are bounded to eight lines of up to 4096 bytes each. Each claim and quote occupies one line.
+
+Session-local extmarks track positions as other transcript lines move. The evidence action and winbar check the claim line and source block against the captured text; no search for replacement evidence runs after an edit. Neither persistence nor fork copies these links. The winbar uses the rendered window's cursor. `gE` opens the source fold and records the claim in the native jumplist for `Ctrl-O`.
+
 ## Transcript rendering ("Quiet blocks") — fn.render + themed highlights
 
 Presentation layer over the untouched marker buffer. The `%%[straps:KIND]%%`
@@ -2556,12 +2577,9 @@ Idempotent: clears before repopulating, so N renders == 1 render's extmarks.
 
 ### Collapse (folds + colored foldtext)
 
-Tool_use/tool_result pairs collapse to one summary line. The system block, harness notices, and agent messages also fold. Each notice has a separate fold whose summary shows `harness` or `agent N` and its first content line. Ordinary user and assistant turns remain open under `zM`. Default `foldlevel=0` closes these folds; `config.tools_expanded` raises it to 99 and opens them all. The whole-session
-reading scale is served by the outline (`gO`) and the `]]`/`[[` turn motions
-instead of turn folds; the outline line is
-`<role>  <headline> · N tools` — the headline is the block's first content
-line (text typed on the marker line wins, since `state.match_marker` treats
-it as content), truncated with `…`.
+Tool_use/tool_result pairs collapse to one summary line. The system block, harness notices, and agent messages also fold. Each notice has a separate fold whose summary shows `harness` or `agent N` and its first content line. Ordinary user and assistant turns remain open under `zM`. Default `foldlevel=0` closes these folds; `config.tools_expanded` raises it to 99 and opens them all. The `gO` location-list outline shows `<role>  <headline> · N tools`, with the block's first content line truncated with `…`. Text typed on the marker line takes precedence.
+
+`:StrapsOutline` opens a separate tab with the original transcript buffer. `straps.outline` creates native manual folds from each earlier user prompt to the line before the next prompt. Fold labels use the first nonblank prompt line and its ordinal. Harness and agent notices are not headings. The latest turn and any draft stay open. The reading window uses no nested tool folds, so `zo` reveals the whole turn. No run hook creates or closes outline folds. Closing the reading window returns to the original view with its native fold state intact.
 
 `foldtext` is a function returning a **chunk list** `{{text,hl},...}` (Neovim
 ≥0.10) so every collapsed summary is colored, NOT hidden grey. For a tool call:
@@ -3053,8 +3071,7 @@ Presentation tools (also lua/straps/editor.lua) turn agent output into real
 Neovim views instead of transcript prose. They change no files — they open
 views / set the findings list — so `hook.confirm` auto-allows them like
 show_user, and they never steal the user's focus. A shared PRELUDE helper
-(`new_split_win`, `scratch_buf`, `unified_diff`) keeps them DRY and factors the
-unified-diff renderer that the confirm-dialog edit preview also uses.
+(`new_split_win`, `scratch_buf`, `unified_diff`) implements the shared view operations.
 
 - `show_diff {path, content}` (proposed vs current) or `{left, right,
   filetype?, left_label?, right_label?}` (two texts) — a native `:diffthis`

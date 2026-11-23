@@ -94,9 +94,18 @@ function M.permission_wait(bufnr)
   return false
 end
 
+function M.wait_label(bufnr, dock)
+  local workbench = package.loaded["straps.workbench"]
+  local edit = workbench and workbench.pending(bufnr)
+  local label = require("straps").config.render ~= false and "%#StrapsPermit#◆ waiting%*" or "waiting"
+  if edit then return label .. " — Permission pending (:StrapsInspect / :StrapsPermission)  " end
+  if dock then return label .. " — Permission pending (:StrapsPermission)  " end
+  return M.permission_wait(bufnr) and label .. "  " or ""
+end
+
 local function redraw_permission(kind, bufnr)
   if kind == "permission" or kind == "consent" then
-    pcall(function() require("straps.turn_decoration").redraw(bufnr) end)
+    pcall(vim.cmd, "redrawstatus!")
   end
 end
 

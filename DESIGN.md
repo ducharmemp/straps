@@ -804,11 +804,13 @@ Both views share the editable transcript, including its undo history.
   starts over; the conversation does not. Distinct from `:StrapsResume`, which
   reopens a saved transcript from disk.
 
-### Current-turn decoration
+### Pending permissions
 
-`turn_decoration` defaults to `true` and respects `render = false`. The loop sets an extmark on the assistant block at provider dispatch. The next provider turn replaces that extmark. Run termination and buffer unload clear it. Buffer-local extmarks add a one-cell rule to transcript lines from the anchor through the end of the turn, excluding the draft. Native fold summaries carry the same rule. The feature does not change buffer text or window options.
+The session winbar reports pending approval while the reader scrolls through earlier work. A disabled or replaced winbar stays disabled or replaced. `StrapsPermit` links to `DiagnosticWarn` by default.
 
-The decoration reads Workbench pending metadata and the permission/consent wait state. Workbench identifies the action by provider tool-call ID when available. Without an ID, Straps marks the action only when one unresolved call matches in the current turn. The winbar reports pending approval even if the action is ambiguous or outside the viewport. A disabled or replaced winbar stays disabled or replaced. `StrapsTurnAccent` and `StrapsPermit` default-link to `Identifier` and `DiagnosticWarn` under the active colorscheme.
+### Since-you-left divider
+
+`since_you_left.lua` tracks focus and one unread divider per loaded session buffer. An unfocused session can receive a divider even with a split still visible. Transcript writers identify assistant and tool output and framed notices; the run loop identifies provider deltas. Draft writes, history edits, and empty assistant placeholders do not set a divider. A virtual line marks the first affected transcript line, including when streaming resumes on a line with existing text. The divider does not enter the transcript or persist across unloads. Later output leaves the extmark in place. Cursor movement or scrolling past the marked line in the focused transcript clears it for all views. `render = false` disables the feature.
 
 ### Session dock
 
@@ -2513,10 +2515,10 @@ schemes clear highlights on load.
 | StrapsRoleAgent | Keyword         | the `Cinch` (agent) role tag + leading rule segment |
 | StrapsRoleSystem| Comment         | the `system` tag (dim) |
 | StrapsRoleNotice| Identifier      | the `harness` / `agent N` tag on a notice carried in a user block |
-| StrapsTool      | Special         | `⚙` glyph + tool name |
-| StrapsToolOk    | DiagnosticOk    | `✓` on a good result |
-| StrapsToolError | DiagnosticError | `✗` on `is_error` |
-| StrapsRule      | Comment         | the turn rules |
+| StrapsTool      | Special         | expanded tool command verb |
+| StrapsToolOk    | DiagnosticOk    | legacy link; closed folds use `StrapsRule` for `ok` |
+| StrapsToolError | DiagnosticError | `failed` in closed tool folds |
+| StrapsRule      | Comment         | turn rules and muted closed-fold text |
 | StrapsCardBorder| Comment         | the expanded-tool box art |
 | StrapsWinbar    | WinBar          | session-window winbar |
 | StrapsWinbarNC  | WinBarNC        | that winbar in a non-current window |
@@ -2581,17 +2583,29 @@ Tool_use/tool_result pairs collapse to one summary line. The system block, harne
 
 `:StrapsOutline` opens a separate tab with the original transcript buffer. `straps.outline` creates native manual folds from each earlier user prompt to the line before the next prompt. Fold labels use the first nonblank prompt line and its ordinal. Harness and agent notices are not headings. The latest turn and any draft stay open. The reading window uses no nested tool folds, so `zo` reveals the whole turn. No run hook creates or closes outline folds. Closing the reading window returns to the original view with its native fold state intact.
 
-`foldtext` is a function returning a **chunk list** `{{text,hl},...}` (Neovim
-≥0.10) so every collapsed summary is colored, NOT hidden grey. For a tool call:
-`▸ ⚙ <tool_name>   <first input line / id>   ✓|✗` — StrapsTool on the glyph +
-name, StrapsToolOk/Error on the status mark, StrapsRule on the rest.
+`foldtext` returns highlighted chunks. A closed tool fold reads, for example,
+`▸ read_file  src/main.lua · ok`. `StrapsRule` mutes the chevron, tool name
+and count. `Normal` gives the target full contrast, and `StrapsToolError`
+colors `failed` through `DiagnosticError`.
 
-Expanded tool (fold open): a `virt_lines` header rule above the tool_use
-(`╭─ ⚙ <name> ─────`, StrapsCardBorder + StrapsTool) and a closing rule after
-the tool_result (`╰────`), with a `result` divider rule before the
-tool_result. **No right-hand border / no full 4-sided box** — right-edge
-alignment across variable-width content is fragile (the Option-B pitfall);
-left-anchored top/divider/bottom rules give the card feel robustly.
+The target comes from a string input field (`path`, `filename`, `file` or
+`url`), the first line of a shell command for command tools, or the pattern
+for `glob` and `grep` when no path is present. A standalone result shows its
+call ID if known. A call takes metadata from a result with the same ID in
+its own fold. The result marker's boolean `is_error` supplies `ok` or
+`failed`. A nonnegative integer `count` supplies `count: N` when present;
+the default tool runner does not write a count. Missing or invalid values
+are omitted. The summary never reads the result body.
+
+Expanded tools retain the command header, `result` divider, and closing rule.
+Each open result body adds `StrapsCardBorder` virtual text at column zero:
+`╭` on the first content line, `│` on interior lines, and `╰` on the last.
+The renderer skips leading and trailing whitespace-only lines. A one-line
+result uses `│`; an empty result has no bracket. Tool inputs and prose have
+no bracket prefix. The prefix appears once per buffer line, so wrapped
+continuation rows do not repeat it. Neovim hides the body decorations when
+a window closes the fold. The renderer clears them when `render = false`.
+The prefix reserves display cells without changing the transcript or yanks.
 
 ### Navigation (turn motions + outline)
 
@@ -2643,15 +2657,11 @@ a shell line, reads/writes/greps as terse verbs.
   (StrapsRule). Single-token displays are all-verb. So bash reads as a colored
   `$` prompt + dim command, not a wash.
 
-Wire into both render surfaces, replacing the old `⚙ <name>  <first input line>`:
-- `_fold_summary` (the collapsed default view): decode the tool_use block's JSON
-  content, call fn.tool_display, render `▸ <verb> <args>   ✓|✗`.
-- the expanded card header (`render_block` tool_use): `╭─ <verb> <args> ─────`.
-- Add a helper to decode a tool_use block's content to a table (pcall, {} on
-  failure) since both sites need the input.
-- v1 leaves the expanded JSON body as raw detail (fully terminal-rendering the
-  multi-line body is blocked by conceal not removing lines — a possible v2).
-  The default (folded) view is command-style, which is the win.
+The expanded card header uses `fn.tool_display` and retains the JSON input
+body. The default closed fold uses the tool name and structured input fields.
+A `fn.tool_display` override also formats the closed fold: its first token
+is muted and its remaining text uses normal contrast. If the override
+throws or returns a non-string, the fold falls back to the tool name.
 
 Redefinable like everything: `:StrapsEdit fn.tool_display` to add a formatter
 for an agent-defined tool or change the style.
@@ -2686,8 +2696,8 @@ possible, assert on `nvim_buf_get_extmarks(buf, ns, ..., {details=true})`:
   same labels, aligned.
 - message body lines carry NO straps-render extmark (color only on marks).
 - fn.render is idempotent (same extmark set after two runs).
-- the foldtext function (exposed for test) returns a colored chunk list with
-  StrapsTool + StrapsToolOk for a good result, StrapsToolError for is_error.
+- the closed tool fold returns muted labels, a normal-contrast target and
+  status or count from result markers, with `StrapsToolError` for a failure.
 - highlight groups exist and resolve to their link target
   (`nvim_get_hl(0,{name=...,link=true})`), and a user `hi link StrapsTool X`
   survives a re-apply (default=true).

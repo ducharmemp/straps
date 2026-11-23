@@ -487,6 +487,19 @@ display-only layer of conceal + extmarks + folds over the raw markers; nothing
 mutates the buffer text. `:set conceallevel=0` reveals the raw markers, and
 |straps-config| `render = false` turns the whole layer off.
 
+Closed tool folds show a muted chevron and tool name, a target when known,
+and status or count from result marker metadata. `failed` uses
+`StrapsToolError`. The fold does not infer metadata from output.
+An override of |fn.tool_display| formats the label and target text.
+Open a tool fold with |zo| to see a muted `╭ │ ╰` bracket to the left of its
+output. The bracket uses `StrapsCardBorder` and does not enter yanked text.
+Prose and tool inputs have no bracket prefix.
+
+The `── since you left ──` divider marks the first line affected by output
+while the transcript is unfocused, even when a split still shows it. Draft
+edits do not set the divider. Move the cursor or scroll the top of the view
+past it to clear it in all views. `render = false` disables the divider.
+
 							*straps-steering*
 Steering. A message sent while a run is active is queued (not started as a new
 run) and drained into the transcript at the next turn boundary, so the model
@@ -517,12 +530,7 @@ Buffer/window leave removes only the Straps expression and restores the prior
 local value. Returning to the session reinstalls the expression. Global values
 and user replacements remain unchanged.
 
-Current turn. A thin accent rule marks the active model turn. When Straps
-can identify the tool call awaiting approval, its line shows `◆ permit`.
-The session winbar shows `◆ waiting` even when the action is out of view.
-Set `turn_decoration = false` to disable these decorations. `render = false`
-also disables them.
-The rule and label leave transcript text, cursor and focus unchanged.
+The session winbar shows `◆ waiting` when a permission request needs a decision.
 
 Own components. `ui.session_info(bufnr)` returns the session's RESOLVED state
 (provider, model, model_label, effort, overridden, status, parent, usage,
@@ -666,8 +674,6 @@ auto_compact_tokens	(number|nil) nil (off). Auto-compact when the estimated
 auto_compact_bytes	context passes this threshold. Both off by default.
 render			(boolean) true. Master switch for the |fn.render|
 			presentation layer.
-turn_decoration		(boolean) true. Show the current-turn rule and
-			approval decoration. Requires `render`.
 tools_expanded		(boolean) false. Fold tool blocks OPEN by default.
 session_winbar		(boolean) true. Window-local model/status winbar on
 			session windows. The dock retains its identity and
@@ -1414,7 +1420,8 @@ fn.system_prompt_layer.<name>(opts) -> string|nil
 fn.render(bufnr)		The transcript presentation pass (conceal +
 				extmarks + folds). No-op it for raw markers.
 						*fn.tool_display*
-fn.tool_display(name, input)	Format a tool call as a command-style line.
+fn.tool_display(name, input)	Format the expanded tool header. Overrides also
+				set the closed fold's label and target.
 						*fn.compact*
 fn.compact(bufnr, opts?)	Mechanically shrink old tool block contents;
 				returns a summary. |:StrapsCompact|.
@@ -2128,7 +2135,6 @@ follow your colorscheme; a user `hi link` wins and survives a re-apply.
 	StrapsCardBorder	Comment		expanded-tool box art
 	StrapsWinbar		WinBar		session-window winbar
 	StrapsWinbarNC		WinBarNC	that winbar in a non-current window
-	StrapsTurnAccent	Identifier	current-turn rule
 	StrapsPermit		DiagnosticWarn	pending approval
 	StrapsProgress		Comment		run-progress text on the last line
 	StrapsFileRef		Underlined	path:line references

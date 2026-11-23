@@ -4,6 +4,7 @@
 -- (callers schedule as needed).
 
 local registry = require("straps.registry")
+local since_you_left = require("straps.since_you_left")
 local uv = vim.uv
 
 local M = {}
@@ -540,13 +541,12 @@ function M._blocks_cache_size()
   return n
 end
 
--- Windows showing bufnr with the cursor on the last line stay pinned to the
--- new bottom after a mutation.
 local function with_pin(bufnr, mutate)
   local last = M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
   local pinned = {}
   for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
-    if vim.w[win].straps_steer_origin ~= bufnr and vim.api.nvim_win_get_cursor(win)[1] == last then
+    if vim.w[win].straps_steer_origin ~= bufnr and vim.api.nvim_win_get_cursor(win)[1] == last
+      and since_you_left.follow(win, bufnr) then
       pinned[#pinned + 1] = win
     end
   end
@@ -1030,14 +1030,21 @@ function M.append(bufnr, kind, attrs, text)
       lines[#lines + 1] = escape_line(l)
     end
   end
+  local output = kind == "tool_use" or kind == "tool_result"
+    or (kind == "assistant" and text ~= nil and text ~= "")
+    or (kind == "user" and since_you_left.wants_output(bufnr) and M.notice_of(text) ~= nil)
   with_pin(bufnr, function()
     local tail = M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
+    local row
     if buffer_is_blank(bufnr) then
+      row = 0
       vim.api.nvim_buf_set_lines(bufnr, 0, tail, false, lines)
     else
+      row = tail + 1
       table.insert(lines, 1, "")
       vim.api.nvim_buf_set_lines(bufnr, tail, tail, false, lines)
     end
+    if output then since_you_left.output(bufnr, row) end
   end)
   -- Block boundary: persist a file-backed buffer (no-op on scratch buffers).
   M.persist(bufnr)
@@ -1045,12 +1052,15 @@ end
 
 --- Append raw text at the buffer tail (streaming deltas into the current
 --- block); text may contain "\n".
-function M.append_text(bufnr, text)
+function M.append_text(bufnr, text, output)
+  local first_row
   with_pin(bufnr, function()
     local row = (M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)) - 1
     local tail = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ""
     local pieces = vim.split(text, "\n", { plain = true })
     local mk, _, minline = match_marker(tail)
+    first_row = mk and not minline and row + 1 or row
+    if pieces[1] == "" and #pieces > 1 and first_row == row and tail ~= "" then first_row = row + 1 end
     if mk and not minline then
       for i, piece in ipairs(pieces) do if piece == DRAFT_MARKER then pieces[i] = escape_line(piece) end end
       vim.api.nvim_buf_set_lines(bufnr, row + 1, row + 1, false, pieces)
@@ -1068,6 +1078,7 @@ function M.append_text(bufnr, text)
       vim.api.nvim_buf_set_text(bufnr, row, #tail, row, #tail, pieces)
     end
   end)
+  if output and text ~= "" then since_you_left.output(bufnr, first_row) end
 end
 
 --- Append an empty user marker unless the last block already is one.

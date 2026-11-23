@@ -28,14 +28,13 @@ local HL_LINKS = {
   StrapsRoleAgent = "Keyword",     -- the `Cinch` (agent) role tag + leading rule segment
   StrapsRoleSystem = "Comment",    -- the `system` tag (dim)
   StrapsRoleNotice = "Identifier", -- the `harness` / `agent N` tag on a notice in a user block
-  StrapsTool = "Special",          -- ⚙ glyph + tool name
-  StrapsToolOk = "DiagnosticOk",   -- ✓ on a good result
-  StrapsToolError = "DiagnosticError", -- ✗ on is_error
+  StrapsTool = "Special",
+  StrapsToolOk = "DiagnosticOk",
+  StrapsToolError = "DiagnosticError",
   StrapsRule = "Comment",          -- the turn rules
   StrapsCardBorder = "Comment",    -- the expanded-tool box art
   StrapsWinbar = "WinBar",         -- session-window winbar (model/effort/status)
   StrapsWinbarNC = "WinBarNC",     -- the same winbar in a non-current window
-  StrapsTurnAccent = "Identifier",
   StrapsPermit = "DiagnosticWarn",
   StrapsProgress = "Comment",      -- the run-progress virtual text on the last line
   StrapsFileRef = "Underlined",    -- path:line[:col] under treesitter (apply_file_ref_match)
@@ -248,8 +247,6 @@ end
 
 -- Decode a tool_use block's content (pretty-printed JSON of the tool input)
 -- into a Lua table. pcall-safe: returns {} on empty content or decode failure.
--- Both render surfaces (fold summary + expanded card header) need the input to
--- build the command-style fn.tool_display line.
 local function decode_tool_input(bufnr, blk)
   if not blk or blk.first_lnum > blk.last_lnum then
     return {}
@@ -267,8 +264,9 @@ end
 -- (StrapsRule, leading space kept). pcall/try_call so a broken redefinition can
 -- never break rendering — it falls back to the bare tool name. Single-token
 -- displays are all-verb (empty args). Returns verb, args.
-local function tool_display_parts(bufnr, blk, name)
-  local input = decode_tool_input(bufnr, blk)
+local TOOL_DISPLAY_SRC
+
+local function tool_display_parts(name, input)
   local ok, disp = pcall(require("straps.registry").try_call, "fn.tool_display", name, input)
   local display = (ok and type(disp) == "string" and disp) or name
   local sp = display:find(" ", 1, true)
@@ -278,24 +276,49 @@ local function tool_display_parts(bufnr, blk, name)
   return display, ""
 end
 
--- The tool_result block paired with the tool_use at blocks[idx] (matching id
--- when available, else the next tool_result), or nil.
-local function paired_result(blocks, idx, id)
-  for i = idx + 1, #blocks do
-    local b = blocks[i]
-    if b.kind == "tool_result" then
-      if not id or not (b.attrs and b.attrs.id) or b.attrs.id == id then
-        return b
-      end
-    end
-  end
-  return nil
+
+local function fold_label(value)
+  if type(value) ~= "string" or not value:find("%S") then return end
+  return vim.fn.strtrans(value)
 end
 
---- Returns {{text, hl}, ...}: a tool_use folds to `▸ <verb> <args>   ✓|✗`
---- (command-style via fn.tool_display — StrapsTool verb, dim StrapsRule
---- args); a dangling tool_result keeps `▸ ⚙ result …`.
---- StrapsToolOk/StrapsToolError on the mark.
+local function fold_target(name, input)
+  for _, key in ipairs({ "path", "filename", "file", "url" }) do
+    local target = fold_label(input[key])
+    if target then return target end
+  end
+  if name == "bash" or name == "run_in_terminal" or name == "run_quickfix" then
+    local command = type(input.command) == "string" and input.command or ""
+    local first = fold_label(command:match("^[^\r\n]*"))
+    return first and (first .. (command:find("[\r\n]") and " …" or ""))
+  end
+  if name == "glob" or name == "grep" then return fold_label(input.pattern) end
+end
+
+local function fold_result_attrs(blocks, idx, id)
+  if type(id) ~= "string" or id == "" then return end
+  for i = idx + 1, #blocks do
+    local b = blocks[i]
+    if b.kind ~= "tool_result" then return end
+    if b.attrs and b.attrs.id == id then return b.attrs end
+  end
+end
+
+local function tool_fold_summary(name, target, result)
+  local chunks = { { "▸ ", "StrapsRule" }, { name, "StrapsRule" } }
+  if target then chunks[#chunks + 1] = { "  " .. target, "Normal" } end
+  if result then
+    if type(result.is_error) == "boolean" then
+      chunks[#chunks + 1] = { " · ", "StrapsRule" }
+      chunks[#chunks + 1] = result.is_error and { "failed", "StrapsToolError" } or { "ok", "StrapsRule" }
+    end
+    local count = result.count
+    if type(count) == "number" and count >= 0 and count < math.huge and count % 1 == 0 then
+      chunks[#chunks + 1] = { " · count: " .. count, "StrapsRule" }
+    end
+  end
+  return chunks
+end
 function M._fold_summary(bufnr, start_lnum)
   local blocks = require("straps.state").list_blocks(bufnr)
   local idx, blk
@@ -326,66 +349,33 @@ function M._fold_summary(bufnr, start_lnum)
       { (" · %d lines"):format(nlines), "StrapsRule" },
     }
   end
-  -- A tool_use folds to a command-style line: `▸ <verb> <args>   ✓|✗` — the
-  -- verb (leading token of fn.tool_display) colored StrapsTool, the args dim
-  -- StrapsRule. This replaces the old `⚙ <name>  <first input line>` view.
   if blk and blk.kind == "tool_use" then
-    local name = (blk.attrs and blk.attrs.name) or "tool"
-    local verb, args = tool_display_parts(bufnr, blk, name)
-    local is_error, has_status = false, false
-    local tr = paired_result(blocks, idx, blk.attrs and blk.attrs.id)
-    if tr then
-      is_error = (tr.attrs and tr.attrs.is_error) or false
-      has_status = true
+    local attrs = blk.attrs or {}
+    local name = fold_label(attrs.name) or "tool"
+    local input = decode_tool_input(bufnr, blk)
+    local entry = require("straps.registry").get("fn.tool_display")
+    local target
+    if entry and entry.source ~= TOOL_DISPLAY_SRC then
+      local verb, args = tool_display_parts(name, input)
+      name = fold_label(verb) or name
+      target = fold_label(vim.trim(args))
+    else
+      target = fold_target(name, input)
     end
-    local chunks = {
-      { "▸ ", "StrapsRule" },
-      { verb, "StrapsTool" },
-    }
-    if args ~= "" then
-      chunks[#chunks + 1] = { args, "StrapsRule" }
-    end
-    if has_status then
-      chunks[#chunks + 1] = { "   ", "StrapsRule" }
-      chunks[#chunks + 1] = { is_error and "✗" or "✓", is_error and "StrapsToolError" or "StrapsToolOk" }
-    end
-    return chunks
+    return tool_fold_summary(name, target, fold_result_attrs(blocks, idx, attrs.id))
   end
-
-  -- tool_result (a dangling result, or the fallback): keep the ⚙ label form.
-  local name, detail, is_error, has_status = "tool", "", false, false
   if blk and blk.kind == "tool_result" then
-    name = "result"
-    detail = (blk.attrs and blk.attrs.id) or ""
-    is_error = (blk.attrs and blk.attrs.is_error) or false
-    has_status = true
+    local attrs = blk.attrs or {}
+    return tool_fold_summary("result", fold_label(attrs.id), attrs)
   end
-  local chunks = {
-    { "▸ ", "StrapsRule" },
-    { "⚙ " .. name, "StrapsTool" },
-  }
-  if detail ~= "" then
-    chunks[#chunks + 1] = { "   " .. detail, "StrapsRule" }
-  end
-  if has_status then
-    chunks[#chunks + 1] = { "   ", "StrapsRule" }
-    chunks[#chunks + 1] = { is_error and "✗" or "✓", is_error and "StrapsToolError" or "StrapsToolOk" }
-  end
-  return chunks
+  return { { "▸ ", "StrapsRule" }, { "⚙ tool", "StrapsTool" } }
 end
 
 --- foldtext function for session buffers (Neovim >= 0.10 renders the returned
 --- chunk list with color). Reads v:foldstart in the current buffer.
 function M.foldtext()
   local buf = vim.api.nvim_get_current_buf()
-  local chunks = M._fold_summary(buf, vim.v.foldstart)
-  local decoration = require("straps.turn_decoration")
-  local first, last, permit = decoration.rows(buf)
-  local row = vim.v.foldstart - 1
-  if first and row >= first and row <= last then
-    return vim.list_extend(decoration.chunks(permit and permit >= row and permit < vim.v.foldend), chunks)
-  end
-  return chunks
+  return M._fold_summary(buf, vim.v.foldstart)
 end
 
 -- Conceal the leading marker token on a marker line (display-only).
@@ -422,9 +412,7 @@ local function render_block(bufnr, blk)
     -- hides the interior and shows only the colored foldtext.)
     conceal_marker(bufnr, row, line)
     local name = (blk.attrs and blk.attrs.name) or "tool"
-    -- Command-style header: `╭─ <verb> <args> ─────` (fn.tool_display, same
-    -- verb/args split as the fold summary). Left-anchored, no right border.
-    local verb, args = tool_display_parts(bufnr, blk, name)
+    local verb, args = tool_display_parts(name, decode_tool_input(bufnr, blk))
     local header = {
       { "╭─ ", "StrapsCardBorder" },
       { verb, "StrapsTool" },
@@ -448,7 +436,19 @@ local function render_block(bufnr, blk)
         { bar(RULE_WIDTH - 10), "StrapsCardBorder" },
       } },
     })
-    local close_row = math.max(blk.first_lnum - 1, blk.last_lnum - 1)
+    local first, last = blk.first_lnum - 1, blk.last_lnum - 1
+    local lines = vim.api.nvim_buf_get_lines(bufnr, first, last + 1, false)
+    local lo, hi = 1, #lines
+    while lo <= hi and lines[lo]:match("^%s*$") do lo = lo + 1 end
+    while hi >= lo and lines[hi]:match("^%s*$") do hi = hi - 1 end
+    for i = lo, hi do
+      local edge = lo == hi and "│" or (i == lo and "╭" or (i == hi and "╰" or "│"))
+      vim.api.nvim_buf_set_extmark(bufnr, render_ns, first + i - 1, 0, {
+        virt_text = { { edge .. " ", "StrapsCardBorder" } },
+        virt_text_pos = "inline",
+      })
+    end
+    local close_row = math.max(row, last)
     vim.api.nvim_buf_set_extmark(bufnr, render_ns, close_row, 0, {
       virt_lines_above = false,
       virt_lines = { { { "╰" .. bar(RULE_WIDTH - 1), "StrapsCardBorder" } } },
@@ -771,7 +771,9 @@ local function present_session(bufnr, split_cmd)
     M._attach_render(bufnr)
   end
   M.map_session_keys(bufnr)
-  vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(bufnr), 0 })
+  if not require("straps.since_you_left").preserve_view(bufnr) then
+    vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(bufnr), 0 })
+  end
   return bufnr
 end
 
@@ -1394,7 +1396,7 @@ function M.winbar()
     hint = hint:gsub("%%", "%%%%")
     if hint ~= "" then bar = bar .. " " .. hint .. " " end
     local dock_pending = dock and require("straps.dock").has_permission(bufnr)
-    local waiting = require("straps.turn_decoration").wait_label(bufnr, dock_pending)
+    local waiting = require("straps.attention").wait_label(bufnr, dock_pending)
     if dock then
       local label = vim.fn.strtrans(M.session_label(bufnr)):gsub("%%", "%%%%")
       if cfg.session_winbar == false then return " " .. waiting .. label .. (hint ~= "" and "  " .. hint or "") end
@@ -2707,7 +2709,7 @@ end
 -- function(name, input) -> string; wholly self-contained so it round-trips
 -- through registry.render. The whole body is pcall-guarded: any branch throwing
 -- degrades to the bare tool name, and every branch guards nil/mis-typed input.
-local TOOL_DISPLAY_SRC = [==[
+TOOL_DISPLAY_SRC = [==[
 return function(name, input)
   local nm = type(name) == "string" and name or "tool"
   local ok, out = pcall(function()
@@ -2848,14 +2850,12 @@ function M.setup()
   require("straps.registry").define_default({
     name = "fn.tool_display",
     kind = "fn",
-    doc = "Format a tool call (name, input) as a command-style one-liner: bash "
-      .. "as `$ <command>`, read/write/edit/glob/grep/registry_*/eval_lua as "
-      .. "terse verbs, unknown tools as `<name> <preview>`. The caller splits "
-      .. "on the first space — verb colored (StrapsTool), args dim (StrapsRule).",
+    doc = "Format an expanded tool call (name, input) as a command-style one-liner. "
+      .. "An override also sets the closed-fold label and target. The first token is "
+      .. "the label; the rest is the target. Result metadata is independent.",
     source = TOOL_DISPLAY_SRC,
   })
   M.apply_highlights()
-  require("straps.turn_decoration").setup()
   local group = vim.api.nvim_create_augroup(AUGROUP, { clear = true })
   vim.api.nvim_create_autocmd("FileType", {
     group = group,

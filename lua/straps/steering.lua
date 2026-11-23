@@ -54,6 +54,7 @@ function M.open(bufnr)
   if not api.nvim_win_is_valid(win) or api.nvim_win_get_buf(win) ~= bufnr then return end
   record.win = win
   windows[bufnr] = record
+  vim.w[win].straps_steer_draft = bufnr
   vim.w[origin].straps_steer_origin = bufnr
   api.nvim_create_autocmd("WinClosed", {
     pattern = tostring(win), once = true, callback = function() close_record(bufnr, record) end,

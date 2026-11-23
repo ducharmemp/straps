@@ -240,35 +240,64 @@ it("render leaves buffer text, modified and parse unchanged", function()
 end)
 
 -- --------------------------------------------------------------- fold summary
-it("fold summary is a command-style colored chunk list — ok result", function()
-  -- bash tool_use at line 10 with {"command":"echo hi"} now folds to
-  -- `▸ $ echo hi   ✓`: `$` verb (StrapsTool), ` echo hi` args (StrapsRule).
-  local chunks = ui._fold_summary(buf, LN.tool_use_ok)
-  local saw_verb, saw_args, saw_ok = false, false, false
-  for _, c in ipairs(chunks) do
-    if c[1] == "$" and c[2] == "StrapsTool" then saw_verb = true end
-    if c[1]:find("echo hi", 1, true) and c[2] == "StrapsRule" then saw_args = true end
-    if c[1] == "✓" and c[2] == "StrapsToolOk" then saw_ok = true end
-    if c[1] == "✗" then error("ok result shows an error mark") end
-    if c[1]:find("⚙", 1, true) then error("bash summary must not show the ⚙ glyph") end
-  end
-  assert(saw_verb, "summary missing $ verb / StrapsTool")
-  assert(saw_args, "summary missing echo hi args / StrapsRule")
-  assert(saw_ok, "summary missing ✓ / StrapsToolOk")
+it("fold summary mutes the chevron, tool name and success but gives the target normal contrast", function()
+  assert.same({
+    { "▸ ", "StrapsRule" }, { "bash", "StrapsRule" }, { "  echo hi", "Normal" },
+    { " · ", "StrapsRule" }, { "ok", "StrapsRule" },
+  }, ui._fold_summary(buf, LN.tool_use_ok))
 end)
 
-it("fold summary reads is_error from the tool_result — error case", function()
-  -- grep tool_use at line 18 (is_error) folds to `▸ grep "boom"   ✗`.
+it("fold summary colors an explicit failure", function()
   local chunks = ui._fold_summary(buf, LN.tool_use_err)
-  local saw_verb, saw_err = false, false
-  for _, c in ipairs(chunks) do
-    if c[1] == "grep" and c[2] == "StrapsTool" then saw_verb = true end
-    if c[1] == "✗" and c[2] == "StrapsToolError" then saw_err = true end
-    if c[1] == "✓" then error("error result shows an ok mark") end
-    if c[1]:find("⚙", 1, true) then error("grep summary must not show the ⚙ glyph") end
-  end
-  assert(saw_verb, "summary missing grep verb / StrapsTool")
-  assert(saw_err, "summary missing ✗ / StrapsToolError")
+  assert.same({ "failed", "StrapsToolError" }, chunks[#chunks])
+end)
+
+describe("structured fold metadata", function()
+  local b
+  before_each(function() b = vim.api.nvim_create_buf(false, true) end)
+  after_each(function() vim.api.nvim_buf_delete(b, { force = true }) end)
+
+  it("displays a known path and a zero count from the matching result marker", function()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_use]%% {"id":"read","name":"read_file"}',
+      '{"path":"src/file with spaces.lua","limit":15}',
+      '%%[straps:tool_result]%% {"id":"other","is_error":true,"count":99}', "wrong result",
+      '%%[straps:tool_result]%% {"id":"read","is_error":false,"count":0}', "failed, 20 results",
+    })
+    local chunks = ui._fold_summary(b, 1)
+    assert.same({ "  src/file with spaces.lua", "Normal" }, chunks[3])
+    assert.same({ "ok", "StrapsRule" }, chunks[5])
+    assert.same({ " · count: 0", "StrapsRule" }, chunks[6])
+  end)
+
+  it("omits unknown metadata even when output looks like status or count", function()
+    for _, attrs in ipairs({ '{"id":"x"}', '{"id":"x","is_error":"true","count":"12"}',
+      '{"id":"x","count":-1}', '{"id":"x","count":1.5}' }) do
+      vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+        '%%[straps:tool_use]%% {"id":"x","name":"custom"}', '{"body":"not a target"}',
+        '%%[straps:tool_result]%% ' .. attrs, "Exit code: 1", "12 matches",
+      })
+      assert.same({ { "▸ ", "StrapsRule" }, { "custom", "StrapsRule" } }, ui._fold_summary(b, 1))
+    end
+  end)
+
+  it("does not use metadata from a later fold even if the id matches", function()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_use]%% {"id":"x","name":"custom"}', "{}",
+      '%%[straps:tool_use]%% {"id":"x","name":"another"}', "{}",
+      '%%[straps:tool_result]%% {"id":"x","is_error":true,"count":5}', "failure",
+    })
+    assert.same({ { "▸ ", "StrapsRule" }, { "custom", "StrapsRule" } }, ui._fold_summary(b, 1))
+  end)
+
+  it("uses the available metadata on a standalone result", function()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_result]%% {"id":"lonely","count":2}', "two items",
+    })
+    assert.same({
+      { "▸ ", "StrapsRule" }, { "result", "StrapsRule" }, { "  lonely", "Normal" }, { " · count: 2", "StrapsRule" },
+    }, ui._fold_summary(b, 1))
+  end)
 end)
 
 -- --------------------------------------------------------- fn.tool_display
@@ -311,48 +340,43 @@ it("fn.tool_display is defensive: bad/missing input never errors", function()
   assert(ok_wt and type(out_wt) == "string", "wrong-typed input should return a string")
 end)
 
-it("a broken fn.tool_display redefinition can't break fn.render", function()
-  local reg = require("straps.registry")
-  local original = reg.get("fn.tool_display").source
-  reg.define({
-    name = "fn.tool_display",
-    kind = "fn",
-    source = "return function() error('boom') end",
-  })
-  local buf2 = make_buf()
-  local ok = pcall(function()
-    -- render must not throw even though the formatter always errors...
-    registry.call("fn.render", buf2)
-    -- ...and the fold summary falls back to the bare tool name (no crash).
-    local chunks = ui._fold_summary(buf2, LN.tool_use_ok)
-    local saw_verb = false
-    for _, c in ipairs(chunks) do
-      if c[1] == "bash" and c[2] == "StrapsTool" then saw_verb = true end
+local function expanded_header_verb(b)
+  for _, mark in ipairs(marks_on_row(b, LN.tool_use_ok)) do
+    for _, line in ipairs(mark[4].virt_lines or {}) do
+      if line[1] and line[1][1] == "╭─ " then return line[2] end
     end
-    assert(saw_verb, "broken formatter should fall back to the tool name verb")
+  end
+end
+
+local function with_tool_display(source, fn)
+  local original = registry.get("fn.tool_display").source
+  registry.define({ name = "fn.tool_display", kind = "fn", source = source })
+  local ok, err = pcall(fn)
+  registry.define({ name = "fn.tool_display", kind = "fn", source = original })
+  if not ok then error(err) end
+end
+
+it("a broken fn.tool_display redefinition falls back in the header and fold", function()
+  with_tool_display("return function() error('boom') end", function()
+    local b = make_buf()
+    registry.call("fn.render", b)
+    assert.same({ "bash", "StrapsTool" }, expanded_header_verb(b))
+    assert.same({
+      { "▸ ", "StrapsRule" }, { "bash", "StrapsRule" }, { " · ", "StrapsRule" }, { "ok", "StrapsRule" },
+    }, ui._fold_summary(b, LN.tool_use_ok))
   end)
-  reg.define({ name = "fn.tool_display", kind = "fn", source = original }) -- restore
-  assert(ok, "broken fn.tool_display propagated an error into rendering")
 end)
 
-it("redefining fn.tool_display changes the next fold summary (late-bound)", function()
-  local reg = require("straps.registry")
-  local original = reg.get("fn.tool_display").source
-  reg.define({ name = "fn.tool_display", kind = "fn", source = "return function() return 'XX' end" })
-  local chunks = ui._fold_summary(buf, LN.tool_use_ok)
-  local saw_xx = false
-  for _, c in ipairs(chunks) do
-    if c[1] == "XX" and c[2] == "StrapsTool" then saw_xx = true end
-  end
-  assert(saw_xx, "redefined fn.tool_display not picked up by the next _fold_summary")
-  -- restore the shipped formatter
-  reg.define({ name = "fn.tool_display", kind = "fn", source = original })
-  local restored = ui._fold_summary(buf, LN.tool_use_ok)
-  local saw_dollar = false
-  for _, c in ipairs(restored) do
-    if c[1] == "$" and c[2] == "StrapsTool" then saw_dollar = true end
-  end
-  assert(saw_dollar, "restore of fn.tool_display failed")
+it("redefining fn.tool_display changes both the header and next fold summary", function()
+  with_tool_display("return function(_, input) return 'XX ' .. input.command end", function()
+    local b = make_buf()
+    registry.call("fn.render", b)
+    assert.same({ "XX", "StrapsTool" }, expanded_header_verb(b))
+    local chunks = ui._fold_summary(b, LN.tool_use_ok)
+    assert.same({ "XX", "StrapsRule" }, chunks[2])
+    assert.same({ "  echo hi", "Normal" }, chunks[3])
+  end)
+  assert.same({ "bash", "StrapsRule" }, ui._fold_summary(buf, LN.tool_use_ok)[2])
 end)
 
 -- ------------------------------------------------------------- config.render
@@ -382,6 +406,14 @@ it("foldexpr merges a tool_use/tool_result pair into one fold", function()
     "tool_use and tool_result are not in the same fold")
   assert(vim.fn.foldclosed(LN.tool_use_ok) == LN.tool_use_ok,
     "at the default foldlevel the tool call should be closed")
+  vim.wo[win][0].foldtext = "v:lua.require'straps.ui'.foldtext()"
+  assert.equals("▸ bash  echo hi · ok", vim.fn.foldtextresult(LN.tool_use_ok))
+  vim.api.nvim_win_set_cursor(win, { LN.tool_use_ok, 0 })
+  vim.cmd("normal! zo")
+  assert.equals(-1, vim.fn.foldclosed(LN.tool_result_ok))
+  assert.equals(LN.tool_use_err, vim.fn.foldclosed(LN.tool_use_err))
+  vim.cmd("normal! zc")
+  assert.equals(LN.tool_use_ok, vim.fn.foldclosed(LN.tool_result_ok))
   -- ... while the conversation itself never folds.
   assert(vim.fn.foldlevel(LN.user_marker) == 0, "user marker must not open a fold")
   assert(vim.fn.foldlevel(LN.assistant_marker) == 0, "assistant marker must not open a fold")

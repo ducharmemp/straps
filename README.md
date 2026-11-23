@@ -107,7 +107,7 @@ Neovim before 0.12 sends no reports. Headless instances have no terminal recipie
 
 Session windows show a model/status winbar. Ordinary session windows restore the previous local value when you leave them. Straps preserves the global winbar and user replacements; set `session_winbar = false` to hide model and status.
 
-During a run, a thin accent rule marks the current model turn. A pending approval shows `◆ permit` beside its tool call when Straps can identify the call. The session winbar shows `◆ waiting` even when you scroll back. The rule and label leave the transcript and cursor unchanged. Set `turn_decoration = false` to remove these decorations; `render = false` also disables them. Workbench and dock commands remain available.
+The session winbar shows `◆ waiting` when a permission request needs a decision, even while you read earlier turns.
 
 Set `session_dock = true` in `require('straps').setup()` to open sessions in a shallow, full-width bottom split. The option defaults to `false`. The dock shows the editable transcript. Drag the separator or use `:resize` from the dock to see more history; shrinking the window keeps your draft. Placement modifiers such as `:vertical Straps` override the dock.
 
@@ -123,7 +123,12 @@ When the default confirmation hook is waiting on `write_file`, `edit_file`, or `
 
 The transcript is the session state. You can use normal Vim editing to revise history before the next request.
 
+When output arrives while you are away from a transcript, `── since you left ──` marks the first affected line. Return to the transcript to keep reading from your previous position. Later output leaves the divider in place until you move your cursor or scroll the top of the view past it. Draft edits do not create a divider. Set `render = false` to disable it.
+
 Straps renders the transcript as a conversation and folds tool calls, harness notices, and agent messages by default. Switching buffers or splits configures transcript folds in each window while preserving existing windows' open and closed folds. The underlying text remains visible with `:set conceallevel=0`.
+
+Closed tool folds show a muted chevron and tool name, the target when known, and any status or count recorded on the result marker. Failures use diagnostic error color. Straps does not infer status or counts from output text.
+Open a tool fold with `zo` to see a muted left bracket beside its output. The bracket leaves prose and yanked text unchanged. Set `render = false` to turn it off with the rest of transcript rendering.
 
 ### Claim evidence
 

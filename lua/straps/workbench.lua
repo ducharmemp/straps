@@ -4,7 +4,6 @@ local pending = {}
 
 local function redraw(bufnr)
   pcall(vim.cmd, "redrawstatus!")
-  pcall(function() require("straps.turn_decoration").redraw(bufnr) end)
 end
 
 function M.pending(bufnr)

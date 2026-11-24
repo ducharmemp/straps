@@ -88,11 +88,6 @@ M.config = {
   -- compresses: llama-server answers a gzip body with HTTP 415.
   gzip = true,
   compact_keep_turns = 2,
-  -- Default hook.after_write behaviour: after the agent writes a file, wait
-  -- briefly for the attached LSP to re-lint it and feed any ERROR/WARN
-  -- diagnostics back into the tool result — the editor-native version of
-  -- "run a linter after every write". false turns it off (the hook returns
-  -- nil); after_write_diagnostics_ms caps how long it waits for the server.
   after_write_diagnostics = true,
   after_write_diagnostics_ms = 800,
   -- Default hook.on_run_end.notify_parent behaviour: when a subagent's run

@@ -624,36 +624,25 @@ end
 
 local function begin_diagnostics(ctx, run, bufnr)
   local state = require("straps.state")
-  local records, order, aug = {}, {}, nil
+  local records, order = {}, {}
   local d = { current = nil }
   local function teardown()
-    if aug then pcall(vim.api.nvim_del_augroup_by_id, aug) end
-    aug = nil
     ctx.defer_diagnostics = nil
     run.diag_teardown = nil
   end
   run.diag_teardown = teardown
   ctx.defer_diagnostics = function(path)
     local buf = state.find_buf(path)
-    if not buf then return false end
+    if not buf or not vim.api.nvim_buf_is_loaded(buf) then return false end
     local r = records[buf]
     if not r then
       r = { bufnr = buf, blocks = {} }
       records[buf] = r
       order[#order + 1] = r
-      if not aug then
-        aug = vim.api.nvim_create_augroup("straps_batch_diagnostics_" .. bufnr, { clear = true })
-        vim.api.nvim_create_autocmd("DiagnosticChanged", {
-          group = aug,
-          callback = function(args)
-            local rec = records[args.buf]
-            if rec then rec.last_event = vim.uv.hrtime() end
-          end,
-        })
-      end
     end
     r.path = path
-    r.last_write = vim.uv.hrtime()
+    r.tick = vim.api.nvim_buf_get_changedtick(buf)
+    r.uri = vim.uri_from_bufnr(buf)
     if d.current then r.blocks[#r.blocks + 1] = d.current end
     return true
   end
@@ -1096,7 +1085,7 @@ local function run_turns(bufnr, ctx, run)
     -- is not mistaken for spinning.
     local n_calls, n_errors, any_repeat, any_new, last_error = 0, 0, false, false, nil
     if all_parallel_readonly(tool_blocks) then
-      local jobs = {}
+      local jobs, pending, resolve_batch = {}, 0, nil
       -- Gate every block first, on the run coroutine (a before-guard may
       -- await), so no job starts until the whole batch has passed the gate.
       for i, block in ipairs(tool_blocks) do
@@ -1112,11 +1101,13 @@ local function run_turns(bufnr, ctx, run)
           if not allowed then
             jobs[i] = { done = true, ok = false, result = reason, ms = 0 }
           else
-            jobs[i] = { done = false, block = block, run = gated_run }
+            pending = pending + 1
+            jobs[i] = { done = false, run = gated_run }
           end
         end
       end
       if run.cancelled then
+        pending = 0
         for _, job in ipairs(jobs) do
           if not job.done then
             job.done, job.ok, job.result, job.ms = true, false, "run cancelled before this tool executed", 0
@@ -1133,6 +1124,8 @@ local function run_turns(bufnr, ctx, run)
             job.ok = ok
             job.result = tostring(result)
             job.ms = math.floor((vim.uv.hrtime() - job.started) / 1e6)
+            pending = pending - 1
+            if pending == 0 and resolve_batch then resolve_batch() end
           end
           local co = coroutine.create(function()
             local cctx = child_ctx(ctx, bufnr, finish, run)
@@ -1146,20 +1139,13 @@ local function run_turns(bufnr, ctx, run)
           if not ok_resume then finish(false, err) end
         end
       end
-      ctx.await(function(resolve)
-        local function poll()
-          local pending = false
-          for _, job in ipairs(jobs) do
-            if not job.done then pending = true break end
-          end
-          if pending and not run.cancelled then
-            vim.defer_fn(poll, 20)
-          else
-            resolve()
-          end
-        end
-        poll()
-      end)
+      if pending > 0 and not run.cancelled then
+        ctx.await(function(resolve)
+          resolve_batch = resolve
+          ctx.on_cancel(resolve)
+        end)
+        resolve_batch = nil
+      end
       for i, block in ipairs(tool_blocks) do
         local job = jobs[i]
         local ok, result = job.ok == true, job.result or ""
@@ -1434,8 +1420,7 @@ function M.stop(bufnr)
   -- cancellation note — the clean path. A forced resume that lands in a
   -- provider (or hook.confirm) await instead escapes as an error into
   -- run_turns' pcall (M.start), which appends "straps: run error: ..." and
-  -- cleans up — less pretty, still ended. The parallel-readonly tool path needs
-  -- no backstop: its poll loop already resolves on run.cancelled within ~20ms.
+  -- cleans up — less pretty, still ended.
   -- stop_backstop_ms is the delay before the forced resume fires (default 4000).
   local ok, straps = pcall(require, "straps")
   local cfg = (ok and type(straps) == "table" and rawget(straps, "config")) or {}

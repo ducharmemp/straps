@@ -607,11 +607,10 @@ gzip			(boolean) true. gzip the Anthropic request body
 			`llama-server` answers a gzip body with HTTP 415.
 compact_keep_turns	(number) 2. Assistant turns |fn.compact| keeps intact.
 after_write_diagnostics	(boolean) true. Default |hook.after_write|: feed the
-			attached LSP's ERROR/WARN diagnostics for a written file
+			ERROR/WARN replies from attached pull diagnostic providers
 			back into the tool result. false makes the hook a no-op.
-after_write_diagnostics_ms (number) 800. The longest |fn.write_diagnostics|
-			waits for the language server to re-lint. In a batch the
-			wait runs once, for every file the batch wrote.
+after_write_diagnostics_ms (number) 800. The shared deadline for
+			|fn.write_diagnostics| requests across all files in a batch.
 terminal_status		(boolean) true. OSC 7501 terminal attention reports on
 			Neovim >= 0.12 through nvim_ui_send. setup() with false
 			clears active IDs and the pane report, then suppresses
@@ -1025,12 +1024,11 @@ hook.guard.<suffix>(op, ...) -> verdict, reason
 						*hook.after_write*
 hook.after_write(path, ctx) -> string|nil
 		Called after write_file / edit_file / patch_file. If it returns a
-		string it is appended to the tool result. The default feeds the
-		editor's own LSP back to the agent: it waits briefly for the language
-		server to re-lint the just-written file, then returns its
-		ERROR/WARN diagnostics, so the agent sees breakage it caused
-		without being asked. No client on the file, or no new
-		diagnostics, appends nothing. Turn off with
+		string, Straps appends it to the tool result. The default requests
+		pull diagnostics for the saved buffer and adds ERROR/WARN
+		replies to the tool result. Push updates still reach Neovim and
+		do not delay the write. With no pull provider or no async context,
+		this default appends nothing. Turn off with
 		|straps-config| `after_write_diagnostics = false`, or redefine
 		it to run an external linter instead. Fanned out
 		(|straps-hooks-fanout|): this default plus every
@@ -1044,10 +1042,10 @@ hook.after_write(path, ctx) -> string|nil
 		successful write.
 
 fn.write_diagnostics(records, ctx) -> { [bufnr] = text }	*fn.write_diagnostics*
-		Wait once for the buffers in `records` ({ bufnr, path, last_write,
-		last_event? }) to be re-linted: each settles 120 ms after its last
-		DiagnosticChanged, capped at `after_write_diagnostics_ms`; a stop
-		ends the wait. Returns each buffer's ERROR/WARN diagnostics.
+		Requests `textDocument/diagnostic` for saved buffers in `records`
+		({ bufnr, path, tick, uri }). Returns ERROR/WARN from full replies
+		for buffers still at their saved revision. One deadline bounds
+		the batch; reaching it or stopping cancels outstanding requests.
 
 fn.starts_segment(name, input) -> boolean		*fn.starts_segment*
 		True makes this call start a new batch segment, so the calls before

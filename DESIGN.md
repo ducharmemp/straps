@@ -683,14 +683,17 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
       but whose result was not post-processed gets "run interrupted after this
       tool ran; its result was not processed", so no unguarded or untruncated
       output reaches the transcript; a refused call keeps its refusal; the rest
-      get "run interrupted before this tool finished"; every diagnostics
-      listener is removed) and only then appends the
+      get "run interrupted before this tool finished"; the diagnostics
+      deferral is cleared) and only then appends the
       "straps: run error" block, so the transcript never holds an unpaired
       `tool_use`; `crashed` pairs the same way.
       The parallel read-only batch gates EVERY block first (on the run
       coroutine, so an awaiting guard finishes before any job starts), stubs
       the batch if the run was cancelled meanwhile, then spawns one job per
       allowed block running `run` → truncate → after_tool → after_guards.
+      If any job is still pending after launch, the run waits for the last
+      completion callback or cancellation. Results retain the model's call
+      order, including completed results when cancellation interrupts a batch.
    f. Stall check (progress-aware soft stop): classify the turn — stalled when
       it issued tool calls AND either every call errored, OR every call was an
       exact repeat of a `(tool, input)` already made this run (i.e. the turn
@@ -2261,18 +2264,8 @@ with none installed behavior is identical to a build without the mechanism.
   input that carries it. A guard blocking every `define` during a run breaks
   spawn (it defines the child's confirm shadow inside a run) — scope guards by
   `op` and name.
-- `hook.after_write` — default is the editor-native lint feedback loop: after
-  a write, wait for the file's LSP to re-lint, then return its ERROR/WARN
-  diagnostics so they append to the tool result. The wait and formatting live
-  in `fn.write_diagnostics(records, ctx)`: one `ctx.await` over any number of
-  buffers, each settled by a `DiagnosticChanged` followed by 120 ms of quiet
-  (every event restarts that buffer's debounce, so a burst reports its last
-  state), skipped for a buffer already re-linted since its write, capped at
-  `config.after_write_diagnostics_ms` (default 800ms), ended at once by a stop.
-  Inside a batch segment the loop sets `ctx.defer_diagnostics(path)`; the
-  default hook calls it and returns nil, the loop listens for that buffer's
-  events from the write onward and calls `fn.write_diagnostics` once for every
-  written buffer after the segment's last call (see the loop, step e). Writes
+- `hook.after_write` requests document diagnostics from attached clients that support pull. `fn.write_diagnostics(records, ctx)` takes one `ctx.await` for the batch. An empty response completes its request. A stop or the `config.after_write_diagnostics_ms` deadline (default 800 ms) cancels outstanding requests. The function returns errors and warnings from completed full reports if the buffer still matches its saved revision and URI. It leaves Neovim's diagnostic cache alone. Push diagnostics and calls without `ctx.await` do not delay or add to the write result.
+  Inside a batch segment the loop sets `ctx.defer_diagnostics(path)`. The default hook records the save and returns nil. The loop calls `fn.write_diagnostics` once with the saved buffers after the segment's last call (see the loop, step e). Writes
   made through `editor.lua`'s `after_writes` (format, code actions,
   rename_symbol) defer the same way. Suffix subscribers still run per write and
   see the same ctx. The buffer is found by `state.find_buf`, which matches by

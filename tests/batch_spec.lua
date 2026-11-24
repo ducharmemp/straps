@@ -1,12 +1,3 @@
--- tests/batch_spec.lua — batches that are not all parallel-read-only run in
--- segments (loop.lua run_segments): gate every block of a segment, then
--- execute, then one diagnostics wait over every written file, then append.
---   busted tests/batch_spec.lua
--- No network: fn.provider is scripted per case. Covers confirm-before-run,
--- segment breaks after define/lua/agent_tool calls and before a segment_break
--- tool, denial, cancel, crash pairing, the batched diagnostics wait, the
--- confirm preview of a second same-file edit, and the gate/tool log events.
-
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(here, ":p"), ":h:h")
 vim.opt.rtp:prepend(root)
@@ -126,6 +117,81 @@ local function mk(path, text)
 end
 
 -- ------------------------------------------------------------------ cases
+
+local function with_parallel_batch(fn)
+  reset()
+  local original = registry.get("tool.read_file")
+  define("tool.read_file", "tool", [==[
+return function(input, ctx)
+  local B = _G.B
+  if not input.sync then
+    ctx.await(function(resolve)
+      B.resolvers[input.id] = resolve
+      ctx.on_cancel(function() B.cancelled[input.id] = true end)
+    end)
+  end
+  B.events[#B.events + 1] = input.id
+  return input.id
+end
+]==], { capability = "exec" })
+  local defer, poll_count = vim.defer_fn, 0
+  vim.defer_fn = function(cb, ms)
+    if ms == 20 and debug.getinfo(cb, "S").source:match("/straps/loop%.lua$") then
+      poll_count = poll_count + 1
+    end
+    return defer(cb, ms)
+  end
+  local backstop = straps.config.stop_backstop_ms
+  straps.config.stop_backstop_ms = 5000
+  local B = _G.B
+  B.resolvers, B.cancelled = {}, {}
+  local buf = state.new_session()
+  state.append_text(buf, "go")
+  scripted({ { name = "read_file", input = { id = "first" } },
+    { name = "read_file", input = { id = "second", sync = true } } })
+  local ok, err = pcall(function()
+    loop.start(buf)
+    assert(vim.wait(1000, function() return B.resolvers.first and index_of(B.events, "second") end, 1))
+    assert(_G.script_calls == 1 and #results(buf) == 0, "batch advanced with a pending job")
+    fn(buf, B)
+    assert(poll_count == 0, "batch scheduled a polling timer")
+  end)
+  vim.defer_fn = defer
+  straps.config.stop_backstop_ms = backstop
+  if loop.running(buf) then loop.stop(buf) end
+  vim.api.nvim_buf_delete(buf, { force = true })
+  registry.define(original, { scope = "global" })
+  if not ok then error(err, 0) end
+end
+
+it("parallel reads resume on completion and report results in call order", function()
+  with_parallel_batch(function(buf, B)
+    B.resolvers.first()
+    assert(vim.wait(1000, function() return not loop.running(buf) end, 1))
+    assert.same({ "confirm:read_file", "confirm:read_file", "second", "first" }, B.events)
+    local r = results(buf)
+    assert.same({ "first", "second" }, { r[1].content, r[2].content })
+    assert.equals(2, _G.script_calls)
+  end)
+end)
+
+it("stopping parallel reads resumes the run without waiting for a child or the backstop", function()
+  with_parallel_batch(function(buf, B)
+    loop.stop(buf)
+    assert(vim.wait(1000, function() return not loop.running(buf) end, 1))
+    local r = results(buf)
+    assert.is_true(B.cancelled.first)
+    assert.is_true(r[1].is_error)
+    assert.equals("run cancelled before this tool executed", r[1].content)
+    assert.equals("second", r[2].content)
+    B.resolvers.first()
+    local drained = false
+    vim.schedule(function() drained = true end)
+    assert(vim.wait(1000, function() return drained end, 1))
+    assert.is_nil(index_of(B.events, "first"))
+    assert.equals(1, _G.script_calls)
+  end)
+end)
 
 it("every confirm of a segment happens before the first call runs", function()
   reset()
@@ -272,13 +338,46 @@ local real_get_clients = vim.lsp.get_clients
 local ns = vim.api.nvim_create_namespace("batch_spec")
 
 local function with_lsp(fn)
-  vim.lsp.get_clients = function() return { { name = "fake" } } end
+  local client = { id = 77, name = "fake", offset_encoding = "utf-16",
+    server_capabilities = { diagnosticProvider = {} } }
+  function client:supports_method(method, buf)
+    assert.equals("textDocument/diagnostic", method)
+    assert.is_number(buf)
+    return true
+  end
+  function client:request(method, params, handler, buf)
+    assert.equals(client, self)
+    assert.equals("textDocument/diagnostic", method)
+    assert.equals(vim.uri_from_bufnr(buf), params.textDocument.uri)
+    _G.B.requests = (_G.B.requests or 0) + 1
+    local id = _G.B.requests
+    _G.B.handlers = _G.B.handlers or {}
+    _G.B.handlers[id] = handler
+    if not _G.B.pending then
+      vim.schedule(function()
+        local message = vim.diagnostic.get(buf, { namespace = ns })[1].message
+        handler(nil, { kind = "full", items = { { message = message, severity = 1,
+          range = { start = { line = 0, character = 0 }, ["end"] = { line = 0, character = 1 } } } } })
+      end)
+    end
+    return true, id
+  end
+  function client:cancel_request(id)
+    _G.B.cancelled_requests = _G.B.cancelled_requests or {}
+    _G.B.cancelled_requests[#_G.B.cancelled_requests + 1] = id
+  end
+  vim.lsp.get_clients = function() return { client } end
   local orig = registry.get("fn.write_diagnostics")
   define("fn.write_diagnostics", "fn", ([==[
 local real = load(%q)()
 return function(records, ctx)
   _G.B.diag_calls = _G.B.diag_calls + 1
   _G.B.diag_records = #records
+  for _, r in ipairs(records) do
+    assert(r.tick == vim.api.nvim_buf_get_changedtick(r.bufnr), 'saved changedtick missing')
+    assert(r.uri == vim.uri_from_bufnr(r.bufnr), 'saved URI missing')
+    assert(type(r.path) == 'string', 'saved path missing')
+  end
   if _G.B.diag_raise then error("diag exploded") end
   local t0 = vim.uv.hrtime()
   local out = real(records, ctx)
@@ -313,6 +412,7 @@ it("three edits to A and one to B wait once; text lands on the last A and on B",
     })
     local r = results(buf)
     assert(_G.B.diag_calls == 1 and _G.B.diag_records == 2, "expected one wait over two buffers: " .. vim.inspect(_G.B))
+    assert.equals(2, _G.B.requests)
     assert(not r[1].content:find("A broken", 1, true) and not r[2].content:find("A broken", 1, true), vim.inspect(r))
     assert(r[3].content:find("B broken", 1, true), "B result lacks its diagnostics: " .. r[3].content)
     assert(r[4].content:find("A broken", 1, true), "last A result lacks diagnostics: " .. r[4].content)
@@ -336,7 +436,7 @@ it("a later failed edit to the same file leaves the text on the earlier success"
   end)
 end)
 
-it("an event during the segment ends the wait within the debounce", function()
+it("pulls after the segment even when cached diagnostics changed during the segment", function()
   local a = tmp .. "/d.lua"
   mk(a, "one\n"); local abuf = seed(a, "D broken")
   with_lsp(function()
@@ -353,26 +453,32 @@ it("an event during the segment ends the wait within the debounce", function()
     vim.api.nvim_del_autocmd(id)
     local r = results(buf)
     assert(r[1].content:find("D relinted", 1, true), r[1].content)
-    assert(_G.B.diag_ms < 60, "waited although the server had already re-linted: " .. tostring(_G.B.diag_ms))
+    assert.equals(1, _G.B.requests)
+    assert(_G.B.diag_ms < straps.config.after_write_diagnostics_ms, "completed pull waited for the cap")
   end)
 end)
 
-it("the debounce takes the last event of a burst", function()
+it("uses a redefined diagnostics seam once for the segment", function()
   local a = tmp .. "/e.lua"
-  mk(a, "one\n"); local abuf = seed(a, "stale")
-  with_lsp(function()
-    reset()
-    local id = vim.api.nvim_create_autocmd("BufWritePost", { buffer = abuf, callback = function()
-      local function set(msg) vim.diagnostic.set(ns, abuf, { { lnum = 0, col = 0, severity = 1, message = msg } }) end
-      vim.defer_fn(function() set("first") end, 10)
-      vim.defer_fn(function() set("middle") end, 90)
-      vim.defer_fn(function() set("final") end, 170)
-    end })
-    local buf = run({ { name = "edit_file", input = { path = a, old_string = "one", new_string = "two" } } })
-    vim.api.nvim_del_autocmd(id)
-    local r = results(buf)
-    assert(r[1].content:find("final", 1, true), "reported an intermediate state: " .. r[1].content)
-  end)
+  mk(a, "one\n")
+  seed(a, "cached")
+  local original = registry.get("fn.write_diagnostics")
+  define("fn.write_diagnostics", "fn", [[return function(records)
+    _G.B.override_calls = (_G.B.override_calls or 0) + 1
+    return { [records[1].bufnr] = 'custom diagnostics' }
+  end]])
+  reset()
+  local real = vim.lsp.get_clients
+  vim.lsp.get_clients = function() return { { name = "override" } } end
+  local ok, buf = pcall(run, { { name = "edit_file", input = { path = a, old_string = "one", new_string = "two" } },
+    { name = "edit_file", input = { path = a, old_string = "two", new_string = "three" } } })
+  vim.lsp.get_clients = real
+  define("fn.write_diagnostics", "fn", original.source)
+  assert.is_true(ok, tostring(buf))
+  assert.equals(1, _G.B.override_calls)
+  local r = results(buf)
+  assert.is_nil(r[1].content:find("custom diagnostics", 1, true))
+  assert.truthy(r[2].content:find("custom diagnostics", 1, true))
 end)
 
 it("diagnostics off, raising fn.write_diagnostics, suffix subscribers, symlinked dirs", function()
@@ -419,6 +525,7 @@ it("cancel during the diagnostics wait ends it at once", function()
   straps.config.after_write_diagnostics_ms = 3000
   with_lsp(function()
     reset()
+    _G.B.pending = true
     scripted({ { name = "edit_file", input = { path = a, old_string = "one", new_string = "two" } } })
     local buf = state.new_session()
     state.append_text(buf, "go")
@@ -428,6 +535,10 @@ it("cancel during the diagnostics wait ends it at once", function()
     loop.stop(buf)
     assert(vim.wait(2000, function() return not loop.running(buf) end, 5), "run did not end")
     assert((vim.uv.hrtime() - t0) / 1e6 < 250, "stop waited for the diagnostics cap")
+    assert.same({ 1 }, _G.B.cancelled_requests)
+    local before = text_of(buf)
+    _G.B.handlers[1](nil, { kind = "full", items = {} })
+    assert.equals(before, text_of(buf))
   end)
   straps.config.after_write_diagnostics_ms = 600
 end)

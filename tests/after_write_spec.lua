@@ -1,154 +1,262 @@
--- tests/after_write_spec.lua — the default hook.after_write feeds LSP
--- diagnostics back into a write's result.
---   busted tests/after_write_spec.lua
--- No network, no real language server. We stub vim.lsp.get_clients (so the
--- hook believes a server is attached) and seed diagnostics with
--- vim.diagnostic.set, then drive the hook directly and through write_file.
-
 local here = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(here, ":p"), ":h:h")
 vim.opt.rtp:prepend(root)
 package.path = root .. "/lua/?.lua;" .. root .. "/lua/?/init.lua;" .. package.path
 
-
 local straps = require("straps").setup({})
 straps.config.session_dir = vim.fn.tempname()
--- Keep the wait short so the suite stays fast.
-straps.config.after_write_diagnostics_ms = 150
+straps.config.after_write_diagnostics_ms = 80
 local registry = require("straps.registry")
-
 local tmp = vim.fn.tempname()
 vim.fn.mkdir(tmp, "p")
-
--- Stub the LSP client probe so the hook proceeds; restore between cases.
-local real_get_clients = vim.lsp.get_clients
-local function with_fake_client(fn)
-  vim.lsp.get_clients = function() return { { name = "fake" } } end
-  local ok, err = pcall(fn)
-  vim.lsp.get_clients = real_get_clients
-  if not ok then error(err) end
-end
-
--- A minimal ctx: no coroutine, so the hook takes the vim.wait fallback path.
-local function ctx_for(buf)
-  return { bufnr = buf }
-end
-
 local ns = vim.api.nvim_create_namespace("straps_test_aw")
+local serial = 0
 
-local function make_buf(path, lines)
+local function make_buf(lines)
+  serial = serial + 1
+  local path = tmp .. "/file" .. serial .. ".lua"
   local f = assert(io.open(path, "w"))
-  f:write(table.concat(lines, "\n") .. "\n")
+  f:write(table.concat(lines or { "x" }, "\n") .. "\n")
   f:close()
   local buf = vim.fn.bufadd(path)
   vim.fn.bufload(buf)
-  return buf
+  return buf, path
 end
 
-it("no LSP client -> nil (nothing appended)", function()
-  local path = tmp .. "/a.lua"
-  local buf = make_buf(path, { "local x = 1" })
-  vim.diagnostic.set(ns, buf, {
-    { lnum = 0, col = 0, severity = vim.diagnostic.severity.ERROR, message = "boom", source = "s" },
-  })
-  -- real_get_clients returns {} for this buffer (no server attached)
-  local out = registry.call("hook.after_write", path, ctx_for(buf))
-  assert(out == nil, "expected nil with no client, got: " .. tostring(out))
-end)
+local function snapshot(buf, path)
+  return { bufnr = buf, path = path or vim.api.nvim_buf_get_name(buf),
+    tick = vim.api.nvim_buf_get_changedtick(buf), uri = vim.uri_from_bufnr(buf) }
+end
 
-it("client + ERROR/WARN diagnostics -> formatted summary", function()
-  local path = tmp .. "/b.lua"
-  local buf = make_buf(path, { "local x = 1", "local y = 2" })
-  vim.diagnostic.set(ns, buf, {
-    { lnum = 0, col = 0, severity = vim.diagnostic.severity.ERROR, message = "boom", source = "tlint" },
-    { lnum = 1, col = 2, severity = vim.diagnostic.severity.WARN, message = "careful" },
-  })
-  local out
-  with_fake_client(function()
-    out = registry.call("hook.after_write", path, ctx_for(buf))
+local function context()
+  local ctx = { waits = 0, cancellations = {} }
+  ctx.on_cancel = function(fn) ctx.cancellations[#ctx.cancellations + 1] = fn end
+  ctx.cancel = function() for _, fn in ipairs(ctx.cancellations) do fn() end end
+  ctx.await = function(subscribe)
+    ctx.waits = ctx.waits + 1
+    local done, value = false, nil
+    subscribe(function(v) done, value = true, v end)
+    assert(vim.wait(2000, function() return done end, 1), "diagnostics await did not resolve")
+    return value
+  end
+  return ctx
+end
+
+local function diagnostic(message, severity, line, character)
+  return { message = message, severity = severity or 1,
+    range = { start = { line = line or 0, character = character or 0 },
+      ["end"] = { line = line or 0, character = (character or 0) + 1 } } }
+end
+
+local function client(reply)
+  local c = { id = 123, name = "fake", offset_encoding = "utf-16", requests = {}, cancelled = {},
+    server_capabilities = { diagnosticProvider = {} } }
+  function c:supports_method(method, buf)
+    assert.equals("textDocument/diagnostic", method)
+    assert.is_number(buf)
+    return self.server_capabilities.diagnosticProvider ~= nil
+  end
+  function c:request(method, params, handler, buf)
+    assert.equals(c, self)
+    assert.equals("textDocument/diagnostic", method)
+    assert.equals(vim.uri_from_bufnr(buf), params.textDocument.uri)
+    local id = #self.requests + 1
+    self.requests[id] = { params = params, handler = handler, bufnr = buf }
+    if reply then reply(self, handler, buf, params) end
+    return true, id
+  end
+  function c:cancel_request(id) self.cancelled[#self.cancelled + 1] = id end
+  return c
+end
+
+local function with_clients(clients, fn)
+  local real_get, real_set = vim.lsp.get_clients, vim.diagnostic.set
+  local writes = 0
+  vim.lsp.get_clients = function() return clients end
+  vim.diagnostic.set = function(...) writes = writes + 1; return real_set(...) end
+  local ok, err = pcall(fn)
+  vim.lsp.get_clients, vim.diagnostic.set = real_get, real_set
+  if not ok then error(err, 0) end
+  assert.equals(0, writes, "pull results changed the diagnostic cache")
+end
+
+local function full(items)
+  return client(function(_, handler) vim.schedule(function() handler(nil, { kind = "full", items = items }) end) end)
+end
+
+it("skips requests and awaits without pull support or an async context", function()
+  local buf, path = make_buf()
+  vim.diagnostic.set(ns, buf, { { lnum = 0, col = 0, severity = 1, message = "cached error" } })
+  for _, clients in ipairs({ {}, { { id = 1, name = "push", supports_method = function() return false end } } }) do
+    with_clients(clients, function()
+      local ctx = context()
+      assert.same({}, registry.call("fn.write_diagnostics", { snapshot(buf, path) }, ctx))
+      assert.equals(0, ctx.waits)
+    end)
+  end
+  local c = full({ diagnostic("fresh") })
+  with_clients({ c }, function()
+    assert.same({}, registry.call("fn.write_diagnostics", { snapshot(buf, path) }, {}))
+    assert.equals(0, #c.requests)
+    assert.is_nil(registry.call("hook.after_write", path, { bufnr = buf }))
+    assert.equals(0, #c.requests)
   end)
-  assert(type(out) == "string", "expected a string summary, got: " .. tostring(out))
-  assert(out:find("diagnostics after write (2):", 1, true), "missing header: " .. out)
-  assert(out:find("b.lua:1:1: ERROR boom [tlint]", 1, true), "missing error line: " .. out)
-  assert(out:find("b.lua:2:3: WARN careful", 1, true), "missing warn line: " .. out)
-  -- Sorted by line: ERROR (line 1) before WARN (line 2).
-  assert(out:find("ERROR", 1, true) < out:find("WARN", 1, true), "not sorted by position")
 end)
 
-it("matches the written file's buffer by exact path, not a similarly named one", function()
-  local path = tmp .. "/exact.lua"
-  local decoy = make_buf(tmp .. "/exact.lua.orig", { "x" })
-  vim.diagnostic.set(ns, decoy, {
-    { lnum = 0, col = 0, severity = vim.diagnostic.severity.ERROR, message = "decoy", source = "s" },
-  })
-  local out
-  with_fake_client(function()
-    out = registry.call("hook.after_write", path, ctx_for(decoy))
+it("formats pull errors and warnings with UTF-16 positions and leaves cached diagnostics unchanged", function()
+  local buf, path = make_buf({ "😀x", "second" })
+  vim.diagnostic.set(ns, buf, { { lnum = 0, col = 0, severity = 1, message = "cached error" } })
+  local warning = diagnostic("careful", 2, 0, 2)
+  warning.source = "lint"
+  local c = full({ diagnostic("later", 1, 1), diagnostic("hint", 4), warning, diagnostic("info", 3) })
+  with_clients({ c }, function()
+    local ctx = context()
+    local out = registry.call("fn.write_diagnostics", { snapshot(buf, path) }, ctx)[buf]
+    assert.equals(1, ctx.waits)
+    assert.equals(1, #c.requests)
+    assert.truthy(out:find("diagnostics after write (2):", 1, true))
+    assert.truthy(out:find(":1:5: WARN careful [lint]", 1, true))
+    assert.truthy(out:find(":2:1: ERROR later", 1, true))
+    assert.is_true(out:find("careful", 1, true) < out:find("later", 1, true))
+    assert.is_nil(out:find("cached error", 1, true))
+    assert.is_nil(out:find("hint", 1, true))
+    assert.is_nil(out:find("info", 1, true))
+    assert.equals("cached error", vim.diagnostic.get(buf, { namespace = ns })[1].message)
   end)
-  assert(out == nil, "the decoy buffer's diagnostics were reported for " .. path .. ": " .. tostring(out))
 end)
 
-it("HINT/INFO only -> nil (below WARN threshold)", function()
-  local path = tmp .. "/c.lua"
-  local buf = make_buf(path, { "x" })
-  vim.diagnostic.set(ns, buf, {
-    { lnum = 0, col = 0, severity = vim.diagnostic.severity.HINT, message = "tidy" },
-    { lnum = 0, col = 0, severity = vim.diagnostic.severity.INFO, message = "fyi" },
-  })
-  local out
-  with_fake_client(function()
-    out = registry.call("hook.after_write", path, ctx_for(buf))
+it("returns no summary for a clean report or reports below the warning threshold", function()
+  for _, items in ipairs({ {}, { diagnostic("tidy", 4), diagnostic("fyi", 3) } }) do
+    local buf, path = make_buf()
+    local c = full(items)
+    with_clients({ c }, function()
+      local ctx = context()
+      assert.same({}, registry.call("fn.write_diagnostics", { snapshot(buf, path) }, ctx))
+      assert.equals(1, ctx.waits)
+      assert.equals(1, #c.requests)
+    end)
+  end
+end)
+
+it("discards responses after the saved changedtick or URI changes", function()
+  for _, change in ipairs({ "tick", "uri" }) do
+    local buf, path = make_buf()
+    local c = client(function(_, handler)
+      vim.schedule(function()
+        if change == "tick" then vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "changed" })
+        else vim.api.nvim_buf_set_name(buf, path .. ".renamed") end
+        handler(nil, { kind = "full", items = { diagnostic("stale") } })
+      end)
+    end)
+    with_clients({ c }, function()
+      local ctx = context()
+      assert.same({}, registry.call("fn.write_diagnostics", { snapshot(buf, path) }, ctx))
+      assert.equals(1, #c.requests)
+    end)
+  end
+end)
+
+it("retains completed reports at the cap and cancels outstanding requests without accepting late callbacks", function()
+  local buf, path = make_buf()
+  local ready, pending = full({ diagnostic("retained") }), client()
+  with_clients({ ready, pending }, function()
+    local ctx = context()
+    local out = registry.call("fn.write_diagnostics", { snapshot(buf, path) }, ctx)
+    assert.equals(1, ctx.waits)
+    assert.truthy(out[buf]:find("retained", 1, true))
+    assert.same({}, ready.cancelled)
+    assert.same({ 1 }, pending.cancelled)
+    local before = vim.deepcopy(out)
+    pending.requests[1].handler(nil, { kind = "full", items = { diagnostic("late") } })
+    assert.same(before, out)
   end)
-  assert(out == nil, "HINT/INFO should not be reported, got: " .. tostring(out))
 end)
 
-it("clean file with a client -> nil", function()
-  local path = tmp .. "/d.lua"
-  local buf = make_buf(path, { "ok" })
-  vim.diagnostic.set(ns, buf, {})
-  local out
-  with_fake_client(function()
-    out = registry.call("hook.after_write", path, ctx_for(buf))
+it("cancels outstanding pulls when the context stops and ignores their callbacks", function()
+  local buf, path = make_buf()
+  local ctx = context()
+  local c = client(function() vim.schedule(ctx.cancel) end)
+  with_clients({ c }, function()
+    local out = registry.call("fn.write_diagnostics", { snapshot(buf, path) }, ctx)
+    assert.equals(1, ctx.waits)
+    assert.same({ 1 }, c.cancelled)
+    assert.same({}, out)
+    c.requests[1].handler(nil, { kind = "full", items = { diagnostic("after stop") } })
+    assert.same({}, out)
   end)
-  assert(out == nil, "clean file should return nil, got: " .. tostring(out))
 end)
 
-it("config.after_write_diagnostics = false -> nil even with diagnostics", function()
-  local path = tmp .. "/e.lua"
-  local buf = make_buf(path, { "x" })
-  vim.diagnostic.set(ns, buf, {
-    { lnum = 0, col = 0, severity = vim.diagnostic.severity.ERROR, message = "boom" },
-  })
-  straps.config.after_write_diagnostics = false
-  local out
-  with_fake_client(function()
-    out = registry.call("hook.after_write", path, ctx_for(buf))
+it("ignores unchanged reports and request errors", function()
+  local buf, path = make_buf()
+  local unchanged = client(function(_, handler) vim.schedule(function() handler(nil, { kind = "unchanged", resultId = "old" }) end) end)
+  local failed = client(function(_, handler) vim.schedule(function() handler({ code = -1, message = "failed" }) end) end)
+  with_clients({ unchanged, failed }, function()
+    local ctx = context()
+    assert.same({}, registry.call("fn.write_diagnostics", { snapshot(buf, path) }, ctx))
+    assert.equals(1, ctx.waits)
+    assert.same({}, unchanged.cancelled)
+    assert.same({}, failed.cancelled)
   end)
-  straps.config.after_write_diagnostics = true
-  assert(out == nil, "disabled hook should return nil, got: " .. tostring(out))
 end)
 
-it("write_file appends the diagnostics summary to its result", function()
-  local path = tmp .. "/f.lua"
-  -- Pre-create + load the buffer so the fake client + seeded diagnostics apply
-  -- to the same buffer write_file will write through.
-  local buf = make_buf(path, { "old" })
-  vim.diagnostic.set(ns, buf, {
-    { lnum = 0, col = 0, severity = vim.diagnostic.severity.ERROR, message = "still broken", source = "x" },
-  })
-  local result
-  with_fake_client(function()
-    result = registry.call("tool.write_file",
-      { path = path, content = "new content\n" }, ctx_for(buf))
+it("write_file appends the pulled summary and a disabled hook makes no requests", function()
+  local buf, path = make_buf({ "old" })
+  local c = full({ diagnostic("still broken") })
+  with_clients({ c }, function()
+    local ctx = context()
+    ctx.bufnr = buf
+    local result = registry.call("tool.write_file", { path = path, content = "new content\n" }, ctx)
+    assert.truthy(result:find("wrote ", 1, true))
+    assert.truthy(result:find("still broken", 1, true))
+    assert.equals(1, ctx.waits)
+    straps.config.after_write_diagnostics = false
+    local ok, out = pcall(registry.call, "hook.after_write", path, ctx)
+    straps.config.after_write_diagnostics = true
+    assert.is_true(ok)
+    assert.is_nil(out)
+    assert.equals(1, #c.requests)
   end)
-  assert(type(result) == "string", "expected a result string")
-  assert(result:find("wrote ", 1, true), "missing write confirmation: " .. result)
-  assert(result:find("diagnostics after write", 1, true),
-    "write_file did not append diagnostics: " .. result)
-  assert(result:find("still broken", 1, true), "missing the diagnostic message: " .. result)
 end)
 
-it("hook never throws on an invalid buffer", function()
-  local out = registry.call("hook.after_write", "/nonexistent/nope.lua", { bufnr = 0 })
-  assert(out == nil, "expected nil for a path with no buffer, got: " .. tostring(out))
+it("passes static and dynamic diagnostic identifiers using both registration APIs", function()
+  for _, version in ipairs({ "static", "0.12", "0.11" }) do
+    local buf, path = make_buf()
+    local c = full({})
+    c.server_capabilities.diagnosticProvider.identifier = "static-id"
+    if version == "0.12" then
+      function c:_registration_provider(method)
+        assert.equals(c, self)
+        assert.equals("textDocument/diagnostic", method)
+        return "diagnosticProvider"
+      end
+      function c:_get_registrations(provider, target)
+        assert.equals("diagnosticProvider", provider)
+        assert.equals(buf, target)
+        return { { registerOptions = { identifier = "dynamic-id" } } }
+      end
+    elseif version == "0.11" then
+      function c:_get_registration_options(method, target)
+        assert.equals(c, self)
+        assert.equals("textDocument/diagnostic", method)
+        assert.equals(buf, target)
+        return { identifier = "dynamic-id" }
+      end
+    end
+    with_clients({ c }, function()
+      registry.call("fn.write_diagnostics", { snapshot(buf, path) }, context())
+      assert.equals(1, #c.requests)
+      assert.equals(version == "static" and "static-id" or "dynamic-id", c.requests[1].params.identifier)
+    end)
+  end
+end)
+
+it("does not use a similarly named buffer or an invalid buffer", function()
+  local buf, path = make_buf()
+  local c = full({ diagnostic("decoy") })
+  with_clients({ c }, function()
+    assert.is_nil(registry.call("hook.after_write", path .. ".missing", context()))
+    assert.is_nil(registry.call("hook.after_write", "/nonexistent/nope.lua", { bufnr = 0 }))
+    assert.equals(0, #c.requests)
+    assert.is_true(vim.api.nvim_buf_is_valid(buf))
+  end)
 end)

@@ -30,7 +30,9 @@ before_each(function()
     local changes = {
       binding = { 'or not vim.deep_equal(record.checks.binding, binding)', 'or false' },
       facts = { 'or not vim.deep_equal(record, current)', 'or false' },
-      cwd = { 'or cwd ~= vim.fn.getcwd()', 'or false' },
+      cwd = { 'or cwd ~= (type(opts) == "table" and opts.cwd or vim.fn.getcwd())', 'or false' },
+      optscwd = { '(type(opts) == "table" and opts.cwd or vim.fn.getcwd())', 'vim.fn.getcwd()' },
+      optstype = { 'type(opts) == "table" and opts.cwd', 'opts and opts.cwd' },
       custom = { 'definition.source ~= expected.source', 'false' },
       shell = { 'if not program or not (shell_paths[program] or shell_output[program]) then', 'if false then' },
       options = { 'shell_output[program] and word:sub(1, 1) == "-"', 'false' },
@@ -56,9 +58,9 @@ before_each(function()
     local change = assert(changes[mutant], "unknown mutation")
     local source = table.concat(vim.fn.readfile(root .. "/lua/straps/contextual_targets.lua"), "\n")
     if mutant == "binding" then
-      local site = 'local current = M.resolve(binding)'
+      local site = 'local current = M.resolve(binding, options)'
       local start, finish = assert(source:find(site, 1, true))
-      source = source:sub(1, start - 1) .. 'local current = M.resolve(record.checks.binding)' .. source:sub(finish + 1)
+      source = source:sub(1, start - 1) .. 'local current = M.resolve(record.checks.binding, options)' .. source:sub(finish + 1)
     end
     local first, last = source:find(change[1], 1, true)
     assert(first, "mutation site missing")
@@ -103,6 +105,28 @@ it("rejects changed working directory at resolution", function()
   local record = targets.resolve(value)
   assert.is_not_nil(record.unresolved[1])
   assert.equals("cwd", record.unresolved[1].field)
+end)
+
+it("ignores a non-table second argument, as before the cwd option existed", function()
+  local value = binding("read_file", { path = "one" })
+  local expected = targets.resolve(value)
+  assert.same(expected, targets.resolve(value, true))
+  assert.is_true(targets.validate(expected, value, true))
+end)
+
+it("resolves against an explicit cwd from a window whose directory differs", function()
+  local value = binding("read_file", { path = "one" })
+  local expected = targets.resolve(value)
+  vim.cmd("tabnew")
+  vim.cmd("tcd " .. vim.fn.fnameescape(directory .. "/two"))
+  local from_other = targets.resolve(value, { cwd = value.cwd })
+  local default = targets.resolve(value)
+  local valid = targets.validate(expected, value, { cwd = value.cwd })
+  vim.cmd("tabclose")
+  assert.same({}, from_other.unresolved)
+  assert.same(expected, from_other)
+  assert.equals("cwd", default.unresolved[1].field)
+  assert.is_true(valid)
 end)
 
 it("rejects window and tab directory differences for global shell execution", function()

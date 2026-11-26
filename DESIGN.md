@@ -335,7 +335,7 @@ Contextual mode is disabled by default. `straps_classifier.setup({ contextual = 
 
 `contextual_human.lua` connects trusted UI surfaces to adoption, submission, continuation, reset, and decision inspection. Legacy/resumed sessions, piped data, and copied fork prompts require explicit human adoption. Adoption displays exact task events and standing sources and can regenerate the prompt. Continue without text retains authority; supplied text creates an instruction event. Stop cancels run tickets while preserving task identity and rejected-family suppression. Reset and closure invalidate pending authority/consent. `questions.lua` binds human answers to the full proposal and records selected-option identity or free-text origin before resolving callbacks. Typing an option label remains free text; dismissal and stale callbacks grant nothing.
 
-`contextual.lua` coordinates synthesis, assessment, execution families, and consent. The registry freezes validated input and definition identity, preserving guard/confirmation vetoes and checking revisions, cancellation, ceilings, and target assumptions before execution. Consent displays complete arguments and classifier objections, binds the exact call, and is consumed once. A human can inspect a decision with `:StrapsAuthorization {id}` and reopen with `!`; reopening performs a fresh gate, rather than invoking a terminal original closure or retrying an unknown outcome. Rejected decision families suppress repeated automatic prompts until human reopening. Execution-started receipts retain metadata only; retained denied decisions support exact-call inspection and fresh reopening. Missing assessment denies automatic authorization with an unassessed reason instead of creating an outage prompt for every call. An adopted session can remain pending without a synthesized task specification. Human reopening can approve the displayed exact call when disclosure, synthesis, assessment, or integration is unavailable, or despite displayed classifier objections. The approval does not synthesize or activate a task. Independent guards, ordinary confirmation, readonly/allow ceilings, fresh call and target checks, and consumption once at execution still apply. A displayed actor consent prompt holds the existing run's attention wait token until approval, rejection, cancellation, closure, expiry, or display error. Standalone adoption/inspection operations have no registered actor attention run; their attention ownership remains unresolved.
+`contextual.lua` coordinates synthesis, assessment, execution families, and consent. The registry freezes validated input and definition identity, preserving guard/confirmation vetoes and checking revisions, cancellation, ceilings, and target assumptions before execution. Consent displays complete arguments and classifier objections, binds the exact call, and is consumed once. A human can inspect a decision with `:StrapsAuthorization {id}` and reopen with `!`; reopening performs a fresh gate, rather than invoking a terminal original closure or retrying an unknown outcome. Rejected decision families suppress repeated automatic prompts until human reopening. Execution-started receipts retain metadata only; retained denied decisions support exact-call inspection and fresh reopening. Missing assessment denies automatic authorization with an unassessed reason instead of creating an outage prompt for every call. An adopted session can remain pending without a synthesized task specification. Human reopening can approve the displayed exact call when disclosure, synthesis, assessment, or integration is unavailable, or despite displayed classifier objections. The approval does not synthesize or activate a task. Independent guards, ordinary confirmation, readonly/allow ceilings, fresh call and target checks, and consumption once at execution still apply. An actor consent request that defers to the permission review (`permission_review = "deferred"`, inside a run, with the default display) holds the run's attention wait token from enqueue, while queued and while displayed, until approval, rejection, cancellation, closure, expiry, or display error; one shown at once holds it from display. Standalone adoption/inspection operations have no registered actor attention run; their attention ownership remains unresolved.
 
 `contextual_children.lua` attaches validated explicit subset delegation and ancestor-intersected capability ceilings before child execution. Conversation copying and inherited capability/archive grants create no task authority. In contextual mode, generic human `:StrapsFork`/`fn.fork` calls are unavailable because they lack a trusted exact invocation. An agent `fork` without delegation creates an inactive copy that requires human adoption before starting. Fork calls with explicit delegation are rejected because the copied prompt has no valid private construction receipt. Classifier consent cannot enlarge readonly/allow ceilings or bypass other guards. `:StrapsAdopt [text]` reviews/adopts task text and standing instructions; `:StrapsTaskReset` invalidates the authorization task without erasing the transcript.
 
@@ -344,6 +344,8 @@ The contextual provider factory fixes provider/model, endpoint, account/credenti
 Contextual capability ceilings classify exact shipped definition identities through private trusted setup. Public `capability` metadata and replaceable `fn.capability` do not assign trusted ceiling categories to custom tools. Unknown/custom definitions retain exact-definition assessment and independent ceiling requirements; wider custom-category authority remains unsupported.
 
 `contextual_targets.lua` records known target facts, unresolved facts, and revalidation checks for bounded default definitions and literal shell syntax. It rechecks relied-upon path/account/directory facts, but cannot prevent filesystem races after the check, constrain shell startup, or prove executable semantics. Custom definitions and hidden executable targets may remain unresolved. The Lua process and shell are not an operating-system sandbox.
+
+Contextual consent refresh (`validate` inside the gate, reached from expiry timers, other sessions' requests, `adapter.status`, `adapter.reopen`, `consent.consume` and the presenter) compares the directory of the window that was current when the gate ran (`gate_win`, falling back to the current window when it closed) with the gate-time directory, and revalidates standing instructions and targets against that directory: `instructions.discover(config, cwd)`, `contextual_targets.resolve(binding, { cwd })`, and the provider prompt receipts take it. `registry` passes the gate directory to `validate_stamp` as an optional third argument (`validate_stamp(session, stamp, cwd)`); contextual's implementation uses it, and an implementation that ignores it compares against the current window as before. A user-supplied `resolve_targets` receives `{ cwd = cwd }` as its second argument, and a user-supplied `validate_targets` receives `cwd` in its options table; one that ignores it uses the current window, so a refresh from another tab can invalidate the consent. Execution-time validation in `run()` still uses the current window.
 
 Provider disclosure, numeric calibration against labeled/held-out cases and Matt's acceptance, default enablement, unsupported routes, and locked-public-core compatibility remain parked. Passing offline routing/module tests does not establish completed integration, live calibration, or production readiness. Progress enforcement and a structured remote-operation tool remain deferred.
 
@@ -761,6 +763,26 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
      still gets acted on. `max_turns` still bounds total iterations.
 - `:StrapsSteer {text}` submits the supplied text directly. Without arguments,
   `:StrapsSteer` moves to the composer in the transcript window.
+- `:[range]StrapsAsk[!] [text]` (`straps.ask`) quotes the range from the current
+  buffer under a `path:first-last` header in a fence one backtick longer than the
+  quote's longest backtick run (at least three), with the filetype as the info
+  string and `text` on the next line. The path is `fnamemodify(name, ":.")` when
+  the window's directory is the global one (`getcwd(-1, -1)`, which the tools
+  use): relative under that directory, absolute outside it. In any other window
+  it is absolute. The target is `ui.resolve_session`, else the session buffer with the
+  highest `b:straps_last_focus` (a counter bumped on each session `BufEnter`; a
+  clock would tie within one event-loop iteration), else a new session. Strict
+  mode appends to an existing session's draft raw (submission escapes it), seeds
+  a new session's trailing user block with it, and `!` sends through
+  `steering.send`. Contextual mode keeps the quote as data and `text` as the
+  instruction: a new session goes through `human.open` with `opts.data`, like
+  piped stdin; an existing idle session whose trailing user block holds no
+  unsent text submits at once through `human.ask`,
+  which writes `instruction .. "\n\n" .. data` into the trailing user block,
+  records the draft split (instruction, data, displayed text, block count), and
+  only then calls `loop.start`, so a run that ends inside `loop.start` cannot
+  leave a record that refuses the next draft. A draft-based record would be
+  dropped by the stale-draft rule and bypassed by steering.
 - `%%[straps:draft]%%` separates the editable composer from the conversation. An
   extmark tracks the boundary. The renderer conceals the marker, overlays the
   `you` role header with a muted `draft` label on the same line, and hides the
@@ -815,13 +837,19 @@ The session winbar reports pending approval while the reader scrolls through ear
 
 `session_dock` defaults to `false`. When enabled, default session opens request a native seven-line split at the bottom of the tab. Explicit placement modifiers override the dock. The split displays the session buffer, so Neovim controls scrolling, resizing, undo, and draft retention. The dock's winbar keeps the conversation name and permission state visible even if another window has focus or `session_winbar = false`.
 
-`dock.lua` tracks dock windows and pending presentations by session buffer. If a dock exists when a default tool confirmation or contextual consent request reaches presentation, the run waits and the winbar reports `Permission pending`. The default file-edit confirmation path also defers approval for ordinary transcript windows. `workbench.pending(bufnr)` returns detached metadata (`call_id` when supplied by the provider, `name`, and `path`) from arrival through decision or cancellation. `:StrapsInspect` opens one read-only unified diff beside the originating transcript without entering the split. Closing the split does not resolve the request. The preview uses the staged batch base when available, then falls back to the live file buffer or disk. It does not authorize or apply an edit. `:StrapsPermission` resolves a session through the ordinary session-command rules and presents its waiting request. The existing confirmation or consent code handles the decision. Cancellation removes the pending presentation. Custom confirmation and consent implementations retain their own presentation behavior.
+`dock.lua` tracks dock windows and registers pending presentations with `permission_review.lua`. With `permission_review = "deferred"` (the default), every default `hook.confirm` prompt made inside a run coroutine (`ctx.await` and `ctx.on_cancel` present) defers, and contextual consent defers when it uses the default display, has an awaitable context, and belongs to a valid session buffer. With `"modal"`, a non-edit prompt and consent defer only while the dock is visible, and a session-buffer file edit defers through `workbench`; every other prompt calls `vim.fn.confirm` or opens consent's split at once. Calls without a coroutine prompt at once in both modes.
+
+Entries are typed. `{ kind = "confirm", bufnr, seq, spec, done, present, mode }` comes from `hook.confirm` through `dock.confirm` and `workbench.confirm`; `spec` carries the name, target, title, preview and keyed choices, `present` is the modal `vim.fn.confirm` closure, and `mode` is the setting at creation. `{ kind = "presenter", bufnr, seq, present, label, status, expires?, clock? }` comes from consent: a queued record registers at enqueue with no `present`, and its split presenter replaces it at display. `dock.defer(bufnr, entry)` refuses an invalid bufnr, so the caller falls back to the modal path, and takes a bare function as `{ kind = "presenter", present = fn }` for callers of its earlier `dock.defer(bufnr, present)` form. `dock.has_permission(bufnr)` reads the review entries, so the review module holds the only pending list. `seq` is a module-wide counter.
+
+`permission_review.lua` draws every pending entry, in `seq` order, as one sanitized row in a top-right float of the current tab (`focusable = false`, zindex 200), and a `waiting:` virtual line above the waiting session's draft marker, or before the pending batch's first `tool_use` marker when there is no draft. Every update re-checks the float's window and tabpage and re-opens it on a mismatch; `TabEnter`, `VimResized` and a 30 s timer while consent rows exist trigger updates. A render error notifies and names `:StrapsPermission`. Review (`gy`, `:StrapsPermission`) resolves the target session's own entry, then a descendant's, then the oldest. A `"deferred"` confirm entry with a `spec` opens a review float (zindex 250) built from the spec only, so a session shadow of `fn.render` cannot change it; its keys are the choice letters, `i` (`workbench.inspect` beside the prior window, then the float closes with the entry still pending, so the float does not cover the diff), `<Tab>`/`<S-Tab>`, an inert `<CR>`, `q`/`<Esc>` and `gy`. Every other entry calls `present`. Review refuses inside the cmdline window and while `registry.tool_body_running_here()` is true: a tool body that is executing (status `running` or `normal`), or the main-thread key; bodies suspended in `ctx.await` do not block review. `workbench.pending(bufnr)` returns detached metadata (`call_id` when supplied by the provider, `name`, and `path`) from arrival through decision or cancellation. `:StrapsInspect` opens one read-only unified diff beside the originating transcript without entering the split. Closing the split does not resolve the request. The preview uses the staged batch base when available, then falls back to the live file buffer or disk. It does not authorize or apply an edit. Cancellation, the decision, and buffer wipe remove the entry. Custom confirmation and consent implementations retain their own presentation behavior; a custom `hook.confirm` can defer through `dock.confirm(ctx, present, spec)`, or through `dock.confirm(ctx, present)`, whose row reads `allow (custom hook.confirm)` and whose review calls `present`.
+
+Threat model: the review float and the corner float take their text only from the entry's sanitized fields and never from the transcript or registry renderers. The review does not constrain a session that has had a `lua`, `define` or `exec` call approved, once or by grant: that code can queue keys that run after the body yields, leave a timer, a `vim.schedule` callback or a coroutine that decides a later request, or drive Neovim over its RPC socket. The modal prompt has the same exposure. Deciding from a window whose `:lcd`/`:tcd` differs from the gate window resumes the run there, and the execution-time directory check refuses the approved call.
 
 ### Terminal attention
 
-`attention.lua` translates admitted loop runs and actual prompt lifetimes into OSC 7501 reports through Neovim 0.12's `nvim_ui_send`. `terminal_status` defaults to true. Disabling through `setup()` clears active task IDs and the root pane report; enabling replays the aggregate and active named records. The reporter owns the root OSC 7501 record while enabled, so another reporter in the same pane can replace it. Clearing that root removes every named protocol record in the pane, including other reporters' records, on disable, shutdown, or removal of the last retained record. This core mechanism preserves registry hooks and does not infer blocked states from tool names or progress events.
+`attention.lua` translates admitted loop runs and the lifetimes of permission requests and prompts into OSC 7501 reports through Neovim 0.12's `nvim_ui_send`. `terminal_status` defaults to true. Disabling through `setup()` clears active task IDs and the root pane report; enabling replays the aggregate and active named records. The reporter owns the root OSC 7501 record while enabled, so another reporter in the same pane can replace it. Clearing that root removes every named protocol record in the pane, including other reporters' records, on disable, shutdown, or removal of the last retained record. This core mechanism preserves registry hooks and does not infer blocked states from tool names or progress events.
 
-Each session ID includes a process nonce and buffer number. Wait tokens belong to a specific run identity, so a callback from an old run cannot alter its replacement. Named records represent active sessions and standalone prompts; finishing a run clears its named record. Completed outcomes remain internal, ordered by completion sequence. A root report without an ID projects the pane status: the newest wait across runs and standalone prompts selects blocked and its kind; otherwise any active run selects working; otherwise the latest remaining completion selects done for `ok`, idle for cancellation, or error for other reasons. A failed child cannot override a running parent or its later success. Removing the latest completion exposes the preceding remaining outcome, or clears the root if none remains. Actual built-in permission and question prompts report blocked with permission/question kinds. Standalone API key entry and logout confirmation use temporary task IDs. Prompt exception, dismissal, cancellation, and forced-resume paths release their waiting tokens. Closing a standalone prompt recomputes the current root state.
+Each session ID includes a process nonce and buffer number. Wait tokens belong to a specific run identity, so a callback from an old run cannot alter its replacement. Named records represent active sessions and standalone prompts; finishing a run clears its named record. Completed outcomes remain internal, ordered by completion sequence. A root report without an ID projects the pane status: the newest wait across runs and standalone prompts selects blocked and its kind; otherwise any active run selects working; otherwise the latest remaining completion selects done for `ok`, idle for cancellation, or error for other reasons. A failed child cannot override a running parent or its later success. Removing the latest completion exposes the preceding remaining outcome, or clears the root if none remains. Built-in permission requests report blocked with the permission kind from the moment they are listed or displayed until decided; question prompts report blocked with the question kind while displayed. Standalone API key entry and logout confirmation use temporary task IDs. Prompt exception, dismissal, cancellation, and forced-resume paths release their waiting tokens. Closing a standalone prompt recomputes the current root state.
 
 Buffer unload (`:bdelete`, `:bwipeout`, or `:bunload`) clears the session ID without cancelling an active run. Hiding a loaded session, `:file`, and `:saveas` preserve its task ID. Late wait releases and run completion cannot republish an unloaded session's cleared record. Shutdown clears active named records and the root before run cancellation callbacks execute and suppresses later reports. UI attachment replays the root before active named records. Completed named records never replay. No transcript content, credential data, error details, or invented progress leaves the reporter. Neovim broadcasts to all attached `stdout_tty` UIs; headless instances have no terminal recipient and versions before 0.12 perform no reporting. Browser authorization intervals, project-trust dialogs, and descendant-stop confirmations are excluded. Those dialogs can leave an active run reported as working.
 
@@ -1699,15 +1727,14 @@ its investments a place to survive the session.
   tool/hook before the third time; user says "always" / "every time" /
   "from now on" → that IS a registry_define, not something to remember; a
   tool failing the same way twice → redefine the tool, don't work around it.
-- Session-start ritual: first task in a repository → work out build/test/
-  lint commands and register them as tools (tool.run_tests, tool.lint)
-  instead of retyping bash strings.
+- Build/test/lint trigger: the first time the agent runs the project's
+  build, test or lint command during a task, it registers that command as a
+  tool (tool.run_tests, tool.lint) instead of retyping bash strings. It
+  learns the command from the task and does not survey the repo for it.
 - Workflow checkpoint appended to the locate→read→edit→verify loop: "after
   verifying, ask: did I do anything manually that a hook could do
   automatically next time? If yes, install it now."
-- Second worked example (different shape from the after_write hook): a full
-  registry_define of tool.run_tests wrapping a repo's test command with an
-  optional path-filter input.
+- One worked example: hook.after_write running a linter through ctx.await.
 - Persistence: a trusted `.straps.lua` at the project root is loaded
   automatically; to keep an improvement across sessions, render it with
   registry_get and append the definition to `.straps.lua` (file writes go
@@ -1943,7 +1970,7 @@ API names (registry names prefixed `tool.`):
   pass). Any other entry errors "exceeds this session's own grants". A gated
   spawner passing neither `allow` nor `readonly` gets a read-only child, and
   the spawn result appends a line saying so. An ungated session's grant set
-  (`:StrapsAuto`) imposes no ceiling; the user's dialog is its gate. The child
+  (`:StrapsAuto`) imposes no ceiling; the user's permission review is its gate. The child
   shadow's deny messages skip the marker, so a readonly child still reports
   "readonly subagent: ...". Nesting depth: `vim.b.straps_spawn_depth` (0 for a
   top-level session, +1 per level) against `fn.spawn_depth_limit()` =
@@ -1979,7 +2006,10 @@ API names (registry names prefixed `tool.`):
   `spawn`) is enforced against its `straps_spawn_started_ms` (so time the parent
   spent before calling spawn_wait counts against the child) — an overrunning
   child is `loop.stop`ped and marked timed out; cancelling the parent stops
-  every outstanding child. Returns one `## subagent (buffer N)` section per
+  every outstanding child. Temporary limitation: the deadline keeps counting while a
+  child waits on a deferred permission review (`permission_review = "deferred"`), so
+  it can expire and stop the child mid-review. A follow-up change removes
+  `spawn_wait` and the spawn deadline. Returns one `## subagent (buffer N)` section per
   child (status + task + transcript path + the child's last assistant text).
   `fn.build_tools` hides BOTH `spawn` and `spawn_wait` at the spawn depth limit
   and for a gated scope without `cap:spawn`.
@@ -2184,7 +2214,11 @@ Default hooks registered here:
   of the form `cap:<category>` in the per-session grant set
   (`registry.granted(ctx.bufnr)`) silently permits every call
   `fn.capability` classifies into that category (cap: keys are written by
-  `:StrapsAuto` and by spawn's `allow`); for everything else
+  `:StrapsAuto` and by spawn's `allow`); for everything else it asks: inside a
+  run with `permission_review = "deferred"` (the default) the request is listed
+  in the corner float and decided in the review float with the keys of its
+  `spec.choices` (see the permission review paragraphs under the dock section);
+  outside a run, or with `"modal"` outside the dock and session-buffer edits,
   `vim.fn.confirm("straps: allow <name>?\n<preview of input>", ...)`
   — "Always this tool" adds `registry.tool_grant_key(name)` (`<name>@v<version>[@<bufnr>]`)
   to the grant set via `registry.grant(ctx.bufnr, key)`, and the lookup reads the
@@ -2328,7 +2362,10 @@ of redefining `fn.system_prompt` wholesale) is documented under
   `CLAUDE.md` found walking upward from cwd
   (`vim.fs.find(..., {upward = true, limit = math.huge})`, reversed so the
   farthest ancestor is added first and the nearest last); (3) any explicit
-  paths in `config.instructions_files` (list, default {}), last of all.
+  paths in `config.instructions_files` (list, default {}), last of all. A relative
+  path joins the directory discovery runs in; a `~` path is left for `fnamemodify` to expand.
+  `instructions.discover(config, cwd)` takes that directory as an optional second argument
+  (default `vim.fn.getcwd()`).
   Each distinct file is fenced with a header naming its path and included
   whole (no size cap; the user owns the budget); a path seen twice (e.g. `$HOME` is
   also an ancestor) is included once at its most general position;
@@ -2390,6 +2427,30 @@ Written for agent-ability and ecosystem norms; concise, imperative:
   the thing); if an LSP-backed operation may help, use `lsp_status` to see
   whether Neovim has a server for the file; make the smallest change that solves
   the problem; match the surrounding code style.
+- Investigation depth (`# Tool use`): when the task is to fix or change
+  something and the user or an error message names a file, service, setting or
+  option, the agent starts there, and reads upstream source, other hosts'
+  config or unrelated modules only when that file and the error message do not
+  show the cause. When searches for a file, symbol or setting the user refers
+  to as existing, its plausible spellings and its likely locations find
+  nothing, the agent reports what it searched and stops.
+- Scope (`# Scope`): the request defines the boundary; off-path findings are
+  noted in one line; pre-existing failures are reported, not adopted. Rules
+  derived from user corrections in stored sessions: an information or
+  assessment question is answered in the reply and the turn ends, with no
+  edits, no tool or hook registration and no deploys; read-only commands and
+  the existing test, build or command that shows the behavior are allowed;
+  general facts come from the model's knowledge, and facts about the repo,
+  environment and installed versions are read or run; the answer addresses the
+  case the user set up, including earlier constraints ("can you X" is a request
+  to do X; a question mid-task is answered and the task continues unless the
+  question rejects the approach); no
+  component the request does not name and the result does not need
+  (certificates, secrets, extra services, caching layers); edit_file keeps the
+  anchor line when adding a setting, and existing settings the request did not
+  mention stay; a correction narrows the task, with no substitute mechanism,
+  and when the reduced request cannot work the agent asks through `ask_user`,
+  otherwise it delivers the reduced version.
 - Editor-agent powers (this is what distinguishes straps from a terminal
   agent): files the user has open may have unsaved changes; writes reload
   their buffers automatically. `eval_lua` runs INSIDE the user's Neovim —
@@ -2398,7 +2459,9 @@ Written for agent-ability and ecosystem norms; concise, imperative:
   shelling out when the editor already knows the answer.
 - Permissions: some tool calls prompt the user for approval; a denial comes
   back as a tool error — respect it, adjust the approach, do not retry the
-  identical call. Genuinely ambiguous scope goes through `ask_user`; when the
+  identical call. After its opening sentence the section is a bullet list. The
+  rule against ending a turn to ask whether to proceed covers the agent's own
+  next step; a user's question is covered under Scope. Genuinely ambiguous scope goes through `ask_user`; when the
   options are competing implementations, each is passed as `{ label, preview }`
   with a sketch of that option's code, so the user picks between visible
   sketches rather than one-line summaries. The question renders inline in the
@@ -2470,7 +2533,20 @@ Written for agent-ability and ecosystem norms; concise, imperative:
   chunks returning `function(input, ctx)`; a first project test/build/lint run
   is a cue to define a tiny session tool for repeated use; the hook.after_write
   linter idiom remains the worked example — encode persistent behaviors into
-  hooks instead of remembering to repeat them.
+  hooks instead of remembering to repeat them. A "Permissions for
+  registry_define" bullet list states what the agent can act on: session
+  tool/hook/fn definitions and session tool calls are lua, session skills are
+  read; global, malformed and protected-name definitions are define (prompt in
+  an unrestricted session, denied to a readonly or allow-restricted child); the
+  definition prompt is Yes/No; without a lua grant each definition prompts,
+  each call of the new tool prompts until Always this tool, and a redefinition
+  prompts again; no grant covers define; a new-name global tool is agent_tool,
+  so a lua grant does not cover its calls, which prompt with Yes/No/Always this
+  tool; allow={"lua"} children may extend, readonly children may define skills,
+  allow={"registry_define"} is denied; session scope limits visibility, not
+  what the Lua can do. The persistence paragraph states that session scope
+  keeps an entry out of sessions other than this one and its subagents, and
+  .straps.lua keeps it across sessions.
 - Project instructions from AGENTS.md/CLAUDE.md, when present, appear in a
   later section and take precedence over general guidance here.
 
@@ -2533,10 +2609,16 @@ Clears the straps-render namespace and repopulates by walking
 `state.list_blocks(bufnr)`. Per block:
 
 - **user / assistant / system marker line** → a `conceal=""` extmark hiding the
-  raw marker text, plus an `overlay` `virt_text` at col 0 drawing a turn rule
+  raw marker text, plus a `virt_text` at col 0 drawing a turn rule
   (fixed ~52-col): light `─` rules for user and system (`──── you ─────…`,
   `──── system ─────…`), a heavy `━` rule for the assistant
-  (`━━━━ Cinch ━━━━━…`, labeled Cinch). The rule char differs per role and the
+  (`━━━━ Cinch ━━━━━…`, labeled Cinch). Assistant rules are `overlay`; user,
+  system and notice rules are `inline`, because those markers can start a
+  closed fold and an overlay would paint over its foldtext. With the cursor on
+  an inline-rule marker in Insert or Visual mode (`concealcursor=nc`), the raw
+  marker shows after the rule.
+  An assistant turn that made tool calls carries a stats segment:
+  `━━━━ Cinch · 6 calls · 14s · 1.2k out ━━━`. See Turn stats below. The rule char differs per role and the
   leading segment + role word take the StrapsRole* color while trailing bars
   stay dim StrapsRule — a bounded categorical mark, not a wash, sized so user
   and agent turns delineate at a glance. The blank line the writer puts before
@@ -2569,6 +2651,34 @@ future renders). Also render once on open.
 
 Idempotent: clears before repopulating, so N renders == 1 render's extmarks.
 
+### Turn stats
+
+The assistant rule of a turn with tool calls reads `· N calls`, then `· Ns` and
+`· N out` when recorded. `calls` counts the `tool_use` blocks in the turn's
+`turn_extent` range from the transcript, so it survives restarts. Seconds and
+output tokens live in memory only: `ui.record_turn_stats(bufnr, key, ms, out)`
+stores them under the turn's key, the id of its first `tool_use` whose id is a
+non-empty string not starting with `straps-replay-`. A turn without such an id,
+and two turns sharing a key, show `calls` only. `BufWipeout` clears the table;
+an entry whose key left the transcript is never shown.
+
+`loop.lua` stores once per response that requested tools, after the stall check:
+wall time since the `thinking` event, from `vim.uv.hrtime()`, minus the growth of
+`attention.wait_ms(bufnr)` over the same span (clamped at 0), and
+`resp.usage.output_tokens` when present. Cancelled, errored and stalled turns
+store nothing. The debounced render shows the numbers; the loop does not render.
+
+`attention.wait_ms` sums every wait on the human (permission, consent and
+`ask_user` questions) in `wait_totals[bufnr]`, a table separate from the
+attention record, so `:edit!` (which clears the record at BufUnload) keeps it.
+Each `attention.wait` token increments the count and releases at most once.
+
+Known limitations: a run's final answer turn has no tool calls and shows no
+stats. A replay `tool_use` counts toward the preceding turn. Waits in descendant
+sessions are not subtracted from a parent's seconds, and the count includes
+waits from parallel `child_ctx` tool bodies. Turns from earlier Neovim
+processes show `calls` only.
+
 ### Collapse (folds + colored foldtext)
 
 Tool_use/tool_result pairs collapse to one summary line. The system block, harness notices, and agent messages also fold. Each notice has a separate fold whose summary shows `harness` or `agent N` and its first content line. Ordinary user and assistant turns remain open under `zM`. Default `foldlevel=0` closes these folds; `config.tools_expanded` raises it to 99 and opens them all. The `gO` location-list outline shows `<role>  <headline> · N tools`, with the block's first content line truncated with `…`. Text typed on the marker line takes precedence.
@@ -2583,8 +2693,11 @@ colors `failed` through `DiagnosticError`.
 The target comes from a string input field (`path`, `filename`, `file` or
 `url`), the first line of a shell command for command tools, or the pattern
 for `glob` and `grep` when no path is present. A standalone result shows its
-call ID if known. A call takes metadata from a result with the same ID in
-its own fold. The result marker's boolean `is_error` supplies `ok` or
+call ID if known. A call takes metadata from the result run that follows its
+batch of calls: the k-th call with an ID pairs with the k-th result with that
+ID, and empty assistant markers between the calls and the results are passed
+over. A user block or an assistant block with text ends the search. The
+result marker's boolean `is_error` supplies `ok` or
 `failed`. A nonnegative integer `count` supplies `count: N` when present;
 the default tool runner does not write a count. Missing or invalid values
 are omitted. The summary never reads the result body.
@@ -2663,7 +2776,7 @@ for an agent-defined tool or change the style.
 - `fn.render` is a registry entry → `:StrapsEdit fn.render` + `:w` reshapes the
   whole presentation live, like every other entry.
 - Raw markers: `:set conceallevel=0` (window) shows the real text under the
-  overlays, or redefine `fn.render` to a no-op. Document both.
+  rules, or redefine `fn.render` to a no-op. Document both.
 - Never mutate buffer text or `modified`; extmarks/conceal are display-only, so
   parse, persist (buftype="" durable buffers), and `:w` are unaffected.
 
@@ -2677,12 +2790,14 @@ for an agent-defined tool or change the style.
 Build a session buffer with a scripted transcript (user, assistant, a
 tool_use+tool_result pair, system). Then, without a real window where
 possible, assert on `nvim_buf_get_extmarks(buf, ns, ..., {details=true})`:
-- marker lines carry a conceal extmark and an overlay virt_text: a lead rule
-  segment + role word in StrapsRoleUser/Agent/System, a dim StrapsRule
-  trailing run, and per-role bar chars (light `─` for user/system, heavy `━`
-  for the assistant) on lead and trailing alike.
-- a user block holding a `[straps] ` harness notice overlays `harness` in
-  StrapsRoleNotice with the `┄` bar; a `state.agent_message` block overlays
+- marker lines carry a conceal extmark and a rule virt_text (`overlay` for the
+  assistant, `inline` for user, system and notices): a lead rule segment + role
+  word in StrapsRoleUser/Agent/System, an optional stats segment on assistant
+  rules, a dim StrapsRule trailing run as the last chunk, and per-role bar chars
+  (light `─` for user/system, heavy `━` for the assistant) on lead and trailing
+  alike.
+- a user block holding a `[straps] ` harness notice draws `harness` in
+  StrapsRoleNotice with the `┄` bar; a `state.agent_message` block draws
   `agent N`; a plain user block, an indented `  [straps] ` lookalike and the
   `[straps: …]` colon form keep `you`/StrapsRoleUser. The outline carries the
   same labels, aligned.
@@ -2767,7 +2882,7 @@ Existing suites must all still pass.
   `<CR>` opens the transcript in the dashboard window through the existing `"none"` split sentinel, preserving jumplist navigation. `i` sends a targeted message through `fn.session_notify`: running sessions receive steering, idle sessions receive a user block without starting. `g<CR>` explicitly starts or continues an idle session. `r` changes the durable title, including during a run, without renaming the file. `x` stops a running session with explicit descendant-cancellation confirmation. `R` clears saved-summary caches and renders immediately. `<F1>` opens help; native search, Visual mode, and window commands remain available.
   `p` opens selected-agent details in an ordinary read-only scratch split without taking focus. `P` toggles follow-selection, disabled initially. Details separate task, model, context, parent, observed status, and a bounded latest-assistant preview. Buffer-derived preview data uses changedtick caching and bounded lookup rather than full transcript parsing on every progress update. No generated summaries or inferred input-wait states appear. Ending reasons distinguish finished, stopped, failed, and other observed termination states; a new run clears stale termination metadata.
   Progress, dashboard buffer entry, and resize request a trailing debounced refresh. Hidden dashboards do not render. Saved listing excludes loaded paths before summary work. First-prompt extraction streams through the first real complete user block, preserving title preference, notice filtering, and marker escaping, and closes its file handle on every exit. A display-only in-memory cache stores summaries, including nil, keyed by absolute path and transcript/metadata file signatures (size and modification/change timestamps). Title writes invalidate cached summaries; listing prunes vanished entries. No cache changes the transcript or metadata schema.
-  `ui.pick_agents()`, `ui.running_agents()`, and `ui.agents_status()` remain available with their existing meanings.
+  `ui.pick_agents()` and `ui.running_agents()` remain available with their existing meanings. `ui.agents_status()` returns `🤖 <top-level>` plus `+<subagents>` for running sessions, and appends ` ◆<n>` for running sessions with an open wait on the human (`attention.waiting`, from the `wait_totals` count): `🤖 2+1 ◆1`. Each wait start and end runs `redrawstatus!` and `redrawtabline`.
 - Statusline hints: `vim.b[bufnr].straps_status` = "running"|"idle" (+ redraw)
   is the PER-buffer state; `ui.agents_status()` is the buffer-independent
   cross-session count (loop does a `redrawstatus!` on run start/end so a
@@ -2869,7 +2984,19 @@ Existing suites must all still pass.
 - Folding for the session buffer: foldexpr folds `tool_use`/`tool_result`
   pairs, the system block, harness notices, and agent messages at level 1.
   `foldlevel=0` closes those folds. Ordinary user and assistant turns remain open.
-- Every window option straps sets — fold\*, conceal\*, and the agents window's
+  Lines from the draft marker down are level 0, so a marker line quoted or
+  pasted into the draft opens no fold there.
+- Session window options, set with the fold options: `fillchars` `fold: ` (closed
+  folds fill with blanks), `linebreak`, `breakindent` and `breakindentopt=list:-1`,
+  so a wrapped list item continues under its text. Buffer options from
+  `ui.apply_buffer_opts`: `formatlistpat` (`ui.LIST_PATTERN`, bullets and numbered
+  items) and `omnifunc` (`straps.ask`: `@path` completes files, `@#query` asks
+  every `workspace/symbol` client and completes `@path:line[:col]`). The ftplugin
+  and the FileType autocmd apply them; the autocmd skips them when
+  `b:did_ftplugin` is set, so an after/ftplugin setting survives a `setup()`
+  that runs after filetype plugins load. `undo_ftplugin` restores them.
+- Every window option straps sets — fold\*, conceal\*, `fillchars`, `breakindentopt`,
+  `linebreak`, `breakindent`, and the agents window's
   `wrap`/`number`/`signcolumn`/`foldcolumn` — is written per-(window, buffer)
   with `vim.wo[win][0]` (`:setlocal`). Plain `vim.wo[win].opt = v` is `:set`,
   which also writes the per-window value, and that value outlives the buffer in
@@ -3260,7 +3387,7 @@ carried no sender and was a no-op on an idle peer.
   `agent_message`, so only line 1 can speak for a sender.
 - Tests: `tests/messaging_spec.lua` (classifier, title skip, both delivery
   paths, validation, real readonly/allow children at depth 1 and 2),
-  `tests/render_spec.lua` (overlays and outline), `tests/prompt_spec.lua`.
+  `tests/render_spec.lua` (inline and overlay rules, and outline), `tests/prompt_spec.lua`.
 
 Model AWARENESS (`fn.model_note` — layers/agents.lua, call site in loop.lua): the
 winbar has always told the USER which model a session runs on; the agent itself
@@ -3328,15 +3455,19 @@ parent's (tools.lua) — a real decision the agent had no inputs for.
   substitute on the line of every entry in the CURRENT findings list (the set
   grep just made) through `findings.locations_do`, so it's a native multi-file
   edit that goes through buffers → undoable (ties into ws2). Empty list →
-  message ("run grep first"). Reject newline/`|` in pattern/replacement,
-  escape the delimiter, and whitelist substitute flags so user input cannot
+  message ("run grep first"). Put the pattern in the search register, reject
+  newline, carriage return, `|` and NUL in pattern/replacement, refuse a
+  replacement that starts with `\=` or `~` or ends in an unescaped backslash,
+  pick a `:s` delimiter absent from the replacement, and whitelist substitute flags so user input cannot
   append another Ex command; flags `c` (prompts per match) and `n` (counts
   without substituting) are rejected. Return the count of files changed.
   Gated by hook.confirm (it writes). Optional `{ dry_run = true }` → report
   targets without editing.
 - Tests: grep populates a non-empty quickfix list with correct file/lnum;
   bulk_replace over a seeded qf list edits the files (undoably) and reports the
-  count; empty-qf and dry_run paths.
+  count; empty-qf and dry_run paths. `tests/bulk_replace_guard_spec.lua` covers the
+  refused patterns and replacements and the search-register restore;
+  `tests/quickfix_spec.lua` covers refused flags.
 - `run_quickfix {command, errorformat?, title?, timeout_ms?, open?}` — run a
   build/test/lint command and parse its output into the quickfix list through
   Vim's NATIVE errorformat (`getqflist({lines, efm})` — the efm given, else the
@@ -3383,8 +3514,10 @@ list ("loclist"/"quickfix"). Tools' user-facing summaries say `:lnext/:cnext`
 accordingly. Tested in `quickfix_spec.lua`: two on-screen sessions get isolated
 per-window lists (and the global qf list stays untouched), bulk_replace on
 session A edits only A's file, a windowless session uses its private store,
-opening a list keeps focus, and bulk_replace leaves the user's window,
-jumplist and search register alone. Visibility-transition tests cover stored
+opening a list keeps focus, and bulk_replace leaves the user's window and
+jumplist alone and restores the search register's text and direction (the
+previous search's offset, magic state and smartcase override are lost; see
+SECURITY.md). Visibility-transition tests cover stored
 findings becoming visible, visible findings becoming hidden, and stale list
 replacement. Multiline substitution tests exercise later extmarks moving and
 undo restoring both replacements in one buffer. `bulk_replace` rejects `c`,

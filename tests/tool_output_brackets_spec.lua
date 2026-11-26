@@ -38,7 +38,7 @@ local function prefixes(buf)
   local found = {}
   for _, mark in ipairs(api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
     local details = mark[4]
-    if details.virt_text_pos == "inline" then
+    if details.virt_text_pos == "inline" and details.virt_text[1][2] == "StrapsCardBorder" then
       found[#found + 1] = { mark[2] + 1, mark[3], details.virt_text }
     end
   end

@@ -305,11 +305,15 @@ it("11: a hand-opened .straps file gets every session keymap, and undo_ftplugin 
     assert(vim.fn.maparg(lhs, "n", false, true).buffer == 1, lhs .. " not mapped")
   end
   assert.are.equal("expr", vim.wo[0].foldmethod)
+  assert.is_true(vim.wo[0].linebreak)
   vim.bo[b].filetype = "text"
   for _, lhs in ipairs(ui.SESSION_KEYS) do
     assert(vim.fn.maparg(lhs, "n", false, true).buffer ~= 1, lhs .. " still mapped after ft change")
   end
   assert.are_not.equal("expr", vim.wo[0].foldmethod)
+  assert.is_false(vim.wo[0].linebreak)
+  assert.are.equal(vim.go.formatlistpat, vim.bo[b].formatlistpat)
+  assert.are.equal(vim.go.omnifunc, vim.bo[b].omnifunc)
 end)
 
 it("8: :StrapsSteer with no run puts the text in the trailing user block and warns", function()
@@ -451,9 +455,39 @@ end)
 it("12: doc/straps.txt and README.md document every session keymap", function()
   local doc = table.concat(vim.fn.readfile(root .. "/doc/straps.txt"), "\n")
   local readme = table.concat(vim.fn.readfile(root .. "/README.md"), "\n")
-  for _, lhs in ipairs({ "]]", "[[", "gO" }) do
+  for _, lhs in ipairs({ "]]", "[[", "][", "[]", "gO", "g?", "gy" }) do
     assert(doc:find("\n\t" .. lhs .. "\t", 1, true), lhs .. " missing from doc mappings")
     assert(readme:find("`" .. lhs .. "`", 1, true), lhs .. " missing from README")
+  end
+end)
+
+it("17: g? lists the session keys and Straps commands and closes back to the session", function()
+  vim.cmd("filetype plugin on")
+  local b = session_in_split()
+  local session_win = vim.api.nvim_get_current_win()
+  vim.cmd("normal g?")
+  local win = vim.api.nvim_get_current_win()
+  assert.are_not.equal(session_win, win)
+  assert.are.equal("editor", vim.api.nvim_win_get_config(win).relative)
+  local text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false), "\n")
+  for _, needle in ipairs({ "<CR>", "gO", "gy", "g?", "][", "[]", ":StrapsAsk", ":StrapsPermission" }) do
+    assert(text:find("\n  " .. needle .. " ", 1, true), needle .. " missing from the key reference:\n" .. text)
+  end
+  vim.cmd("normal q")
+  assert.are.equal(session_win, vim.api.nvim_get_current_win())
+  assert.is_false(vim.api.nvim_win_is_valid(win))
+  vim.keymap.set("n", "zq", "<Nop>", { buffer = b, desc = require("straps.questions").KEY_DESC })
+  vim.cmd("normal g?")
+  local esc_win = vim.api.nvim_get_current_win()
+  local listed = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(esc_win), 0, -1, false), "\n")
+  assert.is_nil(listed:find("\n  zq ", 1, true), listed)
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "mx", false)
+  assert.are.equal(session_win, vim.api.nvim_get_current_win())
+  assert.is_false(vim.api.nvim_win_is_valid(esc_win))
+  vim.keymap.del("n", "zq", { buffer = b })
+  vim.bo[b].filetype = "text"
+  for _, lhs in ipairs({ "][", "g?" }) do
+    assert(vim.fn.maparg(lhs, "n", false, true).buffer ~= 1, lhs .. " still mapped after ft change")
   end
 end)
 

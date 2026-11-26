@@ -98,32 +98,94 @@ function M.wait_label(bufnr, dock)
   local workbench = package.loaded["straps.workbench"]
   local edit = workbench and workbench.pending(bufnr)
   local label = require("straps").config.render ~= false and "%#StrapsPermit#◆ waiting%*" or "waiting"
-  if edit then return label .. " — Permission pending (:StrapsInspect / :StrapsPermission)  " end
-  if dock then return label .. " — Permission pending (:StrapsPermission)  " end
+  if edit then return label .. " — Permission pending (gy / :StrapsInspect / :StrapsPermission)  " end
+  if dock then return label .. " — Permission pending (gy / :StrapsPermission)  " end
   return M.permission_wait(bufnr) and label .. "  " or ""
 end
 
-local function redraw_permission(kind, bufnr)
-  if kind == "permission" or kind == "consent" then
+local function redraw_permission(kind)
+  if kind == "permission" or kind == "consent" or kind == "question" then
     pcall(vim.cmd, "redrawstatus!")
+    pcall(vim.cmd, "redrawtabline")
   end
+end
+
+local wait_totals = {}
+local wait_cleanup = false
+
+local function now_ms()
+  return vim.uv.hrtime() / 1e6
+end
+
+local function open_total(bufnr)
+  if type(bufnr) ~= "number" then return end
+  if not wait_cleanup then
+    wait_cleanup = true
+    vim.api.nvim_create_autocmd("BufWipeout", {
+      group = vim.api.nvim_create_augroup("straps_wait_totals", { clear = true }),
+      callback = function(args) wait_totals[args.buf] = nil end,
+    })
+  end
+  local total = wait_totals[bufnr]
+  if not total then
+    total = { count = 0, closed_ms = 0 }
+    wait_totals[bufnr] = total
+  end
+  total.count = total.count + 1
+  if total.count == 1 then total.open_start = now_ms() end
+  return total
+end
+
+local function close_total(total)
+  if not total then return end
+  total.count = total.count - 1
+  if total.count == 0 then
+    total.closed_ms = total.closed_ms + (now_ms() - total.open_start)
+    total.open_start = nil
+  end
+end
+
+function M.wait_ms(bufnr)
+  local total = wait_totals[bufnr]
+  if not total then return 0 end
+  return total.closed_ms + (total.open_start and now_ms() - total.open_start or 0)
+end
+
+function M.waiting(bufnr)
+  local total = wait_totals[bufnr]
+  local loop = package.loaded["straps.loop"]
+  return total ~= nil and total.count > 0 and loop ~= nil and loop.running(bufnr)
 end
 
 function M.wait(ctx, kind)
   local key = ctx and ctx.bufnr
+  local total = open_total(key)
+  local released = false
   local record = records[key]
-  if not record or not record.run or record.run.ctx ~= ctx or stopped then return function() end end
+  if not record or not record.run or record.run.ctx ~= ctx or stopped then
+    if total then redraw_permission(kind) end
+    return function()
+      if released then return end
+      released = true
+      close_total(total)
+      if total then redraw_permission(kind) end
+    end
+  end
   local run = record.run
   serial = serial + 1
   local token = { kind = kind, seq = serial }
   record.waits[token] = true
   publish(record)
-  redraw_permission(kind, key)
+  redraw_permission(kind)
   return function()
-    if records[key] ~= record or record.run ~= run or not record.waits[token] then return end
-    record.waits[token] = nil
-    publish(record)
-    redraw_permission(kind, key)
+    if released then return end
+    released = true
+    close_total(total)
+    if records[key] == record and record.run == run and record.waits[token] then
+      record.waits[token] = nil
+      publish(record)
+    end
+    redraw_permission(kind)
   end
 end
 

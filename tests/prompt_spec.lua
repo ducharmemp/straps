@@ -4,7 +4,9 @@
 -- entries in registration order). Covers composition, AGENTS.md/CLAUDE.md
 -- discovery and upward layering, config.instructions_files, whole-file
 -- inclusion with no size cap, late-bound layer redefinition, new_session pickup, the env VCS
--- line, and third-party layer contribution via fn.system_prompt_layer.*.
+-- line, third-party layer contribution via fn.system_prompt_layer.*, untrusted
+-- content, the subagent variant, the showing-user skill, and per-section rule text
+-- (# Scope, # Permissions, # Tool use, # Self-extension, subagent product choices).
 -- Run: busted tests/prompt_spec.lua
 
 local here = debug.getinfo(1, "S").source:sub(2)
@@ -495,4 +497,83 @@ it("relative order of the four builtin layers is preserved", function()
   -- Counterfactual: scrambled positions would fail this chain.
   assert(not (project_pos < core_pos and env_pos < skills_pos and skills_pos < project_pos),
     "counterfactual: a scrambled order should fail the chain")
+end)
+
+-- ------------------------------------------------ correction-derived rules
+local function section(prompt, name)
+  local body = prompt:match("\n# " .. vim.pesc(name) .. "\n(.-)\n# ")
+    or prompt:match("\n# " .. vim.pesc(name) .. "\n(.*)$")
+  assert(body, "# " .. name .. " section not found")
+  local flat = body:gsub("%s+", " ")
+  return flat
+end
+
+local function has_all(text, label, phrases)
+  for _, phrase in ipairs(phrases) do
+    assert(text:find(phrase, 1, true), label .. " missing: " .. phrase)
+  end
+end
+
+it("# Scope bounds questions, additions, settings and corrections", function()
+  local scope = section(registry.call("fn.system_prompt_core"), "Scope")
+  has_all(scope, "# Scope", {
+    "answer it in your reply and end the turn",
+    "are requests to do X",
+    "run a command only for a fact",
+    "register no tools or hooks",
+    "read or run to establish facts about this repo",
+    "Answer the case the user set up",
+    "otherwise deliver the reduced version",
+    "continue the task unless the question rejects the current approach",
+    "Add no component to the user's project or infrastructure",
+    "keep the anchor line",
+    "A correction narrows the task",
+  })
+end)
+
+it("# Permissions keeps its facts as bullets and scopes the proceed rule", function()
+  local core = registry.call("fn.system_prompt_core")
+  local raw = core:match("\n# Permissions\n(.-)\n# ")
+  assert(raw and raw:find("\n- A denial comes back", 1, true) and raw:find("\n- ask_user chooses", 1, true),
+    "# Permissions should be a bullet list")
+  local perms = section(core, "Permissions")
+  has_all(perms, "# Permissions", {
+    "covers your own next step",
+  })
+  has_all(perms, "# Permissions retained fact", {
+    "do not retry the identical call",
+    "blocked by hook.guard",
+    ":StrapsAuto",
+    "{ label, preview }",
+    "never use it as a shall-I-proceed dialog",
+    "steer you mid-run",
+  })
+end)
+
+it("# Tool use starts at the named target and stops on an unfound name", function()
+  local tools = section(registry.call("fn.system_prompt_core"), "Tool use")
+  has_all(tools, "# Tool use", {
+    "When the task is to fix or change something",
+    "do not show the cause",
+    "the user refers to as existing",
+    "and its likely locations find nothing",
+    "report what you searched and stop",
+  })
+end)
+
+it("# Self-extension states registry_define permissions the model can act on", function()
+  local selfext = section(registry.call("fn.system_prompt_core"), "Self-extension")
+  has_all(selfext, "# Self-extension", {
+    "Permissions for registry_define:",
+    "prompts until the user picks Always this tool",
+    "No grant covers the define category",
+    "A child spawned with allow={\"lua\"} may make session extensions",
+    "global tool with a new name is agent_tool",
+    "keeps an entry out of sessions other than this one and its subagents",
+    "full process privileges",
+  })
+  for _, gone in ipairs({ "Contextual dispatch", "Transcript excision", "Manual combined approval",
+      "Session scope is the sandbox" }) do
+    assert(not selfext:find(gone, 1, true), "removed text still present: " .. gone)
+  end
 end)

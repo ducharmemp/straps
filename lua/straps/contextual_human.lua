@@ -60,6 +60,13 @@ function M.install(adapter, options)
     if not draft or draft.data == "" then drafts[bufnr] = nil end
     return submit(bufnr, text, enqueue or function() loop.start(bufnr) end)
   end
+  function callbacks.ask(bufnr, instruction, data, deliver)
+    return submit(bufnr, instruction, function()
+      deliver(instruction .. "\n\n" .. data)
+      callbacks.draft(bufnr, instruction, data, state.last_user_text(bufnr))
+      loop.start(bufnr)
+    end)
+  end
   function callbacks.steer(bufnr, text, enqueue)
     return submit(bufnr, text, enqueue or function()
       if not loop.steer(bufnr, text) then state.add_to_trailing_user(bufnr, text) end

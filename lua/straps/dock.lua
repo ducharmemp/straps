@@ -1,5 +1,5 @@
 local M = {}
-local windows, pending = {}, {}
+local windows = {}
 
 function M.is_window(win, bufnr)
   return windows[win] == bufnr
@@ -27,48 +27,58 @@ local function redraw()
   pcall(vim.cmd, "redrawstatus!")
 end
 
-function M.defer(bufnr, present)
-  local queue = pending[bufnr] or {}
-  pending[bufnr] = queue
-  local entry = { present = present }
-  queue[#queue + 1] = entry
+function M.defer(bufnr, entry)
+  if type(bufnr) ~= "number" or bufnr <= 0 or not vim.api.nvim_buf_is_valid(bufnr) then return nil end
+  if type(entry) == "function" then entry = { kind = "presenter", present = entry } end
+  local review = require("straps.permission_review")
+  entry.bufnr = bufnr
+  review.add(entry)
   redraw()
+  local released = false
   return function()
-    for i, active in ipairs(queue) do
-      if active == entry then table.remove(queue, i); break end
-    end
-    if pending[bufnr] == queue and #queue == 0 then pending[bufnr] = nil end
+    if released then return end
+    released = true
+    review.remove(entry)
     redraw()
   end
 end
 
 function M.has_permission(bufnr)
-  return pending[bufnr] ~= nil
-end
-
-function M.review_permission(bufnr)
-  if require("straps.registry").any_tool_executing() then return false end
-  for _, entry in ipairs(pending[bufnr] or {}) do
-    if entry.present then
-      local present = entry.present
-      entry.present = nil
-      present()
-      return true
-    end
+  for _, entry in ipairs(require("straps.permission_review").entries()) do
+    if entry.bufnr == bufnr then return true end
   end
   return false
 end
 
-function M.confirm(ctx, present)
-  if not (ctx and ctx.await and ctx.on_cancel and coroutine.running() and M.visible(ctx.bufnr)) then return present() end
+function M.review_permission(bufnr)
+  if not M.has_permission(bufnr) then return false end
+  return require("straps.permission_review").review(bufnr)
+end
+
+function M.confirm(ctx, present, spec)
+  local review = require("straps.permission_review")
+  local mode = review.mode()
+  if not (ctx and ctx.await and ctx.on_cancel and coroutine.running()) then return present() end
+  if mode ~= "deferred" and not M.visible(ctx.bufnr) then return present() end
   local release_attention = require("straps.attention").wait(ctx, "permission")
   local ok, choice = ctx.await(function(done)
     local release
-    release = M.defer(ctx.bufnr, function()
+    local entry = { kind = "confirm", spec = spec, mode = mode }
+    entry.present = function()
       local success, result = pcall(present)
       release()
       done(success, result)
-    end)
+    end
+    entry.done = function(result)
+      release()
+      done(true, result)
+    end
+    release = M.defer(ctx.bufnr, entry)
+    if not release then
+      release = function() end
+      done(pcall(present))
+      return
+    end
     ctx.on_cancel(function()
       release()
       release_attention()

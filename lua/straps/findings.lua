@@ -150,6 +150,37 @@ function M.set_locations(bufnr, what, open)
 end
 
 --- Read this session's findings list. Returns items(list), kind, win-or-nil.
+function M.signature(bufnr)
+  local ok, items = pcall(M.get_locations, bufnr)
+  if not ok or type(items) ~= "table" then return "" end
+  local parts = {}
+  for _, e in ipairs(items) do
+    parts[#parts + 1] = ("%s:%s:%s"):format(tostring(e.bufnr), tostring(e.lnum), tostring(e.col))
+  end
+  return table.concat(parts, ",")
+end
+
+local approved = {}
+
+local function approval_key(input)
+  return table.concat({ tostring(input.pattern), tostring(input.replacement), tostring(input.flags) }, "\0")
+end
+
+function M.approve(bufnr, input, signature)
+  local by_key = approved[bufnr] or {}
+  approved[bufnr] = by_key
+  local key = approval_key(input)
+  local queue = by_key[key] or {}
+  by_key[key] = queue
+  queue[#queue + 1] = signature
+end
+
+function M.take_approved(bufnr, input)
+  local queue = approved[bufnr] and approved[bufnr][approval_key(input)]
+  if not queue or #queue == 0 then return nil end
+  return table.remove(queue, 1)
+end
+
 function M.get_locations(bufnr)
   if is_session(bufnr) then
     local win = M.session_win(bufnr)

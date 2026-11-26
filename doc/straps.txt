@@ -156,6 +156,35 @@ yourself, before any command, to pass options.
 			until you reopen the reading tab. Use :StrapsOutline
 			or |:close| there to return to the prior view.
 
+							*:StrapsAsk*
+:[range]StrapsAsk[!] [{text}]
+			Quote [range] (default: the current line) into a
+			session: a `path:first-last` header, a fenced block
+			whose info string is the buffer's 'filetype', then
+			{text} on the next line. When the window's directory
+			equals the global directory, a file under it gets a
+			relative path and a file outside it an absolute one;
+			under an |:lcd| or |:tcd| elsewhere the path is
+			absolute. An unnamed buffer reads `[No Name]`. The
+			fence is one backtick longer than the longest
+			backtick run in the quote, at least three.
+			The target is the current or sole visible session,
+			else the most recently entered session buffer, else a
+			new session. Split modifiers such as |:vertical|
+			place a new window. An existing session gets the quote
+			in its draft with the cursor at its end; a new session
+			starts with it as its request. ! sends it (steering
+			when a run is active). From a session buffer the
+			quote is the transcript's own lines.
+			In contextual mode the quote is data and {text} is the
+			instruction, and the request reads {text}, a blank
+			line, then the quote. A new session records them
+			separately, like piped stdin. An existing session
+			must be idle with no unsent request, and {text} is
+			required; the request submits at once
+			with the composition in the trailing user block, and
+			the draft is left untouched.
+
 							*:StrapsSend*
 :StrapsSend		Submit the draft: queue steering during a run, or start
 			a turn when idle. Also bound to normal-mode <CR>.
@@ -177,7 +206,7 @@ yourself, before any command, to pass options.
 			The divider stays until you move past it.
 
 Commands that act on a session (|:StrapsSend|, |:StrapsSendNow|, |:StrapsSteer|,
-|:StrapsJumpUnread|, |:StrapsStop|, |:StrapsPermission|, |:StrapsContinue|,
+|:StrapsJumpUnread|, |:StrapsStop|, |:StrapsContinue|,
 |:StrapsCompact|, |:StrapsRename|,
 |:StrapsAuto|) act on the current buffer when it is a session, else on the
 sole distinct session buffer visible in the current tab. Otherwise they warn
@@ -194,16 +223,19 @@ resolution, and make a global pick when no session resolves.
 			see |:StrapsContinue|.
 
 							*:StrapsPermission*
-:StrapsPermission	Open the session's pending permission review. Run it
-			from the session or from another window when exactly
-			one session is visible in the current tab. Choose an
-			outcome in the review itself, or use |:StrapsStop| to
+:StrapsPermission	Review a pending permission request. From any window:
+			the current or sole visible session's own request
+			first, then one from its subagents, then the oldest.
+			A second call focuses an open review float. See
+			|straps-permission-review|. Use |:StrapsStop| to
 			cancel the waiting run.
+
 							*:StrapsInspect*
 :StrapsInspect		Open the pending file edit's unified diff from its
 			transcript. The split adjoins the transcript and leaves
 			its focus and cursor in place. Closing the diff leaves
-			approval pending. Use |:StrapsPermission| to decide.
+			approval pending. Use `gy` or |:StrapsPermission| to
+			decide.
 			Only the default confirmation hook for write_file,
 			edit_file and patch_file supports this action.
 							*:StrapsContinue*
@@ -478,13 +510,37 @@ hand-opened `*.straps` file:
 		is shown as a warning.
 	]]	Jump to the next conversation turn ([count] turns).
 	[[	Jump to the previous conversation turn ([count] turns).
+	][	Jump to the last text line of the next turn, before its
+		tool calls ([count] turns).
+	[]	Jump to the last text line of the previous turn, before
+		its tool calls ([count] turns).
 	gO	List the turns in the window's |location-list|.
+	gy	Review the pending permission request (|:StrapsPermission|).
+	g?	List the session keys and every `:Straps*` command in a
+		float; `q` or `<Esc>` closes it. Shadows the built-in
+		|g?| (rot13) in session buffers.
 	gE	Jump to the original tool-result quote when the cursor is on
 		a claim and the session winbar shows the evidence hint.
 		Use |CTRL-O| to return. Evidence links are buffer-local and
 		do not persist when you reopen or fork the session.
+Session windows also get 'linebreak', 'breakindent', a space as the closed-fold
+fill (`fold: ` in 'fillchars'), `list:-1` in 'breakindentopt', and a
+'formatlistpat' that matches `-`, `*`, `+` and numbered list items. The
+session buffer's 'omnifunc' completes, after `@`, file paths (none when the
+text after `@` contains a backtick), and after `@#`,
+workspace symbols from the attached language servers as `@path:line[:col]`
+(at most 200; servers that have not answered after one second are left
+out). Use |i_CTRL-X_CTRL-O|. The window options are set the first time a
+window shows the transcript, so a later |:setlocal|
+survives. The window keeps its own copies of 'fillchars' and
+'breakindentopt', so a later global |:set| of either does not reach it.
 Changing 'filetype' away from straps removes these mappings and restores the
-fold and conceal options.
+fold, conceal, wrapping and list options and 'omnifunc'. Straps' ftplugin
+sets 'formatlistpat' and 'omnifunc', so an after/ftplugin/straps.lua can
+override them. With filetype plugins off, the |FileType| autocmd sets them.
+When another ftplugin/straps file sets `b:did_ftplugin` first, neither runs;
+set 'omnifunc' to `v:lua.require'straps.ask'.omnifunc` and 'formatlistpat'
+yourself.
 
 Transcript grammar. Blocks are marker lines `%%[straps:KIND]%%` (with compact
 JSON attrs for tool blocks) followed by content; KIND is one of
@@ -536,7 +592,21 @@ Buffer/window leave removes only the Straps expression and restores the prior
 local value. Returning to the session reinstalls the expression. Global values
 and user replacements remain unchanged.
 
-The session winbar shows `◆ waiting` when a permission request needs a decision.
+The session winbar shows `◆ waiting` when a permission request needs a
+decision (|straps-permission-review|).
+
+Turn stats. Each assistant turn that calls tools shows on its rule in the
+transcript the number of calls, its seconds without the time spent waiting
+for you, and its output tokens when the provider reports them:
+`Cinch · 3 calls · 12s · 840 out`. A turn without tool calls, such as a
+run's final answer, shows none of these. The seconds and tokens last for the
+Neovim session; a reopened transcript shows the call count only.
+
+`ui.agents_status()` returns `🤖 <n>` for running top-level sessions, `+<n>`
+for running subagents, and ` ◆<n>` for running sessions that wait for you
+(permission, consent or a question): `🤖 2+1 ◆1`. It is "" when nothing runs.
+Straps redraws the statusline and the tabline when a permission, consent or
+question wait starts or ends.
 
 Own components. `ui.session_info(bufnr)` returns the session's RESOLVED state
 (provider, model, model_label, effort, overridden, status, parent, usage,
@@ -549,6 +619,86 @@ the same optional bufnr, and `ui.human_tokens(n)` formats a token count.
 Note a GLOBAL tabline cannot resolve the session implicitly: %{} there (and
 bufnr() inside it) evaluates in the current window's context. Pass a bufnr
 from a Lua component framework, or use `ui.agents_status()`.
+
+PERMISSION REVIEW				*straps-permission-review*
+
+With `permission_review = "deferred"` (the default), a run's permission
+requests wait without taking focus. Each pending request, from any session,
+is a row in the corner float at the top right of the current tab:
+	◆ <session> · allow <tool> <target>
+	◆ <session> · consent <tool> · expires in <n>m
+	◆ <session> · consent <tool> · queued · expires in <n>m
+Rows show the first line of each field with control characters made
+printable. The float cannot be focused, is outside |CTRL-W_w|, moves to the
+current tab on |TabEnter|, and re-opens on the next update when |:only| or
+|:tabclose| closes it. The waiting session shows
+`◆ waiting: allow <tool> <target> · gy review` above its draft, or before the
+pending batch when it has no draft.
+
+`gy` in a session buffer and |:StrapsPermission| from any window open the
+review float: the session's own request, then one from its subagents, then
+the oldest. A review from another tab moves the float to the current tab.
+When the call has more rows than the float, wrapped rows included, the
+footer starts with `<n> of <m> rows shown, scroll`. Keys in the review float:
+	y n d p a l	The choices in the footer. `y` allows once and `n`
+			denies. A file edit offers `d` (its directory), `p`
+			(its project, when it has one) and `a` (all edits).
+			Another tool offers `a` (always this tool), and an
+			edit-category tool adds `l` (all edits). Deletes and
+			definitions offer `y` and `n` only.
+	i		Open the pending file edit's diff beside the window
+			you came from (|:StrapsInspect|) and close the float;
+			the request stays pending for `gy`.
+	<Tab> <S-Tab>	Review the next or previous request.
+	<CR>		Does nothing.
+	q <Esc>		Close the float; the request stays pending.
+	gy		Resolve again from the session you came from, and
+			switch when that gives another request.
+Contextual consent opens its own split on review. In that split `y` allows
+once; `s`, when offered, approves the amended boundary the split displays,
+which needs a fresh assessment before the call can run; and `q`, <Esc> or
+closing the split rejects. Unlike the review float, closing the consent
+split decides the request, and a rejected decision family stays denied until
+a fresh review (|:StrapsAuthorization| with !) reopens it. Only one
+consent is active at a time; a queued consent becomes reviewable after the
+active one is decided. A consent expires five minutes after the request,
+displayed or not; the call is then refused and its row goes. Review is
+refused inside the |cmdwin| and from a running tool body.
+
+Deciding from a window whose |:lcd| or |:tcd| differs from the window that
+made the request resumes the run there, and the gate refuses the approved
+call with "execution directory changed". A grant chosen in that decision
+stays recorded. A pending contextual consent is revalidated against the
+directory of the window that made the request, so a |:tcd| in another tab
+does not invalidate it; once that window closes, the current window's
+directory is compared.
+
+Temporary limitation: a `spawn_wait` deadline keeps counting while a child
+waits on a deferred review, so the deadline can expire and stop the child
+mid-review. Decide its requests promptly, or ask the agent to pass a larger
+`timeout_ms` when it spawns the child.
+
+With `permission_review = "modal"`, a confirmation prompts with |confirm()|
+and contextual consent opens its split when the request arrives, except a
+file edit in a session buffer and any request while the session dock is
+visible; those wait for |:StrapsPermission|. Requests made
+outside a run prompt at once in both modes.
+
+In both modes a custom |hook.confirm| controls its own display. Inside a run,
+a custom hook can list and defer its request by calling
+`require("straps.dock").confirm(ctx, present, spec)`, where `present` is a
+function that prompts and returns the choice index and `spec` is optional.
+`spec` is a table `{ name, target, title, preview, choices }` whose
+`choices` are `{ key, label, index }` tables. The row reads
+`allow <name> <target>`; without `spec`, or with a `spec` that has no
+`name`, it reads `allow (custom hook.confirm)`. In "deferred" mode review
+opens the review float from `spec`, and a key returns its `index`. Each
+`key` must be one printable ASCII character other than space, distinct, and
+not `g`, `i` or `q`, and `choices` must not be empty; otherwise review
+calls `present` instead. Without `spec`, review calls `present`. In "modal"
+mode
+`dock.confirm` defers only while the session dock is visible, and review
+calls `present`; otherwise it calls `present` at once.
 
 ==============================================================================
 5. CONFIGURATION					*straps-config*
@@ -622,10 +772,12 @@ terminal_status		(boolean) true. OSC 7501 terminal attention reports on
 			pane status: done for success, idle for cancellation,
 			error for other endings. Earlier failures cannot override
 			active work or later success. Transcripts retain outcomes.
-			Built-in agent permission/question prompts report
-			blocked; API key entry and logout confirmation use
-			temporary IDs. Unload (:bdelete, :bwipeout, :bunload)
-			and shutdown clear owned statuses. Unload does not
+			A built-in permission request reports blocked from
+			when it is listed or displayed until decided, and a
+			question prompt while displayed; API key entry and
+			logout confirmation use temporary IDs. Unload
+			(:bdelete, :bwipeout, :bunload) and shutdown clear
+			owned statuses. Unload does not
 			cancel an active run; late callbacks cannot republish
 			its cleared task. Hiding or renaming a loaded session
 			preserves its ID. Unload removes its retained outcome
@@ -664,7 +816,12 @@ max_subprocesses	(number|nil) nil -> 2 * CPU count. How many
 			every admission; a call past the limit parks in
 			ctx.await until a slot frees. See |straps-subprocesses|.
 instructions_files	(list) {}. Extra memory files included in the system
-			prompt after AGENTS.md/CLAUDE.md.
+			prompt after AGENTS.md/CLAUDE.md. A relative entry
+			resolves against the directory discovery runs in (the
+			window's |getcwd()|, or the gate window's directory
+			when contextual consent revalidates); a `~` entry,
+			or `~user` for an existing user, expands to that home
+			directory.
 skill_discovery		(boolean) true. false turns off SKILL.md discovery
 			(|straps-skill-files|).
 skill_roots		(list|nil) nil -> ~/.agents/skills, ~/.claude/skills,
@@ -686,10 +843,28 @@ session_winbar		(boolean) true. Window-local model/status winbar on
 session_dock		(boolean) false. Open the session buffer in a shallow,
 			full-width bottom split. Use `:resize` or drag the
 			separator; resizing preserves the draft. Explicit
-			window placement overrides the dock. The default tool
-			confirmation and contextual consent dialog wait for
-			|:StrapsPermission|. Check the winbar for the session
-			name and `Permission pending` without switching focus.
+			window placement overrides the dock. In
+			`permission_review = "modal"` the default tool
+			confirmation and contextual consent wait for
+			|:StrapsPermission| while the dock is visible. In
+			either mode the dock's winbar shows the session name
+			and `Permission pending (gy / :StrapsPermission)`
+			while a confirmation or consent waits, or
+			`Permission pending (gy / :StrapsInspect /
+			:StrapsPermission)` while a file edit waits; with
+			`session_winbar` on, any session window shows the
+			second text while a file edit waits.
+permission_review	("deferred"|"modal") "deferred". How a run's permission
+			requests reach you; see |straps-permission-review|.
+			"deferred": every default |hook.confirm| prompt and
+			contextual consent inside a run waits in the corner
+			float for `gy` or |:StrapsPermission|. "modal": a
+			confirmation prompts with |confirm()| and consent
+			opens its split when the request arrives,
+			except session-buffer file edits and requests while
+			the dock is visible. A request made outside a run
+			prompts at once in both modes. An entry keeps the
+			mode it was created in.
 agents_winbar		(boolean) true. The agents buffer's keymap legend in a
 			window-local winbar; false = first buffer line instead.
 models			(list) 4 curated Anthropic entries { id, label?,
@@ -945,8 +1120,11 @@ hook.confirm(name, input, ctx, call_id?) -> allowed, reason, source
 		`cap:<category>` key in the session's grant set, written by
 		|:StrapsAuto| or a subagent `allow`); otherwise prompt
 		(Yes / No / Always this tool / for edits, Always in <dir>
-		/ Always all edits). For pending file edits, open the diff
-		with |:StrapsInspect| and decide with |:StrapsPermission|.
+		/ Always all edits). Inside a run the prompt waits in
+		the corner float (|straps-permission-review|) unless
+		`permission_review = "modal"`. For pending file edits,
+		open the diff with |:StrapsInspect| or `i` in the review
+		float, and decide with `gy` or |:StrapsPermission|.
 		"Always all edits" (`editfiles:*`) covers every |fn.capability|
 		`edit` call, including bulk_replace, rename_symbol, format,
 		move_file(s), undo_edit and code_action with an index; those
@@ -1897,7 +2075,7 @@ a category it holds, a tool name it holds, or a tool whose category it holds;
 read-only tools always pass. An entry outside them errors at spawn time. A
 child it spawns without `allow`/`readonly` is made read-only, and the `spawn`
 result says so. A gated child that was not granted `spawn` sees no `spawn`
-tool. An ungated session (the user's confirm dialog or |:StrapsAuto| is its
+tool. An ungated session (the user's permission review or |:StrapsAuto| is its
 gate) is under no ceiling. |:StrapsStop| on a session stops every running
 descendant.
 

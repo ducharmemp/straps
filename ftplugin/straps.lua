@@ -15,12 +15,14 @@ local bufnr = vim.api.nvim_get_current_buf()
 -- honor the bar, matching core ftplugins (query.lua, markdown.lua).
 local undo = {
   "setlocal foldmethod< foldexpr< foldtext< foldlevel< conceallevel< concealcursor<",
+  "setlocal fillchars= breakindentopt< linebreak< breakindent< formatlistpat< omnifunc<",
 }
 
 pcall(function()
   local ui = require("straps.ui")
   ui.apply_highlights()
   ui.map_session_keys(bufnr)
+  ui.apply_buffer_opts(bufnr)
   require("straps.evidence").map(bufnr)
   undo[#undo + 1] = "silent! call nvim_buf_del_keymap(0, 'n', 'gE')"
   for _, lhs in ipairs(ui.SESSION_KEYS) do

@@ -202,7 +202,7 @@ local function spawn(input, ctx, transaction)
   -- grant) is a permission ceiling for its own children: it may delegate only
   -- what it holds, and a child it spawns without allow/readonly is read-only.
   -- A grant set with no marker is an ungated session whose gate is the user's
-  -- confirm dialog (or :StrapsAuto), so no ceiling applies there.
+  -- permission review (or :StrapsAuto), so no ceiling applies there.
   local parent_grants = registry.granted(ctx.bufnr)
   local gated = parent_grants["spawn:gated"] == true
   local forced_readonly = false

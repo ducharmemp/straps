@@ -194,3 +194,44 @@ it("uses current straps configuration when config is omitted and ignores unrelat
   assert.equals("default", a.sources[1].text)
   assert.same(a, discover({ instructions_files = { path }, unrelated = true }))
 end)
+
+it("resolves a relative ../ entry with cwd omitted to the same path as fnamemodify :p", function()
+  vim.fn.getcwd = original.cwd
+  local previous = original.cwd()
+  vim.api.nvim_set_current_dir(tmp .. "/project/deep")
+  write(tmp .. "/project/x", "parent note")
+  local expected = vim.fn.fnamemodify("../x", ":p")
+  local ok, result = pcall(discover, { instructions_files = { "../x" } })
+  vim.api.nvim_set_current_dir(previous)
+  assert(ok, tostring(result))
+  assert.equals(1, #result.sources)
+  assert.equals(expected, result.sources[1].path)
+end)
+
+it("deduplicates a ../AGENTS.md entry against the upward-found AGENTS.md", function()
+  local agents = tmp .. "/project/AGENTS.md"
+  write(agents, "agents")
+  files["AGENTS.md"] = { agents }
+  local result = discover({ instructions_files = { "../AGENTS.md" } })
+  assert.equals(1, #result.sources)
+  assert.equals(agents, result.sources[1].path)
+  files["AGENTS.md"] = {}
+  local alone = discover({ instructions_files = { "../AGENTS.md" } })
+  assert.equals(1, #alone.sources)
+  assert.equals(agents, alone.sources[1].path)
+  assert.equals("agents", alone.sources[1].text)
+end)
+
+it("collapses a repeated slash in a relative entry, as fnamemodify :p does with cwd omitted", function()
+  vim.fn.getcwd = original.cwd
+  local previous = original.cwd()
+  vim.api.nvim_set_current_dir(tmp .. "/project/deep")
+  write(tmp .. "/project/deep/x/y", "nested")
+  local expected = vim.fn.fnamemodify("x//y", ":p")
+  local ok, result = pcall(discover, { instructions_files = { "x//y" } })
+  vim.api.nvim_set_current_dir(previous)
+  assert(ok, tostring(result))
+  assert.equals(1, #result.sources)
+  assert.equals(expected, result.sources[1].path)
+  assert.equals("nested", result.sources[1].text)
+end)

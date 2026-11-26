@@ -20,12 +20,12 @@ local function unavailable(path)
   return digest(parts)
 end
 
-function M.discover(config)
+function M.discover(config, cwd)
   if config == nil then
     local ok, straps = pcall(require, "straps")
     config = (ok and type(straps) == "table" and rawget(straps, "config")) or {}
   end
-  local cwd = vim.fn.getcwd()
+  cwd = cwd or vim.fn.getcwd()
   local cfg = vim.fn.stdpath("config")
   local home = vim.loop.os_homedir()
   local names = { "AGENTS.md", "CLAUDE.md" }
@@ -53,7 +53,11 @@ function M.discover(config)
   for _, path in ipairs(extras) do
     config_parts[#config_parts + 1] = type(path)
     config_parts[#config_parts + 1] = type(path) == "string" and path or ""
-    add(path)
+    if type(path) == "string" and path ~= "" and path:sub(1, 1) ~= "/" and path:sub(1, 1) ~= "~" then
+      add(vim.fs.normalize(vim.fs.joinpath(cwd, path)))
+    else
+      add(path)
+    end
   end
   local config_hash = digest(config_parts)
   local snapshot_parts = { config_hash }

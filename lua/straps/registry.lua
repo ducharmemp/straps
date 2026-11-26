@@ -37,6 +37,11 @@ local grants = {}
 -- same counter as the default.
 local subprocess = { in_flight = 0, waiters = {} }
 
+function M.window_cwd(win)
+  if not (win and vim.api.nvim_win_is_valid(win)) then return vim.fn.getcwd() end
+  return vim.fn.getcwd(win, vim.api.nvim_tabpage_get_number(vim.api.nvim_win_get_tabpage(win)))
+end
+
 function M.subprocess_state()
   return subprocess
 end
@@ -461,6 +466,17 @@ local next_call = 0
 local executing_calls = setmetatable({}, { __mode = "k" })
 local data_copy
 
+function M.tool_body_running_here()
+  for co in pairs(executing_name) do
+    if co == "main" then return true end
+    if type(co) == "thread" then
+      local status = coroutine.status(co)
+      if status == "running" or status == "normal" then return true end
+    end
+  end
+  return false
+end
+
 function M.any_tool_executing()
   for _, set in pairs(executing_for) do if next(set) then return true end end
   return next(executing_name) ~= nil
@@ -700,6 +716,7 @@ local function gate_tool(name, input, ctx, opts)
   end
 
   local gate_cwd = vim.fn.getcwd()
+  local gate_win = vim.api.nvim_get_current_win()
   local gate_ctx = ctx and { bufnr = ctx.bufnr, cancelled = ctx.cancelled } or nil
   local used = false
   local function invalidate(reason)
@@ -707,14 +724,15 @@ local function gate_tool(name, input, ctx, opts)
     if authorization and handle and authorization.invalidate then pcall(authorization.invalidate, handle, reason) end
     if handle then calls[handle] = nil end
   end
-  local function valid(run_ctx, executing)
+  local function gate_window_cwd() return M.window_cwd(gate_win) end
+  local function valid(run_ctx, executing, refresh)
     if used and not executing then return false, "gate result already used" end
     local permitted, permission_reason = M.child_permission(name, frozen, gate_ctx)
     if not permitted then return false, permission_reason end
     if ctx and (ctx.bufnr ~= gate_ctx.bufnr or ctx.cancelled ~= gate_ctx.cancelled) then return false, "execution context changed" end
     if gate_ctx and gate_ctx.cancelled and gate_ctx.cancelled() then return false, "execution cancelled" end
     if (family and family.cancelled) or (run_ctx and run_ctx.cancelled and run_ctx.cancelled()) then return false, "execution cancelled" end
-    if vim.fn.getcwd() ~= gate_cwd then return false, "execution directory changed" end
+    if (refresh and gate_window_cwd() or vim.fn.getcwd()) ~= gate_cwd then return false, "execution directory changed" end
     if run_ctx and (run_ctx.bufnr ~= session or run_ctx.cancelled ~= (gate_ctx and gate_ctx.cancelled)) then return false, "execution context changed" end
     if authorization and ctx and families[ctx] ~= family_handle then return false, "execution context changed" end
     if authorization and run_ctx and families[run_ctx] ~= family_handle then return false, "execution context changed" end
@@ -726,6 +744,7 @@ local function gate_tool(name, input, ctx, opts)
     if authorization.ceilings.revision(session) ~= ceiling_revision then return false, "capability ceiling changed" end
     local ceiling_ok, why = authorization.ceilings.check(session, view(entry), frozen)
     if not ceiling_ok then return false, why end
+    if refresh then return immediate(authorization.validate_stamp, session, vim.deepcopy(stamp), gate_cwd) end
     return immediate(authorization.validate_stamp, session, vim.deepcopy(stamp))
   end
   if authorization then
@@ -740,7 +759,7 @@ local function gate_tool(name, input, ctx, opts)
       description = { call_id = next_call, session = session, session_id = stamp.session_id, task_id = stamp.task_id,
         epoch = stamp.epoch, scope = scope, cwd = gate_cwd, input = vim.deepcopy(frozen),
         definition = view(entry), stamp = vim.deepcopy(stamp), ceiling_revision = ceiling_revision },
-      validate = function() return valid(ctx) end,
+      validate = function() return valid(ctx, nil, true) end,
     }
   end
 

@@ -185,12 +185,13 @@ local function role_for(bufnr, blk)
   }
 end
 
--- Overlay chunk list for a role marker line, fixed ~RULE_WIDTH wide. The
+-- Chunk list for a role marker line's rule, fixed ~RULE_WIDTH wide, drawn
+-- inline or as an overlay, with an optional suffix such as the turn stats. The
 -- leading segment and role word carry the role's StrapsRole* group and the
 -- rule char differs per role (light ─ for you/system, heavy ━ for Cinch) so
 -- user and agent turns read apart at a glance; the trailing run stays dim
 -- StrapsRule.
-local function role_overlay(role, suffix)
+local function role_chunks(role, suffix)
   local chunks = { { bar(4, role.bar) .. " ", role.hl }, { role.label, role.hl } }
   local trailing = RULE_WIDTH - 5 - #role.label - 1
   if suffix then
@@ -297,12 +298,34 @@ local function fold_target(name, input)
   if name == "glob" or name == "grep" then return fold_label(input.pattern) end
 end
 
-local function fold_result_attrs(blocks, idx, id)
+local function empty_assistant(bufnr, b)
+  if b.kind ~= "assistant" then return false end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, b.marker_lnum - 1, math.max(b.marker_lnum, b.last_lnum), false)
+  lines[1] = (lines[1] or ""):gsub("^%%%%%[straps:assistant%]%%%%", "")
+  for _, line in ipairs(lines) do
+    if line:find("%S") then return false end
+  end
+  return true
+end
+
+local function fold_result_attrs(bufnr, blocks, idx, id)
   if type(id) ~= "string" or id == "" then return end
-  for i = idx + 1, #blocks do
+  local k = 1
+  for i = idx - 1, 1, -1 do
     local b = blocks[i]
+    if b.kind ~= "tool_use" then break end
+    if b.attrs and b.attrs.id == id then k = k + 1 end
+  end
+  local i = idx + 1
+  while blocks[i] and blocks[i].kind == "tool_use" do i = i + 1 end
+  while blocks[i] and empty_assistant(bufnr, blocks[i]) do i = i + 1 end
+  for j = i, #blocks do
+    local b = blocks[j]
     if b.kind ~= "tool_result" then return end
-    if b.attrs and b.attrs.id == id then return b.attrs end
+    if b.attrs and b.attrs.id == id then
+      k = k - 1
+      if k == 0 then return b.attrs end
+    end
   end
 end
 
@@ -364,7 +387,7 @@ function M._fold_summary(bufnr, start_lnum)
     else
       target = fold_target(name, input)
     end
-    return tool_fold_summary(name, target, fold_result_attrs(blocks, idx, attrs.id))
+    return tool_fold_summary(name, target, fold_result_attrs(bufnr, blocks, idx, attrs.id))
   end
   if blk and blk.kind == "tool_result" then
     local attrs = blk.attrs or {}
@@ -391,9 +414,70 @@ local function conceal_marker(bufnr, row, line)
   end
 end
 
--- Render one block's marks into render_ns. blocks is the full list (for
--- pairing tool_use with its tool_result when drawing the closing card rule).
-local function render_block(bufnr, blk)
+local turn_stats = {}
+local turn_stats_cleanup = false
+
+local function valid_turn_key(id)
+  return type(id) == "string" and id ~= "" and not vim.startswith(id, "straps-replay-")
+end
+
+function M.turn_stats_key(tool_blocks)
+  for _, b in ipairs(tool_blocks) do
+    if valid_turn_key(b.id) then return b.id end
+  end
+end
+
+function M.record_turn_stats(bufnr, key, ms, out)
+  if not turn_stats_cleanup then
+    turn_stats_cleanup = true
+    vim.api.nvim_create_autocmd("BufWipeout", {
+      group = vim.api.nvim_create_augroup("StrapsTurnStats", { clear = true }),
+      callback = function(args) turn_stats[args.buf] = nil end,
+    })
+  end
+  turn_stats[bufnr] = turn_stats[bufnr] or {}
+  turn_stats[bufnr][key] = { ms = ms, out = out }
+end
+
+local function turn_key(blocks, idx)
+  for i = idx + 1, #blocks do
+    local b = blocks[i]
+    if TURN_KIND[b.kind] then return end
+    if b.kind == "tool_use" and b.attrs and valid_turn_key(b.attrs.id) then return b.attrs.id end
+  end
+end
+
+local function turn_key_counts(blocks)
+  local counts = {}
+  for i, b in ipairs(blocks) do
+    if b.kind == "assistant" then
+      local key = turn_key(blocks, i)
+      if key then counts[key] = (counts[key] or 0) + 1 end
+    end
+  end
+  return counts
+end
+
+local function format_tokens(n)
+  if n >= 1000 then return ("%.1fk"):format(n / 1000) end
+  return tostring(math.floor(n))
+end
+
+local function turn_stats_suffix(bufnr, blocks, idx, key_counts)
+  local _, calls = turn_extent(blocks, idx)
+  if calls == 0 then return nil end
+  local parts = { calls == 1 and "1 call" or (calls .. " calls") }
+  local key = turn_key(blocks, idx)
+  local stats = key and key_counts[key] == 1 and turn_stats[bufnr] and turn_stats[bufnr][key]
+  if stats then
+    parts[#parts + 1] = ("%ds"):format(math.floor(stats.ms / 1000 + 0.5))
+    if stats.out then parts[#parts + 1] = format_tokens(stats.out) .. " out" end
+  end
+  return " · " .. table.concat(parts, " · ")
+end
+
+local function render_block(bufnr, blocks, idx, key_counts)
+  local blk = blocks[idx]
   local row = blk.marker_lnum - 1
   local line = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1]
   if not line then
@@ -401,11 +485,10 @@ local function render_block(bufnr, blk)
   end
   local role = role_for(bufnr, blk)
   if role then
-    -- user / assistant / system: conceal the marker, overlay the turn rule.
     conceal_marker(bufnr, row, line)
     vim.api.nvim_buf_set_extmark(bufnr, render_ns, row, 0, {
-      virt_text = role_overlay(role),
-      virt_text_pos = "overlay",
+      virt_text = role_chunks(role, blk.kind == "assistant" and turn_stats_suffix(bufnr, blocks, idx, key_counts) or nil),
+      virt_text_pos = blk.kind == "assistant" and "overlay" or "inline",
       hl_mode = "combine",
     })
   elseif blk.kind == "tool_use" then
@@ -490,13 +573,14 @@ function M._render(bufnr)
       })
     end
   end
-  for _, blk in ipairs(blocks) do
-    if blk ~= placeholder then render_block(bufnr, blk) end
+  local key_counts = turn_key_counts(blocks)
+  for i, blk in ipairs(blocks) do
+    if blk ~= placeholder then render_block(bufnr, blocks, i, key_counts) end
   end
   if draft then
     conceal_marker(bufnr, draft, vim.api.nvim_buf_get_lines(bufnr, draft, draft + 1, false)[1])
     vim.api.nvim_buf_set_extmark(bufnr, render_ns, draft, 0, {
-      virt_text = role_overlay(ROLE.user, " · draft"),
+      virt_text = role_chunks(ROLE.user, " · draft"),
       virt_text_pos = "overlay",
       hl_mode = "combine",
     })
@@ -785,7 +869,7 @@ local function present_session(bufnr, split_cmd)
   M.apply_file_ref_match(bufnr)
   register_winbar_lifecycle()
   apply_winbar()
-  -- Transcript rendering: window-local conceal so the marker overlays show,
+  -- Transcript rendering: window-local conceal so the marker rules show,
   -- one render now, and a debounced renderer for future appends/edits. The
   -- whole presentation is fn.render — config.render = false skips the wiring
   -- (raw markers), and :set conceallevel=0 reveals them per window.
@@ -848,7 +932,11 @@ end
 ---   session (validated before anything is created); instruction = text to
 ---   seed the trailing user block with; send = true starts the run when the
 ---   seeded block is non-empty; explicit_split = true when the caller passed a
----   window modifier, which disables the startup window reuse below.
+---   window modifier, which disables the startup window reuse below; data =
+---   text appended to the seed after a blank line and recorded as data for a
+---   contextual session (piped stdin is appended after it); data_buf = the
+---   buffer data was quoted from, so stdin is not appended twice when data
+---   already quotes the stdin buffer.
 ---   During startup (v:vim_did_enter == 0, i.e. `nvim +Straps`) the text of
 ---   the stdin buffer (`nvim -`, recorded by plugin/straps.lua) is appended to
 ---   the seed and that buffer is wiped, and the session takes over the
@@ -873,10 +961,14 @@ function M.open_session(split_cmd, opts, captured)
   end
   local seed = opts.instruction or ""
   local data = ""
+  if type(opts.data) == "string" and opts.data:match("%S") then
+    data = opts.data
+    seed = seed ~= "" and (seed .. "\n\n" .. data) or data
+  end
   if stdin_buf then
     local piped = table.concat(vim.api.nvim_buf_get_lines(stdin_buf, 0, -1, false), "\n")
-    if piped:match("%S") then
-      data = piped
+    if piped:match("%S") and opts.data_buf ~= stdin_buf then
+      data = data ~= "" and (data .. "\n\n" .. piped) or piped
       seed = seed ~= "" and (seed .. "\n\n" .. piped) or piped
     end
     vim.g.straps_stdin_buf = nil
@@ -1246,7 +1338,8 @@ end
 
 --- Statusline component: a compact count of running agents, "" when none.
 --- Format: "🤖 N" for N top-level runs, "🤖 N+M" when M subagents are also
---- active (M = agents with a parent). Drop it into a statusline with
+--- active (M = agents with a parent), followed by " ◆N" when N of them wait
+--- on the human. Drop it into a statusline with
 --- %{v:lua.require'straps.ui'.agents_status()}.
 function M.agents_status()
   local agents = M.running_agents()
@@ -1260,10 +1353,14 @@ function M.agents_status()
     end
   end
   local top = #agents - subs
-  if subs > 0 then
-    return ("🤖 %d+%d"):format(top, subs)
+  local attention = require("straps.attention")
+  local waiting = 0
+  for _, a in ipairs(agents) do
+    if attention.waiting(a.bufnr) then waiting = waiting + 1 end
   end
-  return ("🤖 %d"):format(top)
+  local text = subs > 0 and ("🤖 %d+%d"):format(top, subs) or ("🤖 %d"):format(top)
+  if waiting > 0 then text = text .. (" ◆%d"):format(waiting) end
+  return text
 end
 
 function M.all_sessions()
@@ -2429,6 +2526,8 @@ function M.auto(arg)
 end
 
 function M.foldexpr(lnum)
+  local draft = require("straps.state").draft_row(vim.api.nvim_get_current_buf())
+  if draft and lnum > draft then return 0 end
   local kind = vim.fn.getline(lnum):match("^%%%%%[straps:([%w_]+)%]%%%%")
   if kind == "tool_use" or kind == "system" then
     return ">1"
@@ -2559,7 +2658,75 @@ function M.outline(bufnr)
   return #items
 end
 
-M.SESSION_KEYS = { "<CR>", "<S-CR>", "gf", "]]", "[[", "gO" }
+M.SESSION_KEYS = { "<CR>", "<S-CR>", "gf", "]]", "[[", "][", "[]", "gO", "g?", "gy" }
+
+local function sorted_rows(rows)
+  table.sort(rows, function(a, b) return a[1] < b[1] end)
+  return rows
+end
+
+function M.key_reference(bufnr)
+  local keys, seen = {}, {}
+  for _, map in ipairs(vim.api.nvim_buf_get_keymap(bufnr, "n")) do
+    local desc = map.desc
+    if type(desc) == "string" and vim.startswith(desc, "straps:") and desc ~= require("straps.questions").KEY_DESC
+      and not seen[map.lhs] then
+      seen[map.lhs] = true
+      keys[#keys + 1] = { map.lhs, vim.trim(desc:sub(#"straps:" + 1)) }
+    end
+  end
+  local commands = {}
+  for name, cmd in pairs(vim.api.nvim_get_commands({})) do
+    if vim.startswith(name, "Straps") then
+      commands[#commands + 1] = { ":" .. name, cmd.definition or "" }
+    end
+  end
+  local lines = {}
+  local function section(title, rows)
+    local width = 0
+    for _, row in ipairs(rows) do width = math.max(width, vim.fn.strdisplaywidth(row[1])) end
+    lines[#lines + 1] = title
+    for _, row in ipairs(sorted_rows(rows)) do
+      local first = vim.split(row[2], "\n", { plain = true })[1]
+      lines[#lines + 1] = vim.fn.strtrans(("  %s%s  %s"):format(row[1],
+        (" "):rep(width - vim.fn.strdisplaywidth(row[1])), first))
+    end
+  end
+  section("Keys", keys)
+  lines[#lines + 1] = ""
+  section("Commands", commands)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = "wipe"
+  local width = 0
+  for _, line in ipairs(lines) do width = math.max(width, vim.fn.strdisplaywidth(line)) end
+  width = math.max(1, math.min(width + 1, vim.o.columns - 4))
+  local height = math.max(1, math.min(#lines, vim.o.lines - 4))
+  local ok, win = pcall(vim.api.nvim_open_win, buf, false, {
+    relative = "editor",
+    row = math.floor((vim.o.lines - height) / 2) - 1,
+    col = math.floor((vim.o.columns - width) / 2),
+    width = width,
+    height = height,
+    style = "minimal",
+    border = "single",
+    title = " straps keys ",
+    zindex = 260,
+  })
+  if not ok then
+    vim.notify("straps: cannot open the key reference: " .. tostring(win), vim.log.levels.WARN)
+    return
+  end
+  local function close()
+    pcall(vim.api.nvim_win_close, win, true)
+  end
+  for _, lhs in ipairs({ "q", "<Esc>" }) do
+    vim.keymap.set("n", lhs, close, { buffer = buf, nowait = true, desc = "close the key reference" })
+  end
+  pcall(vim.api.nvim_set_current_win, win)
+  return win
+end
 
 function M.map_session_keys(bufnr)
   vim.keymap.set("n", "<CR>", function()
@@ -2568,6 +2735,12 @@ function M.map_session_keys(bufnr)
   vim.keymap.set("n", "<S-CR>", function()
     require("straps.steering").send(bufnr, human, true)
   end, { buffer = bufnr, desc = "straps: stop and send now" })
+  vim.keymap.set("n", "g?", function()
+    M.key_reference(bufnr)
+  end, { buffer = bufnr, desc = "straps: list session keys and commands" })
+  vim.keymap.set("n", "gy", function()
+    require("straps.permission_review").review_or_notify(bufnr)
+  end, { buffer = bufnr, desc = "straps: review the pending permission request" })
   M.map_file_refs(bufnr)
   M.map_navigation(bufnr)
 end
@@ -2585,10 +2758,10 @@ function M.map_navigation(bufnr)
   vim.keymap.set("n", "[[", motion(-1), { buffer = bufnr, desc = "straps: previous turn" })
   vim.keymap.set("n", "][", function()
     M.goto_turn_end(1, vim.v.count1)
-  end, { buffer = bufnr, desc = "straps: next turn end" })
+  end, { buffer = bufnr, desc = "straps: next turn's last text line" })
   vim.keymap.set("n", "[]", function()
     M.goto_turn_end(-1, vim.v.count1)
-  end, { buffer = bufnr, desc = "straps: previous turn end" })
+  end, { buffer = bufnr, desc = "straps: previous turn's last text line" })
   vim.keymap.set("n", "gO", function()
     M.outline(bufnr)
   end, { buffer = bufnr, desc = "straps: outline the transcript" })
@@ -2613,7 +2786,8 @@ end
 
 --- Apply the straps fold options (foldmethod=expr + foldexpr + foldtext +
 --- foldlevel from config.tools_expanded) to every window currently showing
---- bufnr. foldlevel is set only the first time a window gets the straps
+--- bufnr, and, the first time a window gets them, the session window options
+--- (fillchars fold fill, breakindentopt list:-1, linebreak, breakindent). foldlevel is set only the first time a window gets the straps
 --- foldexpr, so re-showing a session keeps the level the user chose (zR/zM).
 ---
 --- Folding is window-local, so this must run once the buffer is
@@ -2647,9 +2821,38 @@ function M.apply_fold_opts(bufnr, target_win)
       if vim.wo[win].foldtext ~= text then vim.wo[win][0].foldtext = text end
       if first then
         vim.wo[win][0].foldlevel = expanded and 99 or 0
+        M.apply_window_opts(win)
       end
     end
   end
+end
+
+local function merge_item(value, key, item)
+  local items, found = {}, false
+  for part in value:gmatch("[^,]+") do
+    if vim.startswith(part, key .. ":") then
+      if not found then items[#items + 1] = item end
+      found = true
+    else
+      items[#items + 1] = part
+    end
+  end
+  if not found then items[#items + 1] = item end
+  return table.concat(items, ",")
+end
+
+function M.apply_window_opts(win)
+  vim.wo[win][0].fillchars = merge_item(vim.wo[win].fillchars, "fold", "fold: ")
+  vim.wo[win][0].breakindentopt = merge_item(vim.wo[win].breakindentopt, "list", "list:-1")
+  vim.wo[win][0].linebreak = true
+  vim.wo[win][0].breakindent = true
+end
+
+M.LIST_PATTERN = [[^\s*\%([-*+]\|\d\+[.)]\)\s\+]]
+
+function M.apply_buffer_opts(bufnr)
+  vim.bo[bufnr].formatlistpat = M.LIST_PATTERN
+  vim.bo[bufnr].omnifunc = "v:lua.require'straps.ask'.omnifunc"
 end
 
 local function clear_file_ref_match(win)
@@ -2888,8 +3091,15 @@ function M.setup()
     group = group,
     pattern = "straps",
     callback = function(ev)
+      if not vim.b[ev.buf].did_ftplugin then M.apply_buffer_opts(ev.buf) end
       M.apply_fold_opts(ev.buf)
       M.apply_file_ref_match(ev.buf)
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = group,
+    callback = function(ev)
+      if vim.b[ev.buf].straps_session then require("straps.ask").focused(ev.buf) end
     end,
   })
 end

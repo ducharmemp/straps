@@ -125,7 +125,7 @@ local function shell(record, command, cwd)
   end
 end
 
-function M.resolve(binding)
+function M.resolve(binding, opts)
   local record = { known = { paths = {} }, unresolved = {}, checks = {} }
   if type(binding) ~= "table" or type(binding.definition) ~= "table" or type(binding.input) ~= "table" then
     issue(record, "binding", "exact frozen binding unavailable")
@@ -137,7 +137,7 @@ function M.resolve(binding)
   record.known.account = account and { uid = account.uid, gid = account.gid, username = account.username } or nil
   if not record.known.account then issue(record, "account", "process account unavailable") end
   local cwd = binding.cwd
-  if not literal(cwd) or cwd:sub(1, 1) ~= "/" or cwd ~= vim.fn.getcwd() then
+  if not literal(cwd) or cwd:sub(1, 1) ~= "/" or cwd ~= (type(opts) == "table" and opts.cwd or vim.fn.getcwd()) then
     issue(record, "cwd", "frozen execution directory unavailable or changed")
     return record
   end
@@ -178,7 +178,7 @@ function M.validate(record, binding, options)
   end
   local allow_unresolved = type(options) == "table" and options.allow_unresolved == true
   if type(record.unresolved) ~= "table" or not allow_unresolved and next(record.unresolved) ~= nil then return false, "unresolved material targets" end
-  local current = M.resolve(binding)
+  local current = M.resolve(binding, options)
   if not allow_unresolved and next(current.unresolved) ~= nil or not vim.deep_equal(record, current) then
     return false, "relied-upon target facts changed"
   end

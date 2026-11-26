@@ -126,46 +126,46 @@ step(function()
   registry.call("fn.render", buf)
 end)
 
-it("marker lines carry a conceal extmark and a role-rule overlay", function()
+it("marker lines carry a conceal extmark and a role rule, inline where a fold can start", function()
   for _, spec in ipairs({
-    { lnum = LN.user_marker, word = "you", hl = "StrapsRoleUser" },
-    { lnum = LN.assistant_marker, word = "Cinch", hl = "StrapsRoleAgent" },
-    { lnum = LN.system_marker, word = "system", hl = "StrapsRoleSystem" },
+    { lnum = LN.user_marker, word = "you", hl = "StrapsRoleUser", pos = "inline" },
+    { lnum = LN.assistant_marker, word = "Cinch", hl = "StrapsRoleAgent", pos = "overlay" },
+    { lnum = LN.system_marker, word = "system", hl = "StrapsRoleSystem", pos = "inline" },
   }) do
     local marks = marks_on_row(buf, spec.lnum)
     assert(#marks > 0, "no render marks on marker line " .. spec.lnum)
-    local saw_conceal, saw_overlay = false, false
+    local saw_conceal, saw_rule = false, false
     for _, m in ipairs(marks) do
       local d = m[4]
       if d.conceal ~= nil then
         saw_conceal = true
       end
-      if d.virt_text and d.virt_text_pos == "overlay" then
+      if d.virt_text and d.virt_text_pos == spec.pos then
         for _, chunk in ipairs(d.virt_text) do
           if chunk[1] == spec.word and chunk[2] == spec.hl then
-            saw_overlay = true
+            saw_rule = true
           end
         end
       end
     end
     assert(saw_conceal, "no conceal mark on " .. spec.word .. " marker")
-    assert(saw_overlay, "no overlay with " .. spec.word .. "/" .. spec.hl)
+    assert(saw_rule, "no " .. spec.pos .. " rule with " .. spec.word .. "/" .. spec.hl)
   end
 end)
 
 it("role rules read apart: per-role bar char + role-colored lead", function()
-  local function overlay_chunks(lnum)
+  local function rule_chunks(lnum, pos)
     for _, m in ipairs(marks_on_row(buf, lnum)) do
       local d = m[4]
-      if d.virt_text and d.virt_text_pos == "overlay" then
+      if d.virt_text and d.virt_text_pos == pos then
         return d.virt_text
       end
     end
   end
-  local user = overlay_chunks(LN.user_marker)
-  local agent = overlay_chunks(LN.assistant_marker)
-  local system = overlay_chunks(LN.system_marker)
-  assert(user and agent and system, "missing role-rule overlay on a marker line")
+  local user = rule_chunks(LN.user_marker, "inline")
+  local agent = rule_chunks(LN.assistant_marker, "overlay")
+  local system = rule_chunks(LN.system_marker, "inline")
+  assert(user and agent and system, "missing role rule on a marker line")
   assert(user[1][1]:find("─", 1, true) and not user[1][1]:find("━", 1, true),
     "user lead must use the light ─ bar")
   assert(agent[1][1]:find("━", 1, true) and not agent[1][1]:find("─", 1, true),
@@ -178,13 +178,13 @@ it("role rules read apart: per-role bar char + role-colored lead", function()
     "agent lead must carry StrapsRoleAgent, got " .. tostring(agent[1][2]))
   assert(system[1][2] == "StrapsRoleSystem",
     "system lead must carry StrapsRoleSystem, got " .. tostring(system[1][2]))
-  assert(agent[3][1]:find("━", 1, true) and not agent[3][1]:find("─", 1, true),
+  assert(agent[#agent][1]:find("━", 1, true) and not agent[#agent][1]:find("─", 1, true),
     "agent trailing run must keep the heavy ━ bar")
-  assert(user[3][1]:find("─", 1, true) and not user[3][1]:find("━", 1, true),
+  assert(user[#user][1]:find("─", 1, true) and not user[#user][1]:find("━", 1, true),
     "user trailing run must keep the light ─ bar")
-  assert(system[3][1]:find("─", 1, true) and not system[3][1]:find("━", 1, true),
+  assert(system[#system][1]:find("─", 1, true) and not system[#system][1]:find("━", 1, true),
     "system trailing run must keep the light ─ bar")
-  assert(user[3][2] == "StrapsRule" and agent[3][2] == "StrapsRule" and system[3][2] == "StrapsRule",
+  assert(user[#user][2] == "StrapsRule" and agent[#agent][2] == "StrapsRule" and system[#system][2] == "StrapsRule",
     "trailing bars must stay dim StrapsRule")
 end)
 
@@ -281,13 +281,80 @@ describe("structured fold metadata", function()
     end
   end)
 
-  it("does not use metadata from a later fold even if the id matches", function()
+  it("shows each call's own status in a batch", function()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_use]%% {"id":"a","name":"custom"}', "{}",
+      '%%[straps:tool_use]%% {"id":"b","name":"custom"}', "{}",
+      '%%[straps:tool_use]%% {"id":"c","name":"custom"}', "{}",
+      '%%[straps:tool_result]%% {"id":"a","is_error":false}', "one",
+      '%%[straps:tool_result]%% {"id":"b","is_error":true}', "two",
+      '%%[straps:tool_result]%% {"id":"c","is_error":false}', "three",
+    })
+    local function status(lnum) return ui._fold_summary(b, lnum)[4][1] end
+    assert.are.equal("ok", status(1))
+    assert.are.equal("failed", status(3))
+    assert.are.equal("ok", status(5))
+  end)
+
+  it("pairs duplicate ids in order", function()
     vim.api.nvim_buf_set_lines(b, 0, -1, false, {
       '%%[straps:tool_use]%% {"id":"x","name":"custom"}', "{}",
       '%%[straps:tool_use]%% {"id":"x","name":"another"}', "{}",
       '%%[straps:tool_result]%% {"id":"x","is_error":true,"count":5}', "failure",
+      '%%[straps:tool_result]%% {"id":"x","is_error":false}', "fine",
     })
-    assert.same({ { "▸ ", "StrapsRule" }, { "custom", "StrapsRule" } }, ui._fold_summary(b, 1))
+    assert.same({ { "▸ ", "StrapsRule" }, { "custom", "StrapsRule" }, { " · ", "StrapsRule" },
+      { "failed", "StrapsToolError" }, { " · count: 5", "StrapsRule" } }, ui._fold_summary(b, 1))
+    assert.same({ { "▸ ", "StrapsRule" }, { "another", "StrapsRule" }, { " · ", "StrapsRule" },
+      { "ok", "StrapsRule" } }, ui._fold_summary(b, 3))
+  end)
+
+  it("does not use a result past a user marker or an assistant block with text", function()
+    for _, between in ipairs({ { "%%[straps:user]%%" }, { "%%[straps:assistant]%%", "reply" } }) do
+      local lines = { '%%[straps:tool_use]%% {"id":"x","name":"custom"}', "{}" }
+      vim.list_extend(lines, between)
+      vim.list_extend(lines, { '%%[straps:tool_result]%% {"id":"x","is_error":true}', "failure" })
+      vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
+      assert.same({ { "▸ ", "StrapsRule" }, { "custom", "StrapsRule" } }, ui._fold_summary(b, 1))
+    end
+  end)
+
+  it("uses a result after an empty assistant marker", function()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_use]%% {"id":"x","name":"custom"}', "{}",
+      '%%[straps:tool_use]%% {"id":"y","name":"custom"}', "{}",
+      "%%[straps:assistant]%%", "",
+      '%%[straps:tool_result]%% {"id":"x","is_error":true}', "failure",
+      '%%[straps:tool_result]%% {"id":"y","is_error":false}', "fine",
+    })
+    assert.are.equal("failed", ui._fold_summary(b, 1)[4][1])
+    assert.are.equal("ok", ui._fold_summary(b, 3)[4][1])
+  end)
+
+  it("does not count a same-id call from the previous turn", function()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_use]%% {"id":"x","name":"custom"}', "{}",
+      '%%[straps:tool_result]%% {"id":"x","is_error":true}', "first",
+      "%%[straps:assistant]%%",
+      '%%[straps:tool_use]%% {"id":"x","name":"custom"}', "{}",
+      '%%[straps:tool_result]%% {"id":"x","is_error":false}', "second",
+    })
+    assert.are.equal("failed", ui._fold_summary(b, 1)[4][1])
+    assert.are.equal("ok", ui._fold_summary(b, 6)[4][1])
+  end)
+
+  it("stops the same-id count at an empty assistant block before the call", function()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_use]%% {"id":"x","name":"custom"}', "{}",
+      "%%[straps:assistant]%%",
+      '%%[straps:tool_use]%% {"id":"x","name":"custom"}', "{}",
+      '%%[straps:tool_result]%% {"id":"x","is_error":false}', "only",
+    })
+    assert.are.equal("ok", ui._fold_summary(b, 4)[4][1])
+    for _, chunk in ipairs(ui._fold_summary(b, 1)) do
+      assert.are_not.equal("ok", chunk[1])
+      assert.are_not.equal("failed", chunk[1])
+    end
   end)
 
   it("uses the available metadata on a standalone result", function()
@@ -796,7 +863,7 @@ it("every window-option write in the source uses the :setlocal form", function()
     .. table.concat(offenders, ", "))
 end)
 
--- ---------------------------------------------------------- notice overlays
+-- ---------------------------------------------------------- notice rules
 -- A user block that carries a harness notice or a peer-agent message (the
 -- `[straps] ` content convention, state.notice_of) is not the user's turn and
 -- must not render as `you`. The marker-line inline form and an indented
@@ -833,10 +900,10 @@ step(function()
   registry.call("fn.render", nbuf)
 end)
 
-local function overlay_of(lnum)
+local function rule_of(lnum)
   for _, m in ipairs(marks_on_row(nbuf, lnum)) do
     local d = m[4]
-    if d.virt_text and d.virt_text_pos == "overlay" then
+    if d.virt_text and d.virt_text_pos == "inline" then
       return d.virt_text
     end
   end
@@ -844,8 +911,8 @@ end
 
 it("a harness notice in a user block renders as `harness`, not `you`", function()
   for _, lnum in ipairs({ NLN.harness, NLN.inline }) do
-    local v = overlay_of(lnum)
-    assert(v, "no overlay on line " .. lnum)
+    local v = rule_of(lnum)
+    assert(v, "no role rule on line " .. lnum)
     assert(v[2][1] == "harness", ("line %d label: %s"):format(lnum, v[2][1]))
     assert(v[2][2] == "StrapsRoleNotice" and v[1][2] == "StrapsRoleNotice",
       "notice label and lead must carry StrapsRoleNotice")
@@ -854,16 +921,16 @@ it("a harness notice in a user block renders as `harness`, not `you`", function(
 end)
 
 it("a peer-agent message renders as `agent N` with the buffer number", function()
-  local v = overlay_of(NLN.agent)
-  assert(v, "no overlay on the agent-message marker")
+  local v = rule_of(NLN.agent)
+  assert(v, "no role rule on the agent-message marker")
   assert(v[2][1] == "agent 104", "label: " .. tostring(v[2][1]))
   assert(v[2][2] == "StrapsRoleNotice", "agent label must carry StrapsRoleNotice")
 end)
 
 it("the user's own words keep the `you` rule, lookalikes included", function()
   for _, lnum in ipairs({ NLN.you, NLN.indented, NLN.colon }) do
-    local v = overlay_of(lnum)
-    assert(v, "no overlay on line " .. lnum)
+    local v = rule_of(lnum)
+    assert(v, "no role rule on line " .. lnum)
     assert(v[2][1] == "you" and v[2][2] == "StrapsRoleUser",
       ("line %d should render as you/StrapsRoleUser, got %s/%s"):format(lnum, v[2][1], v[2][2]))
   end

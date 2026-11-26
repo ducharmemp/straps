@@ -32,11 +32,10 @@ it('reports a pending edit in the winbar without marking the active turn', funct
   check(3, winbar():find(':StrapsInspect', 1, true))
   local ns = api.nvim_get_namespaces().straps_turn_decoration
   check(4, not ns or #api.nvim_buf_get_extmarks(buf, ns, 0, -1, {}) == 0)
-  local confirm = vim.fn.confirm
-  vim.fn.confirm = function() return 2 end
   local ok, err = pcall(require('straps.dock').review_permission, buf)
-  vim.fn.confirm = confirm
   assert(ok, err)
+  assert(require('straps.permission_review').review_window(), 'review float did not open')
+  api.nvim_feedkeys('n', 'mx', false)
   check(5, vim.wait(1000, function() return not loop.running(buf) end))
   check(6, not winbar():find('waiting', 1, true))
 end)

@@ -4,54 +4,6 @@ Ideated but not yet built. Each entry is self-contained enough to pick up
 cold. Ordered roughly by value-per-line, not commitment. Delete an entry
 when it ships (and fold its design into DESIGN.md).
 
-## Input: ranged `:StrapsAsk` + `@file`/`@symbol` completion
-
-The push direction from editor to transcript is missing. `tool.context`
-already *reports* the last visual selection (lua/straps/editor.lua:1542), but
-nothing lets the user shove a selection or a file reference INTO the session.
-
-- **Ranged send.** A command with `{ range = true }` — e.g. `:StrapsAsk` —
-  that takes the visual selection (or `o.line1..o.line2`) from the CURRENT
-  (non-session) file and appends it to the newest session as a fenced block
-  with a `path:line-line` header, optionally followed by a prompt line via
-  `vim.ui.input`. No existing command takes a range (verified: every
-  `nvim_create_user_command` in plugin/straps.lua except `:StrapsResume!` is
-  range-less). Sketch:
-
-  ```lua
-  vim.api.nvim_create_user_command("StrapsAsk", function(o)
-    -- o.line1..o.line2 from the current file -> fenced block into the
-    -- newest/most-recent session buffer, path:line header, then optional
-    -- vim.ui.input prompt line. Reuse state.append(bufnr, "user", ...).
-  end, { range = true, nargs = "?" })
-  ```
-
-  Lands in the transcript as:
-
-  ```
-  lua/straps/loop.lua:327-341
-  ```lua
-  for i, block in ipairs(tool_blocks) do
-  ...
-  ```
-  why is this O(n^2)?
-  ```
-
-- **`@file` / `@symbol` completion in the session buffer.** An `omnifunc` (or
-  a completion source) on the session buffer that expands `@<path>` from the
-  project (glob) and `@<symbol>` via workspace symbols, so the user pulls
-  context in without leaving the buffer. There is currently no completion of
-  any kind on the session buffer (no `omnifunc`/`completefunc`, no cmp/blink
-  source — verified absent).
-
-Design notes / open questions:
-- Which session does a ranged send target off a non-session buffer? Most
-  recent by mtime (state.list_sessions()[1]) is the obvious default; a `!`
-  variant could pick.
-- Keep it native: reuse `state.append` and the `path:line` ref format the
-  `gf` mapping already understands (ui.lua:436), so a pushed ref is
-  round-trippable back to the file.
-
 ## Registry undo: version history, diff, rollback
 
 The registry is the one thing with no undo. Redefining an entry bumps

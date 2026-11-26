@@ -39,14 +39,14 @@ local function diff_lines(record)
   return lines
 end
 
-function M.inspect()
-  local transcript = api.nvim_get_current_win()
-  local bufnr = api.nvim_win_get_buf(transcript)
+function M.inspect(bufnr, target_win)
+  local transcript = target_win and api.nvim_win_is_valid(target_win) and target_win or api.nvim_get_current_win()
+  bufnr = bufnr or api.nvim_win_get_buf(transcript)
   local record = pending[bufnr]
-  if not record or record.deciding or require("straps.registry").any_tool_executing() then
-    return false, "no pending edit to inspect in the current transcript"
+  if not record or record.deciding or require("straps.registry").tool_body_running_here() then
+    return false, "no pending edit to inspect for this session"
   end
-  if vim.fn.getcwd() ~= record.cwd then return false, "pending edit's execution directory changed" end
+  if require("straps.registry").window_cwd(transcript) ~= record.cwd then return false, "pending edit's execution directory changed" end
   if record.transcript == transcript and record.win and api.nvim_win_is_valid(record.win)
       and api.nvim_win_get_buf(record.win) == record.buf then
     return true
@@ -74,12 +74,12 @@ function M.inspect()
   return true
 end
 
-function M.confirm(name, input, ctx, call_id, present)
+function M.confirm(name, input, ctx, call_id, present, spec)
   local dock = require("straps.dock")
   local bufnr = ctx and ctx.bufnr
   if not (bufnr and bufnr > 0 and api.nvim_buf_is_valid(bufnr) and vim.b[bufnr].straps_session == true
       and ctx.await and ctx.on_cancel and coroutine.running()) then
-    return dock.confirm(ctx, present)
+    return dock.confirm(ctx, present, spec)
   end
   if pending[bufnr] then return nil end
   local record = {
@@ -100,11 +100,17 @@ function M.confirm(name, input, ctx, call_id, present)
       redraw(bufnr)
       done(success, result)
     end
-    record.release = dock.defer(bufnr, function()
+    local entry = { kind = "confirm", spec = spec, mode = require("straps.permission_review").mode() }
+    entry.present = function()
       record.deciding = true
       local success, result = pcall(present)
       finish(success, result)
-    end)
+    end
+    entry.done = function(result)
+      record.deciding = true
+      finish(true, result)
+    end
+    record.release = dock.defer(bufnr, entry)
     ctx.on_cancel(function() finish(true, nil) end)
     redraw(bufnr)
   end)

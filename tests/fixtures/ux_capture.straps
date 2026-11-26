@@ -1,0 +1,40 @@
+%%[straps:system]%%
+You are Cinch, a coding agent running inside Neovim.
+This system block stands in for the full prompt.
+
+%%[straps:user]%%
+List the files and check the build.
+
+%%[straps:assistant]%%
+Checking three things at once.
+
+%%[straps:tool_use]%% {"id":"cap1","name":"bash"}
+{"command":"ls"}
+
+%%[straps:tool_use]%% {"id":"cap2","name":"bash"}
+{"command":"make"}
+
+%%[straps:tool_use]%% {"id":"cap3","name":"read_file"}
+{"path":"README.md"}
+
+%%[straps:tool_result]%% {"id":"cap1"}
+README.md
+src
+
+%%[straps:tool_result]%% {"id":"cap2","is_error":true}
+make: *** No targets specified and no makefile found.  Stop.
+
+%%[straps:tool_result]%% {"id":"cap3"}
+# Example
+
+%%[straps:assistant]%%
+The build has no makefile. Next steps:
+
+- Add a Makefile with a default target that builds the sources under src and runs the test suite, so that a plain make from the repository root does something useful.
+- Document the build in README.md.
+
+%%[straps:user]%%
+[straps] run finished
+
+%%[straps:user]%%
+

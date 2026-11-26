@@ -72,7 +72,7 @@ local function display(view, answer)
     })
   end)
   if not ok then dispose(); error(reason, 0) end
-  return dispose
+  return dispose, window
 end
 
 function M.connect(options)
@@ -106,8 +106,10 @@ function M.connect(options)
   local pump
   local function terminal(record, status, reason)
     record.status, record.reason = status, reason
-    local dispose, release_attention = record.dispose, record.release_attention
+    local dispose, release_attention, release_entry = record.dispose, record.release_attention, record.release_entry
     record.dispose, record.release_attention, record.context = nil, nil, nil
+    record.release_entry, record.entry = nil, nil
+    if release_entry then pcall(release_entry) end
     if release_attention then pcall(release_attention) end
     if dispose then pcall(dispose) end
     if active == record then active = nil end
@@ -130,6 +132,31 @@ function M.connect(options)
       local valid, reason = current(record)
       if not valid then terminal(record, reason == "expired" and "expired" or "invalidated", reason) end
     end
+  end
+  local function tool_label(record)
+    local definition = record.binding and record.binding.definition
+    local name = type(definition) == "table" and definition.name or nil
+    return type(name) == "string" and (name:gsub("^tool%.", "")) or "call"
+  end
+  local function presenter_entry(record, fields)
+    return vim.tbl_extend("force", { kind = "presenter", label = tool_label(record), expires = record.expires, clock = now }, fields)
+  end
+  local function would_defer(record)
+    local context = record.context
+    local bufnr = context and context.bufnr
+    if show ~= display or not (context and context.await and context.on_cancel) then return false end
+    if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) or vim.b[bufnr].straps_session ~= true then
+      return false
+    end
+    return require("straps.permission_review").mode() == "deferred"
+  end
+  local function defer_queued(record)
+    if not would_defer(record) then return end
+    local entry = presenter_entry(record, { status = "queued" })
+    local release_entry = require("straps.dock").defer(record.context.bufnr, entry)
+    if not release_entry then return end
+    record.entry, record.release_entry = entry, release_entry
+    record.release_attention = require("straps.attention").wait(record.context, "consent")
   end
   local function view(record)
     return copy({ binding = record.binding, assessment = record.assessment, status = record.status,
@@ -174,27 +201,41 @@ function M.connect(options)
           active, record.status = record, "displayed"
           record.display_revision = (record.display_revision or 0) + 1
           local revision = record.display_revision
-          record.release_attention = require("straps.attention").wait(record.context, "consent")
+          if not record.release_attention then
+            record.release_attention = require("straps.attention").wait(record.context, "consent")
+          end
           local function present()
             return show(view(record), function(choice)
               if record.display_revision == revision then decide(record, choice) end
             end)
           end
+          local close, window
+          local function presenter()
+            if window and vim.api.nvim_win_is_valid(window) then
+              vim.api.nvim_set_current_win(window)
+              return
+            end
+            refresh(record)
+            if active ~= record then pump(); return end
+            local shown, cleanup, win = pcall(present)
+            if shown then close, window = cleanup, win else terminal(record, "invalidated", "consent display failed"); pump() end
+          end
           local dock = require("straps.dock")
           local bufnr = record.context and record.context.bufnr
           local ok, dispose
-          if show == display and dock.visible(bufnr) then
-            local close
-            local release = dock.defer(bufnr, function()
-              refresh(record)
-              if active ~= record then pump(); return end
-              local shown, cleanup = pcall(present)
-              if shown then close = cleanup else terminal(record, "invalidated", "consent display failed"); pump() end
-            end)
+          if record.entry then
+            record.entry.status, record.entry.present = "displayed", presenter
+            require("straps.permission_review").changed()
             ok, dispose = true, function()
-              release()
               if close then close() end
             end
+          elseif show == display and dock.visible(bufnr) then
+            local release = dock.defer(bufnr, presenter_entry(record, { present = presenter }))
+            ok, dispose = true, function()
+              if release then release() end
+              if close then close() end
+            end
+            if not release then ok, dispose = pcall(present) end
           else
             ok, dispose = pcall(present)
           end
@@ -243,7 +284,11 @@ function M.connect(options)
       else
         if opts and opts.human_reopen == true then rejected[record.family] = nil end
         if rejected[record.family] then record.reason = "decision family rejected; human reopen required"
-        else record.status = "queued"; queue[#queue + 1] = record end
+        else
+          record.status = "queued"
+          queue[#queue + 1] = record
+          defer_queued(record)
+        end
       end
     end
     pump()

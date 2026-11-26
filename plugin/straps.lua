@@ -104,12 +104,18 @@ end, {
     .. " [categories] pre-grant permissions, `-- text` seeds the request, ! sends it",
 })
 
+command("StrapsAsk", function(opts)
+  require("straps.ask").run(opts, human, split_cmd_of(opts.smods), opts.smods.split ~= "" or opts.smods.vertical)
+end, {
+  nargs = "*",
+  range = true,
+  bang = true,
+  desc = "straps: quote the range (default: current line) with path:lines for a session, with text; ! sends",
+})
+
 command("StrapsPermission", function()
-  local bufnr = resolve_session()
-  if bufnr and not require("straps.dock").review_permission(bufnr) then
-    vim.notify("straps: no permission request to open for this session", vim.log.levels.INFO)
-  end
-end, { desc = "straps: review the session's pending permission request" })
+  require("straps.permission_review").review_or_notify(require("straps.ui").resolve_session(vim.api.nvim_get_current_buf()))
+end, { desc = "straps: review the pending permission request (this session's, a subagent's, or the oldest)" })
 
 command("StrapsInspect", function()
   local ok, reason = require("straps.workbench").inspect()

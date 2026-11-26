@@ -1,6 +1,7 @@
 :Straps	straps.txt	/*:Straps*
 :StrapsAdopt	straps.txt	/*:StrapsAdopt*
 :StrapsAgents	straps.txt	/*:StrapsAgents*
+:StrapsAsk	straps.txt	/*:StrapsAsk*
 :StrapsAuthorization	straps.txt	/*:StrapsAuthorization*
 :StrapsAuto	straps.txt	/*:StrapsAuto*
 :StrapsCompact	straps.txt	/*:StrapsCompact*
@@ -118,6 +119,7 @@ straps-introduction	straps.txt	/*straps-introduction*
 straps-layers	straps.txt	/*straps-layers*
 straps-models-tool	straps.txt	/*straps-models-tool*
 straps-multiplayer	straps.txt	/*straps-multiplayer*
+straps-permission-review	straps.txt	/*straps-permission-review*
 straps-registry	straps.txt	/*straps-registry*
 straps-send-message-tool	straps.txt	/*straps-send-message-tool*
 straps-session	straps.txt	/*straps-session*

@@ -99,7 +99,7 @@ On Neovim 0.12 or later, Straps sends OSC 7501 status reports by default. Suppor
 
 Active sessions have distinct task IDs, which Straps clears when their runs finish. A pane-level report shows blocked while any prompt waits, using the newest wait's kind, or working while any session runs. After all work ends, the latest completed run determines the pane status: done for success, idle for cancellation, or error for other endings. Earlier failures cannot override active work or a later success. Completed outcomes remain in the Straps transcripts; Zellij does not retain separate completed task records.
 
-Agent permission and question prompts report blocked while displayed. API key entry and logout confirmation use temporary task IDs. Closing a standalone prompt recomputes the pane status. Reports contain no conversation content, credentials, error details, or progress percentages. Unloading a session buffer (`:bdelete`, `:bwipeout`, or `:bunload`) removes its task and outcome from the pane calculation. Hiding or renaming a loaded session preserves its task ID. Unloading does not cancel a running agent; later callbacks cannot republish the cleared task. Disabling reports or exiting Neovim clears the active task IDs and pane report. Straps owns the pane-level OSC 7501 record while reporting; other reporters in the same pane can replace that record. Clearing the pane report also clears every named OSC 7501 task in that pane, including tasks from other reporters.
+A permission request reports blocked from the moment it is listed in the corner float or displayed until it is decided or cancelled; a question prompt reports blocked while displayed. API key entry and logout confirmation use temporary task IDs. Closing a standalone prompt recomputes the pane status. Reports contain no conversation content, credentials, error details, or progress percentages. Unloading a session buffer (`:bdelete`, `:bwipeout`, or `:bunload`) removes its task and outcome from the pane calculation. Hiding or renaming a loaded session preserves its task ID. Unloading does not cancel a running agent; later callbacks cannot republish the cleared task. Disabling reports or exiting Neovim clears the active task IDs and pane report. Straps owns the pane-level OSC 7501 record while reporting; other reporters in the same pane can replace that record. Clearing the pane report also clears every named OSC 7501 task in that pane, including tasks from other reporters.
 
 Neovim before 0.12 sends no reports. Headless instances have no terminal recipient. Neovim broadcasts reports to every attached UI advertising `stdout_tty`; Straps cannot select one terminal. Browser authorization intervals, project-trust dialogs, and descendant-stop confirmations do not report blocked. Replacement permission/question implementations must manage their own waiting state; Straps does not infer waiting from tool names or progress hooks.
 
@@ -107,19 +107,19 @@ Neovim before 0.12 sends no reports. Headless instances have no terminal recipie
 
 Session windows show a model/status winbar. Ordinary session windows restore the previous local value when you leave them. Straps preserves the global winbar and user replacements; set `session_winbar = false` to hide model and status.
 
-The session winbar shows `◆ waiting` when a permission request needs a decision, even while you read earlier turns.
-
 Set `session_dock = true` in `require('straps').setup()` to open sessions in a shallow, full-width bottom split. The option defaults to `false`. The dock shows the editable transcript. Drag the separator or use `:resize` from the dock to see more history; shrinking the window keeps your draft. Placement modifiers such as `:vertical Straps` override the dock.
 
-The dock's winbar keeps the conversation name visible when you return to the source, including with `session_winbar = false`. When the default permission prompt or contextual consent dialog needs a decision, the dock shows `Permission pending` without taking focus. Run `:StrapsPermission` from the dock or from a source window with one visible session to open the review. Choose an outcome in the review itself. Use `:StrapsStop` to cancel a waiting run. Custom confirmation and consent interfaces control their own display. If you close the dock while a review is pending, reopen the session to review or stop the run.
+The dock's winbar keeps the conversation name visible when you return to the source, including with `session_winbar = false`.
 
-When the default confirmation hook is waiting on `write_file`, `edit_file`, or `patch_file`, run `:StrapsInspect` from the transcript to open the proposed unified diff. The adjoining split leaves focus and the cursor in the transcript. Closing the split leaves approval pending. Run `:StrapsPermission` to choose an outcome, or `:StrapsStop` to cancel. Contextual consent and custom hooks use their own interfaces.
+The session winbar shows `◆ waiting` when a permission request needs a decision, even while you read earlier turns. While a file edit is pending it reads `◆ waiting — Permission pending (gy / :StrapsInspect / :StrapsPermission)`, and the dock's winbar reads `◆ waiting — Permission pending (gy / :StrapsPermission)` for any other pending confirmation or consent.
 
 1. Run `:Straps`.
 2. Type a request in the session buffer.
 3. Press `<CR>` in normal mode to send it.
 4. Continue editing while the agent works. Press `<CR>` during a run to steer it.
-5. Review and approve tool calls when prompted.
+5. When the corner float lists a permission request, press `gy` in the session to review it (see Permission requests below).
+
+In the draft, `<C-x><C-o>` after `@` completes file paths, and after `@#` it completes workspace symbols from the attached language servers as `@path:line[:col]` (at most 200, waiting at most one second for slow servers).
 
 The transcript is the session state. You can use normal Vim editing to revise history before the next request.
 
@@ -129,6 +129,20 @@ Straps renders the transcript as a conversation and folds tool calls, harness no
 
 Closed tool folds show a muted chevron and tool name, the target when known, and any status or count recorded on the result marker. Failures use diagnostic error color. Straps does not infer status or counts from output text.
 Open a tool fold with `zo` to see a muted left bracket beside its output. The bracket leaves prose and yanked text unchanged. Set `render = false` to turn it off with the rest of transcript rendering.
+
+Each assistant turn that calls tools shows on its rule the number of calls, its seconds without the time spent waiting for you, and its output tokens when the provider reports them: `Cinch · 3 calls · 12s · 840 out`. A turn without tool calls, such as a run's final answer, shows none of these. The seconds and tokens stay for the current Neovim session; a reopened transcript shows the call count only.
+
+### Permission requests
+
+A permission request from a run does not take focus. Straps lists every pending request, from any session, in the corner float at the top right of the current tab: `◆ <session> · allow <tool> <target>` for a confirmation, or `◆ <session> · consent <tool> · expires in Nm` for contextual consent (`◆ <session> · consent <tool> · queued · expires in Nm` while it waits behind another consent). The float cannot receive focus and stays out of `<C-w>w`. The session waiting on the request shows a `◆ waiting: allow <tool> <target> · gy review` line above its draft, or `◆ waiting: consent <tool> · expires in Nm · gy review` for consent.
+
+Press `gy` in a session buffer, or run `:StrapsPermission` from any window, to review a request. Straps picks the session's own request, then one from a subagent of that session, then the oldest. The review float shows the call, and its footer lists the choices with their letters. When the call has more rows than the float, the footer starts with `<n> of <m> rows shown, scroll`; scroll before you decide. A review from another tab moves the float to the current tab. Press a letter to decide: `y` allows once and `n` denies. For a file edit, `d` allows edits in its directory, `p` in its project, and `a` all edits. For another tool, `a` always allows that tool, and an edit-category tool adds `l` for all edits. Press `i` on a file edit to open the proposed diff beside the window you came from; the review float closes and the request stays pending, so read the diff and press `gy` again to decide. `<Tab>` and `<S-Tab>` move to the next or previous request, `<CR>` does nothing, and `q` or `<Esc>` closes the float with the request still pending. Pressing `gy` again in the float re-resolves from the session you came from. A delete or a definition offers only `y` and `n`. Contextual consent opens its own split on review: there `y` allows once, `s` (when offered) approves the amended boundary it displays, which needs a fresh assessment before the call can run, and `q`, `<Esc>` or closing the split rejects. Unlike the review float, closing the consent split decides the request, and a rejected decision family stays denied until a fresh review (`:StrapsAuthorization! {id}`, with the id from the denial text) reopens it. Use `:StrapsStop` to cancel a waiting run.
+
+Set `permission_review = "modal"` to restore the blocking dialog: each confirmation prompts with `confirm()`, and contextual consent opens its split, as the request arrives, unless a visible session dock or a session-buffer file edit defers it. A request made outside a run (a direct `registry.call("hook.confirm", ...)`) always prompts at once.
+
+In both modes, a custom `hook.confirm` controls its own display. Inside a run, a custom hook can list and defer its request by calling `require("straps.dock").confirm(ctx, present, spec)`, with `spec` optional; in `"modal"` mode it defers only while the session dock is visible; without `spec` the row reads `allow (custom hook.confirm)` and review calls `present`. `:help straps-permission-review` describes `spec`.
+
+When the default confirmation hook is waiting on `write_file`, `edit_file`, or `patch_file`, run `:StrapsInspect` from the transcript to open the proposed unified diff. The adjoining split leaves focus and the cursor in the transcript. Closing the split leaves approval pending.
 
 ### Claim evidence
 
@@ -184,12 +198,13 @@ A personal entries file saved with `registry.dump()` pins the entry sources it h
 | Command | Purpose |
 | --- | --- |
 | `:Straps[!] [{cats}] [-- {instruction}]` | Open a new session. `{cats}` pre-grants permission categories (`edit,exec`, `all`), `-- {instruction}` seeds the request, `!` sends it. |
+| `:StrapsAsk[!] [text]` | Quote the given Ex line range (`:[range]StrapsAsk`; default: the current line) under a `path:first-last` header in a fenced block, with `text` after it, for the current or sole visible session, else the most recently focused session, else a new session. An existing session gets it in its draft; a new session starts with it as its request. `!` sends. Split modifiers such as `:vertical` place a new window. In contextual mode the quote is data and `text` is the instruction, so the request reads `text`, a blank line, then the quote: an existing session must be idle with no unsent request, `text` is required, and the request submits at once. |
 | `:StrapsSend` | Submit the draft. Queue it as steering during a run, or start a turn when idle. |
 | `:StrapsSendNow` | Stop the active run and submit the draft as the next turn after it ends. Does not undo tools that ran. |
 | `:StrapsSteer [text]` | Without text, move to the composer. With text, queue it for the active run or add it to the trailing user block if idle. |
 | `:StrapsJumpUnread` | Jump to the first unread line in a transcript reading window. Leaves the divider in place until you move past it. |
 | `:StrapsStop` | Stop the active run. |
-| `:StrapsPermission` | Open the session's pending permission review. |
+| `:StrapsPermission` | Review a pending permission request: the current or sole visible session's, then a subagent's, then the oldest. Works from any window. |
 | `:StrapsInspect` | Open the pending edit diff from its transcript without deciding. |
 | `:StrapsAuto [off\|all\|{cats}]` | With no argument, choose category grants in a Snacks multi-select picker, or report grants without Snacks. Tab toggles; Enter applies the selection; Esc cancels. Explicit categories (or `all`) add grants; `off` clears category grants. |
 | `:StrapsContinue [instruction]` | Continue a stopped run. |
@@ -216,9 +231,9 @@ A personal entries file saved with `registry.dump()` pins the entry sources it h
 | `:StrapsEval` | Execute the current buffer as Lua. |
 | `:StrapsHelp [tag]` | Open the reference documentation. |
 
-Commands that act on a session (`:StrapsSend`, `:StrapsSendNow`, `:StrapsSteer`, `:StrapsStop`, `:StrapsPermission`, `:StrapsContinue`, `:StrapsCompact`, `:StrapsRename`, `:StrapsAuto`) also work from another window when exactly one session is visible in the tab. The model, effort and provider pickers use that session too; with no visible session or multiple visible sessions, they change global defaults. `:StrapsResume`, `:StrapsEdit`, `:StrapsRegistry` and `:StrapsAgents` accept window modifiers (`:vertical StrapsRegistry`).
+Commands that act on a session (`:StrapsSend`, `:StrapsSendNow`, `:StrapsSteer`, `:StrapsStop`, `:StrapsContinue`, `:StrapsCompact`, `:StrapsRename`, `:StrapsAuto`) also work from another window when exactly one session is visible in the tab. The model, effort and provider pickers use that session too; with no visible session or multiple visible sessions, they change global defaults. `:StrapsResume`, `:StrapsEdit`, `:StrapsRegistry` and `:StrapsAgents` accept window modifiers (`:vertical StrapsRegistry`).
 
-In a session buffer (or any `*.straps` file), normal-mode `<CR>` sends or steers and `<S-CR>` stops and sends. Use `:StrapsSendNow` if your terminal does not distinguish Shift-Enter. `gf` opens the `path:line` reference under the cursor, `]]` and `[[` move between conversation turns, and `gO` lists the turns in the location list.
+In a session buffer (or any `*.straps` file), normal-mode `<CR>` sends or steers and `<S-CR>` stops and sends. Use `:StrapsSendNow` if your terminal does not distinguish Shift-Enter. `gf` opens the `path:line` reference under the cursor, `]]` and `[[` move between conversation turns, `][` and `[]` move to the last text line of the next or previous turn, before its tool calls, and `gO` lists the turns in the location list. `gy` reviews the pending permission request (see Permission requests above), and `g?` lists the session keys and every `:Straps*` command in a float.
 
 Run `:StrapsOutline` from a transcript to open a reading tab showing the same buffer. Earlier turns fold under numbered first lines of their prompts. Use `zo` on a heading to reveal its prompt, response and tool output in place. The latest turn and any draft stay open. New turns stay unfolded until you reopen the reader. Run `:StrapsOutline` again or use `:close` to return to the prior view.
 
@@ -308,7 +323,7 @@ Send a targeted message with `i`; messaging an idle agent does not start it. Gat
 
 ## Run events
 
-Each session buffer carries `b:straps_status` ("running" or "idle"). `b:straps_run_reason` records the last observed run ending and clears when a new run starts. Every run fires the `User` autocmds `StrapsRunStart`, `StrapsRunEnd` and `StrapsStatusChanged`, so a statusline or bufferline can show when an agent finishes. See `:help straps-events` for the `data` fields and an example.
+Each session buffer carries `b:straps_status` ("running" or "idle"). `b:straps_run_reason` records the last observed run ending and clears when a new run starts. Every run fires the `User` autocmds `StrapsRunStart`, `StrapsRunEnd` and `StrapsStatusChanged`, so a statusline or bufferline can show when an agent finishes. `require('straps.ui').agents_status()` returns `🤖 <n>` for running top-level sessions with `+<n>` for running subagents and ` ◆<n>` for running sessions that wait for you (`🤖 2+1 ◆1`). See `:help straps-events` for the `data` fields and an example.
 
 ## Security
 

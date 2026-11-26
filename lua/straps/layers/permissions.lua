@@ -174,10 +174,17 @@ end
       .. " show_buffer, show_terminal, set_findings, ask_user, code_action/fix_diagnostic in list mode i.e. without"
       .. " index, undo_edit in history mode, and transcript_excise in list mode"
       .. " i.e. without blocks/range);"
-      .. " otherwise prompt via vim.fn.confirm. For session file edits (write_file, edit_file, patch_file),"
-      .. " :StrapsInspect opens the proposed unified diff from the transcript on demand."
+      .. " otherwise ask. Inside a run with permission_review = \"deferred\" (the default) the request waits in"
+      .. " the corner float until reviewed in the review float (gy / :StrapsPermission; Yes is y and No is n,"
+      .. " a file edit adds d (directory), p (project) and a (all edits), another edit-category tool adds a (this tool)"
+      .. " and l (all edits), and any other tool except deletes and definitions adds a (this tool)); outside a run, or"
+      .. " with \"modal\" outside the dock and session-buffer edits, it prompts via vim.fn.confirm; with \"modal\","
+      .. " a request while the dock is visible or a session-buffer edit waits for gy / :StrapsPermission, which then prompts."
+      .. " For session file edits (write_file, edit_file, patch_file),"
+      .. " :StrapsInspect or i in the review float opens the proposed unified diff on demand; i closes the review"
+      .. " float and leaves the request pending."
       .. " Inside a batch it uses ctx.batch_preview(path) when available."
-      .. " :StrapsPermission opens the decision prompt, which offers"
+      .. " The decision offers"
       .. " Yes / No / 'Always in <parent dir>' / 'Always in this project <root>'"
       .. " (shown only when a project root marker — .jj/.git/.straps.lua/.hg/.svn —"
       .. " is found above the file, and not identical to the parent dir) /"
@@ -313,7 +320,9 @@ return function(name, input, ctx, call_id)
   end
 
   local preview = field_listing(input)
+  local shown_findings
   if name == "bulk_replace" and type(input) == "table" then
+    shown_findings = require("straps.findings").signature(ctx and ctx.bufnr)
     local entries, files = 0, 0
     pcall(function()
       local items = require("straps.findings").get_locations(ctx and ctx.bufnr)
@@ -335,51 +344,74 @@ return function(name, input, ctx, call_id)
     preview = "Deletion is NOT undo-reversible: there is no buffer undo for a removed file.\n" .. preview
   end
 
-  -- For edits the choices are, in order:
-  --   1 Yes  2 No  3 Always in <parent dir>  [4 Always in this project <root>]
-  --   last  Always all edits
-  -- The project choice is only present when a root marker is found, so its
-  -- index is dynamic; capture it rather than hard-coding.
   local dir, root
   local root_choice_idx, all_choice_idx
-  local choices
+  local options
   if is_edit then
     dir = parent_dir(input.path)
     root = project_root(input.path)
-    -- Don't offer the project choice when it would be identical to the
-    -- immediate parent (editing a file directly in the repo root).
     if root == dir then root = nil end
-    -- confirm() hotkeys are case-insensitive: each choice needs a distinct
-    -- letter (an "&Always" here would steal the `a` of "Always &all edits").
-    -- Paths are shown literally, so escape any "&" in them.
     local function esc(s) return (s:gsub("&", "&&")) end
-    choices = "&Yes\n&No\nAlways in &dir " .. esc(dir)
-    local idx = 3
+    options = { { "&Yes", "yes", "y" }, { "&No", "no", "n" }, { "Always in &dir " .. esc(dir), "dir", "d" } }
     if root then
-      idx = idx + 1
-      root_choice_idx = idx
-      choices = choices .. "\nAlways in this &project (" .. esc(root) .. ")"
+      options[#options + 1] = { "Always in this &project (" .. esc(root) .. ")", "project", "p" }
+      root_choice_idx = #options
     end
-    idx = idx + 1
-    all_choice_idx = idx
-    choices = choices .. "\nAlways &all edits"
+    options[#options + 1] = { "Always &all edits", "all edits", "a" }
+    all_choice_idx = #options
   elseif is_delete or is_definition then
-    choices = "&Yes\n&No"
+    options = { { "&Yes", "yes", "y" }, { "&No", "no", "n" } }
   elseif is_edit_cap then
-    choices = "&Yes\n&No\n&Always this tool\nAlways a&ll edits"
+    options = { { "&Yes", "yes", "y" }, { "&No", "no", "n" }, { "&Always this tool", "always tool", "a" },
+      { "Always a&ll edits", "all edits", "l" } }
+    all_choice_idx = #options
   else
-    choices = "&Yes\n&No\n&Always this tool"
+    options = { { "&Yes", "yes", "y" }, { "&No", "no", "n" }, { "&Always this tool", "always tool", "a" } }
   end
+  local modal_choices, spec_choices = {}, {}
+  for i, option in ipairs(options) do
+    modal_choices[i] = option[1]
+    spec_choices[i] = { label = option[2], key = option[3], index = i }
+  end
+  local choices = table.concat(modal_choices, "\n")
 
   local function present()
     return require("straps.attention").prompt(ctx, "permission", vim.fn.confirm,
       "straps: allow " .. tostring(name) .. "?\n" .. preview, choices, 2)
   end
+  local body = preview
+  if is_edit then
+    local grants = "d: always in " .. dir
+    if root then grants = grants .. "\np: always in this project " .. root end
+    body = grants .. "\n\n" .. preview
+  end
+  local target
+  local entry_schema = require("straps.registry").get("tool." .. tostring(name))
+  local properties = type(entry_schema) == "table" and type(entry_schema.input_schema) == "table"
+    and type(entry_schema.input_schema.properties) == "table" and entry_schema.input_schema.properties or {}
+  for _, field in ipairs({ "path", "command", "pattern", "name" }) do
+    if properties[field] ~= nil and type(input) == "table" and type(input[field]) == "string" then
+      target = input[field]
+      break
+    end
+  end
+  local spec = {
+    name = tostring(name),
+    target = target,
+    title = "allow " .. tostring(name),
+    preview = body,
+    choices = spec_choices,
+    inspect = is_edit or nil,
+  }
   local choice
   if is_edit then
-    choice = require("straps.workbench").confirm(name, input, ctx, call_id, present)
+    choice = require("straps.workbench").confirm(name, input, ctx, call_id, present, spec)
   else
-    choice = require("straps.dock").confirm(ctx, present)
+    choice = require("straps.dock").confirm(ctx, present, spec)
+  end
+
+  if shown_findings and (choice == 1 or choice == 3 or choice == 4) then
+    require("straps.findings").approve(ctx and ctx.bufnr, input, shown_findings)
   end
 
   if choice == 1 then
@@ -401,11 +433,7 @@ return function(name, input, ctx, call_id)
     grant("editdir:" .. root)
     return true
   end
-  if is_edit and choice == all_choice_idx then
-    grant("editfiles:*")
-    return true
-  end
-  if is_edit_cap and choice == 4 then
+  if (is_edit or is_edit_cap) and choice == all_choice_idx then
     grant("editfiles:*")
     return true
   end
@@ -414,7 +442,7 @@ return function(name, input, ctx, call_id)
     return true
   end
 
-  return false, "denied via confirm dialog"
+  return false, "denied by the user"
 end
 ]==],
   })

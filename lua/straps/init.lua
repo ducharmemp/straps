@@ -158,6 +158,7 @@ M.config = {
   -- manual statusline either way.
   session_winbar = true,
   session_dock = false,
+  permission_review = "deferred",
   terminal_status = true,
 
   -- Agents-buffer winbar (:StrapsAgents): the keymap legend in a window-local

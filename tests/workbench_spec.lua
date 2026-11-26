@@ -41,7 +41,16 @@ local function start(is_dock, calls, leave_transcript)
   return transcript, source
 end
 
+local function split_count()
+  local n = 0
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if api.nvim_win_get_config(win).relative == '' then n = n + 1 end
+  end
+  return n
+end
+
 before_each(function()
+  straps.config.permission_review = 'modal'
   decisions, choice, messages = 0, 2, {}
   vim.fn.confirm = function(prompt, options, default)
     decisions = decisions + 1
@@ -87,7 +96,7 @@ it('defers inspection and approval, preserves the transcript cursor, and keeps a
   local lines = api.nvim_buf_get_lines(buf, 0, -1, false)
   check('unified_diff', vim.tbl_contains(lines, '-before') and vim.tbl_contains(lines, '+after') and not vim.bo[buf].modifiable)
   vim.cmd.StrapsInspect()
-  check('reuses_diff', preview() == diff and #api.nvim_tabpage_list_wins(0) == 3)
+  check('reuses_diff', preview() == diff and split_count() == 3)
   api.nvim_win_close(diff, false)
   check('close_keeps_pending', not api.nvim_buf_is_valid(buf) and awaiting('edit-1') and decisions == 0)
   check('inspect_writes_nothing', vim.fn.readfile(path)[2] == 'before' and next(registry.granted(session)) == nil)

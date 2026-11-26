@@ -69,6 +69,7 @@ end
 -- from its buffer (loading it if needed) and maps the offset with
 -- vim.str_byteindex; falls back to character+1 if anything is unavailable.
 local function lsp_char_to_byte_col(uri, line0, char0, encoding)
+  if type(char0) ~= "number" then return 1 end
   local ok, col = pcall(function()
     local fname = vim.uri_to_fname(uri)
     local buf = vim.fn.bufadd(fname)
@@ -88,6 +89,27 @@ local function lsp_char_to_byte_col(uri, line0, char0, encoding)
     return byte + 1
   end)
   return (ok and type(col) == "number") and col or (char0 + 1)
+end
+
+local function symbol_location(symbol, encoding, opts)
+  local loc = type(symbol) == "table" and symbol.location
+  if type(loc) ~= "table" or type(loc.uri) ~= "string" then return nil end
+  local parsed, fname = pcall(vim.uri_to_fname, loc.uri)
+  if not parsed then return nil end
+  local file = vim.fn.fnamemodify(fname, ":~:.")
+  if not (type(loc.range) == "table" and type(loc.range.start) == "table" and type(loc.range.start.line) == "number") then
+    return file, false
+  end
+  local line0 = loc.range.start.line
+  if opts and opts.load == false then
+    local loaded = false
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_get_name(b) == fname and vim.api.nvim_buf_is_loaded(b) then loaded = true end
+    end
+    if not loaded then return string.format("%s:%d", file, line0 + 1), true end
+  end
+  local col = lsp_char_to_byte_col(loc.uri, line0, loc.range.start.character, encoding)
+  return string.format("%s:%d:%d", file, line0 + 1, col), true
 end
 
 -- Format a single LSP Location / LocationLink into "file:line:col".
@@ -694,6 +716,13 @@ end
 -- Build a full tool source: the shared prelude followed by the tool body.
 local function src(body)
   return PRELUDE .. "\n" .. body
+end
+
+local prelude_exports
+function M.symbol_location(symbol, encoding, opts)
+  prelude_exports = prelude_exports
+    or assert(loadstring(PRELUDE .. "\nreturn { symbol_location = symbol_location }", "=straps.editor.prelude"))()
+  return prelude_exports.symbol_location(symbol, encoding, opts)
 end
 
 function M.register()
@@ -1561,19 +1590,9 @@ return function(input, ctx)
   local enc = buf_offset_encoding(buf)
   each_result(res, function(result)
     for _, s in ipairs(result or {}) do
-      local where = ""
-      local loc = s.location
-      if type(loc) == "table" and loc.uri then
-        local file = vim.fn.fnamemodify(vim.uri_to_fname(loc.uri), ":~:.")
-        if loc.range and loc.range.start then
-          local col = lsp_char_to_byte_col(loc.uri, loc.range.start.line, loc.range.start.character, enc)
-          where = string.format("%s:%d:%d",
-            file, loc.range.start.line + 1, col)
-          locs[#locs + 1] = where
-        else
-          where = file
-        end
-      end
+      local where, ranged = symbol_location(s, enc, { load = true })
+      if ranged then locs[#locs + 1] = where end
+      where = where or ""
       local line = string.format("%s  %s  %s",
         s.name or "?", kinds[s.kind] or tostring(s.kind or "?"), where)
       if not seen[line] then

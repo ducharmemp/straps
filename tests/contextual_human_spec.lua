@@ -28,6 +28,7 @@ before_each(function()
   loop.steer = function(buf, text) log[#log + 1] = { "steer", buf, text }; return true end
   loop.running = function() return false end
   local source = table.concat(vim.fn.readfile(root .. "/lua/straps/contextual_human.lua"), "\n")
+  local draft_record = '      callbacks.draft(bufnr, instruction, data, state.last_user_text(bufnr))'
   local changes = {
     capture = { "return adapter.submit(bufnr, text, enqueue)", "return enqueue()" },
     stdin = { "then text = draft.instruction end", "then text = draft.displayed end" },
@@ -44,6 +45,8 @@ before_each(function()
     refusal_feedback = { 'if ok == false then vim.notify("straps: " .. tostring(reason or "authorization replay refused"), vim.log.levels.WARN) end', '' },
     command_reason = false,
     command_exact_id = false,
+    ask_record = { draft_record .. '\n', '' },
+    ask_record_late = { draft_record .. '\n      loop.start(bufnr)', '      loop.start(bufnr)\n' .. draft_record },
     stale_draft = { 'if draft and #state.list_blocks(bufnr) > draft.block_count then drafts[bufnr], draft = nil, nil end\n      if draft and text == draft.displayed',
       'if draft and text == draft.displayed' },
   }
@@ -439,4 +442,161 @@ it("public loop source flags and duplicate installation never mint callbacks", f
   assert.is_nil(human.send)
   assert.has_error(function() human.install({}, {}) end)
   assert.has_error(function() human.attach("plugin", function() end) end)
+end)
+
+describe(":StrapsAsk in contextual mode", function()
+  local function wipe_sessions()
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.b[b].straps_session then pcall(vim.api.nvim_buf_delete, b, { force = true }) end
+    end
+  end
+  local quote = "[No Name]:1-2\n```\nfirst\nsecond\n```"
+
+  local function source()
+    vim.cmd("enew!")
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "first", "second" })
+    return vim.api.nvim_get_current_buf()
+  end
+
+  local function idle_session()
+    local src = source()
+    local buf = state.new_session()
+    vim.cmd("split")
+    require("straps.ui").show_session(buf, "none")
+    vim.cmd("wincmd p")
+    vim.api.nvim_set_current_buf(src)
+    return buf
+  end
+
+  before_each(wipe_sessions)
+
+  it("a new session records the quote as data and the text as instruction; ! submits the instruction only", function()
+    source()
+    vim.cmd("1,2StrapsAsk! explain")
+    local construct = assert(last("construct"))
+    assert.is_not_nil(last("commit"))
+    assert.are.equal("explain", assert(last("submit"))[3])
+    assert.are.equal("explain\n\n" .. quote, state.last_user_text(construct[2]))
+  end)
+
+  it(":vertical opens the new session in a vertical split", function()
+    source()
+    vim.cmd("only")
+    vim.cmd("vertical 1,2StrapsAsk explain")
+    assert.is_true(vim.b[vim.api.nvim_get_current_buf()].straps_session)
+    assert.are.equal("row", vim.fn.winlayout()[1])
+  end)
+
+  it("a new session with piped stdin adopts the quote and the piped text", function()
+    local stdin = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(stdin, 0, -1, false, { "piped data" })
+    source()
+    vim.g.straps_stdin_buf = stdin
+    vim.cmd("1,2StrapsAsk explain")
+    vim.cmd("StrapsAdopt")
+    vim.fn.maparg("y", "n", false, true).callback()
+    assert.are.equal("explain\n\n" .. quote .. "\n\npiped data", last("submit")[3])
+  end)
+
+  it("an existing idle session submits at once and writes the composition into the trailing user block", function()
+    local buf = idle_session()
+    state.open_draft(buf)
+    vim.api.nvim_buf_set_lines(buf, state.draft_row(buf) + 1, -1, false, { "keep me" })
+    vim.cmd("1,2StrapsAsk explain")
+    assert.are.equal(buf, last("submit")[2])
+    assert.are.equal("explain", last("submit")[3])
+    assert.is_nil(last("start"))
+    pending[#pending]()
+    assert.are.equal("explain\n\n" .. quote, state.last_user_text(buf))
+    assert.are.equal(buf, last("start")[2])
+    assert.are.equal("keep me", state.draft_text(buf))
+  end)
+
+  it("refuses an existing session whose request is still unsent", function()
+    source()
+    vim.cmd("1,2StrapsAsk old")
+    local first = assert(last("construct"))[2]
+    vim.cmd("wincmd p")
+    source()
+    local from = vim.api.nvim_get_current_win()
+    vim.cmd("1StrapsAsk second ask")
+    assert.are.equal(from, vim.api.nvim_get_current_win())
+    assert.is_nil(last("submit"))
+    assert(last("notify")[2]:find("unsent request", 1, true), last("notify")[2])
+    assert.are.equal("old\n\n" .. quote, state.last_user_text(first))
+  end)
+
+  it("shows a hidden existing session it submits to", function()
+    local buf = idle_session()
+    vim.cmd("only")
+    assert.are.equal(-1, vim.fn.bufwinid(buf))
+    assert(vim.api.nvim_buf_is_loaded(buf))
+    require("straps.ask").focused(buf)
+    vim.cmd("1,2StrapsAsk explain")
+    assert.are.equal(buf, last("submit")[2])
+    assert.are_not.equal(-1, vim.fn.bufwinid(buf))
+  end)
+
+  it("refuses without text and when the session is running", function()
+    local buf = idle_session()
+    vim.cmd("1,2StrapsAsk")
+    assert.is_nil(last("submit"))
+    assert(last("notify")[2]:find("needs an instruction", 1, true), last("notify")[2])
+    loop.running = function(b) return b == buf end
+    vim.cmd("1,2StrapsAsk explain")
+    assert.is_nil(last("submit"))
+    assert(last("notify")[2]:find("needs an idle session", 1, true), last("notify")[2])
+  end)
+
+  it("when the run does not start, :StrapsSend submits the instruction only and :StrapsAdopt displays the composition", function()
+    local buf = idle_session()
+    vim.cmd("1,2StrapsAsk explain")
+    pending[#pending]()
+    vim.api.nvim_set_current_buf(buf)
+    vim.cmd("StrapsSend")
+    assert.are.equal("explain", last("submit")[3])
+    vim.cmd("StrapsAdopt")
+    local shown = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+    assert(shown:find("explain\n\n" .. quote, 1, true), shown)
+    vim.cmd("normal y")
+    assert.are.equal("explain\n\n" .. quote, last("submit")[3])
+    local _, count = last("submit")[3]:gsub("explain", "")
+    assert.are.equal(1, count)
+  end)
+
+  it("refuses to send an edited composition", function()
+    local buf = idle_session()
+    vim.cmd("1,2StrapsAsk explain")
+    pending[#pending]()
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    for i = #lines, 1, -1 do
+      if lines[i] == "second" then
+        vim.api.nvim_buf_set_lines(buf, i - 1, i, false, { "edited" })
+        break
+      end
+    end
+    local submits = #vim.tbl_filter(function(e) return e[1] == "submit" end, log)
+    vim.api.nvim_set_current_buf(buf)
+    vim.cmd("StrapsSend")
+    assert.are.equal(submits, #vim.tbl_filter(function(e) return e[1] == "submit" end, log))
+    assert(last("notify")[2]:find("review edited piped data", 1, true), last("notify")[2])
+  end)
+
+  it("a run that ends inside loop.start leaves the next draft sendable", function()
+    local buf = idle_session()
+    loop.start = function(b)
+      log[#log + 1] = { "start", b }
+      state.append(b, "assistant", nil, "[error] provider failed")
+      state.append(b, "user", nil, "")
+    end
+    vim.cmd("1,2StrapsAsk explain")
+    pending[#pending]()
+    state.open_draft(buf)
+    vim.api.nvim_buf_set_lines(buf, state.draft_row(buf) + 1, -1, false, { "try again" })
+    vim.api.nvim_set_current_buf(buf)
+    local notices = #vim.tbl_filter(function(e) return e[1] == "notify" end, log)
+    vim.cmd("StrapsSend")
+    assert.are.equal("try again", last("submit")[3])
+    assert.are.equal(notices, #vim.tbl_filter(function(e) return e[1] == "notify" end, log))
+  end)
 end)

@@ -103,7 +103,7 @@ function M.setup(config)
   end
   assert(type(config.run_human) == "function", "trusted human scheduler required")
   local authorization = require("straps.authorization")
-  local discover = config.discover or function() return require("straps.instructions").discover(config) end
+  local discover = config.discover or function(_, cwd) return require("straps.instructions").discover(config, cwd) end
   local compositions = {}
   local receipts = config.receipts or {}
   local core, controller, consent, assessor
@@ -133,27 +133,27 @@ function M.setup(config)
       task_id = snapshot.task_id, epoch = snapshot.epoch } or nil
     return snapshot
   end
-  local function composition(bufnr)
+  local function composition(bufnr, cwd)
     if type(receipts.identity) ~= "function" then return nil end
-    return immediate(receipts.identity, bufnr)
+    return immediate(receipts.identity, bufnr, cwd)
   end
-  local function prompt_current(bufnr, standing)
-    return type(receipts.validate) == "function" and immediate(receipts.validate, bufnr, copy(standing)) == true
+  local function prompt_current(bufnr, standing, cwd)
+    return type(receipts.validate) == "function" and immediate(receipts.validate, bufnr, copy(standing), cwd) == true
   end
-  local function unchanged(bufnr, stamp, ctx)
+  local function unchanged(bufnr, stamp, ctx, cwd)
     if ctx and ctx.cancelled and ctx.cancelled() then return false, "operation cancelled" end
     if not vim.deep_equal(stamp, authorization.execution_stamp(bufnr)) then return false, "authorization changed" end
-    local standing = immediate(discover)
+    local standing = immediate(discover, nil, cwd)
     if type(standing) ~= "table" then return false, "standing discovery unavailable" end
     local snapshot = authorization.snapshot(bufnr)
     if not snapshot or not vim.deep_equal(snapshot.standing, standing) then return false, "standing instructions changed" end
-    local identity = composition(bufnr)
+    local identity = composition(bufnr, cwd)
     if identity == nil or not vim.deep_equal(identity, compositions[bufnr]) then return false, "instruction composition changed" end
-    if not prompt_current(bufnr, standing) then return false, "persisted prompt changed or unavailable" end
+    if not prompt_current(bufnr, standing, cwd) then return false, "persisted prompt changed or unavailable" end
     return true
   end
-  local function current(bufnr, stamp)
-    local valid, reason = unchanged(bufnr, stamp)
+  local function current(bufnr, stamp, cwd)
+    local valid, reason = unchanged(bufnr, stamp, nil, cwd)
     if not valid then
       if reason == "standing instructions changed" or reason == "instruction composition changed" then
         authorization.suspend(bufnr)
@@ -197,11 +197,11 @@ function M.setup(config)
     if now and now.status == "active" then expected.status = "active" end
     if unchanged(bufnr, expected, ctx) then enqueue() end
   end
-  local function targets(binding)
+  local function targets(binding, cwd)
     if type(config.resolve_targets) ~= "function" then
       return { unavailable = "resolver absent", binding = copy(binding), known = {}, unresolved = { "material target resolver unavailable" }, checks = {} }
     end
-    local ok, value, reason = pcall(function() return immediate(config.resolve_targets, copy(binding)) end)
+    local ok, value, reason = pcall(function() return immediate(config.resolve_targets, copy(binding), { cwd = cwd }) end)
     if not ok or type(value) ~= "table" or type(value.known) ~= "table" or type(value.unresolved) ~= "table"
         or type(value.checks) ~= "table" then
       return { unavailable = not ok and "resolver exception" or value == nil and "resolver unavailable" or "resolver malformed",
@@ -216,20 +216,21 @@ function M.setup(config)
     if result.checks and result.checks.binding then result.checks.binding.call_id = nil end
     return result
   end
-  local function target_current(record, human_override)
-    local resolved = targets(record.binding)
+  local function target_current(record, human_override, cwd)
+    local resolved = targets(record.binding, cwd)
     if not vim.deep_equal(resolved, record.targets) then return false, "target facts changed" end
     if record.targets.unavailable then return human_override == true, "material target facts unavailable" end
     if type(config.validate_targets) ~= "function" then return false, "target validation unavailable" end
-    return immediate(config.validate_targets, copy(record.targets), copy(record.binding), { allow_unresolved = human_override == true })
+    return immediate(config.validate_targets, copy(record.targets), copy(record.binding),
+      { allow_unresolved = human_override == true, cwd = cwd })
   end
-  local function validate_record(record)
+  local function validate_record(record, cwd)
     if not record or record.terminal then return false, "call terminal" end
-    local valid, reason = current(record.binding.session, record.binding.stamp)
+    local valid, reason = current(record.binding.session, record.binding.stamp, cwd)
     if not valid then return false, reason end
     local active, unavailable = authorization.validate_stamp(record.binding.session, record.binding.stamp)
     if not active and not record.human_override then return false, unavailable end
-    local target_ok, why = target_current(record, record.human_override)
+    local target_ok, why = target_current(record, record.human_override, cwd)
     if target_ok ~= true then return false, why or "target facts changed" end
     return true
   end
@@ -316,7 +317,7 @@ function M.setup(config)
     validate = function(handle, binding)
       local record = records[handle]
       if not record or not vim.deep_equal(record.binding, binding) then return false end
-      local valid, reason = validate_record(record)
+      local valid, reason = validate_record(record, binding.cwd)
       if not valid then return false, reason end
       return controller.validate(handle, binding)
     end,

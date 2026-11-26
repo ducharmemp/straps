@@ -1,4 +1,6 @@
 local M = {}
+
+M.KEY_DESC = "straps: ask_user"
 local prepare, answer
 
 function M.install_contextual(adapter)
@@ -248,7 +250,7 @@ function M.ask(input, ctx)
       vim.keymap.set("n", lhs, function()
         local ok, err = pcall(fn)
         if not ok then vim.notify("ask_user: " .. tostring(err), vim.log.levels.ERROR) end
-      end, { buffer = bufnr, nowait = true, desc = "straps: ask_user" })
+      end, { buffer = bufnr, nowait = true, desc = M.KEY_DESC })
     end
     local function move(d)
       selected = ((selected - 1 + d) % #options) + 1

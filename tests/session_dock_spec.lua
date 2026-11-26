@@ -18,6 +18,13 @@ local function check(ok, name)
   if assertion == tonumber(vim.env.STRAPS_DOCK_COUNTERFACTUAL) then ok = not ok end
   assert(ok, ('dock assertion %d: %s'):format(assertion, name))
 end
+local function split_count()
+  local n = 0
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if api.nvim_win_get_config(win).relative == '' then n = n + 1 end
+  end
+  return n
+end
 local function border(win)
   return api.nvim_eval_statusline(vim.wo[win].winbar, { winid = win, use_winbar = true }).str
 end
@@ -66,6 +73,7 @@ end)
 
 it('defers the default gate without focus or a preview split and clears on decision or stop', function()
   straps.config.session_dock = true
+  straps.config.permission_review = 'modal'
   local decisions = 0
   vim.fn.confirm = function()
     decisions = decisions + 1
@@ -90,7 +98,7 @@ it('defers the default gate without focus or a preview split and clears on decis
     local before = decisions
     loop.start(b)
     check(vim.wait(1000, function() return dock.has_permission(b) or decisions ~= before end), 'reaches permission gate')
-    check(decisions == before and entered == 0 and #api.nvim_tabpage_list_wins(0) == 2, 'arrival neither prompts nor opens a window')
+    check(decisions == before and entered == 0 and split_count() == 2, 'arrival neither prompts nor opens a window')
     check(api.nvim_get_current_win() == source and api.nvim_get_current_buf() == source_buf, 'source remains focused')
     check(border(w):find('Permission pending', 1, true) ~= nil, 'rendered border shows pending state')
     vim.cmd(resolution)
@@ -105,14 +113,16 @@ end)
 
 it('defers the default contextual consent dialog until explicit review', function()
   straps.config.session_dock = true
+  straps.config.permission_review = 'modal'
   local b, w, source = open()
   api.nvim_set_current_win(source)
   local decision
-  local ctx = { bufnr = b, await = function(register) register(function(status) decision = status end) end }
+  local ctx = { bufnr = b, await = function(register) register(function(status) decision = status end) end,
+    on_cancel = function() end }
   consent.request({}, { outcome = 'ask', decision = {
     boundary = 'edit', targets = { 'test file' }, effects = { 'write' },
   } }, ctx)
-  check(decision == nil and api.nvim_get_current_win() == source and #api.nvim_tabpage_list_wins(0) == 2,
+  check(decision == nil and api.nvim_get_current_win() == source and split_count() == 2,
     'consent waits without opening its dialog')
   check(border(w):find('Permission pending', 1, true) ~= nil, 'rendered border shows pending consent')
   vim.cmd.StrapsPermission()

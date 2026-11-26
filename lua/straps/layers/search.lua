@@ -345,12 +345,15 @@ end
 
   -- ------------------------------------------------------------- bulk_replace
 
+  local delimiters = "#@!%,;:^$*+=?/-"
   define({
     name = "tool.bulk_replace",
     kind = "tool",
     doc = "Substitute text across the CURRENT findings list — the set the grep"
       .. " tool populates for THIS session — as a single native multi-file edit."
-      .. " Runs `s/<pattern>/<replacement>/<flags> | update` on the line of every"
+      .. " Puts the pattern in the search register and runs"
+      .. " `smagic##<replacement>#<flags> | update` (the delimiter is the first of " .. delimiters .. " absent"
+      .. " from the replacement) on the line of every"
       .. " entry (as :ldo/:cdo would, but without moving any window or the jumplist),"
       .. " editing each file THROUGH its buffer so the changes enter each"
       .. " file's native undo history (revert with `u`, `:earlier`, or undotree in"
@@ -360,22 +363,34 @@ end
       .. " This is a WRITE tool and prompts for"
       .. " confirmation. Parameters: pattern (required) — a Vim :s search pattern"
       .. " (Vim regex, NOT rg/PCRE); replacement (required) — the replacement"
-      .. " text (Vim :s syntax, e.g. \\1 backreferences); flags (optional, default"
+      .. " text (Vim :s syntax, e.g. \\1 backreferences; a replacement that starts with"
+      .. " \\= or ~, ends in an unescaped backslash, contains a newline, carriage return, | or NUL, or contains"
+      .. " every candidate delimiter is refused; a pattern containing a newline, carriage return, | or NUL is"
+      .. " refused); flags (optional, default"
       .. " 'ge') — :s flags; c, n and & are rejected; the 'e' flag is always ensured so a file in the list"
       .. " with no match does not abort the run; dry_run (optional) — when true,"
       .. " report how many findings-list entries and distinct files WOULD be edited"
-      .. " without changing anything. Returns the number of files changed.",
+      .. " without changing anything. Returns the number of files changed. Afterwards the search register"
+      .. " holds its previous text and direction and search highlighting keeps its previous state, but its offset,"
+      .. " magic state and smartcase override are reset.",
     input_schema = {
       type = "object",
       properties = {
-        pattern = { type = "string", description = "Vim :s search pattern (Vim regex)." },
-        replacement = { type = "string", description = "Replacement text (Vim :s syntax)." },
+        pattern = {
+          type = "string",
+          description = "Vim :s search pattern (Vim regex); must not contain a newline, carriage return, | or NUL.",
+        },
+        replacement = {
+          type = "string",
+          description = "Replacement text (Vim :s syntax). Must not start with \\= or ~, end in an unescaped backslash,"
+            .. " contain a newline, carriage return, | or NUL, or contain every candidate delimiter (" .. delimiters .. ").",
+        },
         flags = { type = "string", description = ":s flags (default 'ge'; 'e' is always ensured; c, n and & are rejected)." },
         dry_run = { type = "boolean", description = "Report the would-edit count without changing files." },
       },
       required = { "pattern", "replacement" },
     },
-    source = [==[
+    source = "local delimiters = " .. ("%q"):format(delimiters) .. "\n" .. [==[
 return function(input, ctx)
   local pattern = input.pattern
   local replacement = input.replacement
@@ -395,7 +410,39 @@ return function(input, ctx)
   end
   if not flags:find("e", 1, true) then flags = flags .. "e" end
 
+  local function reject_cmd_chars(label, value)
+    if value:find("\n", 1, true) or value:find("\r", 1, true)
+      or value:find("|", 1, true) then
+      error("bulk_replace: " .. label .. " must not contain newline, carriage return or |", 0)
+    end
+  end
+  reject_cmd_chars("pattern", pattern)
+  reject_cmd_chars("replacement", replacement)
+  if pattern:find("\0", 1, true) or replacement:find("\0", 1, true) then
+    error("bulk_replace: pattern and replacement must not contain a NUL byte", 0)
+  end
+  if replacement:sub(1, 2) == "\\=" or replacement:sub(1, 1) == "~" then
+    error("bulk_replace: a replacement must not start with \\= (expression) or ~ (previous replacement)", 0)
+  end
+  if #replacement:match("\\*$") % 2 == 1 then
+    error("bulk_replace: a replacement must not end in an unescaped backslash", 0)
+  end
+  local delim
+  for c in delimiters:gmatch(".") do
+    if not replacement:find(c, 1, true) then
+      delim = c
+      break
+    end
+  end
+  if not delim then
+    error("bulk_replace: the replacement uses every available :s delimiter (" .. table.concat(vim.split(delimiters, ""), " ") .. ")", 0)
+  end
+
   local findings = require("straps.findings")
+  local approved = findings.take_approved(ctx and ctx.bufnr, input)
+  if approved and approved ~= findings.signature(ctx and ctx.bufnr) then
+    error("bulk_replace: the findings list changed after this call was approved; call bulk_replace again to review the new list", 0)
+  end
   local qf, list_kind = findings.get_locations(ctx and ctx.bufnr)
   if type(qf) ~= "table" or #qf == 0 then
     return "findings list is empty — run grep first to populate it"
@@ -417,21 +464,6 @@ return function(input, ctx)
       #qf, list_kind, #qf == 1 and "y" or "ies", #bufs, #bufs == 1 and "" or "s")
   end
 
-  local function reject_cmd_chars(label, value)
-    if value:find("\n", 1, true) or value:find("\r", 1, true)
-      or value:find("|", 1, true) then
-      error("bulk_replace: " .. label .. " must not contain newline or |", 0)
-    end
-  end
-  reject_cmd_chars("pattern", pattern)
-  reject_cmd_chars("replacement", replacement)
-
-  -- Use '#' as the :s delimiter and escape only that in pattern/replacement, so
-  -- the pattern keeps its Vim-regex meaning and the delimiter can never be
-  -- mistaken for a real character in the text.
-  local pat = pattern:gsub("#", "\\#")
-  local rep = replacement:gsub("#", "\\#")
-
   -- Snapshot changedtick of each target buffer so we can count what actually
   -- changed (a substitute bumps changedtick; `update` writing does not).
   local ticks = {}
@@ -440,8 +472,14 @@ return function(input, ctx)
     ticks[b] = vim.api.nvim_buf_get_changedtick(b)
   end
 
-  local body = string.format("s#%s#%s#%s | update", pat, rep, flags)
-  local ok, err = findings.locations_do(ctx and ctx.bufnr, body)
+  local command = ("smagic%s%s%s%s%s"):format(delim, delim, replacement, delim, flags)
+  local saved_pattern, saved_forward, saved_highlight = vim.fn.getreg("/"), vim.v.searchforward, vim.v.hlsearch
+  vim.fn.setreg("/", pattern)
+  local called, ok, err = pcall(findings.locations_do, ctx and ctx.bufnr, command .. " | update")
+  vim.fn.setreg("/", saved_pattern)
+  vim.v.searchforward = saved_forward
+  vim.v.hlsearch = saved_highlight
+  if not called then ok, err = false, ok end
   if not ok then
     error("bulk_replace: substitution failed: " .. tostring(err), 0)
   end
@@ -456,9 +494,9 @@ return function(input, ctx)
   end
 
   return string.format(
-    "bulk_replace: applied `s#%s#%s#%s` across the %s list; %d file%s changed"
+    "bulk_replace: applied `%s` with search pattern `%s` across the %s list; %d file%s changed"
     .. " — undo with u in each buffer",
-    pat, rep, flags, list_kind, changed, changed == 1 and "" or "s")
+    command, pattern, list_kind, changed, changed == 1 and "" or "s")
 end
 ]==],
   })

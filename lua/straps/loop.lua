@@ -986,6 +986,7 @@ local function run_turns(bufnr, ctx, run)
       recovery = management.capture_recovery(bufnr, ctx, tools, note, allowance)
     end
     progress(bufnr, ctx, { type = "thinking", turn = turn, max = max_turns }, "thinking")
+    local turn_started, turn_waited = vim.uv.hrtime(), require("straps.attention").wait_ms(bufnr)
     local function capture_evidence()
       run.evidence_stream = nil
       if not evidence.has_original_results(request) then return end
@@ -1188,6 +1189,17 @@ local function run_turns(bufnr, ctx, run)
             .. " config.stall_limit"):format(run.stall, stall_limit, why))
         log(bufnr, { ev = "stall", turn = turn, consecutive = run.stall })
         return "stalled"
+      end
+    end
+
+    if #tool_blocks > 0 then
+      local ui = require("straps.ui")
+      local key = ui.turn_stats_key(tool_blocks)
+      if key then
+        local waited = require("straps.attention").wait_ms(bufnr) - turn_waited
+        local ms = (vim.uv.hrtime() - turn_started) / 1e6 - math.max(0, waited)
+        local out = type(resp.usage) == "table" and tonumber(resp.usage.output_tokens) or nil
+        ui.record_turn_stats(bufnr, key, math.max(0, ms), out)
       end
     end
 

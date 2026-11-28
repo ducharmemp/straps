@@ -240,16 +240,16 @@ it("render leaves buffer text, modified and parse unchanged", function()
 end)
 
 -- --------------------------------------------------------------- fold summary
-it("fold summary mutes the chevron, tool name and success but gives the target normal contrast", function()
+it("fold summary puts the muted status before the normal-contrast target", function()
   assert.same({
-    { "▸ ", "StrapsRule" }, { "bash", "StrapsRule" }, { "  echo hi", "Normal" },
-    { " · ", "StrapsRule" }, { "ok", "StrapsRule" },
+    { "▸ ", "StrapsRule" }, { "bash", "StrapsRule" }, { " · ", "StrapsRule" }, { "ok", "StrapsRule" },
+    { "  echo hi", "Normal" },
   }, ui._fold_summary(buf, LN.tool_use_ok))
 end)
 
 it("fold summary colors an explicit failure", function()
   local chunks = ui._fold_summary(buf, LN.tool_use_err)
-  assert.same({ "failed", "StrapsToolError" }, chunks[#chunks])
+  assert.same({ "failed", "StrapsToolError" }, chunks[4])
 end)
 
 describe("structured fold metadata", function()
@@ -265,9 +265,9 @@ describe("structured fold metadata", function()
       '%%[straps:tool_result]%% {"id":"read","is_error":false,"count":0}', "failed, 20 results",
     })
     local chunks = ui._fold_summary(b, 1)
-    assert.same({ "  src/file with spaces.lua", "Normal" }, chunks[3])
-    assert.same({ "ok", "StrapsRule" }, chunks[5])
-    assert.same({ " · count: 0", "StrapsRule" }, chunks[6])
+    assert.same({ "ok", "StrapsRule" }, chunks[4])
+    assert.same({ " · count: 0", "StrapsRule" }, chunks[5])
+    assert.same({ "  src/file with spaces.lua", "Normal" }, chunks[6])
   end)
 
   it("omits unknown metadata even when output looks like status or count", function()
@@ -357,12 +357,74 @@ describe("structured fold metadata", function()
     end
   end)
 
+  it("shortens a long target in the middle to fit the window and keeps the status", function()
+    local long = ("deep/"):rep(39) .. "proxmox-image.nix"
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_use]%% {"id":"r","name":"read_file"}',
+      vim.json.encode({ path = long }),
+      '%%[straps:tool_result]%% {"id":"r","is_error":true}', "boom",
+    })
+    local chunks = ui._fold_summary(b, 1, 60)
+    local text = ""
+    for _, chunk in ipairs(chunks) do text = text .. chunk[1] end
+    assert(vim.fn.strdisplaywidth(text) <= 60, text)
+    assert.same({ "failed", "StrapsToolError" }, chunks[4])
+    assert(text:find("…", 1, true), text)
+    assert(text:find("proxmox-image.nix", 1, true), text)
+    local full = ui._fold_summary(b, 1)
+    assert.same({ "  " .. long, "Normal" }, full[#full])
+  end)
+
+  it("foldtext fits the drawing window", function()
+    local long = ("deep/"):rep(39) .. "proxmox-image.nix"
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_use]%% {"id":"r","name":"read_file"}',
+      vim.json.encode({ path = long }),
+      '%%[straps:tool_result]%% {"id":"r","is_error":false}', "ok",
+    })
+    vim.cmd("vsplit")
+    local w = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(w, b)
+    vim.api.nvim_win_set_width(w, 60)
+    vim.wo[w][0].number = true
+    vim.wo[w][0].foldmethod = "manual"
+    vim.wo[w][0].foldtext = "v:lua.require'straps.ui'.foldtext()"
+    vim.cmd("1,4fold")
+    local text = vim.api.nvim_win_call(w, function() return vim.fn.foldtextresult(1) end)
+    local textoff = vim.fn.getwininfo(w)[1].textoff
+    vim.api.nvim_win_close(w, true)
+    assert(textoff > 0, "number column")
+    assert(vim.fn.strdisplaywidth(text) <= 60 - textoff, text)
+    assert(text:find("^▸ read_file · ok  deep/deep/"), text)
+    assert(text:find("proxmox%-image%.nix$"), text)
+  end)
+
+  it("shows a name input as the target", function()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_use]%% {"id":"s","name":"skill"}', '{"name":"charting"}',
+      '%%[straps:tool_result]%% {"id":"s","is_error":false}', "loaded",
+    })
+    local chunks = ui._fold_summary(b, 1)
+    assert.same({ "  charting", "Normal" }, chunks[#chunks])
+  end)
+
+  it("renders and folds a tool call whose input holds a NUL byte", function()
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, {
+      '%%[straps:tool_use]%% {"id":"z","name":"bash"}', '{"command":"echo a\\u0000b"}',
+      '%%[straps:tool_result]%% {"id":"z","is_error":false}', "ok",
+    })
+    local ok, err = pcall(ui._render, b)
+    assert(ok, tostring(err))
+    local chunks = ui._fold_summary(b, 1)
+    assert.same({ "  echo a^@b", "Normal" }, chunks[#chunks])
+  end)
+
   it("uses the available metadata on a standalone result", function()
     vim.api.nvim_buf_set_lines(b, 0, -1, false, {
       '%%[straps:tool_result]%% {"id":"lonely","count":2}', "two items",
     })
     assert.same({
-      { "▸ ", "StrapsRule" }, { "result", "StrapsRule" }, { "  lonely", "Normal" }, { " · count: 2", "StrapsRule" },
+      { "▸ ", "StrapsRule" }, { "result", "StrapsRule" }, { " · count: 2", "StrapsRule" }, { "  lonely", "Normal" },
     }, ui._fold_summary(b, 1))
   end)
 end)
@@ -441,7 +503,15 @@ it("redefining fn.tool_display changes both the header and next fold summary", f
     assert.same({ "XX", "StrapsTool" }, expanded_header_verb(b))
     local chunks = ui._fold_summary(b, LN.tool_use_ok)
     assert.same({ "XX", "StrapsRule" }, chunks[2])
-    assert.same({ "  echo hi", "Normal" }, chunks[3])
+    assert.same({ "  echo hi", "Normal" }, chunks[#chunks])
+  end)
+  with_tool_display("return function(_, input) return 'XX ' .. ('long/'):rep(40) .. input.command end", function()
+    local b = make_buf()
+    local chunks = ui._fold_summary(b, LN.tool_use_ok, 40)
+    local text = ""
+    for _, chunk in ipairs(chunks) do text = text .. chunk[1] end
+    assert(vim.fn.strdisplaywidth(text) <= 40, text)
+    assert(text:find("…", 1, true) and text:find("echo hi", 1, true), text)
   end)
   assert.same({ "bash", "StrapsRule" }, ui._fold_summary(buf, LN.tool_use_ok)[2])
 end)
@@ -474,7 +544,7 @@ it("foldexpr merges a tool_use/tool_result pair into one fold", function()
   assert(vim.fn.foldclosed(LN.tool_use_ok) == LN.tool_use_ok,
     "at the default foldlevel the tool call should be closed")
   vim.wo[win][0].foldtext = "v:lua.require'straps.ui'.foldtext()"
-  assert.equals("▸ bash  echo hi · ok", vim.fn.foldtextresult(LN.tool_use_ok))
+  assert.equals("▸ bash · ok  echo hi", vim.fn.foldtextresult(LN.tool_use_ok))
   vim.api.nvim_win_set_cursor(win, { LN.tool_use_ok, 0 })
   vim.cmd("normal! zo")
   assert.equals(-1, vim.fn.foldclosed(LN.tool_result_ok))

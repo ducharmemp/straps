@@ -303,6 +303,7 @@ function M.persist_checked(bufnr, previous_disk)
     check_saved_source(bufnr)
     assert(disk(path) == previous_disk, "transcript file changed during compaction")
     assert(live_bytes(bufnr) == data, "live transcript changed before persistence")
+    if state.repair_draft(bufnr) then data = live_bytes(bufnr) end
     attempted = true
     vim.api.nvim_buf_call(bufnr, function() vim.cmd("silent noautocmd write") end)
     assert(live_bytes(bufnr) == data, "live transcript changed during persistence")

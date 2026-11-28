@@ -491,6 +491,113 @@ it("17: g? lists the session keys and Straps commands and closes back to the ses
   end
 end)
 
+it("g? groups commands, drops the straps: prefix, and hides commands for disabled features", function()
+  local b = session_in_split()
+  local function reference()
+    vim.cmd("normal g?")
+    local win = vim.api.nvim_get_current_win()
+    local text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false), "\n")
+    vim.api.nvim_win_close(win, true)
+    return text
+  end
+  local text = reference()
+  for _, heading in ipairs({ "\nSession\n", "\nPermissions\n", "\nNavigation\n", "\nConfiguration\n", "\nRegistry\n" }) do
+    assert(text:find(heading, 1, true), heading .. " heading missing:\n" .. text)
+  end
+  assert.is_nil(text:find("straps:", 1, true), text)
+  assert.is_nil(text:find(":StrapsAdopt ", 1, true), text)
+  assert.is_nil(text:find(":StrapsContextPin ", 1, true), text)
+  assert.is_nil(text:find("\nContext\n", 1, true), text)
+  local session_at = text:find("\nSession\n", 1, true)
+  local permissions_at = text:find("\nPermissions\n", 1, true)
+  local send_at = text:find("\n  :StrapsSend ", 1, true)
+  assert(send_at > session_at and send_at < permissions_at, "StrapsSend is not under Session:\n" .. text)
+  for line in text:gmatch("[^\n]+") do
+    assert(vim.fn.strdisplaywidth(line) <= math.min(vim.o.columns - 4, 100), "line too wide: " .. line)
+  end
+  vim.b[b].straps_context_management = { enabled = true }
+  text = reference()
+  assert(text:find("\n  :StrapsContextPin ", 1, true), text)
+  assert(text:find("\nContext\n", 1, true), text)
+  vim.b[b].straps_context_management = nil
+end)
+
+it("every command plugin/straps.lua defines has a key-reference group", function()
+  local source = table.concat(vim.fn.readfile(root .. "/plugin/straps.lua"), "\n")
+  local found = 0
+  for name in source:gmatch('command%("(Straps%w*)"') do
+    found = found + 1
+    assert(ui.COMMAND_GROUP[name], name .. " has no group in ui.COMMAND_GROUP")
+  end
+  assert(found >= 30, "found only " .. found .. " commands")
+end)
+
+describe("resume leaves an unmodified transcript unmodified", function()
+  local function saved(lines)
+    local path = vim.fn.tempname() .. ".straps"
+    vim.fn.writefile(lines, path)
+    return path
+  end
+  local fixtures = {
+    ["no draft marker"] = { "%%[straps:user]%%", "hello", "%%[straps:assistant]%%", "hi" },
+    ["a draft marker as the last line"] = { "%%[straps:user]%%", "hello", "%%[straps:assistant]%%", "hi",
+      "%%[straps:draft]%%" },
+    ["an interrupted tool call"] = { "%%[straps:user]%%", "go", '%%[straps:tool_use]%% {"id":"z1","name":"bash"}',
+      '{"command":"sleep 99"}' },
+  }
+  for label, lines in pairs(fixtures) do
+    it("with " .. label, function()
+      only_window()
+      local b
+      capture(function() b = ui.resume_session(saved(lines)) end)
+      assert(state.draft_row(b), "no draft line after resume")
+      assert.is_false(vim.bo[b].modified)
+      local count = vim.api.nvim_buf_line_count(b)
+      vim.cmd("silent normal! u")
+      assert(vim.api.nvim_buf_line_count(b) < count, "u did not undo the draft line")
+      vim.api.nvim_buf_delete(b, { force = true })
+    end)
+  end
+
+  it("restores the draft line after autoread reloads a rewritten session file", function()
+    only_window()
+    local path = saved(fixtures["no draft marker"])
+    local b
+    capture(function() b = ui.resume_session(path) end)
+    vim.bo[b].autoread = true
+    vim.fn.writefile({ "%%[straps:user]%%", "hello", "%%[straps:assistant]%%", "hi again" }, path)
+    local later = os.time() + 5
+    vim.uv.fs_utime(path, later, later)
+    vim.cmd("checktime " .. b)
+    assert.are.equal("hi again", vim.api.nvim_buf_get_lines(b, 3, 4, false)[1])
+    assert(state.draft_row(b), "no draft line after reload")
+    assert.is_false(vim.bo[b].modified)
+    vim.api.nvim_buf_delete(b, { force = true })
+  end)
+
+  it("keeps an already-loaded, modified buffer modified (guard)", function()
+    only_window()
+    local path = saved(fixtures["no draft marker"])
+    local b
+    capture(function() b = ui.resume_session(path) end)
+    vim.api.nvim_buf_set_lines(b, 1, 2, false, { "edited" })
+    assert.is_true(vim.bo[b].modified)
+    only_window()
+    local again
+    capture(function() again = ui.resume_session(path) end)
+    assert.are.equal(b, again)
+    assert.is_true(vim.bo[b].modified)
+    vim.api.nvim_buf_delete(b, { force = true })
+  end)
+
+  it("leaves a new session modified after the draft line is added (guard)", function()
+    only_window()
+    local b = state.new_session()
+    ui.show_session(b)
+    assert.is_true(vim.bo[b].modified)
+  end)
+end)
+
 it("16: the README command table has a row for every user command", function()
   local readme = table.concat(vim.fn.readfile(root .. "/README.md"), "\n")
   for name in pairs(vim.api.nvim_get_commands({})) do
@@ -511,3 +618,341 @@ it("13: commands run setup() lazily when the registry has no fn.provider", funct
   local res = vim.system(cmd, { text = true }):wait(20000)
   assert.are.equal("true true", vim.trim(res.stdout or ""))
 end)
+
+describe("hand-opened transcripts render", function()
+  local TRANSCRIPT = { "%%[straps:user]%%", "hello", "%%[straps:assistant]%%", "hi there" }
+
+  local function child(order, body)
+    local file = vim.fn.tempname() .. ".straps"
+    vim.fn.writefile(TRANSCRIPT, file)
+    local script = vim.fn.tempname() .. ".lua"
+    local prelude = {
+      "vim.opt.rtp:prepend(" .. vim.inspect(root) .. ")",
+      "vim.cmd('runtime! ftdetect/straps.vim')",
+      "local function setup() require('straps').setup({ session_dir = vim.fn.tempname() }) end",
+      order == "setup_first" and "setup(); vim.cmd('filetype plugin on')"
+        or order == "plugin_first" and "vim.cmd('filetype plugin on'); setup()"
+        or "vim.cmd('filetype plugin on')",
+      "local function marks(b) local ns = vim.api.nvim_get_namespaces().straps_render; return ns and #vim.api.nvim_buf_get_extmarks(b or 0, ns, 0, -1, {}) or 0 end",
+      "local function settle() vim.wait(120, function() return false end, 10) end",
+      "local out = {}",
+      "local file = " .. vim.inspect(file),
+    }
+    vim.fn.writefile(vim.list_extend(prelude, vim.list_extend(body, {
+      "io.stdout:write(vim.json.encode(out))",
+      "vim.cmd('qa!')",
+    })), script)
+    local res = vim.system({ vim.v.progpath, "--headless", "--clean", "-l", script }, { text = true }):wait(20000)
+    local ok, decoded = pcall(vim.json.decode, res.stdout or "")
+    assert(ok, "child output: " .. tostring(res.stdout) .. "\n" .. tostring(res.stderr))
+    return decoded, res
+  end
+
+  for _, order in ipairs({ "setup_first", "plugin_first", "no_setup" }) do
+    it(order .. ": :edit conceals and renders, and :edit! sets conceal again", function()
+      local out = child(order, {
+        "vim.cmd.edit(file)",
+        "settle()",
+        "out.cl, out.marks = vim.wo.conceallevel, marks()",
+        "vim.cmd('setlocal conceallevel=0')",
+        "vim.cmd('edit!')",
+        "settle()",
+        "out.after_edit = vim.wo.conceallevel",
+        "local before = marks()",
+        "vim.api.nvim_buf_set_lines(0, -1, -1, false, { '%%[straps:user]%%', 'again', '%%[straps:assistant]%%', 'ok' })",
+        "vim.wait(300, function() return marks() > before end, 10)",
+        "out.rerendered = marks() > before",
+      })
+      assert.are.equal(2, out.cl)
+      assert(out.marks > 0, vim.inspect(out))
+      assert.are.equal(2, out.after_edit)
+      assert.is_true(out.rerendered)
+    end)
+  end
+
+  it(":setlocal conceallevel=0 survives window switches, a split and show_session", function()
+    local out = child("setup_first", {
+      "vim.cmd.edit(file)",
+      "settle()",
+      "vim.cmd('setlocal conceallevel=0')",
+      "vim.cmd('vsplit')",
+      "out.split = vim.wo.conceallevel",
+      "vim.cmd('wincmd w')",
+      "vim.cmd('wincmd w')",
+      "out.switch = vim.wo.conceallevel",
+      "_G.renders = 0",
+      "require('straps.registry').define({ name = 'fn.render', kind = 'fn', source = 'return function(b) _G.renders = _G.renders + 1; return require([[straps.ui]])._render(b) end' })",
+      "require('straps.ui').show_session(vim.api.nvim_get_current_buf(), 'none')",
+      "out.show = vim.wo.conceallevel",
+      "out.reshow_renders = _G.renders",
+    })
+    assert.are.equal(0, out.split)
+    assert.are.equal(0, out.switch)
+    assert.are.equal(0, out.show)
+    assert.are.equal(1, out.reshow_renders)
+  end)
+
+  it(":set ft=text clears the render and stops the listener; :set ft=straps renders again", function()
+    local out = child("setup_first", {
+      "vim.cmd.edit(file)",
+      "settle()",
+      "vim.cmd('set ft=text')",
+      "settle()",
+      "out.text_marks = marks()",
+      "vim.api.nvim_buf_set_lines(0, -1, -1, false, { '%%[straps:user]%%', 'more' })",
+      "settle()",
+      "out.edited_marks = marks()",
+      "vim.cmd('set ft=straps')",
+      "settle()",
+      "out.cl, out.marks = vim.wo.conceallevel, marks()",
+    })
+    assert.are.equal(0, out.text_marks)
+    assert.are.equal(0, out.edited_marks)
+    assert.are.equal(2, out.cl)
+    assert(out.marks > 0, vim.inspect(out))
+  end)
+
+  it("a hidden-loaded transcript shown with :b renders", function()
+    local out = child("setup_first", {
+      "local b = vim.fn.bufadd(file)",
+      "vim.fn.bufload(b)",
+      "vim.bo[b].buflisted = true",
+      "vim.cmd('buffer ' .. b)",
+      "settle()",
+      "out.cl, out.marks = vim.wo.conceallevel, marks(b)",
+    })
+    assert.are.equal(2, out.cl)
+    assert(out.marks > 0, vim.inspect(out))
+  end)
+
+  it("after setup, removing fn.render leaves a hand-opened transcript unrendered", function()
+    local out = child("setup_first", {
+      "require('straps.registry').remove('fn.render')",
+      "vim.cmd.edit(file)",
+      "settle()",
+      "out.marks = marks()",
+    })
+    assert.are.equal(0, out.marks)
+  end)
+
+  it("render = false: :edit and show_session attach no listener that renders after render is turned back on", function()
+    local out = child("setup_first", {
+      "require('straps').config.render = false",
+      "_G.renders = 0",
+      "require('straps.registry').define({ name = 'fn.render', kind = 'fn', source = 'return function() _G.renders = _G.renders + 1 end' })",
+      "vim.cmd.edit(file)",
+      "settle()",
+      "require('straps.ui').show_session(vim.api.nvim_get_current_buf(), 'none')",
+      "settle()",
+      "require('straps').config.render = true",
+      "vim.api.nvim_buf_set_lines(0, -1, -1, false, { 'x' })",
+      "settle()",
+      "out.renders = _G.renders",
+    })
+    assert.are.equal(0, out.renders)
+  end)
+
+  it("a transcript reloaded while hidden renders and conceals again when shown with :buffer", function()
+    local out = child("setup_first", {
+      "vim.cmd.edit(file)",
+      "settle()",
+      "local b = vim.api.nvim_get_current_buf()",
+      "out.before = marks(b)",
+      "vim.cmd('setlocal conceallevel=0')",
+      "vim.cmd('enew')",
+      "vim.api.nvim_buf_call(b, function() vim.cmd('edit!') end)",
+      "settle()",
+      "vim.cmd('buffer ' .. b)",
+      "settle()",
+      "out.after = marks(b)",
+      "out.cl = vim.wo.conceallevel",
+    })
+    assert(out.before > 0, vim.inspect(out))
+    assert(out.after > 0, vim.inspect(out))
+    assert.are.equal(2, out.cl)
+  end)
+
+  it(":edit! restores conceal in every window that shows the transcript", function()
+    local out = child("setup_first", {
+      "vim.cmd.edit(file)",
+      "settle()",
+      "vim.cmd('split')",
+      "settle()",
+      "local wins = vim.fn.win_findbuf(vim.api.nvim_get_current_buf())",
+      "for _, w in ipairs(wins) do vim.wo[w].conceallevel = 0 end",
+      "vim.cmd('edit!')",
+      "settle()",
+      "out.cl = {}",
+      "for _, w in ipairs(wins) do out.cl[#out.cl + 1] = vim.wo[w].conceallevel end",
+    })
+    assert.are.same({ 2, 2 }, out.cl)
+  end)
+
+  it("a render already queued when the filetype changes away does not repaint", function()
+    local out = child("setup_first", {
+      "vim.cmd.edit(file)",
+      "settle()",
+      "local b = vim.api.nvim_get_current_buf()",
+      "local t = vim.uv.new_timer()",
+      "t:start(5, 0, function() vim.schedule(function() vim.bo[b].filetype = 'text' end) end)",
+      "vim.api.nvim_buf_set_lines(b, -1, -1, false, { '%%[straps:user]%%', 'late' })",
+      "vim.uv.sleep(80)",
+      "settle()",
+      "out.ft, out.marks = vim.bo[b].filetype, marks(b)",
+    })
+    assert.are.equal("text", out.ft)
+    assert.are.equal(0, out.marks)
+  end)
+
+  it("re-resuming a session that is on screen renders once", function()
+    local out = child("setup_first", {
+      "_G.renders = 0",
+      "require('straps.registry').define({ name = 'fn.render', kind = 'fn', source = 'return function(b) _G.renders = _G.renders + 1; return require([[straps.ui]])._render(b) end' })",
+      "require('straps.ui').resume_session(file)",
+      "settle()",
+      "_G.renders = 0",
+      "require('straps.ui').resume_session(file)",
+      "out.renders = _G.renders",
+      "settle()",
+      "out.marks = marks()",
+    })
+    assert.are.equal(1, out.renders)
+    assert(out.marks > 0, vim.inspect(out))
+  end)
+
+  it("a windowless session buffer is not rendered until a window shows it", function()
+    local out = child("setup_first", {
+      "_G.renders = 0",
+      "require('straps.registry').define({ name = 'fn.render', kind = 'fn', source = 'return function(b) _G.renders = _G.renders + 1; return require([[straps.ui]])._render(b) end' })",
+      "local b = require('straps.state').new_session()",
+      "settle()",
+      "vim.api.nvim_buf_set_lines(b, -1, -1, false, { 'x' })",
+      "settle()",
+      "out.hidden = _G.renders",
+      "require('straps.ui').show_session(b, 'none')",
+      "settle()",
+      "out.shown, out.cl = _G.renders, vim.wo.conceallevel",
+    })
+    assert.are.equal(0, out.hidden)
+    assert.are.equal(1, out.shown)
+    assert.are.equal(2, out.cl)
+  end)
+
+  it("render = false: :edit and show_session call fn.render 0 times and attaches no listener", function()
+    local out = child("setup_first", {
+      "require('straps').config.render = false",
+      "_G.renders = 0",
+      "require('straps.registry').define({ name = 'fn.render', kind = 'fn', source = 'return function() _G.renders = _G.renders + 1 end' })",
+      "vim.cmd.edit(file)",
+      "settle()",
+      "vim.api.nvim_buf_set_lines(0, -1, -1, false, { 'x' })",
+      "require('straps.ui').show_session(vim.api.nvim_get_current_buf(), 'none')",
+      "vim.api.nvim_buf_set_lines(0, -1, -1, false, { 'y' })",
+      "settle()",
+      "out.renders, out.cl = _G.renders, vim.wo.conceallevel",
+    })
+    assert.are.equal(0, out.renders)
+    assert.are.equal(0, out.cl)
+  end)
+
+  it("a raising fn.render does not break :edit, and the listener still attaches", function()
+    local out, res = child("setup_first", {
+      "_G.renders = 0",
+      "require('straps.registry').define({ name = 'fn.render', kind = 'fn', source = 'return function() _G.renders = _G.renders + 1; error(\"boom\") end' })",
+      "_G.warnings = 0",
+      "vim.notify = function() _G.warnings = _G.warnings + 1 end",
+      "out.ok = pcall(vim.cmd.edit, file)",
+      "settle()",
+      "out.linebreak = vim.wo.linebreak",
+      "local before = _G.renders",
+      "vim.api.nvim_buf_set_lines(0, -1, -1, false, { 'x' })",
+      "vim.wait(300, function() return _G.renders > before end, 10)",
+      "out.rerendered = _G.renders > before",
+      "vim.api.nvim_buf_set_lines(0, -1, -1, false, { 'y' })",
+      "vim.wait(300, function() return false end, 10)",
+      "out.warnings = _G.warnings",
+    })
+    assert.is_true(out.ok)
+    assert.is_nil((res.stderr or ""):find("boom", 1, true), res.stderr)
+    assert.are.equal(1, out.warnings)
+    assert.is_true(out.linebreak)
+    assert.is_true(out.rerendered)
+  end)
+end)
+
+describe("draft marker survives insert-mode Enter at its end", function()
+  for _, case in ipairs({
+    { "A\rsecret draft\27" },
+    { "Gddk$a\rsecret draft\27" },
+    { "A\r%%[straps:user]%%\rsecret draft\27" },
+    { "A\rsecret draft\27", reply = true },
+    { "A\rsecret draft\27u\18", reply = true },
+    { "A\rsecret draft\27uA\rsecret draft\27" },
+  }) do
+    local keys = case[1]
+    it("keeps the typed text in the draft for " .. vim.inspect(keys) .. (case.reply and " after a reply" or ""), function()
+      vim.cmd("only")
+      local b = state.new_session()
+      ui.show_session(b, "none")
+      if case.reply then
+        state.seed_user(b, "hi")
+        state.append(b, "assistant", nil, "reply")
+      end
+      vim.api.nvim_buf_set_lines(b, -1, -1, false, { "draftline" })
+      local row = state.draft_row(b)
+      vim.api.nvim_win_set_cursor(0, { row + 1, 0 })
+      vim.api.nvim_feedkeys(keys, "xt", false)
+      state.repair_draft(b)
+      local lines = state.transcript_lines(b)
+      assert.are_not.equal("secret draft", lines[#lines])
+      for _, line in ipairs(lines) do assert.are_not.equal("%%[straps:draft]%%", line) end
+      assert(state.draft_text(b):find("secret draft", 1, true), state.draft_text(b))
+      assert.are.equal(1, #vim.tbl_filter(function(l) return l == "%%[straps:draft]%%" end, vim.api.nvim_buf_get_lines(b, 0, -1, false)))
+    end)
+  end
+end)
+
+it("g? finishes when a command name is wider than the float", function()
+  local name = "Straps" .. ("X"):rep(80)
+  vim.api.nvim_create_user_command(name, function() end, { desc = "straps: probe" })
+  local ok, err = pcall(function()
+    vim.cmd("only")
+    local b = state.new_session()
+    ui.show_session(b, "none")
+    vim.cmd("normal g?")
+    local win = vim.api.nvim_get_current_win()
+    local width = vim.api.nvim_win_get_width(win)
+    local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
+    vim.api.nvim_win_close(win, true)
+    for _, line in ipairs(lines) do assert(vim.fn.strdisplaywidth(line) <= width, "line too wide: " .. line) end
+  end)
+  pcall(vim.api.nvim_del_user_command, name)
+  assert(ok, tostring(err))
+end)
+
+for _, cols in ipairs({ 30, 24 }) do
+it("g? keeps every line inside the float on a " .. cols .. "-column screen", function()
+  local columns = vim.o.columns
+  vim.api.nvim_create_user_command("StrapsWideProbe", function() end, { desc = ("\u{5bbd}"):rep(30) })
+  vim.api.nvim_create_user_command("StrapsAVeryLongProbeCommandName", function() end, { desc = "probe" })
+  local ok, err = pcall(function()
+    vim.cmd("only")
+    local b = state.new_session()
+    ui.show_session(b, "none")
+    vim.o.columns = cols
+    vim.cmd("normal g?")
+    local win = vim.api.nvim_get_current_win()
+    local width = vim.api.nvim_win_get_width(win)
+    local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
+    vim.api.nvim_win_close(win, true)
+    assert(width <= math.max(20, cols - 4), "float width " .. width)
+    for _, line in ipairs(lines) do assert(vim.fn.strdisplaywidth(line) <= width, "line too wide: " .. line) end
+    assert(table.concat(lines, "\n"):find("\n  :StrapsSend\n", 1, true), table.concat(lines, "\n"))
+    assert(table.concat(lines, "\n"):find("\u{5bbd}", 1, true), "wide probe missing")
+  end)
+  vim.o.columns = columns
+  pcall(vim.api.nvim_del_user_command, "StrapsWideProbe")
+  pcall(vim.api.nvim_del_user_command, "StrapsAVeryLongProbeCommandName")
+  assert(ok, tostring(err))
+end)
+end

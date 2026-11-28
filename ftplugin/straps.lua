@@ -19,6 +19,7 @@ local undo = {
 }
 
 pcall(function()
+  require("straps.state").transcript_end(bufnr)
   local ui = require("straps.ui")
   ui.apply_highlights()
   ui.map_session_keys(bufnr)
@@ -28,6 +29,7 @@ pcall(function()
   for _, lhs in ipairs(ui.SESSION_KEYS) do
     undo[#undo + 1] = ("silent! call nvim_buf_del_keymap(0, 'n', '%s')"):format(lhs)
   end
+  undo[#undo + 1] = "call v:lua.require'straps.ui'.detach_render(0)"
   ui.apply_fold_opts(bufnr)
 end)
 

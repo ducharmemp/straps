@@ -21,51 +21,118 @@ local KINDS = {
 local DRAFT_MARKER = "%%[straps:draft]%%"
 local draft_ns = vim.api.nvim_create_namespace("straps.draft")
 local draft_marks = {}
-
-vim.api.nvim_create_autocmd({ "BufReadPost", "BufUnload" }, {
-  callback = function(ev)
-    if draft_marks[ev.buf] then vim.api.nvim_buf_clear_namespace(ev.buf, draft_ns, 0, -1) end
-    draft_marks[ev.buf] = nil
-  end,
-})
+local marker_marks = {}
 
 local function mark_draft(bufnr, row)
-  draft_marks[bufnr] = vim.api.nvim_buf_set_extmark(bufnr, draft_ns, row, 0, {
-    id = draft_marks[bufnr] or nil,
-    right_gravity = true,
-  })
+  draft_marks[bufnr] = vim.api.nvim_buf_set_extmark(bufnr, draft_ns, row + 1, 0, { right_gravity = false })
+  marker_marks[bufnr] = vim.api.nvim_buf_set_extmark(bufnr, draft_ns, row, #DRAFT_MARKER, { right_gravity = false })
 end
 
-function M.draft_row(bufnr)
+local function marker_row(bufnr)
+  local id = marker_marks[bufnr]
+  if not id then return nil end
+  local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, draft_ns, id, {})
+  if not pos[1] or pos[2] ~= #DRAFT_MARKER then return nil end
+  if vim.api.nvim_buf_get_lines(bufnr, pos[1], pos[1] + 1, false)[1] == DRAFT_MARKER then return pos[1] end
+end
+
+local function draft_start(bufnr)
   local mark = draft_marks[bufnr]
   if mark == nil then
     draft_marks[bufnr] = false
     for i, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)) do
       if line == DRAFT_MARKER then
         mark_draft(bufnr, i - 1)
-        return i - 1
+        return i, i - 1
       end
     end
   elseif mark then
-    local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, draft_ns, mark, {})
-    if pos[1] and vim.api.nvim_buf_get_lines(bufnr, pos[1], pos[1] + 1, false)[1] == DRAFT_MARKER then
-      return pos[1]
+    local start = vim.api.nvim_buf_get_extmark_by_id(bufnr, draft_ns, mark, {})[1]
+    if start then
+      if start > 0 and vim.api.nvim_buf_get_lines(bufnr, start - 1, start, false)[1] == DRAFT_MARKER then
+        return start, start - 1
+      end
+      local row = marker_row(bufnr)
+      if row and row <= start then
+        vim.api.nvim_buf_set_extmark(bufnr, draft_ns, row + 1, 0, { id = mark, right_gravity = false })
+        return row + 1, row
+      end
+      return start
     end
   end
 end
 
+vim.api.nvim_create_autocmd({ "BufReadPost", "BufUnload" }, {
+  callback = function(ev)
+    if draft_marks[ev.buf] then vim.api.nvim_buf_clear_namespace(ev.buf, draft_ns, 0, -1) end
+    draft_marks[ev.buf] = nil
+    marker_marks[ev.buf] = nil
+    if ev.event == "BufReadPost" and (vim.b[ev.buf].straps_session or vim.bo[ev.buf].filetype == "straps") then
+      draft_start(ev.buf)
+    end
+  end,
+})
+
+vim.api.nvim_create_autocmd("FileChangedShellPost", {
+  group = vim.api.nvim_create_augroup("StrapsDraftReload", { clear = true }),
+  callback = function(ev)
+    if vim.b[ev.buf].straps_session and vim.api.nvim_buf_is_loaded(ev.buf) then M.open_draft(ev.buf, { keep_unmodified = true }) end
+  end,
+})
+
+function M.draft_row(bufnr)
+  local _, row = draft_start(bufnr)
+  return row
+end
+
+function M.transcript_end(bufnr)
+  local start, row = draft_start(bufnr)
+  return row or start or vim.api.nvim_buf_line_count(bufnr)
+end
+
 function M.transcript_lines(bufnr)
-  return vim.api.nvim_buf_get_lines(bufnr, 0, M.draft_row(bufnr) or -1, false)
+  return vim.api.nvim_buf_get_lines(bufnr, 0, M.transcript_end(bufnr), false)
 end
 
 function M.transcript_bytes(bytes)
   if type(bytes) ~= "string" then return nil end
+  if bytes == DRAFT_MARKER or vim.startswith(bytes, DRAFT_MARKER .. "\n") then return "" end
   local marker = bytes:find("\n" .. DRAFT_MARKER .. "\n", 1, true)
-  return marker and bytes:sub(1, marker) or bytes
+  if marker then return bytes:sub(1, marker) end
+  if vim.endswith(bytes, "\n" .. DRAFT_MARKER) then return bytes:sub(1, -#DRAFT_MARKER - 1) end
+  return bytes
 end
 
-function M.open_draft(bufnr)
-  local row = M.draft_row(bufnr)
+local function undo_break(bufnr)
+  vim.api.nvim_buf_call(bufnr, function() vim.cmd("let &l:undolevels = &l:undolevels") end)
+end
+
+function M.repair_draft(bufnr)
+  local start, row = draft_start(bufnr)
+  if not start or row then return row end
+  undo_break(bufnr)
+  if start > 0 then
+    local prev = vim.api.nvim_buf_get_lines(bufnr, start - 1, start, false)[1]
+    vim.api.nvim_buf_set_text(bufnr, start - 1, #prev, start - 1, #prev, { "", DRAFT_MARKER })
+  else
+    vim.api.nvim_buf_set_lines(bufnr, 0, 0, false, { DRAFT_MARKER })
+    vim.api.nvim_buf_del_extmark(bufnr, draft_ns, draft_marks[bufnr])
+    if marker_marks[bufnr] then vim.api.nvim_buf_del_extmark(bufnr, draft_ns, marker_marks[bufnr]) end
+    mark_draft(bufnr, 0)
+  end
+  undo_break(bufnr)
+  return start
+end
+vim.api.nvim_create_autocmd("BufWritePre", {
+  callback = function(ev)
+    if draft_marks[ev.buf] and (vim.b[ev.buf].straps_session or vim.bo[ev.buf].filetype == "straps") then
+      M.repair_draft(ev.buf)
+    end
+  end,
+})
+function M.open_draft(bufnr, opts)
+  local unmodified = opts and opts.keep_unmodified and not vim.bo[bufnr].modified
+  local row = M.repair_draft(bufnr)
   if not row then
     row = vim.api.nvim_buf_line_count(bufnr)
     vim.api.nvim_buf_set_lines(bufnr, row, row, false, { DRAFT_MARKER, "" })
@@ -73,15 +140,16 @@ function M.open_draft(bufnr)
   elseif row + 1 == vim.api.nvim_buf_line_count(bufnr) then
     vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "" })
   end
+  if unmodified then vim.bo[bufnr].modified = false end
 end
 
 function M.draft_text(bufnr)
-  local row = M.draft_row(bufnr)
-  if row then return table.concat(vim.api.nvim_buf_get_lines(bufnr, row + 1, -1, false), "\n") end
+  local start = draft_start(bufnr)
+  if start then return table.concat(vim.api.nvim_buf_get_lines(bufnr, start, -1, false), "\n") end
 end
 
 function M.clear_draft(bufnr)
-  local row = M.draft_row(bufnr)
+  local row = M.repair_draft(bufnr)
   if row then
     vim.api.nvim_buf_set_lines(bufnr, row + 1, -1, false, { "" })
     M.persist(bufnr)
@@ -89,7 +157,7 @@ function M.clear_draft(bufnr)
 end
 
 function M.replace_transcript(bufnr, replacement)
-  local row = M.draft_row(bufnr)
+  local row = M.repair_draft(bufnr)
   if not row then return vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, replacement) end
   local old = M.transcript_lines(bufnr)
   local first, last, new_last = 1, #old, #replacement
@@ -98,7 +166,6 @@ function M.replace_transcript(bufnr, replacement)
     last, new_last = last - 1, new_last - 1
   end
   vim.api.nvim_buf_set_lines(bufnr, first - 1, last, false, vim.list_slice(replacement, first, new_last))
-  mark_draft(bufnr, #replacement)
 end
 
 -- A content line that would read as a marker (or as an escape) gets the
@@ -542,17 +609,18 @@ function M._blocks_cache_size()
 end
 
 local function with_pin(bufnr, mutate)
-  local last = M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
+  M.repair_draft(bufnr)
+  local last = M.transcript_end(bufnr)
   local pinned = {}
   for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
-    if vim.api.nvim_win_get_cursor(win)[1] == last and since_you_left.follow(win, bufnr) then
+    if last > 0 and vim.api.nvim_win_get_cursor(win)[1] == last and since_you_left.follow(win, bufnr) then
       pinned[#pinned + 1] = win
     end
   end
   mutate()
-  local new_last = M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
+  local new_last = M.transcript_end(bufnr)
   for _, win in ipairs(pinned) do
-    vim.api.nvim_win_set_cursor(win, { new_last, 0 })
+    vim.api.nvim_win_set_cursor(win, { math.max(1, new_last), 0 })
   end
 end
 
@@ -610,11 +678,9 @@ function M.persist(bufnr)
   -- Nothing to write if the buffer is already in sync with its file; skip the
   -- write so we do not churn the file's mtime (which reorders list_sessions)
   -- on no-op block boundaries.
-  if not vim.bo[bufnr].modified then
-    return
-  end
   pcall(vim.api.nvim_buf_call, bufnr, function()
-    vim.cmd("silent noautocmd write")
+    M.repair_draft(bufnr)
+    if vim.bo[bufnr].modified then vim.cmd("silent noautocmd write") end
   end)
 end
 
@@ -768,6 +834,15 @@ function M.session_title(path)
     return nil
   end)
   return ok and title or nil
+end
+
+function M.session_meta_path(path)
+  return meta_path(_canon_path(path))
+end
+
+function M.session_title_meta(path)
+  local meta = read_meta(M.session_meta_path(path))
+  return meta.title, meta.generated_by, meta.generated_title
 end
 
 --- Set (or clear, with nil/"") the durable title for a session transcript,
@@ -963,14 +1038,13 @@ end
 function M.open_session_file(path)
   local abspath = vim.fn.fnamemodify(path, ":p")
   local bufnr = vim.fn.bufnr(abspath)
-  if bufnr == -1 then
-    bufnr = vim.fn.bufadd(abspath)
-    vim.fn.bufload(bufnr)
-  end
+  if bufnr == -1 then bufnr = vim.fn.bufadd(abspath) end
+  if not vim.api.nvim_buf_is_loaded(bufnr) then vim.fn.bufload(bufnr) end
   vim.bo[bufnr].buftype = ""
   vim.bo[bufnr].swapfile = false
   vim.bo[bufnr].filetype = "straps"
   vim.b[bufnr].straps_session = true
+  draft_start(bufnr)
   if vim.fn.has("nvim-0.12") == 1 then
     vim.bo[bufnr].fsync = false
   end
@@ -1054,7 +1128,12 @@ end
 function M.append_text(bufnr, text, output)
   local first_row
   with_pin(bufnr, function()
-    local row = (M.draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)) - 1
+    local row = M.transcript_end(bufnr) - 1
+    if row < 0 then
+      vim.api.nvim_buf_set_lines(bufnr, 0, 0, false, vim.tbl_map(escape_line, vim.split(text, "\n", { plain = true })))
+      first_row = 0
+      return
+    end
     local tail = vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false)[1] or ""
     local pieces = vim.split(text, "\n", { plain = true })
     local mk, _, minline = match_marker(tail)

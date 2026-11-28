@@ -195,6 +195,7 @@ local function finish_events(bufnr, reason, run)
   require("straps.attention").finish(bufnr, run, reason)
   pcall(function() vim.b[bufnr].straps_status = "idle" end)
   pcall(function() vim.b[bufnr].straps_run_reason = reason end)
+  pcall(function() require("straps.ratchet").finish(bufnr, reason == "ok" and not run.cancelled) end)
   pcall(vim.api.nvim_exec_autocmds, "User",
     { pattern = "StrapsStatusChanged", data = { bufnr = bufnr, status = "idle" } })
   pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "StrapsRunEnd",
@@ -1319,6 +1320,7 @@ function M.start(bufnr, opts)
     run.family = family
   end
   require("straps.attention").start(bufnr, run)
+  pcall(function() require("straps.ratchet").start(bufnr) end)
   pcall(function() vim.b[bufnr].straps_status = "running" end)
   pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "StrapsRunStart", data = { bufnr = bufnr } })
   pcall(vim.api.nvim_exec_autocmds, "User",

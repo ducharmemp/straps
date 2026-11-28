@@ -51,6 +51,108 @@ it("persists an unsent composer and excludes even marker-looking draft lines", f
   check("reload-transcript", state.parse(resumed), parsed)
 end)
 
+it("keeps the composer boundary through deletion, repair, undo and redo", function()
+  local buf = session()
+  state.seed_user(buf, "request")
+  local before = state.transcript_lines(buf)
+  local marker = "%%[straps:draft]%%"
+  draft(buf, { marker, "unsent" })
+  local row = #before
+  local body = marker .. "\nunsent"
+  local function verify(label, history, physical, text)
+    check(label .. "-history", state.transcript_lines(buf), history)
+    check(label .. "-marker", state.draft_row(buf), physical)
+    check(label .. "-draft", state.draft_text(buf), text or body)
+  end
+  vim.cmd("let &l:undolevels = &l:undolevels")
+  api.nvim_win_set_cursor(0, { row + 1, 0 })
+  key("dd")
+  verify("deleted", before, nil)
+  vim.cmd.StrapsSteer()
+  verify("repaired", before, row)
+  key("u")
+  verify("undo-repair", before, nil)
+  key("u")
+  verify("undo-delete", before, row)
+  key("<C-r>")
+  verify("redo-delete", before, nil)
+  key("<C-r>")
+  verify("redo-repair", before, row)
+  state.append(buf, "assistant", nil, "response")
+  local appended = vim.list_extend(vim.deepcopy(before), { "", "%%[straps:assistant]%%", "response" })
+  verify("append-repair", appended, #appended)
+  key("u")
+  verify("undo-append", before, row)
+  key("<C-r>")
+  verify("redo-append", appended, #appended)
+  local replaced = { "%%[straps:user]%%", "another request" }
+  state.replace_transcript(buf, replaced)
+  verify("replace-history", replaced, #replaced)
+  key("u")
+  verify("undo-replace", appended, #appended)
+  key("<C-r>")
+  verify("redo-replace", replaced, #replaced)
+  api.nvim_win_set_cursor(0, { #replaced + 1, 0 })
+  key("ofirst<Esc>")
+  key("kdd")
+  verify("open-below-delete", replaced, nil, "first\n" .. body)
+  key("Onew first<Esc>")
+  verify("open-above-after-delete", replaced, nil, "new first\nfirst\n" .. body)
+end)
+for _, mode in ipairs({ "write", "persist", "stream" }) do
+  it("restores the draft separator on " .. mode .. " after an in-place reload", function()
+    local buf = session()
+    local notice = "[straps] from agent peer (buffer 42): draft text"
+    local lines = { notice, "%%[straps:system]%%", "unsent" }
+    draft(buf, lines)
+    state.persist(buf)
+    local before = state.transcript_lines(buf)
+    vim.cmd("edit!")
+    api.nvim_win_set_cursor(0, { #before + 1, 0 })
+    key("dd")
+    check(mode .. "-missing", state.draft_row(buf), nil)
+    check(mode .. "-fold-draft", ui.foldexpr(#before + 2), 0)
+    check(mode .. "-fold-user", ui.foldexpr(#before), 0)
+    ui.progress(buf, { type = "start" })
+    local marks = api.nvim_buf_get_extmarks(buf, api.nvim_create_namespace("straps_progress"), 0, -1, {})
+    ui.progress(buf, { type = "done" })
+    check(mode .. "-progress-history", marks[1] and marks[1][2], #before - 1)
+    check(mode .. "-composing", require("straps.since_you_left").wants_output(buf), true)
+    if mode == "write" then
+      vim.cmd.write()
+    elseif mode == "persist" then
+      state.persist(buf)
+    else
+      state.append_text(buf, "response")
+      before[#before + 1] = "response"
+      check("stream-restored", state.draft_row(buf), #before)
+      state.persist(buf)
+    end
+    vim.cmd("edit!")
+    check(mode .. "-saved-history", state.transcript_lines(buf), before)
+    check(mode .. "-saved-draft", state.draft_text(buf), table.concat(lines, "\n"))
+  end)
+end
+
+it("repairs a hand-opened .straps file before writing it", function()
+  vim.cmd("filetype plugin on")
+  local path = vim.fn.tempname() .. ".straps"
+  local history = { "%%[straps:user]%%", "request" }
+  local body = "unsent"
+  vim.fn.writefile(vim.list_extend(vim.deepcopy(history), { "%%[straps:draft]%%", body }), path)
+  vim.cmd.edit(vim.fn.fnameescape(path))
+  local buf = api.nvim_get_current_buf()
+  check("hand-open-filetype", vim.bo[buf].filetype, "straps")
+  check("hand-open-flag", vim.b[buf].straps_session, nil)
+  api.nvim_win_set_cursor(0, { #history + 1, 0 })
+  key("dd")
+  vim.cmd.write()
+  vim.cmd("edit!")
+  check("hand-open-history", state.transcript_lines(buf), history)
+  check("hand-open-draft", state.draft_text(buf), body)
+  vim.fn.delete(path)
+end)
+
 local function slow_run()
   _G.__composer = { requests = {}, cancelled = 0, ended = {} }
   require("straps.registry").define({ name = "fn.provider", kind = "fn", source = [[

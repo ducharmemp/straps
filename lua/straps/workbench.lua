@@ -1,6 +1,7 @@
 local M = {}
 local api = vim.api
 local pending = {}
+local by_entry = setmetatable({}, { __mode = "kv" })
 
 local function redraw(bufnr)
   pcall(vim.cmd, "redrawstatus!")
@@ -37,6 +38,20 @@ local function diff_lines(record)
     lines[#lines + 1] = ("... (%d more diff lines)"):format(more)
   end
   return lines
+end
+
+function M.review_diff(entry)
+  local record = entry and by_entry[entry]
+  if not record or pending[record.bufnr] ~= record or record.deciding or vim.fn.getcwd() ~= record.cwd then return nil end
+  local ok, lines = pcall(diff_lines, record)
+  if not ok or not lines then return nil end
+  return { path = record.metadata.path, lines = lines }
+end
+
+function M._review_record_count()
+  local n = 0
+  for _ in pairs(by_entry) do n = n + 1 end
+  return n
 end
 
 function M.inspect(bufnr, target_win)
@@ -84,6 +99,7 @@ function M.confirm(name, input, ctx, call_id, present, spec)
   if pending[bufnr] then return nil end
   local record = {
     metadata = { call_id = call_id, name = name, path = input.path },
+    bufnr = bufnr,
     input = input,
     base = ctx.batch_preview,
     cwd = vim.fn.getcwd(),
@@ -94,6 +110,7 @@ function M.confirm(name, input, ctx, call_id, present, spec)
     local function finish(success, result)
       if pending[bufnr] ~= record then return end
       pending[bufnr] = nil
+      if record.entry then by_entry[record.entry] = nil end
       record.release()
       release_attention()
       close_preview(record)
@@ -101,6 +118,8 @@ function M.confirm(name, input, ctx, call_id, present, spec)
       done(success, result)
     end
     local entry = { kind = "confirm", spec = spec, mode = require("straps.permission_review").mode() }
+    record.entry = entry
+    by_entry[entry] = record
     entry.present = function()
       record.deciding = true
       local success, result = pcall(present)

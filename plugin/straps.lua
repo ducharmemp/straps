@@ -341,6 +341,17 @@ command("StrapsAgents", function(opts)
   require("straps.ui").open_agents(split_cmd_of(opts.smods))
 end, { desc = "straps: open the agents buffer (running/loaded/saved sessions; :vertical for a vsplit)" })
 
+vim.api.nvim_create_user_command("StrapsEgg", function(opts)
+  local err = require("straps.eggs").play(opts.fargs[1])
+  if err then vim.notify("straps: " .. err, vim.log.levels.WARN) end
+end, {
+  nargs = 1,
+  complete = function(lead)
+    return vim.tbl_filter(function(name) return vim.startswith(name, lead) end, { "firefly", "exoskeleton" })
+  end,
+  desc = "straps: play a session easter egg",
+})
+
 command("StrapsEval", function()
   require("straps.ui").eval_buffer()
 end, { desc = "straps: execute the current buffer as Lua" })

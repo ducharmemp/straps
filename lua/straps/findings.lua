@@ -23,6 +23,7 @@ local function is_session(bufnr)
   return type(bufnr) == "number" and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)
     and vim.b[bufnr].straps_session == true
 end
+M.is_session = is_session
 
 function M.session_win(bufnr)
   if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
@@ -77,6 +78,7 @@ local function store_set(bufnr, title, items)
       callback = function()
         clear_marks(store[bufnr])
         store[bufnr] = nil
+        M.reset_diagnostics(bufnr)
         pcall(vim.api.nvim_del_autocmd, enter)
       end,
     })
@@ -94,6 +96,51 @@ local function store_set(bufnr, title, items)
     end
   end
   store[bufnr] = s
+end
+
+local namespaces = {}
+
+function M.is_findings_namespace(ns)
+  local ok, info = pcall(vim.diagnostic.get_namespace, ns)
+  return ok and type(info) == "table" and type(info.name) == "string"
+    and vim.startswith(info.name, "straps.findings.") or false
+end
+
+function M.reset_diagnostics(bufnr)
+  local ns = namespaces[bufnr]
+  if ns then pcall(vim.diagnostic.reset, ns) end
+end
+
+function M.set_diagnostics(bufnr, items)
+  local ns = namespaces[bufnr] or vim.api.nvim_create_namespace("straps.findings." .. bufnr)
+  namespaces[bufnr] = ns
+  local by_buf = {}
+  for _, it in ipairs(items) do
+    local name = type(it.filename) == "string" and it.filename or ""
+    local b = name ~= "" and vim.fn.bufadd(name) or 0
+    local backed = b > 0 and (vim.fn.filereadable(name) == 1 or (vim.api.nvim_buf_is_loaded(b) and vim.bo[b].modified))
+    if backed and pcall(vim.fn.bufload, b) and vim.api.nvim_buf_is_loaded(b) then
+      local last = math.max(1, vim.api.nvim_buf_line_count(b))
+      local lnum = math.min(math.max(1, tonumber(it.lnum) or 1), last)
+      by_buf[b] = by_buf[b] or {}
+      table.insert(by_buf[b], {
+        lnum = lnum - 1,
+        col = math.min(math.max(0, (tonumber(it.col) or 0) - 1), #(vim.api.nvim_buf_get_lines(b, lnum - 1, lnum, false)[1] or "")),
+        message = it.text ~= "" and it.text or "finding",
+        severity = vim.diagnostic.severity.INFO,
+        source = "straps",
+      })
+    end
+  end
+  for b, list in pairs(by_buf) do vim.diagnostic.set(ns, b, list) end
+end
+
+function M.agent_diagnostics(buf, opts)
+  local out = {}
+  for _, d in ipairs(vim.diagnostic.get(buf, opts) or {}) do
+    if not M.is_findings_namespace(d.namespace) then out[#out + 1] = d end
+  end
+  return out
 end
 
 function M.stored(bufnr)

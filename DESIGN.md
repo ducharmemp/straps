@@ -522,7 +522,11 @@ the new session's system prompt lists their entries. Add
 list_sessions (none → notify + fall through to a new session). Still runs
 load_global_registry and load_project_registry (via show_session). Runs `state.heal_interrupted` on the reopened buffer and
 notifies when it repaired anything, so a session interrupted mid-tool is
-sendable again rather than permanently rejected by the API.
+sendable again rather than permanently rejected by the API. It passes
+`{ keep_unmodified = true }` to `show_session`, so `state.open_draft` clears
+`modified` after adding the draft line when the buffer was unmodified before:
+a resumed transcript opens without `[+]`, and `u` still undoes the draft line.
+A buffer already modified stays modified. When Neovim reloads an unmodified session buffer after another writer changes its file (`autoread`, `:checktime`), a `FileChangedShellPost` handler runs `open_draft` with `keep_unmodified`, so the draft line comes back and the buffer stays unmodified.
 
 **plugin/straps.lua** — `:StrapsResume [path]`: resume_session; completion
 lists session basenames (resolve basename → full path); no arg → most recent.
@@ -783,8 +787,12 @@ Run algorithm (each numbered step goes through the registry so it's swappable):
   only then calls `loop.start`, so a run that ends inside `loop.start` cannot
   leave a record that refuses the next draft. A draft-based record would be
   dropped by the stale-draft rule and bypassed by steering.
-- `%%[straps:draft]%%` separates the editable composer from the conversation. An
-  extmark tracks the boundary. The renderer conceals the marker, overlays the
+- `%%[straps:draft]%%` separates the editable composer from the conversation. A
+  left-gravity extmark at the start of the draft body tracks the boundary even
+  when an edit deletes the separator line. The previous line is the separator
+  only if it matches the literal marker. Composer open, transcript writes, and
+  whole-buffer saves restore a missing separator before the surviving draft.
+  Undo and redo of separator repair follow the buffer's text edits. The renderer conceals the marker, overlays the
   `you` role header with a muted `draft` label on the same line, and hides the
   empty trailing user placeholder if present. `render = false` shows the raw
   markers. Streaming and context replacement write before the boundary.
@@ -835,15 +843,15 @@ The session winbar reports pending approval while the reader scrolls through ear
 
 ### Session dock
 
-`session_dock` defaults to `false`. When enabled, default session opens request a native seven-line split at the bottom of the tab. Explicit placement modifiers override the dock. The split displays the session buffer, so Neovim controls scrolling, resizing, undo, and draft retention. The dock's winbar keeps the conversation name and permission state visible even if another window has focus or `session_winbar = false`.
+`session_dock` defaults to `false`. When enabled, default session opens request a native seven-line split at the bottom of the tab. Explicit placement modifiers override the dock. The split displays the session buffer, so Neovim controls scrolling, resizing, undo, and draft retention. The dock's winbar keeps the conversation name and permission state visible even if another window has focus or `session_winbar = false`. The name is `ui.session_title`: the filename, after a human-set title cut to 40 cells, placed before the waiting label so a pending request does not hide it. The winbar shortens the title in the middle so the filename and the first 12 cells of the waiting label fit the dock window, and drops the title when no room is left for it. Neovim cuts the run status after the `%<` from its left, and cuts the waiting label from the right only when the label alone overflows the window.
 
 `dock.lua` tracks dock windows and registers pending presentations with `permission_review.lua`. With `permission_review = "deferred"` (the default), every default `hook.confirm` prompt made inside a run coroutine (`ctx.await` and `ctx.on_cancel` present) defers, and contextual consent defers when it uses the default display, has an awaitable context, and belongs to a valid session buffer. With `"modal"`, a non-edit prompt and consent defer only while the dock is visible, and a session-buffer file edit defers through `workbench`; every other prompt calls `vim.fn.confirm` or opens consent's split at once. Calls without a coroutine prompt at once in both modes.
 
-Entries are typed. `{ kind = "confirm", bufnr, seq, spec, done, present, mode }` comes from `hook.confirm` through `dock.confirm` and `workbench.confirm`; `spec` carries the name, target, title, preview and keyed choices, `present` is the modal `vim.fn.confirm` closure, and `mode` is the setting at creation. `{ kind = "presenter", bufnr, seq, present, label, status, expires?, clock? }` comes from consent: a queued record registers at enqueue with no `present`, and its split presenter replaces it at display. `dock.defer(bufnr, entry)` refuses an invalid bufnr, so the caller falls back to the modal path, and takes a bare function as `{ kind = "presenter", present = fn }` for callers of its earlier `dock.defer(bufnr, present)` form. `dock.has_permission(bufnr)` reads the review entries, so the review module holds the only pending list. `seq` is a module-wide counter.
+Entries are typed. `{ kind = "confirm", bufnr, seq, spec, done, present, mode }` comes from `hook.confirm` through `dock.confirm` and `workbench.confirm`; `spec` carries the name, target, title, preview and keyed choices, plus `grants` (sanitized grant lines) and `fields` (the field listing) for default-hook file edits, `present` is the modal `vim.fn.confirm` closure, and `mode` is the setting at creation. `{ kind = "presenter", bufnr, seq, present, label, status, expires?, clock? }` comes from consent: a queued record registers at enqueue with no `present`, and its split presenter replaces it at display. `dock.defer(bufnr, entry)` refuses an invalid bufnr, so the caller falls back to the modal path, and takes a bare function as `{ kind = "presenter", present = fn }` for callers of its earlier `dock.defer(bufnr, present)` form. `dock.has_permission(bufnr)` reads the review entries, so the review module holds the only pending list. `seq` is a module-wide counter.
 
-`permission_review.lua` draws every pending entry, in `seq` order, as one sanitized row in a top-right float of the current tab (`focusable = false`, zindex 200), and a `waiting:` virtual line above the waiting session's draft marker, or before the pending batch's first `tool_use` marker when there is no draft. Every update re-checks the float's window and tabpage and re-opens it on a mismatch; `TabEnter`, `VimResized` and a 30 s timer while consent rows exist trigger updates. A render error notifies and names `:StrapsPermission`. Review (`gy`, `:StrapsPermission`) resolves the target session's own entry, then a descendant's, then the oldest. A `"deferred"` confirm entry with a `spec` opens a review float (zindex 250) built from the spec only, so a session shadow of `fn.render` cannot change it; its keys are the choice letters, `i` (`workbench.inspect` beside the prior window, then the float closes with the entry still pending, so the float does not cover the diff), `<Tab>`/`<S-Tab>`, an inert `<CR>`, `q`/`<Esc>` and `gy`. Every other entry calls `present`. Review refuses inside the cmdline window and while `registry.tool_body_running_here()` is true: a tool body that is executing (status `running` or `normal`), or the main-thread key; bodies suspended in `ctx.await` do not block review. `workbench.pending(bufnr)` returns detached metadata (`call_id` when supplied by the provider, `name`, and `path`) from arrival through decision or cancellation. `:StrapsInspect` opens one read-only unified diff beside the originating transcript without entering the split. Closing the split does not resolve the request. The preview uses the staged batch base when available, then falls back to the live file buffer or disk. It does not authorize or apply an edit. Cancellation, the decision, and buffer wipe remove the entry. Custom confirmation and consent implementations retain their own presentation behavior; a custom `hook.confirm` can defer through `dock.confirm(ctx, present, spec)`, or through `dock.confirm(ctx, present)`, whose row reads `allow (custom hook.confirm)` and whose review calls `present`.
+`permission_review.lua` draws every pending entry, in `seq` order, as one sanitized row in a top-right float of the current tab (`focusable = false`, zindex 200), and a `waiting:` virtual line above the waiting session's draft marker, or before the pending batch's first `tool_use` marker when there is no draft. The float sits on the first row below the tab line, one row lower when a normal window of the current tab in that top row has a winbar and its columns overlap the float's (border included). The waiting line fits the narrowest normal window showing the session: `waiting_line` shortens the request in the middle with `…` so ` · gy review` stays, and a window too narrow for that shows `◆ gy review`. Every update re-checks the float's window and tabpage and re-opens it on a mismatch; `TabEnter`, `VimResized`, `WinEnter`, `BufEnter`, `WinNew`, `WinClosed`, `WinResized`, `OptionSet winbar` and a 30 s timer while consent rows exist trigger updates. A render error notifies and names `:StrapsPermission`. Review (`gy`, `:StrapsPermission`) resolves the target session's own entry, then a descendant's, then the oldest. A `"deferred"` confirm entry with a `spec` opens a review float (zindex 250) built from the spec, so a session shadow of `fn.render` cannot change it. When the spec has `grants` and `fields` and `workbench.review_diff(entry)` returns a diff, the float shows the grants, `path: <path>`, the diff, a blank line and the fields; `review_diff` answers only while the entry's record is pending, not deciding, and the current window's cwd equals the record's, and computes the same `diff_lines` as `:StrapsInspect` under `pcall`. The float colors only the diff rows (`Added`, `Removed`, `Changed` extmark highlights, so a field value shaped like a hunk stays uncolored), sets a window-local `showbreak`, and measures its height with `nvim_win_text_height` after `wrap` is set, again on `VimResized`; its keys are the choice letters, `i` (`workbench.inspect` beside the prior window, then the float closes with the entry still pending, so the float does not cover the diff), `<Tab>`/`<S-Tab>`, an inert `<CR>`, `q`/`<Esc>` and `gy`. Every other entry calls `present`. Review refuses inside the cmdline window and while `registry.tool_body_running_here()` is true: a tool body that is executing (status `running` or `normal`), or the main-thread key; bodies suspended in `ctx.await` do not block review. `workbench.pending(bufnr)` returns detached metadata (`call_id` when supplied by the provider, `name`, and `path`) from arrival through decision or cancellation. `:StrapsInspect` opens one read-only unified diff beside the originating transcript without entering the split. Closing the split does not resolve the request. The preview uses the staged batch base when available, then falls back to the live file buffer or disk. It does not authorize or apply an edit. Cancellation, the decision, and buffer wipe remove the entry. Custom confirmation and consent implementations retain their own presentation behavior; a custom `hook.confirm` can defer through `dock.confirm(ctx, present, spec)`, or through `dock.confirm(ctx, present)`, whose row reads `allow (custom hook.confirm)` and whose review calls `present`.
 
-Threat model: the review float and the corner float take their text only from the entry's sanitized fields and never from the transcript or registry renderers. The review does not constrain a session that has had a `lua`, `define` or `exec` call approved, once or by grant: that code can queue keys that run after the body yields, leave a timer, a `vim.schedule` callback or a coroutine that decides a later request, or drive Neovim over its RPC socket. The modal prompt has the same exposure. Deciding from a window whose `:lcd`/`:tcd` differs from the gate window resumes the run there, and the execution-time directory check refuses the approved call.
+Threat model: the review float and the corner float take their text only from the entry's sanitized fields and never from the transcript or registry renderers. The edit diff adds one source: the file text (batch base, live buffer or disk) and the agent's input, passed through `state.simulate_edit` and `vim.diff`, with each line passed through `ui.display_text` (NUL to `^@`, then `strtrans`), so a control byte or newline in the file, the input, the path or a grant directory cannot add or hide a line. The modal `confirm()` button labels pass the directories through `display_text` too, so a newline in a directory cannot add a button. Residuals: the simulation can differ from what the tool writes; the file can change between the float opening and the decision; the diff shows only when the reviewing window has the request's directory. Session titles add a second source: `ui.session_identity` reads the `.meta` title (skipping one straps-renamer generated), passes it through `display_text`, cuts it to 40 cells, and shows it with the filename, which an agent cannot change. In the corner-float rows and the review title the title follows the request text, the request keeps at least half the row (20 cells minimum), and the title appears only when the whole filename fits. In the dock winbar the title precedes the waiting label and is shortened to keep the filename visible. Residual: an agent can write `.meta` without a new prompt under `editfiles:*`, an `editdir:` grant covering `session_dir`, the category grants `cap:edit`, `cap:exec` and `cap:lua`, or an "Always this tool" grant for any tool except the path-scoped `write_file`, `edit_file` and `patch_file`, which ignore a tool grant; that covers `bash`, `eval_lua`, `run_in_terminal`, `move_file`, `move_files` and `bulk_replace` (`meta_grants_spec.lua` tests that these grants skip the prompt, not that each tool can reach `.meta`), so a forged title is possible; the filename beside it still names the session. The review does not constrain a session that has had a `lua`, `define` or `exec` call approved, once or by grant: that code can queue keys that run after the body yields, leave a timer, a `vim.schedule` callback or a coroutine that decides a later request, or drive Neovim over its RPC socket. The modal prompt has the same exposure. Deciding from a window whose `:lcd`/`:tcd` differs from the gate window resumes the run there, and the execution-time directory check refuses the approved call.
 
 ### Terminal attention
 
@@ -2635,8 +2643,15 @@ Clears the straps-render namespace and repopulates by walking
 - **tool_use + tool_result run** → left to the fold (below); the marker lines
   are concealed so the open state is clean.
 - Rendering is window-agnostic (extmarks are buffer-scoped); conceal needs the
-  window opt `conceallevel=2`, `concealcursor=nc` set when the session window
-  opens. Written with `vim.wo[win][0]` (`:setlocal`), never plain `vim.wo[win]`
+  window opt `conceallevel=2`, `concealcursor=nc`. `apply_fold_opts` sets both the
+  first time a window gets the straps foldexpr (session presentation, the ftplugin,
+  the FileType autocmd, and window-entry events), so a hand-opened transcript
+  renders and a later `:setlocal conceallevel=0` survives window switches and
+  `show_session`. Any call from a normal window also runs `ui.apply_render` (one `fn.render` under
+  `pcall`, then the listener) when no listener is attached, and first resets every window showing the buffer to
+  `conceallevel=2`, `concealcursor=nc`, because a reload (`:edit!`, `autoread`) detaches the listener. `ui.detach_render`,
+  run by the ftplugin's `b:undo_ftplugin`, cancels the timer, clears the render
+  namespace and stops the listener when the filetype changes. Written with `vim.wo[win][0]` (`:setlocal`), never plain `vim.wo[win]`
   (`:set`) — see the window-option rule under Folding below.
 
 Trigger: `nvim_buf_attach(bufnr, false, { on_lines = <schedule render> })`
@@ -2686,13 +2701,17 @@ Tool_use/tool_result pairs collapse to one summary line. The system block, harne
 `:StrapsOutline` opens a separate tab with the original transcript buffer. `straps.outline` creates native manual folds from each earlier user prompt to the line before the next prompt. Fold labels use the first nonblank prompt line and its ordinal. Harness and agent notices are not headings. The latest turn and any draft stay open. The reading window uses no nested tool folds, so `zo` reveals the whole turn. No run hook creates or closes outline folds. Closing the reading window returns to the original view with its native fold state intact.
 
 `foldtext` returns highlighted chunks. A closed tool fold reads, for example,
-`▸ read_file  src/main.lua · ok`. `StrapsRule` mutes the chevron, tool name
-and count. `Normal` gives the target full contrast, and `StrapsToolError`
+`▸ read_file · ok  src/main.lua`. The status and count come before the
+target, and `foldtext` shortens a target wider than the window in the middle
+with `…`, or drops it when the label, status and count fill the window, so the
+status stays visible. `StrapsRule` mutes the chevron, tool
+name, status and count. `Normal` gives the target full contrast, and `StrapsToolError`
 colors `failed` through `DiagnosticError`.
 
 The target comes from a string input field (`path`, `filename`, `file` or
-`url`), the first line of a shell command for command tools, or the pattern
-for `glob` and `grep` when no path is present. A standalone result shows its
+`url`), the first line of a shell command for command tools, the pattern
+for `glob` and `grep` when no path is present, or a `name` input field
+(skills and registry tools) when nothing else matches. A standalone result shows its
 call ID if known. A call takes metadata from the result run that follows its
 batch of calls: the k-th call with an ID pairs with the k-th result with that
 ID, and empty assistant markers between the calls and the results are passed
@@ -2775,14 +2794,14 @@ for an agent-defined tool or change the style.
 
 - `fn.render` is a registry entry → `:StrapsEdit fn.render` + `:w` reshapes the
   whole presentation live, like every other entry.
-- Raw markers: `:set conceallevel=0` (window) shows the real text under the
+- Raw markers: `:setlocal conceallevel=0` (window) shows the real text under the
   rules, or redefine `fn.render` to a no-op. Document both.
 - Never mutate buffer text or `modified`; extmarks/conceal are display-only, so
   parse, persist (buftype="" durable buffers), and `:w` are unaffected.
 
 ### config (init.lua)
 
-- `render = true` — master switch; false skips fn.render wiring (raw markers).
+- `render = true` — master switch; false skips fn.render wiring and conceal (raw markers).
 - `tools_expanded = false` — fold tools open by default when true.
 
 ### Tests — tests/render_spec.lua
@@ -2875,6 +2894,8 @@ Existing suites must all still pass.
   sets nomodified. This works generically because render output is executable.
 - `:StrapsRegistry` — scratch listing, `<CR>` on a line opens `:StrapsEdit`.
 - `:StrapsEval` — execute current buffer as Lua (eval-buffer).
+- `:StrapsEgg` plays one animation in the current session’s upper-right corner using temporary floats. The firefly moves horizontally and vertically; the exoskeleton uses four rows. Both can cover text briefly without resizing the session or taking focus or mouse input. Playback stops if the source changes, a prompt becomes pending, or the animation no longer fits. Another invocation replaces playback in that window. Neither animation runs on session open or has a default mapping.
+- The ratchet appears first in the right-aligned group of the stock Neovim statusline for session windows. Custom statuslines can use `ui.ratchet_status(bufnr)`. The ratchet holds still while running. A successful, non-cancelled run shortens the tail in four-cell steps, shows `done`, and returns to `idle`. A new run cancels the previous completion animation. Existing progress virtual text is unchanged.
 - `:StrapsAgents` opens the **agent dashboard** (`straps://agents`), an ordinary searchable, nomodifiable scratch buffer with session trees and a separate saved-transcript section. `ui.all_sessions()` retains its disjoint `{ running, loaded, saved }` classification API. Presentation combines running and loaded sessions into a stable forest ordered by buffer identity, retaining finished children under their parents. Parent links must reference valid session buffers; traversal guards against cycles. Saved files have no reconstructed ancestry.
   The presentation seams remain `fn.agents_render` → `ui._agents_render` and `fn.agents_winbar` → `ui._agents_winbar`. Implementations may delegate to the dashboard module. The winbar dispatcher respects `agents_winbar`; disabling it moves the legend into the buffer.
   Rows, headers, and legends remain bounded: collapse whitespace, measure display cells, and truncate with an ellipsis. Fit the narrowest window showing the dashboard, with a 76-cell fallback when no window displays it. Titles and tasks precede metadata; omit metadata before consuming title space in narrow splits. This replaces the fixed-width policy while retaining its purpose of preventing transcript content from overflowing the layout. Resize triggers a debounced refresh.
@@ -2984,8 +3005,8 @@ Existing suites must all still pass.
 - Folding for the session buffer: foldexpr folds `tool_use`/`tool_result`
   pairs, the system block, harness notices, and agent messages at level 1.
   `foldlevel=0` closes those folds. Ordinary user and assistant turns remain open.
-  Lines from the draft marker down are level 0, so a marker line quoted or
-  pasted into the draft opens no fold there.
+  Lines below the transcript are level 0, including the separator when present.
+  A marker line quoted or pasted into the draft opens no fold there.
 - Session window options, set with the fold options: `fillchars` `fold: ` (closed
   folds fill with blanks), `linebreak`, `breakindent` and `breakindentopt=list:-1`,
   so a wrapped list item continues under its text. Buffer options from
@@ -3163,7 +3184,9 @@ workspace_symbols.
 - `diagnostics {path?, quickfix?}` — `vim.diagnostic.get` for path's buffer
   (bufadd+load it) or all loaded straps-relevant buffers when omitted. Returns
   one line per diagnostic: `file:line:col: SEVERITY message [source]` and can
-  populate the session findings list.
+  populate the session findings list. It and the three helpers below read
+  diagnostics through `findings.agent_diagnostics`, which drops the `straps.findings.<bufnr>`
+  namespaces, so `set_findings` output never comes back as a diagnostic.
 - `diagnostic_at {path, line, col}`, `diagnostic_next {path, line, col,
   direction?, severity?, wrap?}`, and `fix_diagnostic {path, line, col, index?}`
   — position-oriented diagnostic helpers for the common "fix the issue here / go
@@ -3197,8 +3220,8 @@ via `fn.readonly_policy` (see below). Async LSP tools use ctx.await + a timeout
 so a wedged server can't hang the run.
 
 Presentation tools (also lua/straps/editor.lua) turn agent output into real
-Neovim views instead of transcript prose. They change no files — they open
-views / set the findings list — so `hook.confirm` auto-allows them like
+Neovim views instead of transcript prose. They change no files: they open
+views or set the findings list and its diagnostics, so `hook.confirm` auto-allows them like
 show_user, and they never steal the user's focus. A shared PRELUDE helper
 (`new_split_win`, `scratch_buf`, `unified_diff`) implements the shared view operations.
 
@@ -3214,7 +3237,16 @@ show_user, and they never steal the user's focus. A shared PRELUDE helper
   showing the file, else in a new split; keyboard focus returns to the window
   the user was in.
 - `set_findings {items=[{path,line?,col?,text?}], title?, open?}` — load
-  agent-assembled locations into the session's findings list and open it. For
+  agent-assembled locations into the session's findings list and open it.
+  From a session with a window (and `config.findings_diagnostics ~= false`) it
+  also sets one INFO diagnostic per location (source `straps`) in that
+  session's namespace `straps.findings.<bufnr>`, so the human sees them in
+  signs and `]d`/`[d`. Every `set_findings` call from a session first clears
+  that namespace; a windowless session (a subagent) sets none. Lines past the
+  end clamp to the last line and columns past the end to the line length. A
+  path that is not a readable file, and has no buffer with unsaved edits, gets
+  no diagnostic. Diagnostic positions are fixed at set time;
+  loclist entries follow edits. Wiping the session clears its diagnostics. For
   findings the agent built itself; grep and run_quickfix already fill the list
   for searches and build output, so the doc points there first.
 - `show_terminal {buffer?}` is the terminal counterpart; it lives in
@@ -3510,8 +3542,9 @@ they use `setqflist` / `getqflist`. `locations_do(bufnr, body)` edits each
 entry through `nvim_buf_call`, with extmarks tracking line movements. Each invocation starts a separate undo block per buffer and joins that invocation's entries into the block. Before removing its marks, it saves adjusted entry lines to the authoritative store or native list, including when an entry fails, so later calls use the moved targets. Marks stay at the start of replaced lines when substitutions insert newlines. `grep`, `diagnostics{quickfix}`, `run_quickfix`,
 `set_findings` write through `set_locations`; `bulk_replace` reads through
 `get_locations` and edits through `locations_do`, and its result names whichever
-list ("loclist"/"quickfix"). Tools' user-facing summaries say `:lnext/:cnext`
-accordingly. Tested in `quickfix_spec.lua`: two on-screen sessions get isolated
+list ("loclist"/"quickfix"). The summaries of `set_findings`, `run_quickfix` and a
+windowless `grep` end with `findings.nav_hint`: `:lnext/:lprev`, `:cnext/:cprev`, or a note that a
+windowless session keeps them in its private store. Tested in `quickfix_spec.lua`: two on-screen sessions get isolated
 per-window lists (and the global qf list stays untouched), bulk_replace on
 session A edits only A's file, a windowless session uses its private store,
 opening a list keeps focus, and bulk_replace leaves the user's window and

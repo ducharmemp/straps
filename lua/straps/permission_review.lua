@@ -47,7 +47,7 @@ local function request_text(entry)
   local spec = entry.spec
   if type(spec) == "table" and spec.name ~= nil then
     local text = "allow " .. single_line(spec.name)
-    if spec.target then text = text .. " " .. single_line(spec.target) end
+    if spec.target then text = text .. " " .. require("straps.ui").display_text(spec.target) end
     return text
   end
   return "allow (custom hook.confirm)"
@@ -101,11 +101,58 @@ local function tabline_rows()
   return 0
 end
 
+local function identity(bufnr)
+  if not api.nvim_buf_is_valid(bufnr) then return "buffer " .. bufnr, nil end
+  local ok, label, title = pcall(function() return require("straps.ui").session_identity(bufnr) end)
+  if ok and type(label) == "string" then return label, title end
+  return session_label(bufnr), nil
+end
+
+local function cells(text)
+  return vim.fn.strdisplaywidth(text)
+end
+
+local function suffix(title, label, room)
+  local ui = require("straps.ui")
+  if title then
+    local title_room = room - cells(" ·  ()" .. label)
+    if title_room >= 2 then return " · " .. ui.truncate_middle(title, title_room) .. " (" .. label .. ")" end
+  end
+  return " · " .. ui.truncate_middle(label, math.max(0, room - 3))
+end
+
+local function compose(head, request, bufnr, width)
+  local label, title = identity(bufnr)
+  local tail = title and (" · " .. title .. " (" .. label .. ")") or (" · " .. label)
+  local full = head .. request .. tail
+  if cells(full) <= width then return full end
+  local reserve = math.min(math.max(20, math.floor(width / 2)), width - 3 - cells(head))
+  local room = math.max(reserve, width - cells(head) - cells(tail))
+  local shown = require("straps.ui").truncate_middle(request, math.min(cells(request), room))
+  return truncate(head .. shown .. suffix(title, label, width - cells(head) - cells(shown)), width)
+end
+
+local function row_width()
+  return math.min(math.max(20, vim.o.columns - 4), math.max(1, vim.o.columns - 2))
+end
+
+local function float_row(width)
+  local top = tabline_rows()
+  local left = vim.o.columns - width - 2
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if vim.fn.win_gettype(win) == "" and api.nvim_win_get_position(win)[1] == top then
+      local info = vim.fn.getwininfo(win)[1]
+      if info and info.winbar == 1 and info.wincol + info.width - 2 >= left then return top + 1 end
+    end
+  end
+  return top
+end
+
 local function render_list()
   local rows = {}
   for _, entry in ipairs(entries) do
     if api.nvim_buf_is_valid(entry.bufnr) then
-      rows[#rows + 1] = "◆ " .. session_label(entry.bufnr) .. " · " .. request_text(entry)
+      rows[#rows + 1] = compose("◆ ", request_text(entry), entry.bufnr, row_width())
     end
   end
   if #rows == 0 then
@@ -131,7 +178,7 @@ local function render_list()
   local cfg = {
     relative = "editor",
     anchor = "NE",
-    row = tabline_rows(),
+    row = float_row(width),
     col = vim.o.columns,
     width = width,
     height = #shown,
@@ -153,7 +200,22 @@ local function render_list()
 end
 
 local function waiting_line(entry)
-  return { { "◆ waiting: " .. request_text(entry) .. " · gy review", "StrapsPermit" } }
+  local width
+  for _, win in ipairs(vim.fn.win_findbuf(entry.bufnr)) do
+    if vim.fn.win_gettype(win) == "" then
+      local info = vim.fn.getwininfo(win)[1]
+      local room = api.nvim_win_get_width(win) - (info and info.textoff or 0)
+      width = width and math.min(width, room) or room
+    end
+  end
+  local head, tail = "◆ waiting: ", " · gy review"
+  local text = request_text(entry)
+  if width then
+    local room = width - vim.fn.strdisplaywidth(head) - vim.fn.strdisplaywidth(tail)
+    if room < 2 then return { { "◆ gy review", "StrapsPermit" } } end
+    text = require("straps.ui").truncate_middle(text, room)
+  end
+  return { { head .. text .. tail, "StrapsPermit" } }
 end
 
 local function anchor(bufnr)
@@ -214,7 +276,11 @@ end
 
 local function notify_failure(err)
   local entry = entries[1]
-  local who = entry and session_label(entry.bufnr) or "a session"
+  local who = "a session"
+  if entry then
+    local label, title = identity(entry.bufnr)
+    who = title and (title .. " (" .. label .. ")") or label
+  end
   pcall(vim.notify, ("straps: permission request pending in %s; run :StrapsPermission (display failed: %s)")
     :format(who, tostring(err)), vim.log.levels.WARN)
 end
@@ -228,10 +294,19 @@ local function register_lifecycle()
     group = api.nvim_create_augroup("StrapsPermissionReview", { clear = true }),
     callback = function(ev)
       if ev.event == "VimResized" and review.layout and review.win and api.nvim_win_is_valid(review.win) then
-        pcall(api.nvim_win_set_config, review.win, review.layout())
+        pcall(function() api.nvim_win_set_config(review.win, review.layout(review.win)) end)
       end
       if #entries > 0 then M.changed() end
     end,
+  })
+  api.nvim_create_autocmd({ "WinEnter", "BufEnter", "WinNew", "WinClosed", "WinResized" }, {
+    group = "StrapsPermissionReview",
+    callback = function() if #entries > 0 then M.changed() end end,
+  })
+  api.nvim_create_autocmd("OptionSet", {
+    group = "StrapsPermissionReview",
+    pattern = "winbar",
+    callback = function() if #entries > 0 then M.changed() end end,
   })
 end
 
@@ -369,22 +444,54 @@ for _, lhs in ipairs(FIXED_KEYS) do
   if lhs:sub(1, 1) ~= "<" then reserved_keys[lhs:sub(1, 1)] = true end
 end
 
-local function open_review(entry)
+local function review_body(entry)
   local spec = entry.spec
+  local text = type(spec.preview) == "string" and spec.preview or ""
+  if type(spec.grants) == "table" and type(spec.fields) == "string" then
+    local ok, diff = pcall(require("straps.workbench").review_diff, entry)
+    if ok and diff then
+      local display = require("straps.ui").display_text
+      local parts = {}
+      for _, grant in ipairs(spec.grants) do parts[#parts + 1] = display(grant) end
+      parts[#parts + 1] = "path: " .. display(diff.path)
+      local first = #parts + 1
+      for _, line in ipairs(diff.lines) do parts[#parts + 1] = display(line) end
+      local last = #parts
+      parts[#parts + 1] = ""
+      for _, line in ipairs(vim.split(spec.fields, "\n", { plain = true })) do parts[#parts + 1] = display(line) end
+      return parts, { first = first, last = last }
+    end
+  end
   local lines = {}
-  for _, line in ipairs(vim.split(type(spec.preview) == "string" and spec.preview or "", "\n", { plain = true })) do
+  for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
     lines[#lines + 1] = vim.fn.strtrans((line:gsub("%z", "^@")))
   end
+  return lines, nil
+end
+
+local DIFF_GROUPS = { ["+"] = "Added", ["-"] = "Removed", ["@"] = "Changed" }
+
+local function highlight_diff(buf, lines, range)
+  for i = range.first, range.last do
+    local group = DIFF_GROUPS[lines[i]:sub(1, 1)]
+    if group then api.nvim_buf_set_extmark(buf, ns, i - 1, 0, { end_row = i, hl_group = group, hl_eol = true }) end
+  end
+end
+
+local function open_review(entry)
+  local spec = entry.spec
+  local lines, diff_range = review_body(entry)
   if #lines == 0 then lines = { "" } end
-  local title = " " .. single_line(spec.title or ("allow " .. tostring(spec.name))) .. " · " .. session_label(entry.bufnr) .. " "
+  local heading = single_line(spec.title or ("allow " .. tostring(spec.name)))
+  local title = " " .. compose("", heading, entry.bufnr, math.huge) .. " "
   local content = vim.fn.strdisplaywidth(title)
   for _, line in ipairs(lines) do content = math.max(content, vim.fn.strdisplaywidth(line)) end
-  local function layout()
+  local function layout(win)
     local cap = math.max(1, vim.o.columns - 2)
     local width = math.min(math.max(content, vim.fn.strdisplaywidth(footer_for(spec, cap)), 20), cap)
     local function measure()
-      local rows = 0
-      for _, line in ipairs(lines) do rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(line) / width)) end
+      api.nvim_win_set_config(win, { relative = "editor", row = 0, col = 0, width = width, height = 1 })
+      local rows = api.nvim_win_text_height(win, {}).all
       return rows, math.max(1, math.min(rows, vim.o.lines - 6))
     end
     local rows, height = measure()
@@ -404,7 +511,7 @@ local function open_review(entry)
       width = width,
       height = height,
       border = "single",
-      title = truncate(title, width),
+      title = " " .. compose("", heading, entry.bufnr, math.max(1, width - 2)) .. " ",
       footer = footer,
       zindex = 250,
     }
@@ -414,14 +521,19 @@ local function open_review(entry)
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
   local prev = api.nvim_get_current_win()
+  if diff_range then highlight_diff(buf, lines, diff_range) end
   local ok, win = pcall(function()
-    return api.nvim_open_win(buf, false, vim.tbl_extend("force", layout(), { style = "minimal" }))
+    local opened = api.nvim_open_win(buf, false, { relative = "editor", row = 0, col = 0, width = 1, height = 1,
+      style = "minimal", border = "single", zindex = 250 })
+    vim.wo[opened][0].wrap = true
+    vim.wo[opened][0].showbreak = "↪ "
+    api.nvim_win_set_config(opened, layout(opened))
+    return opened
   end)
   if not ok then
     pcall(api.nvim_buf_delete, buf, { force = true })
     return false, "cannot open the permission review: " .. tostring(win)
   end
-  vim.wo[win][0].wrap = true
   vim.wo[win].winfixbuf = true
   review.win, review.entry, review.prev, review.layout = win, entry, prev, layout
   local function map(lhs, fn)

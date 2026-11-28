@@ -119,22 +119,26 @@ yourself, before any command, to pass options.
 			it and |:StrapsResume!| warn and open a new session.
 			A window in the current tab already showing the
 			session gets focus; otherwise |<mods>| place the new
-			window as for |:Straps|.
+			window as for |:Straps|. A buffer that was not
+			'modified' before the resume stays unmodified until
+			you edit it.
+							*:StrapsResume!*
 :StrapsResume!		Open a picker over all saved sessions. Each row shows
 			the session's durable title (see |:StrapsRename|) or,
 			absent one, its first user prompt, plus a relative age
 			— so sessions are identified by what they were about,
 			not by a timestamped filename. With snacks.nvim present
 			the picker fuzzy-matches those rows and previews the
-			transcript; otherwise it is a |vim.ui.select| list.
+			transcript; otherwise it is a |vim.ui.select()| list.
 
 							*:StrapsRename*
 :StrapsRename [{title}]	Give the current session a durable title, stored in a
 			companion "<transcript>.meta" file (the transcript
 			itself is untouched). The title is what |:StrapsResume!|
-			shows for the session. No argument prompts for one
-			(pre-filled with the current title); an empty title
-			clears it.
+			shows for the session; the permission rows, the review
+			float title and the dock winbar show it before the
+			filename. No argument prompts for one (pre-filled
+			with the current title); an empty title clears it.
 
 							*:StrapsSearch*
 :StrapsSearch {pattern}	Full-text search across every saved transcript for
@@ -450,6 +454,14 @@ integration or live calibration.
 			|:Straps| (:vertical StrapsAgents for a vsplit).
 			See the dashboard keys below and |straps-subagents|.
 
+								*:StrapsEgg*
+:StrapsEgg {name}	Play an animation once from the current session window.
+			`firefly` moves across several rows and columns.
+			`exoskeleton` plays a four-row fitting animation.
+			Both use the upper-right corner and may cover text
+			briefly. Neither resizes the window, takes focus,
+			or runs on session open. Tab completes names.
+
 							*:StrapsProvider*
 :StrapsProvider		Pick the backend: anthropic, openai or llamacpp. On a
 			resolved session it sets b:straps_provider for that
@@ -516,9 +528,14 @@ hand-opened `*.straps` file:
 		its tool calls ([count] turns).
 	gO	List the turns in the window's |location-list|.
 	gy	Review the pending permission request (|:StrapsPermission|).
-	g?	List the session keys and every `:Straps*` command in a
-		float; `q` or `<Esc>` closes it. Shadows the built-in
-		|g?| (rot13) in session buffers.
+	g?	List the session keys, then the `:Straps*` commands grouped
+		by task (Session, Permissions, Navigation, Context,
+		Configuration, Registry, Extensions), in a float. Commands
+		for contextual authorization and context management appear
+		only while those features are enabled. On a narrow screen a
+		command's description starts on the line below its name.
+		`q` or `<Esc>` closes it. Shadows the built-in |g?| (rot13)
+		in session buffers.
 	gE	Jump to the original tool-result quote when the cursor is on
 		a claim and the session winbar shows the evidence hint.
 		Use |CTRL-O| to return. Evidence links are buffer-local and
@@ -546,12 +563,19 @@ Transcript grammar. Blocks are marker lines `%%[straps:KIND]%%` (with compact
 JSON attrs for tool blocks) followed by content; KIND is one of
 `system user assistant tool_use tool_result`. `fn.render` (|straps-fn|) draws a
 display-only layer of conceal + extmarks + folds over the raw markers; nothing
-mutates the buffer text. `:set conceallevel=0` reveals the raw markers, and
-|straps-config| `render = false` turns the whole layer off.
+mutates the buffer text. A `*.straps` file opened with |:edit| or |:buffer| gets
+the same layer the first time a window shows it. `:setlocal conceallevel=0`
+reveals the raw markers in that window until the buffer is reloaded (|:edit!|,
+or 'autoread' after another program writes the file) and shown again.
+|straps-config| `render = false` turns conceal and extmarks off (folds stay),
+and changing 'filetype' away from `straps` removes the layer and stops
+re-rendering.
 
-Closed tool folds show a muted chevron and tool name, a target when known,
-and status or count from result marker metadata. `failed` uses
-`StrapsToolError`. The fold does not infer metadata from output.
+Closed tool folds show a muted chevron and tool name, then status or count
+from result marker metadata, then a target when known. A target too wide
+for the window loses its middle to `…`, and the fold drops it when the
+label, status and count fill the window. `failed` uses `StrapsToolError`.
+The fold does not infer metadata from output.
 An override of |fn.tool_display| formats the label and target text.
 Open a tool fold with |zo| to see a muted `╭ │ ╰` bracket to the left of its
 output. The bracket uses `StrapsCardBorder` and does not enter yanked text.
@@ -566,7 +590,10 @@ Editing in the composer leaves it in place. `render = false` disables it.
 								*straps-steering*
 Edit below the `you · draft` header at the end of the transcript. The muted
 `draft` label is display-only. Streaming writes above the composer. The draft
-stays out of requests until sent.
+stays out of requests until sent. If you delete the separator line, Straps
+keeps the remaining text in the draft. Reopening the composer, writing to the
+transcript from Straps, or saving the whole buffer with `:write` restores the
+separator.
 Press normal-mode <CR> to queue it for the next turn boundary during a run
 or start a turn when idle. Normal-mode <S-CR> (|:StrapsSendNow|) submits the
 text captured at the keypress after the active run ends. Edits made while
@@ -575,7 +602,7 @@ waiting stay in the draft. This does not undo tools that ran.
 The harness steers through |fn.session_notify|: a subagent completion notice
 reaches a busy parent this way, without the
 "steering queued" toast a message you typed produces. Each queued entry records
-its source: `user` (you), `harness` (a notice), or `agent` (|send_message|).
+its source: `user` (you), `harness` (a notice), or `agent` (`send_message`).
 Any queued entry ends a `spawn_wait` early, so a waiting agent reads it at
 once. Steering you send, and any run you start, re-arms |watch_agent| wakes
 for that session.
@@ -616,6 +643,10 @@ raw — an unset override says nothing about the effective value — so build
 statusline/winbar components on session_info rather than on b:straps_model.
 `ui.session_status()`, `ui.usage_status()` and `ui.session_winbar()` all take
 the same optional bufnr, and `ui.human_tokens(n)` formats a token count.
+The ratchet appears first in the right-aligned group of the stock statusline
+in Straps sessions. It tightens once on a successful run. Add
+`%{v:lua.require'straps.ui'.ratchet_status()}` to a custom statusline to display
+it there.
 Note a GLOBAL tabline cannot resolve the session implicitly: %{} there (and
 bufnr() inside it) evaluates in the current window's context. Pass a bufnr
 from a Lua component framework, or use `ui.agents_status()`.
@@ -625,21 +656,36 @@ PERMISSION REVIEW				*straps-permission-review*
 With `permission_review = "deferred"` (the default), a run's permission
 requests wait without taking focus. Each pending request, from any session,
 is a row in the corner float at the top right of the current tab:
-	◆ <session> · allow <tool> <target>
-	◆ <session> · consent <tool> · expires in <n>m
-	◆ <session> · consent <tool> · queued · expires in <n>m
-Rows show the first line of each field with control characters made
-printable. The float cannot be focused, is outside |CTRL-W_w|, moves to the
-current tab on |TabEnter|, and re-opens on the next update when |:only| or
-|:tabclose| closes it. The waiting session shows
+	◆ allow <tool> <target> · <session>
+	◆ consent <tool> · expires in <n>m · <session>
+	◆ consent <tool> · queued · expires in <n>m · <session>
+<session> is the transcript filename, or `<title> (<filename>)` for a title
+set with |:StrapsRename| (the rows skip generated titles). The target and
+<session> show control characters as printable text and a newline as `^@`;
+the tool name and the consent label show their first line. A row too wide
+for the screen shortens the request in the middle to no less than half the
+row (at least 20 cells), then shortens the title, then drops it, and last
+shortens the filename. The float cannot be focused, is outside |CTRL-W_w|,
+sits one row lower when it would cover a top-row window's 'winbar', moves
+to the current tab on |TabEnter|, and re-opens on the next update when |:only|
+or |:tabclose| closes it. The waiting session shows
 `◆ waiting: allow <tool> <target> · gy review` above its draft, or before the
-pending batch when it has no draft.
+pending batch when it has no draft. Straps shortens a request wider than the
+window in the middle with `…`; a window too narrow for the suffix shows
+`◆ gy review`.
 
 `gy` in a session buffer and |:StrapsPermission| from any window open the
 review float: the session's own request, then one from its subagents, then
 the oldest. A review from another tab moves the float to the current tab.
-When the call has more rows than the float, wrapped rows included, the
-footer starts with `<n> of <m> rows shown, scroll`. Keys in the review float:
+For a file edit the float lists the grant directories, `path: <file>`, the
+proposed diff against the file as it is when the review opens (inside a
+batch, against the earlier calls' result), a blank line, then the call's
+fields. The diff appears only when the current window's directory matches
+the one the call runs in and the edit changes the file; otherwise the float
+shows the grant directories and the fields. Control characters show as `^X`
+text and newlines as `^@`. When the call has more rows than the float, wrapped
+rows included, the footer starts with `<n> of <m> rows shown, scroll`. Keys in
+the review float:
 	y n d p a l	The choices in the footer. `y` allows once and `n`
 			denies. A file edit offers `d` (its directory), `p`
 			(its project, when it has one) and `a` (all edits).
@@ -688,17 +734,19 @@ In both modes a custom |hook.confirm| controls its own display. Inside a run,
 a custom hook can list and defer its request by calling
 `require("straps.dock").confirm(ctx, present, spec)`, where `present` is a
 function that prompts and returns the choice index and `spec` is optional.
-`spec` is a table `{ name, target, title, preview, choices }` whose
-`choices` are `{ key, label, index }` tables. The row reads
-`allow <name> <target>`; without `spec`, or with a `spec` that has no
-`name`, it reads `allow (custom hook.confirm)`. In "deferred" mode review
-opens the review float from `spec`, and a key returns its `index`. Each
-`key` must be one printable ASCII character other than space, distinct, and
-not `g`, `i` or `q`, and `choices` must not be empty; otherwise review
-calls `present` instead. Without `spec`, review calls `present`. In "modal"
-mode
-`dock.confirm` defers only while the session dock is visible, and review
-calls `present`; otherwise it calls `present` at once.
+`spec` is a table `{ name, target, title, preview, choices, grants, fields }`
+whose `choices` are `{ key, label, index }` tables. `grants` (a list of
+lines) and `fields` (a string) are optional; the default hook sets them for
+file edits so the float can place the diff between them. Without them the
+float shows `preview`. The row reads `allow <name> <target>`; without
+`spec`, or with a `spec` that has no `name`, it reads
+`allow (custom hook.confirm)`. In "deferred" mode review opens the review
+float from `spec`, and a key returns its `index`. Each `key` must be one
+printable ASCII character other than space, distinct, and not `g`, `i` or
+`q`, and `choices` must not be empty; otherwise review calls `present` instead.
+Without `spec`, review calls `present`. In "modal" mode `dock.confirm` defers
+only while the session dock is visible, and review calls `present`; otherwise
+it calls `present` at once.
 
 ==============================================================================
 5. CONFIGURATION					*straps-config*
@@ -837,6 +885,10 @@ auto_compact_bytes	context passes this threshold. Both off by default.
 render			(boolean) true. Master switch for the |fn.render|
 			presentation layer.
 tools_expanded		(boolean) false. Fold tool blocks OPEN by default.
+findings_diagnostics	(boolean) true. `set_findings` from a session with a
+			window also marks each location with an INFO diagnostic
+			(source `straps`); the next `set_findings` replaces
+			them. The agent's diagnostics tools ignore them.
 session_winbar		(boolean) true. Window-local model/status winbar on
 			session windows. The dock retains its identity and
 			permission labels when this is false.
@@ -1123,8 +1175,9 @@ hook.confirm(name, input, ctx, call_id?) -> allowed, reason, source
 		/ Always all edits). Inside a run the prompt waits in
 		the corner float (|straps-permission-review|) unless
 		`permission_review = "modal"`. For pending file edits,
-		open the diff with |:StrapsInspect| or `i` in the review
-		float, and decide with `gy` or |:StrapsPermission|.
+		the review float shows the diff above the fields;
+		|:StrapsInspect| or `i` in the review float opens it
+		in a split. Decide with `gy` or |:StrapsPermission|.
 		"Always all edits" (`editfiles:*`) covers every |fn.capability|
 		`edit` call, including bulk_replace, rename_symbol, format,
 		move_file(s), undo_edit and code_action with an index; those
@@ -1284,7 +1337,7 @@ fn.session_notify({bufnr}, {text}, {opts})
 		toast, for messages the user did not type; `source` labels the
 		queued entry "harness" (default), "agent" or "user". Returns
 		"steer", "append", or nil for an invalid buffer or empty text.
-		Shared by |fn.autocmd_bridge|, |send_message| and
+		Shared by |fn.autocmd_bridge|, `send_message` and
 		|hook.on_run_end.notify_parent|, so redefining it changes every
 		harness-to-agent channel at once.
 
@@ -1560,7 +1613,7 @@ fn.readonly_policy(name, input) -> boolean
 fn.system_prompt(opts?)		Compose the system prompt from its layers:
 				fn.system_prompt_core / _env / _project /
 				_skills, each redefinable on its own. opts
-				(from |tool.spawn| via state.new_session) go
+				(from `tool.spawn` via state.new_session) go
 				to the core layer, which reshapes the prompt
 				for a subagent: # Subagents dropped unless
 				the child has depth budget and may pass its
@@ -2126,7 +2179,7 @@ Awareness, before the collision:
 
 						*straps-models-tool*
 models		Tool. Lists the models available to this session: each id
-		exactly as |tool.spawn|'s `model` argument takes it, its
+		exactly as `tool.spawn`'s `model` argument takes it, its
 		capability/cost label, its context window, and the effort
 		names, with the session's active model marked. Reads the
 		configured/discovered catalog for the active provider (no

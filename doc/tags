@@ -12,6 +12,7 @@
 :StrapsContinue	straps.txt	/*:StrapsContinue*
 :StrapsEdit	straps.txt	/*:StrapsEdit*
 :StrapsEffort	straps.txt	/*:StrapsEffort*
+:StrapsEgg	straps.txt	/*:StrapsEgg*
 :StrapsEval	straps.txt	/*:StrapsEval*
 :StrapsHelp	straps.txt	/*:StrapsHelp*
 :StrapsInspect	straps.txt	/*:StrapsInspect*
@@ -25,6 +26,7 @@
 :StrapsRegistry	straps.txt	/*:StrapsRegistry*
 :StrapsRename	straps.txt	/*:StrapsRename*
 :StrapsResume	straps.txt	/*:StrapsResume*
+:StrapsResume!	straps.txt	/*:StrapsResume!*
 :StrapsSearch	straps.txt	/*:StrapsSearch*
 :StrapsSend	straps.txt	/*:StrapsSend*
 :StrapsSendNow	straps.txt	/*:StrapsSendNow*

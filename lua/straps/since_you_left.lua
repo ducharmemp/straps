@@ -37,8 +37,8 @@ function M.window(buf)
 end
 
 local function composing(win, buf)
-  local row = require("straps.state").draft_row(buf)
-  return row and api.nvim_win_get_cursor(win)[1] > row
+  local row = require("straps.state").transcript_end(buf)
+  return api.nvim_win_get_cursor(win)[1] > row
 end
 
 function M.preserve_view(buf)
@@ -140,7 +140,7 @@ function M.setup(render)
       if rendering() and vim.b[ev.buf].straps_session == true and shows(win, ev.buf) then
         views[ev.buf] = views[ev.buf] or {}
         views[ev.buf][win] = vim.fn.winsaveview()
-        views[ev.buf][win].draft = require("straps.state").draft_row(ev.buf)
+        views[ev.buf][win].draft = require("straps.state").transcript_end(ev.buf)
       end
     end,
   })

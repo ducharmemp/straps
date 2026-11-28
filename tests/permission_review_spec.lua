@@ -298,7 +298,7 @@ describe("display", function()
     arrive(buf)
     local lines = list_lines()
     assert.are.equal(1, #lines)
-    assert(lines[1]:find("echo a", 1, true) and not lines[1]:find("echo b", 1, true), lines[1])
+    assert(lines[1]:find("allow bash echo a^@echo b · ", 1, true), lines[1])
   end)
 
   it("notifies when the float cannot render", function()
@@ -1768,7 +1768,7 @@ describe("bulk_replace review", function()
     assert.are.equal("FOO", vim.fn.readfile(victim)[1])
   end)
 
-  it("puts the grant directories before the call's fields in a file edit's preview", function()
+  it("puts the grant directories first in a file edit's review float", function()
     local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
     local buf, win = session({ { type = "tool_use", id = "sp1", name = "write_file",
@@ -1942,5 +1942,591 @@ describe("review float and corner float edge cases", function()
     assert.are.equal(1, presented)
     assert.are.equal(1, choice)
     assert.are.equal(0, #review.entries())
+  end)
+end)
+
+describe("edit review float diff", function()
+  local CALC = { "local M = {}", "function M.add(a, b)", "  return a + b", "end", "return M" }
+
+  local function calc_file()
+    local dir = vim.fn.resolve(vim.fn.tempname())
+    vim.fn.mkdir(dir, "p")
+    local path = dir .. "/calc.lua"
+    vim.fn.writefile(CALC, path)
+    return dir, path
+  end
+
+  local function edit(id, path, old, new)
+    return { type = "tool_use", id = id, name = "edit_file", input = { path = path, old_string = old, new_string = new } }
+  end
+
+  local function float_lines()
+    return api.nvim_buf_get_lines(api.nvim_win_get_buf(review.review_window()), 0, -1, false)
+  end
+
+  local function index_of(lines, wanted)
+    for i, line in ipairs(lines) do
+      if line == wanted then return i end
+    end
+  end
+
+  local function open(buf, win)
+    loop.start(buf)
+    arrive(buf)
+    api.nvim_set_current_win(win)
+    press("gy")
+    assert(review.review_window(), "no review float")
+  end
+
+  it("lists the grants, the path, the diff, then the call's fields", function()
+    local dir, path = calc_file()
+    local buf, win = session({ edit("o1", path, "return a + b", "return (a or 0) + (b or 0)") })
+    open(buf, win)
+    local lines = float_lines()
+    assert.are.equal("d: always in " .. dir, lines[1])
+    local at_path = index_of(lines, "path: " .. path)
+    local at_minus = index_of(lines, "-  return a + b")
+    local at_plus = index_of(lines, "+  return (a or 0) + (b or 0)")
+    local at_field
+    for i, line in ipairs(lines) do
+      if vim.startswith(line, "old_string:") then at_field = i end
+    end
+    assert(at_path and at_minus and at_plus and at_field, table.concat(lines, "\n"))
+    assert(at_path < at_minus and at_minus < at_plus and at_plus < at_field, table.concat(lines, "\n"))
+    local float = review.review_window()
+    local fbuf = api.nvim_win_get_buf(float)
+    local function groups(row)
+      local found = {}
+      for _, m in ipairs(api.nvim_buf_get_extmarks(fbuf, -1, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+        found[#found + 1] = m[4].hl_group
+      end
+      return table.concat(found, ",")
+    end
+    assert.are.equal("Removed", groups(at_minus))
+    assert.are.equal("Added", groups(at_plus))
+    assert.are.equal("", groups(at_field))
+    assert.are_not.equal("diff", vim.bo[fbuf].syntax)
+    assert.are.equal("↪ ", api.nvim_get_option_value("showbreak", { win = float, scope = "local" }))
+    press("n")
+    assert(finished(buf))
+  end)
+
+  it("diffs against the file as it is when the review opens", function()
+    local _, path = calc_file()
+    local buf, win = session({ edit("c1", path, "return a + b", "return a - b") })
+    loop.start(buf)
+    arrive(buf)
+    local changed = vim.deepcopy(CALC)
+    changed[2] = "function M.add(a, b, c)"
+    vim.fn.writefile(changed, path)
+    api.nvim_set_current_win(win)
+    press("gy")
+    local lines = float_lines()
+    assert(index_of(lines, " function M.add(a, b, c)"), table.concat(lines, "\n"))
+    press("n")
+    assert(finished(buf))
+  end)
+
+  it("inside a batch, diffs against the earlier call's result", function()
+    local _, path = calc_file()
+    local buf, win = session({
+      edit("b1", path, "return a + b", "return a + b + 1"),
+      edit("b2", path, "return a + b + 1", "return a + b + 2"),
+    })
+    open(buf, win)
+    press("y")
+    assert(vim.wait(2000, function()
+      local entry = pending_for(buf)
+      return entry and entry.spec and entry.spec.fields and entry.spec.fields:find("b + 2", 1, true) ~= nil
+    end, 10))
+    settle()
+    api.nvim_set_current_win(win)
+    press("gy")
+    local lines = float_lines()
+    assert(index_of(lines, "-  return a + b + 1"), table.concat(lines, "\n"))
+    assert(index_of(lines, "+  return a + b + 2"), table.concat(lines, "\n"))
+    press("n")
+    assert(finished(buf))
+  end)
+
+  it("shows NUL and ESC in a diff line as printable text", function()
+    local _, path = calc_file()
+    local buf, win = session({ edit("x1", path, "return a + b", "x\0y\27z") })
+    open(buf, win)
+    local lines = float_lines()
+    assert(index_of(lines, "+  x^@y^[z"), table.concat(lines, "\n"))
+    for _, line in ipairs(lines) do
+      assert.is_nil(line:find("[%z\27]"), line)
+    end
+    press("n")
+    assert(finished(buf))
+  end)
+
+  it("shows a newline in the path or directory as ^@ on one line", function()
+    local dir = vim.fn.resolve(vim.fn.tempname()) .. "/odd\ndir"
+    vim.fn.mkdir(dir, "p")
+    local path = dir .. "/a\nb"
+    local buf, win = session({ { type = "tool_use", id = "w1", name = "write_file", input = { path = path, content = "new" } } })
+    open(buf, win)
+    local lines = float_lines()
+    assert.are.equal("d: always in " .. dir:gsub("\n", "^@"), lines[1])
+    assert(index_of(lines, "path: " .. path:gsub("\n", "^@")), table.concat(lines, "\n"))
+    press("n")
+    assert(finished(buf))
+  end)
+
+  it("modal mode gives confirm() one button per choice when the directory contains a newline", function()
+    straps.config.permission_review = "modal"
+    local seen
+    vim.fn.confirm = function(_, choices)
+      seen = choices
+      confirms = confirms + 1
+      return 2
+    end
+    local dir = vim.fn.resolve(vim.fn.tempname()) .. "/odd\ndir"
+    vim.fn.mkdir(dir, "p")
+    local buf = session({ { type = "tool_use", id = "m2", name = "write_file", input = { path = dir .. "/f", content = "x" } } })
+    loop.start(buf)
+    arrive(buf)
+    vim.cmd("StrapsPermission")
+    assert(finished(buf))
+    assert(seen, "confirm was not called")
+    local buttons = vim.split(seen, "\n", { plain = true })
+    assert.are.equal(4, #buttons, seen)
+    assert(buttons[3]:find("odd^@dir", 1, true), seen)
+  end)
+
+  it("colors only the diff rows, not field lines shaped like a hunk", function()
+    local _, path = calc_file()
+    local buf, win = session({ edit("o9", path, "return a + b", "ok\n@@ -1 +1 @@\n-  safe()\n+  safe()") })
+    open(buf, win)
+    local lines = float_lines()
+    local fbuf = api.nvim_win_get_buf(review.review_window())
+    local blank = index_of(lines, "")
+    assert(blank, table.concat(lines, "\n"))
+    local colored, fake = 0, 0
+    for _, m in ipairs(api.nvim_buf_get_extmarks(fbuf, -1, 0, -1, {})) do
+      if m[2] + 1 < blank then colored = colored + 1 else fake = fake + 1 end
+    end
+    assert(colored > 0, table.concat(lines, "\n"))
+    assert.are.equal(0, fake)
+    press("n")
+  end)
+
+  it("keeps the field listing when the review opens from a window with another directory", function()
+    local _, path = calc_file()
+    local buf, win = session({ edit("l1", path, "return a + b", "return a * b") })
+    loop.start(buf)
+    arrive(buf)
+    api.nvim_set_current_win(win)
+    vim.cmd("lcd " .. vim.fn.fnameescape(vim.fn.tempname():match("^(.*)/")))
+    press("gy")
+    local lines = float_lines()
+    assert.is_nil(index_of(lines, "-  return a + b"), table.concat(lines, "\n"))
+    local has_field = false
+    for _, line in ipairs(lines) do has_field = has_field or vim.startswith(line, "old_string:") end
+    assert(has_field, table.concat(lines, "\n"))
+    assert.are.equal(0, #api.nvim_buf_get_extmarks(api.nvim_win_get_buf(review.review_window()), -1, 0, -1, {}))
+    vim.cmd("lcd -")
+    press("n")
+    assert(finished(buf))
+  end)
+
+  local function footer_rows(float)
+    local cfg = api.nvim_win_get_config(float)
+    local footer = type(cfg.footer) == "table" and cfg.footer[1][1] or cfg.footer
+    return tonumber(footer:match(" %d+ of (%d+) rows shown")), footer
+  end
+
+  it("counts wrapped double-width rows the way the window draws them", function()
+    local lines, columns = vim.o.lines, vim.o.columns
+    local ok, err = pcall(function()
+      local _, path = calc_file()
+      local buf, win = session({ edit("dw1", path, "return a + b", vim.fn.join(vim.fn["repeat"]({ ("あ"):rep(38) }, 10), "\n")) })
+      loop.start(buf)
+      arrive(buf)
+      api.nvim_set_current_win(win)
+      vim.o.columns, vim.o.lines = 41, 14
+      press("gy")
+      local float = review.review_window()
+      local total, footer = footer_rows(float)
+      assert(total, footer)
+      assert.are.equal(api.nvim_win_text_height(float, {}).all, total)
+      vim.o.columns = 37
+      vim.api.nvim_exec_autocmds("VimResized", {})
+      total, footer = footer_rows(float)
+      assert(total, footer)
+      assert(api.nvim_win_get_width(float) <= vim.o.columns - 2, "float wider than the screen after resize")
+      assert.are.equal(api.nvim_win_text_height(float, {}).all, total)
+      press("n")
+      assert(finished(buf))
+    end)
+    vim.o.lines, vim.o.columns = lines, columns
+    assert(ok, tostring(err))
+  end)
+
+  it("wraps and counts rows when the review opens from a nowrap window", function()
+    local lines, columns = vim.o.lines, vim.o.columns
+    local ok, err = pcall(function()
+      local _, path = calc_file()
+      local buf, win = session({ edit("nw1", path, "return a + b", ("long "):rep(120)) })
+      loop.start(buf)
+      arrive(buf)
+      api.nvim_set_current_win(win)
+      vim.wo[win][0].wrap = false
+      vim.o.columns, vim.o.lines = 60, 14
+      press("gy")
+      local float = review.review_window()
+      assert.is_true(vim.wo[float].wrap)
+      local total, footer = footer_rows(float)
+      assert(total, footer)
+      assert.are.equal(api.nvim_win_text_height(float, {}).all, total)
+      press("n")
+      assert(finished(buf))
+    end)
+    vim.o.lines, vim.o.columns = lines, columns
+    assert(ok, tostring(err))
+  end)
+
+  it("forgets the entry after the decision", function()
+    local _, path = calc_file()
+    local buf, win = session({ edit("f1", path, "return a + b", "return b + a") })
+    open(buf, win)
+    local entry = pending_for(buf)
+    assert(workbench.review_diff(entry))
+    assert.are.equal(1, workbench._review_record_count())
+    press("n")
+    assert(finished(buf))
+    assert.are.equal(0, workbench._review_record_count())
+    assert.is_nil(workbench.review_diff(entry))
+  end)
+end)
+
+describe("corner float position and waiting line width", function()
+  local function plain()
+    vim.cmd("silent! tabonly! | silent! only! | enew!")
+    vim.wo[0][0].winbar = ""
+  end
+
+  local function top()
+    local stal = vim.o.showtabline
+    return (stal == 2 or (stal == 1 and #api.nvim_list_tabpages() > 1)) and 1 or 0
+  end
+
+  local function row()
+    settle()
+    return api.nvim_win_get_config(review.list_window() or -1).row
+  end
+
+  local function waiting(buf)
+    settle()
+    local ns = api.nvim_get_namespaces().straps_permission_review
+    local marks = api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })
+    return marks[1] and marks[1][4].virt_lines[1][1][1]
+  end
+
+  it("moves one row down when the top-right window has a winbar, and back when it does not", function()
+    plain()
+    local buf = session({ bash("p1", "true") }, true)
+    loop.start(buf)
+    arrive(buf)
+    assert.are.equal(top(), row())
+    vim.wo[0][0].winbar = "bar"
+    assert.are.equal(top() + 1, row())
+    vim.wo[0][0].winbar = ""
+    assert.are.equal(top(), row())
+  end)
+
+  it("moves down when the top-right window of the current layout has a winbar", function()
+    plain()
+    local buf = session({ bash("p2", "true") }, true)
+    loop.start(buf)
+    arrive(buf)
+    local plain = api.nvim_get_current_win()
+    vim.cmd("vsplit")
+    local right = api.nvim_get_current_win()
+    vim.cmd("wincmd L")
+    vim.wo[right][0].winbar = "bar"
+    api.nvim_set_current_win(plain)
+    assert.are.equal(top() + 1, row())
+    api.nvim_win_close(right, true)
+    assert.are.equal(top(), row())
+  end)
+
+  it("moves down for a left window's winbar only when the float reaches over it", function()
+    plain()
+    local columns = vim.o.columns
+    local ok, err = pcall(function()
+      local buf = session({ bash("p3", "true") }, true)
+      loop.start(buf)
+      arrive(buf)
+      local left = api.nvim_get_current_win()
+      vim.cmd("rightbelow vsplit")
+      api.nvim_win_set_width(0, 60)
+      vim.wo[left][0].winbar = "bar"
+      assert(api.nvim_win_get_width(review.list_window() or -1) + 2 < api.nvim_win_get_width(api.nvim_get_current_win()))
+      assert.are.equal(top(), row())
+      loop.stop(buf)
+      assert(finished(buf))
+      local wide = session({ bash("p4", "echo " .. ("w"):rep(90)) }, true)
+      loop.start(wide)
+      arrive(wide)
+      assert.are.equal(top() + 1, row())
+    end)
+    vim.o.columns = columns
+    assert(ok, tostring(err))
+  end)
+
+  it("a floating window with a winbar does not move the float", function()
+    plain()
+    local buf = session({ bash("p5", "true") }, true)
+    loop.start(buf)
+    arrive(buf)
+    local scratch = api.nvim_create_buf(false, true)
+    local float = api.nvim_open_win(scratch, false, { relative = "editor", row = 0, col = vim.o.columns - 10, width = 8, height = 2 })
+    vim.wo[float][0].winbar = "bar"
+    review.changed()
+    assert.are.equal(top(), row())
+    api.nvim_win_close(float, true)
+  end)
+
+  it("fits the waiting line into a 50-column split and keeps the gy review suffix", function()
+    plain()
+    local buf, win = session({ bash("w1", "echo " .. ("long-argument-"):rep(8)) })
+    plain()
+    api.nvim_win_set_buf(0, buf)
+    win = api.nvim_get_current_win()
+    vim.cmd("vsplit")
+    api.nvim_win_set_buf(0, api.nvim_create_buf(false, true))
+    api.nvim_win_set_width(win, 50)
+    vim.wo[win][0].number = true
+    loop.start(buf)
+    arrive(buf)
+    local line = waiting(buf)
+    local info = vim.fn.getwininfo(win)[1]
+    assert(info.textoff > 0, "number column")
+    assert(vim.fn.strdisplaywidth(line) <= api.nvim_win_get_width(win) - info.textoff, line)
+    assert(vim.endswith(line, " · gy review"), line)
+    assert(vim.startswith(line, "◆ waiting: allow b"), line)
+    assert(line:find("…", 1, true), line)
+  end)
+
+  it("shows only ◆ gy review in a 12-column split", function()
+    plain()
+    local buf, win = session({ bash("w2", "echo narrow") })
+    plain()
+    api.nvim_win_set_buf(0, buf)
+    win = api.nvim_get_current_win()
+    vim.cmd("vsplit")
+    api.nvim_win_set_width(win, 12)
+    loop.start(buf)
+    arrive(buf)
+    assert.are.equal("◆ gy review", waiting(buf))
+  end)
+
+  it("opening the review float renders the corner float at most twice", function()
+    plain()
+    local buf, win = session({ bash("r1", "true") })
+    loop.start(buf)
+    arrive(buf)
+    api.nvim_set_current_win(win)
+    local real, count = review._render, 0
+    review._render = function(...)
+      count = count + 1
+      return real(...)
+    end
+    local ok, err = pcall(function()
+      press("gy")
+      assert(review.review_window())
+      vim.wait(300, function() return false end, 10)
+    end)
+    review._render = real
+    assert(ok, tostring(err))
+    assert(count <= 2, "rendered " .. count .. " times")
+    press("n")
+    assert(finished(buf))
+  end)
+end)
+
+describe("session titles in the permission UI", function()
+  local function plain()
+    vim.cmd("silent! tabonly! | silent! only! | enew!")
+  end
+
+  local function meta(buf, fields)
+    vim.fn.writefile({ vim.json.encode(fields) }, api.nvim_buf_get_name(buf) .. ".meta")
+  end
+
+  local function saved(buf)
+    state.persist(buf)
+    assert(vim.fn.filereadable(api.nvim_buf_get_name(buf)) == 1)
+  end
+
+  local function row_of(buf)
+    review.changed()
+    settle()
+    for _, line in ipairs(list_lines() or {}) do
+      if line:find(ui.session_label(buf), 1, true) or line:find("…", 1, true) then return line end
+    end
+    return (list_lines() or {})[1]
+  end
+
+  it("an untitled session's row puts the request first and ends with the filename", function()
+    plain()
+    local buf = session({ bash("t1", "echo untitled") }, true)
+    loop.start(buf)
+    arrive(buf)
+    assert.are.equal("◆ allow bash echo untitled · " .. ui.session_label(buf), row_of(buf))
+  end)
+
+  it(":StrapsRename shows the title with the filename on the row and the review title", function()
+    plain()
+    local buf, win = session({ bash("t2", "echo titled") })
+    loop.start(buf)
+    arrive(buf)
+    saved(buf)
+    ui.rename_session(buf, "Fix calc")
+    settle()
+    local line = list_lines()[1]
+    assert.are.equal("◆ allow bash echo titled · Fix calc (" .. ui.session_label(buf) .. ")", line)
+    api.nvim_set_current_win(win)
+    press("gy")
+    local title = api.nvim_win_get_config(review.review_window()).title
+    title = type(title) == "table" and title[1][1] or title
+    assert.are.equal(" allow bash · Fix calc (" .. ui.session_label(buf) .. ") ", title)
+    press("n")
+    assert(finished(buf))
+  end)
+
+  it("a renamer-generated title shows the filename only", function()
+    plain()
+    local buf = session({ bash("t3", "echo gen") }, true)
+    loop.start(buf)
+    arrive(buf)
+    saved(buf)
+    meta(buf, { title = "Generated", generated_by = "straps_renamer", generated_title = "Generated" })
+    assert.are.equal("◆ allow bash echo gen · " .. ui.session_label(buf), row_of(buf))
+    meta(buf, { title = "Edited by hand", generated_by = "straps_renamer", generated_title = "Generated" })
+    assert.are.equal("◆ allow bash echo gen · Edited by hand (" .. ui.session_label(buf) .. ")", row_of(buf))
+  end)
+
+  it("a .meta rewrite by another writer updates the row on the next render", function()
+    plain()
+    local buf = session({ bash("t4", "echo w") }, true)
+    loop.start(buf)
+    arrive(buf)
+    saved(buf)
+    meta(buf, { title = "First" })
+    assert(row_of(buf):find("First (", 1, true))
+    meta(buf, { title = "Other" })
+    assert(row_of(buf):find("Other (", 1, true))
+  end)
+
+  it("a same-size .meta rewrite with an unchanged mtime still updates the row", function()
+    plain()
+    local buf = session({ bash("t4b", "echo s") }, true)
+    loop.start(buf)
+    arrive(buf)
+    saved(buf)
+    local mp = require("straps.state").session_meta_path(api.nvim_buf_get_name(buf))
+    local tick = os.time()
+    meta(buf, { title = "First" })
+    vim.uv.fs_utime(mp, tick, tick)
+    local before = vim.uv.fs_stat(mp)
+    assert(row_of(buf):find("First (", 1, true))
+    meta(buf, { title = "Other" })
+    vim.uv.fs_utime(mp, tick, tick)
+    local after = vim.uv.fs_stat(mp)
+    assert.are.equal(before.ino, after.ino)
+    assert.are.equal(before.size, after.size)
+    assert(row_of(buf):find("Other (", 1, true), row_of(buf))
+  end)
+
+  it("a .meta dated in the future is read once, then served from the cache", function()
+    plain()
+    local buf = session({ bash("t4c", "echo f") }, true)
+    loop.start(buf)
+    arrive(buf)
+    saved(buf)
+    local st = require("straps.state")
+    local mp = st.session_meta_path(api.nvim_buf_get_name(buf))
+    meta(buf, { title = "Future" })
+    local later = os.time() + 60
+    vim.uv.fs_utime(mp, later, later)
+    local real, reads = st.session_title_meta, 0
+    st.session_title_meta = function(...) reads = reads + 1; return real(...) end
+    local first, second = require("straps.ui").session_title(buf), require("straps.ui").session_title(buf)
+    st.session_title_meta = real
+    assert(first:find("Future", 1, true), first)
+    assert.are.equal(first, second)
+    assert.are.equal(1, reads)
+  end)
+
+  it("the row keeps the filename after :file renames an untitled session", function()
+    plain()
+    local buf = session({ bash("t5", "echo r") }, true)
+    loop.start(buf)
+    arrive(buf)
+    review.changed()
+    settle()
+    api.nvim_buf_set_name(buf, vim.fn.tempname() .. "/renamed.straps")
+    assert(vim.endswith(row_of(buf), "· renamed.straps"), row_of(buf))
+  end)
+
+  it("a title lookup that raises falls back to the filename in the row and in ui.session_title", function()
+    plain()
+    local buf = session({ bash("t6", "echo raise") }, true)
+    loop.start(buf)
+    arrive(buf)
+    local real = state.session_title_meta
+    state.session_title_meta = function() error("boom") end
+    local ok, err = pcall(function()
+      saved(buf)
+      meta(buf, { title = "Never" })
+      assert.are.equal("◆ allow bash echo raise · " .. ui.session_label(buf), row_of(buf))
+      assert.are.equal(ui.display_text(ui.session_label(buf)), ui.session_title(buf))
+    end)
+    state.session_title_meta = real
+    assert(ok, tostring(err))
+  end)
+
+  it("a long request keeps the filename and at least 20 request cells at 80 and 50 columns", function()
+    plain()
+    local columns = vim.o.columns
+    local ok, err = pcall(function()
+      local buf = session({ bash("t7", "echo " .. ("x"):rep(100)) }, true)
+      loop.start(buf)
+      arrive(buf)
+      saved(buf)
+      meta(buf, { title = ("T"):rep(40) })
+      for _, width in ipairs({ 80, 50 }) do
+        vim.o.columns = width
+        local line = row_of(buf)
+        local request = line:match("^◆ (.-) · ")
+        assert(request and vim.fn.strdisplaywidth(request) >= 20, line)
+        assert(vim.fn.strdisplaywidth(line) <= width - 4, line)
+        assert(line:find(ui.session_label(buf):sub(-10), 1, true) or line:find("…)", 1, true), line)
+      end
+      for _, width in ipairs({ 24, 26 }) do
+        vim.o.columns = width
+        local line = row_of(buf)
+        local request = line:match("^◆ (.-) · ")
+        assert(request, line)
+        assert.are.equal(1, select(2, request:gsub("…", "")), line)
+        assert(vim.fn.strdisplaywidth(line) <= math.max(20, width - 4), line)
+      end
+      vim.o.columns = 80
+      assert(vim.endswith(row_of(buf), "(" .. ui.session_label(buf) .. ")"), row_of(buf))
+    end)
+    vim.o.columns = columns
+    assert(ok, tostring(err))
+  end)
+
+  it("a request that fits is not cut", function()
+    plain()
+    local buf = session({ bash("t8", "echo " .. ("y"):rep(20)) }, true)
+    loop.start(buf)
+    arrive(buf)
+    assert.are.equal("◆ allow bash echo " .. ("y"):rep(20) .. " · " .. ui.session_label(buf), row_of(buf))
   end)
 end)

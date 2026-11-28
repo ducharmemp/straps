@@ -741,10 +741,9 @@ function M.register()
       .. " with 1-based line/col and SEVERITY one of ERROR/WARN/INFO/HINT."
       .. " Returns 'no diagnostics' when there are none. With quickfix=true it"
       .. " also loads the reported diagnostics into this session's findings list"
-      .. " (the session window's location list when on-screen, else the global"
-      .. " quickfix list; title 'straps: diagnostics'), so the user can jump"
-      .. " through them with :lnext/:lprev (or :cnext/:cprev when it fell back);"
-      .. " the returned text is unchanged. Parameters: path"
+      .. " (the session window's location list when on-screen, else the"
+      .. " session's private store; title 'straps: diagnostics'); the returned"
+      .. " text is unchanged. Findings set by set_findings are not reported. Parameters: path"
       .. " (optional) — file to inspect; omit to scan all loaded buffers; quickfix"
       .. " (optional boolean) — also populate the findings list.",
     input_schema = {
@@ -782,7 +781,7 @@ return function(input, ctx)
     local lines, items = {}, {}
     for _, buf in ipairs(bufs) do
       local name = vim.api.nvim_buf_get_name(buf)
-      local diags = vim.diagnostic.get(buf) or {}
+      local diags = require("straps.findings").agent_diagnostics(buf)
       for _, d in ipairs(diags) do
         local severity = names[d.severity] or "UNKNOWN"
         local source = (d.source and d.source ~= "") and (" [" .. d.source .. "]") or ""
@@ -800,7 +799,7 @@ return function(input, ctx)
     end
     -- Optionally land the reported diagnostics in this session's findings list
     -- (its window's location list when on-screen — isolated from other
-    -- sessions — else the global quickfix list). A side effect for
+    -- sessions — else the session's private store). A side effect for
     -- :lnext/:cnext; the returned text below is unchanged.
     if input and input.quickfix then
       pcall(function()
@@ -828,7 +827,7 @@ end
     doc = "Report diagnostics covering a specific file position. Returns matching"
       .. " diagnostics as file:line:col: SEVERITY message [source], or a clear"
       .. " no-diagnostic message. Use before code_action when fixing a specific"
-      .. " diagnostic. Parameters: path, line, col (all required).",
+      .. " diagnostic. Findings set by set_findings are not reported. Parameters: path, line, col (all required).",
     input_schema = {
       type = "object",
       properties = {
@@ -847,7 +846,7 @@ return function(input, ctx)
   local names = { [sev.ERROR] = "ERROR", [sev.WARN] = "WARN", [sev.INFO] = "INFO", [sev.HINT] = "HINT" }
   local name = vim.api.nvim_buf_get_name(buf)
   local out = {}
-  for _, d in ipairs(vim.diagnostic.get(buf) or {}) do
+  for _, d in ipairs(require("straps.findings").agent_diagnostics(buf)) do
     local dl0, dc0 = d.lnum or 0, d.col or 0
     if diag_covers(d, line0, col0) then
       local source = (d.source and d.source ~= "") and (" [" .. d.source .. "]") or ""
@@ -869,7 +868,8 @@ end
     doc = "Find the next or previous diagnostic in a file relative to a position."
       .. " Returns one location as file:line:col: SEVERITY message [source]."
       .. " Parameters: path, line, col; direction ('next' default or 'prev');"
-      .. " severity optional (ERROR/WARN/INFO/HINT); wrap optional boolean.",
+      .. " severity optional (ERROR/WARN/INFO/HINT); wrap optional boolean. Findings set by"
+      .. " set_findings are skipped.",
     input_schema = {
       type = "object",
       properties = {
@@ -890,7 +890,7 @@ return function(input, ctx)
   local sev = vim.diagnostic.severity
   local names = { [sev.ERROR] = "ERROR", [sev.WARN] = "WARN", [sev.INFO] = "INFO", [sev.HINT] = "HINT" }
   local want = type(input.severity) == "string" and sev[input.severity:upper()] or nil
-  local diags = vim.diagnostic.get(buf, want and { severity = want } or nil) or {}
+  local diags = require("straps.findings").agent_diagnostics(buf, want and { severity = want } or nil)
   table.sort(diags, function(a, b)
     if (a.lnum or 0) == (b.lnum or 0) then return (a.col or 0) < (b.col or 0) end
     return (a.lnum or 0) < (b.lnum or 0)
@@ -925,6 +925,7 @@ end
     name = "tool.fix_diagnostic",
     kind = "tool",
     doc = "List or apply code actions for the diagnostic at a file position."
+      .. " Findings set by set_findings are not diagnostics for this tool."
       .. " Without index, it lists fixes for diagnostics covering the position"
       .. " (read-only). With index=N, applies the Nth action via the same LSP"
       .. " WorkspaceEdit path as code_action (write, confirm-gated). Rejects WorkspaceEdit"
@@ -946,7 +947,7 @@ return function(input, ctx)
   local line0 = math.max(0, (tonumber(input.line) or 1) - 1)
   local col0 = math.max(0, (tonumber(input.col) or 1) - 1)
   local covering = {}
-  for _, d in ipairs(vim.diagnostic.get(buf) or {}) do
+  for _, d in ipairs(require("straps.findings").agent_diagnostics(buf)) do
     if diag_covers(d, line0, col0) then
       local dl0, dc0 = d.lnum or 0, d.col or 0
       local de0 = d.end_lnum or dl0
@@ -3295,14 +3296,16 @@ end
     name = "tool.set_findings",
     kind = "tool",
     doc = "Load a list of locations into this session's findings list (the"
-      .. " session window's location list when on-screen, else the global"
-      .. " quickfix list) and open it, so the user can step through them with"
-      .. " :lnext/:lprev (or :cnext/:cprev when it fell back). Use this for a set"
+      .. " session window's location list when on-screen, else the session's"
+      .. " private store) and open it, and mark each location with an INFO"
+      .. " diagnostic (source straps) the user sees in signs and ]d/[d when the"
+      .. " session has a window. A later set_findings replaces them. The"
+      .. " diagnostics tools do not report these findings. Use this for a set"
       .. " of file:line findings you assembled yourself (e.g. from reads and"
       .. " analysis) — grep already fills the findings list for searches, and"
       .. " run_quickfix does it for build/lint output, so reach for those first"
-      .. " when they apply. Read-only with respect to files (only sets the"
-      .. " findings list). Parameters: items (required) — an array of"
+      .. " when they apply. Read-only with respect to files (sets the findings"
+      .. " list and, for an on-screen session, its diagnostics). Parameters: items (required) — an array of"
       .. " {path, line?, col?, text?}; title (optional) — the list title; open"
       .. " (optional, default true) — open the findings list window.",
     input_schema = {
@@ -3344,6 +3347,9 @@ return function(input, ctx)
       }
     end
   end
+  local findings = require("straps.findings")
+  local bufnr = ctx and ctx.bufnr
+  if findings.is_session(bufnr) then findings.reset_diagnostics(bufnr) end
   if #qf == 0 then
     error("set_findings: no valid items (each needs a `path`)", 0)
   end
@@ -3351,13 +3357,14 @@ return function(input, ctx)
     or "straps: findings"
   local open = input.open
   if open == nil then open = true end
-  -- Route to THIS session's findings list (its window's location list when
-  -- on-screen — isolated from other sessions — else the global quickfix list).
-  local list_kind = require("straps.findings").set_locations(ctx and ctx.bufnr,
-    { title = title, items = qf }, open)
-  local nav = (list_kind == "loclist") and ":lnext/:lprev" or ":cnext/:cprev"
-  return ("set_findings: loaded %d entr%s (%s) — the user can step them with %s")
-    :format(#qf, #qf == 1 and "y" or "ies", title, nav)
+  local list_kind = findings.set_locations(bufnr, { title = title, items = qf }, open)
+  if findings.is_session(bufnr) then
+    if require("straps").config.findings_diagnostics ~= false and list_kind ~= findings.STORE_KIND then
+      findings.set_diagnostics(bufnr, qf)
+    end
+  end
+  return ("set_findings: loaded %d entr%s (%s); %s")
+    :format(#qf, #qf == 1 and "y" or "ies", title, findings.nav_hint(list_kind))
 end
 ]==]),
   })

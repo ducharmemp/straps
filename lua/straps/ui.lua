@@ -271,7 +271,7 @@ local TOOL_DISPLAY_SRC
 
 local function tool_display_parts(name, input)
   local ok, disp = pcall(require("straps.registry").try_call, "fn.tool_display", name, input)
-  local display = (ok and type(disp) == "string" and disp) or name
+  local display = M.display_text((ok and type(disp) == "string" and disp) or name)
   local sp = display:find(" ", 1, true)
   if sp then
     return display:sub(1, sp - 1), display:sub(sp)
@@ -282,7 +282,7 @@ end
 
 local function fold_label(value)
   if type(value) ~= "string" or not value:find("%S") then return end
-  return vim.fn.strtrans(value)
+  return M.display_text(value)
 end
 
 local function fold_target(name, input)
@@ -296,6 +296,35 @@ local function fold_target(name, input)
     return first and (first .. (command:find("[\r\n]") and " …" or ""))
   end
   if name == "glob" or name == "grep" then return fold_label(input.pattern) end
+  return fold_label(input.name)
+end
+
+function M.display_text(value)
+  if value == nil then return "" end
+  local text = type(value) == "string" and value or tostring(value)
+  return vim.fn.strtrans((text:gsub("%z", "^@")))
+end
+
+function M.truncate_middle(text, width)
+  if vim.fn.strdisplaywidth(text) <= width then return text end
+  if width < 2 then return "" end
+  local chars = vim.fn.split(text, "\\zs")
+  local room = width - 1
+  local head_room = math.floor(room / 3)
+  local head, used = {}, 0
+  for _, char in ipairs(chars) do
+    local cells = vim.fn.strdisplaywidth(char)
+    if used + cells > head_room then break end
+    head[#head + 1], used = char, used + cells
+  end
+  local tail, tail_used = {}, 0
+  for i = #chars, 1, -1 do
+    local cells = vim.fn.strdisplaywidth(chars[i])
+    if used + tail_used + cells > room then break end
+    table.insert(tail, 1, chars[i])
+    tail_used = tail_used + cells
+  end
+  return table.concat(head) .. "…" .. table.concat(tail)
 end
 
 local function empty_assistant(bufnr, b)
@@ -329,9 +358,8 @@ local function fold_result_attrs(bufnr, blocks, idx, id)
   end
 end
 
-local function tool_fold_summary(name, target, result)
+local function tool_fold_summary(name, target, result, width)
   local chunks = { { "▸ ", "StrapsRule" }, { name, "StrapsRule" } }
-  if target then chunks[#chunks + 1] = { "  " .. target, "Normal" } end
   if result then
     if type(result.is_error) == "boolean" then
       chunks[#chunks + 1] = { " · ", "StrapsRule" }
@@ -342,9 +370,17 @@ local function tool_fold_summary(name, target, result)
       chunks[#chunks + 1] = { " · count: " .. count, "StrapsRule" }
     end
   end
+  if target then
+    if width then
+      local used = 0
+      for _, chunk in ipairs(chunks) do used = used + vim.fn.strdisplaywidth(chunk[1]) end
+      target = M.truncate_middle(target, width - used - 2)
+    end
+    if target ~= "" then chunks[#chunks + 1] = { "  " .. target, "Normal" } end
+  end
   return chunks
 end
-function M._fold_summary(bufnr, start_lnum)
+function M._fold_summary(bufnr, start_lnum, width)
   local blocks = require("straps.state").list_blocks(bufnr)
   local idx, blk
   for i, b in ipairs(blocks) do
@@ -387,11 +423,11 @@ function M._fold_summary(bufnr, start_lnum)
     else
       target = fold_target(name, input)
     end
-    return tool_fold_summary(name, target, fold_result_attrs(bufnr, blocks, idx, attrs.id))
+    return tool_fold_summary(name, target, fold_result_attrs(bufnr, blocks, idx, attrs.id), width)
   end
   if blk and blk.kind == "tool_result" then
     local attrs = blk.attrs or {}
-    return tool_fold_summary("result", fold_label(attrs.id), attrs)
+    return tool_fold_summary("result", fold_label(attrs.id), attrs, width)
   end
   return { { "▸ ", "StrapsRule" }, { "⚙ tool", "StrapsTool" } }
 end
@@ -400,7 +436,10 @@ end
 --- chunk list with color). Reads v:foldstart in the current buffer.
 function M.foldtext()
   local buf = vim.api.nvim_get_current_buf()
-  return M._fold_summary(buf, vim.v.foldstart)
+  local win = vim.fn.win_getid()
+  local info = vim.fn.getwininfo(win)[1]
+  local width = vim.fn.winwidth(0) - (info and info.textoff or 0)
+  return M._fold_summary(buf, vim.v.foldstart, width)
 end
 
 -- Conceal the leading marker token on a marker line (display-only).
@@ -541,11 +580,6 @@ local function render_block(bufnr, blocks, idx, key_counts)
   end
 end
 
---- The render pass (fn.render delegates here). Idempotent: clears render_ns
---- and repopulates from state.list_blocks. Never mutates text or `modified`.
---- Skips everything (after clearing) when config.render == false; skips
---- unknown block kinds. Window-agnostic (extmarks are buffer-scoped); conceal
---- needs conceallevel=2, set when the session window opens.
 function M._render(bufnr)
   if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
     return
@@ -603,6 +637,8 @@ local function cancel_render_timer(bufnr)
   end
 end
 
+local render_now
+
 local function schedule_render(bufnr)
   local t = render_timers[bufnr]
   if not t then
@@ -610,9 +646,7 @@ local function schedule_render(bufnr)
     if not t then
       -- Handle exhaustion: fall back to a one-shot scheduled render.
       vim.schedule(function()
-        if vim.api.nvim_buf_is_valid(bufnr) then
-          require("straps.registry").try_call("fn.render", bufnr)
-        end
+        if render_attached[bufnr] and vim.api.nvim_buf_is_valid(bufnr) then render_now(bufnr) end
       end)
       return
     end
@@ -623,27 +657,24 @@ local function schedule_render(bufnr)
   t:start(RENDER_DEBOUNCE_MS, 0, function()
     vim.schedule(function()
       cancel_render_timer(bufnr)
-      if vim.api.nvim_buf_is_valid(bufnr) then
-        require("straps.registry").try_call("fn.render", bufnr)
-      end
+      if render_attached[bufnr] and vim.api.nvim_buf_is_valid(bufnr) then render_now(bufnr) end
     end)
   end)
 end
 
--- Attach the debounced renderer to a session buffer. buf_attach fires on BOTH
--- user edits and programmatic nvim_buf_set_lines (unlike TextChanged), so
--- appends and hand-edits both refresh. Idempotent per buffer; detaches when
--- the buffer is gone or rendering has been switched off.
+local attach_ids = 0
+
 function M._attach_render(bufnr)
   if render_attached[bufnr] then
     return
   end
-  render_attached[bufnr] = true
+  attach_ids = attach_ids + 1
+  local id = attach_ids
+  render_attached[bufnr] = id
   vim.api.nvim_buf_attach(bufnr, false, {
     on_lines = function(_, b)
-      if not vim.api.nvim_buf_is_valid(b) then
-        cancel_render_timer(b)
-        render_attached[b] = nil
+      if render_attached[b] ~= id or not vim.api.nvim_buf_is_valid(b) then
+        if render_attached[b] == id then render_attached[b] = nil end
         return true
       end
       local ok, straps = pcall(require, "straps")
@@ -655,10 +686,50 @@ function M._attach_render(bufnr)
       schedule_render(b)
     end,
     on_detach = function(_, b)
-      cancel_render_timer(b)
-      render_attached[b] = nil
+      if render_attached[b] == id then
+        cancel_render_timer(b)
+        render_attached[b] = nil
+      end
     end,
   })
+end
+
+function M.detach_render(bufnr)
+  bufnr = (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
+  cancel_render_timer(bufnr)
+  render_attached[bufnr] = nil
+  if vim.api.nvim_buf_is_valid(bufnr) then vim.api.nvim_buf_clear_namespace(bufnr, render_ns, 0, -1) end
+end
+
+local render_failed = false
+local rendered_this_turn = {}
+
+function render_now(bufnr)
+  if not rendered_this_turn[bufnr] then
+    rendered_this_turn[bufnr] = true
+    vim.schedule(function() rendered_this_turn[bufnr] = nil end)
+  end
+  local registry = require("straps.registry")
+  local ok, err
+  if registry.get("fn.render") then
+    ok, err = pcall(registry.call, "fn.render", bufnr)
+  elseif not registry.get("fn.provider") then
+    ok, err = pcall(M._render, bufnr)
+  else
+    ok = true
+  end
+  if not ok and not render_failed then
+    render_failed = true
+    vim.notify("straps: fn.render failed: " .. tostring(err), vim.log.levels.WARN)
+  end
+end
+
+function M.apply_render(bufnr)
+  local ok, straps = pcall(require, "straps")
+  if ok and type(straps) == "table" and straps.config and straps.config.render == false then return end
+  if not vim.api.nvim_buf_is_valid(bufnr) then return end
+  render_now(bufnr)
+  M._attach_render(bufnr)
 end
 
 --- Redraw every surface a straps status component can live on. :redrawstatus
@@ -790,9 +861,9 @@ end
 
 --- Set this session's findings list. `what` = { title, items }. Uses the
 --- session window's location list when on-screen (isolated per session), else
---- the global quickfix list. `open` opens the matching list window when there
---- are entries. Returns "loclist" or "quickfix" (so callers can name the right
---- :lnext/:cnext navigation).
+--- the session's private store. `open` opens the matching list window when there
+--- are entries. Returns "loclist", "quickfix" or findings.STORE_KIND, which
+--- findings.nav_hint turns into the matching navigation hint.
 function M.set_locations(bufnr, what, open)
   return require("straps.findings").set_locations(bufnr, what, open)
 end
@@ -854,33 +925,19 @@ end
 
 -- Registry loading is the caller's job: open_session loads before
 -- state.new_session builds the system prompt, show_session loads here.
-local function present_session(bufnr, split_cmd)
-  require("straps.state").open_draft(bufnr)
+local function present_session(bufnr, split_cmd, opts)
+  require("straps.state").open_draft(bufnr, opts)
   open_in_window(bufnr, split_cmd, true)
   -- Don't stomp a live status: a running subagent brought on-screen by the
   -- agents picker is still "running".
   if vim.b[bufnr].straps_status == nil then
     vim.b[bufnr].straps_status = "idle"
   end
-  -- filetype=straps was set on bufnr before it had a window (new_session /
-  -- open_session_file), so the FileType autocmd's vim.opt_local never had a
-  -- window to land on; apply the fold options now that one exists.
   M.apply_fold_opts(bufnr)
   M.apply_file_ref_match(bufnr)
   register_winbar_lifecycle()
   apply_winbar()
-  -- Transcript rendering: window-local conceal so the marker rules show,
-  -- one render now, and a debounced renderer for future appends/edits. The
-  -- whole presentation is fn.render — config.render = false skips the wiring
-  -- (raw markers), and :set conceallevel=0 reveals them per window.
-  local ok_straps, straps = pcall(require, "straps")
-  if not (ok_straps and type(straps) == "table" and straps.config
-      and straps.config.render == false) then
-    vim.wo[0][0].conceallevel = 2
-    vim.wo[0][0].concealcursor = "nc"
-    require("straps.registry").try_call("fn.render", bufnr)
-    M._attach_render(bufnr)
-  end
+  if not rendered_this_turn[bufnr] then M.apply_render(bufnr) end
   M.map_session_keys(bufnr)
   if not require("straps.since_you_left").preserve_view(bufnr) then
     vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(bufnr), 0 })
@@ -900,9 +957,11 @@ end
 ---   instead of splitting, recording a jumplist entry so <C-o>/<C-i> navigate
 ---   back to the replaced buffer and forward again. A window in the current
 ---   tab already showing bufnr is focused instead of opening another.
-function M.show_session(bufnr, split_cmd)
+--- @param opts table? `{ keep_unmodified = true }` leaves an unmodified buffer
+---   unmodified after the draft line is added (resume_session passes it).
+function M.show_session(bufnr, split_cmd, opts)
   load_registries()
-  return present_session(bufnr, split_cmd)
+  return present_session(bufnr, split_cmd, opts)
 end
 
 --- The grantable permission categories (fn.capability() with no args).
@@ -1035,7 +1094,7 @@ function M.resume_session(path, split_cmd)
     vim.notify(("straps: this session was interrupted mid-run; marked %d unfinished"
       .. " tool call(s) as interrupted (:StrapsContinue to pick up)"):format(healed))
   end
-  return M.show_session(bufnr, split_cmd)
+  return M.show_session(bufnr, split_cmd, { keep_unmodified = true })
 end
 
 --- Open a picker over state.list_sessions() ({ path, name, mtime }, newest
@@ -1133,7 +1192,7 @@ function M.pick_session(split_cmd)
 end
 
 --- Give a saved session a durable title (state.set_session_title), so the
---- resume picker shows it instead of the timestamp/first-prompt. `bufnr` is a
+--- resume picker, the permission rows and the dock winbar show it. `bufnr` is a
 --- file-backed session buffer; `title` nil prompts for one (pre-filled with the
 --- current title), "" clears it. No-op with a notice on an ephemeral session.
 function M.rename_session(bufnr, title)
@@ -1150,6 +1209,9 @@ function M.rename_session(bufnr, title)
     end
     local ok, err = state.set_session_title(path, t)
     if ok then
+      M.forget_session_title(bufnr)
+      require("straps.permission_review").changed()
+      pcall(vim.cmd, "redrawstatus!")
       vim.notify(t == "" and "straps: session title cleared"
         or ("straps: session titled " .. t), vim.log.levels.INFO)
     else
@@ -1274,6 +1336,45 @@ function M.session_label(bufnr)
   return vim.fn.fnamemodify(name, ":t")
 end
 local session_label = M.session_label
+local title_cache = {}
+vim.api.nvim_create_autocmd("BufWipeout", {
+  group = vim.api.nvim_create_augroup("StrapsSessionTitleCache", { clear = true }),
+  callback = function(ev) title_cache[ev.buf] = nil end,
+})
+
+local function human_title(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) or vim.bo[bufnr].buftype ~= "" then return nil end
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  if name == "" then return nil end
+  local mp = require("straps.state").session_meta_path(name)
+  local stat = vim.uv.fs_stat(mp)
+  local key = stat and table.concat({ mp, stat.size, stat.mtime.sec, stat.mtime.nsec, stat.ino }, ":") or mp
+  local cached = title_cache[bufnr]
+  local age = stat and os.time() - stat.mtime.sec or 2
+  local settled = age >= 2 or age < -2
+  if cached and cached.key == key and cached.settled then return cached.title end
+  local title, by, generated = require("straps.state").session_title_meta(name)
+  if type(title) ~= "string" or title == "" or (by == "straps_renamer" and generated == title) then title = nil end
+  title_cache[bufnr] = { key = key, title = title, settled = settled }
+  return title
+end
+
+function M.forget_session_title(bufnr)
+  title_cache[bufnr] = nil
+end
+
+function M.session_identity(bufnr)
+  local label = M.display_text(M.session_label(bufnr))
+  local ok, title = pcall(human_title, bufnr)
+  if not ok or not title then return label, nil end
+  return label, M.truncate_middle(M.display_text(title), 40)
+end
+
+function M.session_title(bufnr)
+  local label, title = M.session_identity(bufnr)
+  return title and (title .. " (" .. label .. ")") or label
+end
+
 
 --- Snapshot of every currently-running agent, as
 --- { bufnr, label, parent (bufnr|nil), parent_label (string|nil), depth,
@@ -1469,6 +1570,10 @@ function M.usage_status(bufnr)
   return format_usage(info)
 end
 
+function M.ratchet_status(bufnr)
+  return require("straps.ratchet").status(bufnr or vim.api.nvim_get_current_buf())
+end
+
 --- Winbar for a session window: the active model/effort (session_status) plus
 --- a right-aligned run status (running/idle). Auto-installed on session windows
 --- unless config.session_winbar = false; also usable manually via
@@ -1519,9 +1624,13 @@ function M.winbar()
     local dock_pending = dock and require("straps.dock").has_permission(bufnr)
     local waiting = require("straps.attention").wait_label(bufnr, dock_pending)
     if dock then
-      local label = vim.fn.strtrans(M.session_label(bufnr)):gsub("%%", "%%%%")
-      if cfg.session_winbar == false then return " " .. waiting .. label .. (hint ~= "" and "  " .. hint or "") end
-      return " " .. waiting .. label .. "  %<" .. bar
+      local file, title = M.session_identity(bufnr)
+      local waiting_cells = vim.fn.strdisplaywidth((waiting:gsub("%%#[^#]*#", ""):gsub("%%%*", "")))
+      local room = vim.api.nvim_win_get_width(win) - vim.fn.strdisplaywidth(file) - 6 - math.min(waiting_cells, 12)
+      local label = title and room >= 2 and (M.truncate_middle(title, room) .. " (" .. file .. ")") or file
+      label = label:gsub("%%", "%%%%")
+      if cfg.session_winbar == false then return " " .. label .. "  " .. waiting .. "%<" .. (hint ~= "" and hint or "") end
+      return " " .. label .. "  " .. waiting .. "%<" .. bar
     end
     if waiting ~= "" then return " " .. waiting .. "%<" .. bar end
     return bar
@@ -1710,7 +1819,8 @@ local function progress_draw(bufnr)
   local live = liveness_segment(st.streaming, (now - (st.last_activity or st.start)) / 1e6)
   local text = ("%s · %ds%s · <CR> steer · :StrapsStop stop"):format(st.label, secs, live)
   vim.api.nvim_buf_clear_namespace(bufnr, progress_ns, 0, -1)
-  local tail = require("straps.state").draft_row(bufnr) or vim.api.nvim_buf_line_count(bufnr)
+  local tail = require("straps.state").transcript_end(bufnr)
+  if tail == 0 then return end
   vim.api.nvim_buf_set_extmark(bufnr, progress_ns, tail - 1, 0, {
     virt_text = { { text, "StrapsProgress" } },
     virt_text_pos = "eol",
@@ -2526,17 +2636,17 @@ function M.auto(arg)
 end
 
 function M.foldexpr(lnum)
-  local draft = require("straps.state").draft_row(vim.api.nvim_get_current_buf())
-  if draft and lnum > draft then return 0 end
+  local bufnr = vim.api.nvim_get_current_buf()
+  local tail = require("straps.state").transcript_end(bufnr)
+  if lnum > tail then return 0 end
   local kind = vim.fn.getline(lnum):match("^%%%%%[straps:([%w_]+)%]%%%%")
   if kind == "tool_use" or kind == "system" then
     return ">1"
   elseif kind == "tool_result" then
     return "1"
   elseif kind == "user" then
-    local bufnr = vim.api.nvim_get_current_buf()
     local last = lnum
-    for line = lnum + 1, vim.api.nvim_buf_line_count(bufnr) do
+    for line = lnum + 1, tail do
       local text = vim.fn.getline(line)
       if text:match("^%%%%%[straps:[%w_]+%]%%%%") then break end
       last = line
@@ -2665,6 +2775,24 @@ local function sorted_rows(rows)
   return rows
 end
 
+local COMMAND_GROUPS = { "Session", "Permissions", "Navigation", "Context", "Configuration", "Registry", "Extensions" }
+M.COMMAND_GROUP = {
+  Straps = "Session", StrapsAsk = "Session", StrapsSend = "Session", StrapsSendNow = "Session",
+  StrapsSteer = "Session", StrapsStop = "Session", StrapsContinue = "Session", StrapsResume = "Session",
+  StrapsRename = "Session", StrapsCompact = "Session", StrapsAgents = "Session", StrapsEgg = "Session",
+  StrapsPermission = "Permissions", StrapsInspect = "Permissions", StrapsAuto = "Permissions",
+  StrapsAdopt = "Permissions", StrapsAuthorization = "Permissions", StrapsTaskReset = "Permissions",
+  StrapsJumpUnread = "Navigation", StrapsOutline = "Navigation", StrapsSearch = "Navigation",
+  StrapsContextPreview = "Context", StrapsContextApply = "Context", StrapsContextPin = "Context",
+  StrapsContextUnpin = "Context",
+  StrapsProvider = "Configuration", StrapsModel = "Configuration", StrapsEffort = "Configuration",
+  StrapsLogin = "Configuration", StrapsLogout = "Configuration",
+  StrapsRegistry = "Registry", StrapsEdit = "Registry", StrapsEval = "Registry", StrapsHelp = "Registry",
+}
+local COMMAND_GROUP = M.COMMAND_GROUP
+local CONTEXTUAL_COMMANDS = { "StrapsAdopt", "StrapsAuthorization", "StrapsTaskReset" }
+local CONTEXT_COMMANDS = { "StrapsContextPreview", "StrapsContextApply", "StrapsContextPin", "StrapsContextUnpin" }
+
 function M.key_reference(bufnr)
   local keys, seen = {}, {}
   for _, map in ipairs(vim.api.nvim_buf_get_keymap(bufnr, "n")) do
@@ -2675,33 +2803,86 @@ function M.key_reference(bufnr)
       keys[#keys + 1] = { map.lhs, vim.trim(desc:sub(#"straps:" + 1)) }
     end
   end
-  local commands = {}
+  local hidden = {}
+  if not human then
+    for _, name in ipairs(CONTEXTUAL_COMMANDS) do hidden[name] = true end
+  end
+  if not require("straps.context_management").enabled(bufnr) then
+    for _, name in ipairs(CONTEXT_COMMANDS) do hidden[name] = true end
+  end
+  local groups = {}
   for name, cmd in pairs(vim.api.nvim_get_commands({})) do
-    if vim.startswith(name, "Straps") then
-      commands[#commands + 1] = { ":" .. name, cmd.definition or "" }
+    if vim.startswith(name, "Straps") and not hidden[name] then
+      local group = COMMAND_GROUP[name] or "Extensions"
+      local desc = cmd.definition or ""
+      if vim.startswith(desc, "straps:") then desc = vim.trim(desc:sub(#"straps:" + 1)) end
+      groups[group] = groups[group] or {}
+      table.insert(groups[group], { ":" .. name, desc })
     end
   end
+  local max_width = math.max(20, math.min(vim.o.columns - 4, 100))
   local lines = {}
-  local function section(title, rows)
-    local width = 0
-    for _, row in ipairs(rows) do width = math.max(width, vim.fn.strdisplaywidth(row[1])) end
+  local function split_to(text, room)
+    local pieces = {}
+    while vim.fn.strdisplaywidth(text) > room do
+      local n = 1
+      while vim.fn.strdisplaywidth(vim.fn.strcharpart(text, 0, n + 1)) <= room do n = n + 1 end
+      pieces[#pieces + 1] = vim.fn.strcharpart(text, 0, n)
+      text = vim.fn.strcharpart(text, n)
+    end
+    pieces[#pieces + 1] = text
+    return pieces
+  end
+  local function section(title, rows, width)
     lines[#lines + 1] = title
     for _, row in ipairs(sorted_rows(rows)) do
+      local prefix = ("  %s%s  "):format(row[1], (" "):rep(width - vim.fn.strdisplaywidth(row[1])))
+      local indent = (" "):rep(vim.fn.strdisplaywidth(prefix))
+      if max_width - #indent < 20 then
+        for _, piece in ipairs(split_to(vim.fn.strtrans(row[1]), max_width - 2)) do lines[#lines + 1] = "  " .. piece end
+        prefix, indent = "    ", "    "
+      end
+      local room = max_width - #indent
+      local current = prefix
       local first = vim.split(row[2], "\n", { plain = true })[1]
-      lines[#lines + 1] = vim.fn.strtrans(("  %s%s  %s"):format(row[1],
-        (" "):rep(width - vim.fn.strdisplaywidth(row[1])), first))
+      local words = {}
+      for word in first:gmatch("%S+") do
+        vim.list_extend(words, split_to(word, room))
+      end
+      for _, word in ipairs(words) do
+        if current ~= prefix and current ~= indent
+            and vim.fn.strdisplaywidth(current) + 1 + vim.fn.strdisplaywidth(word) > #indent + room then
+          lines[#lines + 1] = vim.fn.strtrans(current)
+          current = indent .. word
+        elseif current == prefix or current == indent then
+          current = current .. word
+        else
+          current = current .. " " .. word
+        end
+      end
+      lines[#lines + 1] = vim.fn.strtrans(current)
     end
   end
-  section("Keys", keys)
-  lines[#lines + 1] = ""
-  section("Commands", commands)
+  local key_width = 0
+  for _, row in ipairs(keys) do key_width = math.max(key_width, vim.fn.strdisplaywidth(row[1])) end
+  section("Keys", keys, key_width)
+  local command_width = 0
+  for _, rows in pairs(groups) do
+    for _, row in ipairs(rows) do command_width = math.max(command_width, vim.fn.strdisplaywidth(row[1])) end
+  end
+  for _, group in ipairs(COMMAND_GROUPS) do
+    if groups[group] then
+      lines[#lines + 1] = ""
+      section(group, groups[group], command_width)
+    end
+  end
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
   vim.bo[buf].bufhidden = "wipe"
   local width = 0
   for _, line in ipairs(lines) do width = math.max(width, vim.fn.strdisplaywidth(line)) end
-  width = math.max(1, math.min(width + 1, vim.o.columns - 4))
+  width = math.max(1, math.min(width + 1, max_width))
   local height = math.max(1, math.min(#lines, vim.o.lines - 4))
   local ok, win = pcall(vim.api.nvim_open_win, buf, false, {
     relative = "editor",
@@ -2784,32 +2965,12 @@ local function register_fold_lifecycle()
   })
 end
 
---- Apply the straps fold options (foldmethod=expr + foldexpr + foldtext +
---- foldlevel from config.tools_expanded) to every window currently showing
---- bufnr, and, the first time a window gets them, the session window options
---- (fillchars fold fill, breakindentopt list:-1, linebreak, breakindent). foldlevel is set only the first time a window gets the straps
---- foldexpr, so re-showing a session keeps the level the user chose (zR/zM).
----
---- Folding is window-local, so this must run once the buffer is
---- actually displayed — `vim.opt_local` from a FileType autocmd that fires
---- before the buffer is ever windowed (state.new_session/open_session_file
---- set filetype=straps on a still-hidden buffer) has no lasting effect, since
---- there is no window to attach the options to yet. The ftplugin, FileType
---- autocmd, and session presentation initialize folding. Window-entry events
---- configure subsequent native buffer switches and splits.
----
---- Every assignment uses the `vim.wo[win][0]` (`:setlocal`) form, and must.
---- A window option carries two values: a per-(window, buffer) one and a
---- per-window one. Plain `vim.wo[win].opt = v` is `:set` and writes both, and
---- the per-window value outlives this buffer in that window — so a split off
---- the session window, or any file swapped into it (gf, :edit, <C-o>), folds
---- by the straps foldexpr on the user's own source. `[0]` writes only
---- per-(window, buffer), which is exactly the scope the transcript needs.
 function M.apply_fold_opts(bufnr, target_win)
   register_fold_lifecycle()
   local ok, straps = pcall(require, "straps")
   local expanded = ok and type(straps) == "table" and straps.config
     and straps.config.tools_expanded
+  local render_on = not (ok and type(straps) == "table" and straps.config and straps.config.render == false)
   local expr = "v:lua.require'straps.ui'.foldexpr(v:lnum)"
   local outline = package.loaded["straps.outline"]
   for _, win in ipairs(target_win and { target_win } or vim.fn.win_findbuf(bufnr)) do
@@ -2822,6 +2983,19 @@ function M.apply_fold_opts(bufnr, target_win)
       if first then
         vim.wo[win][0].foldlevel = expanded and 99 or 0
         M.apply_window_opts(win)
+        if render_on then
+          vim.wo[win][0].conceallevel = 2
+          vim.wo[win][0].concealcursor = "nc"
+        end
+      end
+      if render_on and not render_attached[bufnr] and vim.fn.win_gettype(win) ~= "autocmd" then
+        for _, shown in ipairs(vim.fn.win_findbuf(bufnr)) do
+          if vim.fn.win_gettype(shown) ~= "autocmd" then
+            vim.wo[shown][0].conceallevel = 2
+            vim.wo[shown][0].concealcursor = "nc"
+          end
+        end
+        M.apply_render(bufnr)
       end
     end
   end
@@ -2913,8 +3087,7 @@ end
 --- Underline path:line[:col] references in every window showing bufnr, but
 --- only when the treesitter highlighter owns the buffer — under legacy syntax
 --- the strapsFileRef rule in syntax/straps.vim already does this. matchadd is
---- window-local with the same set-while-hidden trap as the fold options (see
---- apply_fold_opts), so the ftplugin, present_session and the FileType autocmd
+--- window-local and needs a window showing the buffer: the ftplugin, present_session and the FileType autocmd
 --- all call this, guarded per-window by the returned match id.
 function M.apply_file_ref_match(bufnr)
   if not vim.treesitter.highlighter.active[bufnr] then

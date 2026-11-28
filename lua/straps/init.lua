@@ -144,11 +144,12 @@ M.config = {
   -- %%[straps:KIND]%% marker buffer — conceal + extmarks + folds give each
   -- block a small categorical colored mark and collapse tool calls to a
   -- one-line summary. Buffer text, `modified`, parse and persist are never
-  -- touched. render = false skips the wiring entirely (raw markers show;
-  -- also reachable per-window with :set conceallevel=0). tools_expanded =
+  -- touched. render = false skips conceal and extmarks (raw markers show, folds stay;
+  -- also reachable per-window with :setlocal conceallevel=0). tools_expanded =
   -- true folds tool_use/tool_result blocks OPEN by default.
   render = true,
   tools_expanded = false,
+  findings_diagnostics = true,
 
   -- Session-window winbar: a window-local status line on each session window
   -- showing the active model (per-buffer override, else the provider's model
@@ -434,6 +435,7 @@ function M.setup(opts)
     require("straps.editor").register()
   end
   require("straps.ui").setup()
+  require("straps.ratchet").setup()
   require("straps.since_you_left").setup(M.config.render)
   return M
 end

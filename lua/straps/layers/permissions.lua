@@ -62,8 +62,6 @@ return function(name, input)
     agents = true,
     -- models reads the configured catalog (no network, no writes).
     models = true,
-    -- presentation tools: they open views / set the findings list but change
-    -- no files, exactly like show_user.
     show_diff = true, show_buffer = true, show_terminal = true, set_findings = true,
     -- ask_user IS user interaction; gating it behind a confirm dialog would
     -- be asking permission to ask a question.
@@ -180,8 +178,9 @@ end
       .. " and l (all edits), and any other tool except deletes and definitions adds a (this tool)); outside a run, or"
       .. " with \"modal\" outside the dock and session-buffer edits, it prompts via vim.fn.confirm; with \"modal\","
       .. " a request while the dock is visible or a session-buffer edit waits for gy / :StrapsPermission, which then prompts."
-      .. " For session file edits (write_file, edit_file, patch_file),"
-      .. " :StrapsInspect or i in the review float opens the proposed unified diff on demand; i closes the review"
+      .. " For session file edits (write_file, edit_file, patch_file), the review float shows the grant lines,"
+      .. " the path and the proposed unified diff above the field listing (spec.grants and spec.fields);"
+      .. " :StrapsInspect or i in the review float opens the diff in a split; i closes the review"
       .. " float and leaves the request pending."
       .. " Inside a batch it uses ctx.batch_preview(path) when available."
       .. " The decision offers"
@@ -352,9 +351,10 @@ return function(name, input, ctx, call_id)
     root = project_root(input.path)
     if root == dir then root = nil end
     local function esc(s) return (s:gsub("&", "&&")) end
-    options = { { "&Yes", "yes", "y" }, { "&No", "no", "n" }, { "Always in &dir " .. esc(dir), "dir", "d" } }
+    local display = require("straps.ui").display_text
+    options = { { "&Yes", "yes", "y" }, { "&No", "no", "n" }, { "Always in &dir " .. esc(display(dir)), "dir", "d" } }
     if root then
-      options[#options + 1] = { "Always in this &project (" .. esc(root) .. ")", "project", "p" }
+      options[#options + 1] = { "Always in this &project (" .. esc(display(root)) .. ")", "project", "p" }
       root_choice_idx = #options
     end
     options[#options + 1] = { "Always &all edits", "all edits", "a" }
@@ -380,10 +380,12 @@ return function(name, input, ctx, call_id)
       "straps: allow " .. tostring(name) .. "?\n" .. preview, choices, 2)
   end
   local body = preview
+  local grants
   if is_edit then
-    local grants = "d: always in " .. dir
-    if root then grants = grants .. "\np: always in this project " .. root end
-    body = grants .. "\n\n" .. preview
+    local display = require("straps.ui").display_text
+    grants = { "d: always in " .. display(dir) }
+    if root then grants[#grants + 1] = "p: always in this project " .. display(root) end
+    body = table.concat(grants, "\n") .. "\n\n" .. preview
   end
   local target
   local entry_schema = require("straps.registry").get("tool." .. tostring(name))
@@ -400,6 +402,8 @@ return function(name, input, ctx, call_id)
     target = target,
     title = "allow " .. tostring(name),
     preview = body,
+    grants = grants,
+    fields = grants and preview or nil,
     choices = spec_choices,
     inspect = is_edit or nil,
   }

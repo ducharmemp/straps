@@ -3618,7 +3618,7 @@ into reply prose:
 
 - One location worth their eyes: show_user.
 - Many locations: this session's findings list (the session window's
-  location list when on-screen, else the global quickfix list). grep
+  location list when on-screen, else the session's private store). grep
   already fills it as a side effect, and run_quickfix fills it from
   build/lint output. For findings you assembled yourself (from read_file /
   definition / references, which leave no list behind), call set_findings

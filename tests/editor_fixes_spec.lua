@@ -166,6 +166,20 @@ it("8: diagnostic_at treats end_col as exclusive and matches zero-width diagnost
   assert(fix4 == "fix_diagnostic: no diagnostic at that position", "fix_diagnostic end_col: " .. tostring(fix4))
 end)
 
+it("fix_diagnostic does not treat a set_findings finding as a diagnostic", function()
+  local path = work .. "/finding.txt"
+  write(path, "one two\n")
+  local buf = load(path)
+  local session = vim.api.nvim_create_buf(false, true)
+  vim.b[session].straps_session = true
+  require("straps.findings").set_diagnostics(session, { { filename = path, lnum = 1, col = 1, text = "finding" } })
+  local count = #vim.diagnostic.get(buf)
+  local fix = call("fix_diagnostic", { path = path, line = 1, col = 1 })
+  require("straps.findings").reset_diagnostics(session)
+  assert.are.equal(1, count)
+  assert.are.equal("fix_diagnostic: no diagnostic at that position", fix)
+end)
+
 -- ------------------------------------------------------------------- finding 7
 
 it("7: tags fallback returns file:line:col and honors quickfix=true", function()

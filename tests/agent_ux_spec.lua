@@ -1422,6 +1422,186 @@ it("set_findings with no valid items raises", function()
   assert(out:find("no valid items", 1, true), "expected no-valid-items note: " .. out)
 end)
 
+describe("set_findings diagnostics", function()
+  local findings = require("straps.findings")
+  local target = vim.fn.tempname() .. ".lua"
+  local other = vim.fn.tempname() .. ".lua"
+  write_file(target, "local a = 1\nlocal b = 2\nlocal c = 3\n")
+  write_file(other, "x\ny\n")
+
+  local function session(windowed)
+    vim.cmd("only")
+    local b = state.new_session()
+    if windowed then
+      vim.cmd("split")
+      vim.api.nvim_win_set_buf(0, b)
+    end
+    return b
+  end
+
+  local function set(b, items)
+    return drive(function(ctx)
+      return registry.call("tool.set_findings", { items = items, open = false }, ctx)
+    end, 5000, { bufnr = b })
+  end
+
+  local function ours(b)
+    local list = {}
+    for _, d in ipairs(vim.diagnostic.get(vim.fn.bufadd(target))) do
+      if vim.diagnostic.get_namespace(d.namespace).name == "straps.findings." .. b then list[#list + 1] = d end
+    end
+    return list
+  end
+
+  after_each(function()
+    vim.cmd("silent! only")
+  end)
+
+  it("marks each location with an INFO diagnostic and reports the loclist hint", function()
+    local b = session(true)
+    local out = set(b, { { path = target, line = 2, col = 7, text = "b is unused" } })
+    local list = ours(b)
+    assert.are.equal(1, #list)
+    assert.are.equal(1, list[1].lnum)
+    assert.are.equal(6, list[1].col)
+    assert.are.equal(vim.diagnostic.severity.INFO, list[1].severity)
+    assert.are.equal("straps", list[1].source)
+    assert.are.equal("b is unused", list[1].message)
+    assert(out:find(":lnext/:lprev", 1, true), out)
+  end)
+
+  it("a second set_findings replaces the first set", function()
+    local b = session(true)
+    set(b, { { path = target, line = 1, text = "one" }, { path = target, line = 2, text = "two" } })
+    set(b, { { path = target, line = 3, text = "three" } })
+    local list = ours(b)
+    assert.are.equal(1, #list)
+    assert.are.equal("three", list[1].message)
+  end)
+
+  it("loading the findings list another way leaves the diagnostics", function()
+    local b = session(true)
+    set(b, { { path = target, line = 1, text = "kept" } })
+    findings.set_locations(b, { title = "straps: grep", items = { { filename = other, lnum = 1, text = "x" } } }, false)
+    assert.are.equal(1, #ours(b))
+  end)
+
+  it("two sessions keep separate diagnostics", function()
+    local a = session(true)
+    set(a, { { path = target, line = 1, text = "from a" } })
+    local b = session(true)
+    set(b, { { path = target, line = 2, text = "from b" } })
+    assert.are.equal("from a", ours(a)[1].message)
+    assert.are.equal("from b", ours(b)[1].message)
+  end)
+
+  it("a windowless session sets none and reports the session store", function()
+    local b = session(false)
+    local out = set(b, { { path = target, line = 1, text = "hidden" } })
+    assert.are.equal(0, #ours(b))
+    assert(out:find("private session store", 1, true), out)
+  end)
+
+  it("a windowed set followed by a windowless set clears that session's diagnostics", function()
+    local b = session(true)
+    set(b, { { path = target, line = 1, text = "seen" } })
+    vim.cmd("only")
+    if vim.api.nvim_get_current_buf() == b then vim.cmd("enew") end
+    for _, w in ipairs(vim.fn.win_findbuf(b)) do vim.api.nvim_win_close(w, true) end
+    set(b, { { path = target, line = 2, text = "unseen" } })
+    assert.are.equal(0, #ours(b))
+  end)
+
+  it("findings_diagnostics = false sets none", function()
+    straps.config.findings_diagnostics = false
+    local b = session(true)
+    local ok, err = pcall(set, b, { { path = target, line = 1, text = "off" } })
+    straps.config.findings_diagnostics = true
+    assert(ok, err)
+    assert.are.equal(0, #ours(b))
+  end)
+
+  it("a missing path or a directory gets no diagnostic", function()
+    local b = session(true)
+    local missing, dir = vim.fn.tempname() .. ".lua", vim.fn.tempname()
+    vim.fn.mkdir(dir, "p")
+    set(b, { { path = missing, line = 1, text = "nope" }, { path = dir, line = 1, text = "dir" }, { path = target, line = 2, text = "real" } })
+    for _, p in ipairs({ missing, dir }) do
+      assert.are.equal(0, vim.fn.bufexists(p) == 1 and #vim.diagnostic.get(vim.fn.bufnr(p)) or 0, p)
+    end
+    assert.are.equal(1, #ours(b))
+  end)
+
+  it("an unsaved buffer for a path not on disk gets its diagnostic", function()
+    local b = session(true)
+    local fresh = vim.fn.tempname() .. ".lua"
+    local buf = vim.fn.bufadd(fresh)
+    vim.fn.bufload(buf)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "new()" })
+    set(b, { { path = fresh, line = 1, text = "unsaved" } })
+    local found = 0
+    for _, d in ipairs(vim.diagnostic.get(buf)) do
+      if vim.diagnostic.get_namespace(d.namespace).name == "straps.findings." .. b then found = found + 1 end
+    end
+    vim.api.nvim_buf_delete(buf, { force = true })
+    assert.are.equal(1, found)
+  end)
+
+  it("a column past the end of the line is clamped to the line length", function()
+    local b = session(true)
+    set(b, { { path = target, line = 1, col = 500, text = "far" } })
+    assert.are.equal(#"local a = 1", ours(b)[1].col)
+  end)
+
+  it("a set_findings call with no valid items still clears the previous diagnostics", function()
+    local b = session(true)
+    set(b, { { path = target, line = 1, text = "old" } })
+    assert.are.equal(1, #ours(b))
+    local err = drive_err(function(ctx)
+      return registry.call("tool.set_findings", { items = { { text = "no path" } }, open = false }, ctx)
+    end, 5000, { bufnr = b })
+    assert(err:find("no valid items", 1, true), err)
+    assert.are.equal(0, #ours(b))
+  end)
+
+  it("wiping the session clears its diagnostics", function()
+    local b = session(true)
+    set(b, { { path = target, line = 1, text = "gone" } })
+    assert.are.equal(1, #ours(b))
+    vim.api.nvim_buf_delete(b, { force = true })
+    assert.are.equal(0, #ours(b))
+  end)
+
+  it("a line past the end of an unloaded file lands on its last line", function()
+    local far = vim.fn.tempname() .. ".lua"
+    write_file(far, "one\ntwo\n")
+    local b = session(true)
+    set(b, { { path = far, line = 50, text = "far" } })
+    local fb = vim.fn.bufadd(far)
+    vim.fn.bufload(fb)
+    local list = vim.diagnostic.get(fb)
+    assert.are.equal(1, #list)
+    assert.are.equal(1, list[1].lnum)
+  end)
+
+  it("the agent's diagnostics tools do not report findings", function()
+    local b = session(true)
+    set(b, { { path = target, line = 2, col = 7, text = "finding only" } })
+    local out = drive(function(ctx)
+      return registry.call("tool.diagnostics", { path = target }, ctx)
+    end, 5000, { bufnr = b })
+    assert.are.equal("no diagnostics", out)
+    out = drive(function(ctx)
+      return registry.call("tool.diagnostic_at", { path = target, line = 2, col = 7 }, ctx)
+    end, 5000, { bufnr = b })
+    assert.are.equal("no diagnostic at that position", out)
+    out = drive(function(ctx)
+      return registry.call("tool.diagnostic_next", { path = target, line = 1, col = 1 }, ctx)
+    end, 5000, { bufnr = b })
+    assert.are.equal("no diagnostics", out)
+  end)
+end)
+
 it("hook.confirm auto-allows the presentation tools", function()
   for _, n in ipairs({ "show_diff", "show_buffer", "show_terminal", "set_findings" }) do
     local allowed = registry.call("hook.confirm", n, {}, { bufnr = 0 })

@@ -243,6 +243,35 @@ it("preserves unsaved streamed bytes and undo sequence through native writes and
   check(vim.bo[b].modified == false)
 end)
 
+for _, mode in ipairs({ "checked write", "transaction", "conflict" }) do
+  it("handles a missing draft separator during " .. mode, function()
+    local b = fixture(true)
+    local path = vim.api.nvim_buf_get_name(b)
+    local original = state.transcript_lines(b)
+    local draft = "unsent %%[straps:user]%%"
+    state.open_draft(b)
+    vim.api.nvim_buf_set_lines(b, #original + 1, -1, false, { draft })
+    local saved = bytes(path)
+    vim.api.nvim_buf_call(b, function() vim.cmd((#original + 1) .. "delete _") end)
+    if mode == "conflict" then
+      check(management.persist_checked(b, saved .. "wrong") == nil)
+      check(state.draft_row(b) == nil)
+      check(bytes(path) == saved)
+      return
+    elseif mode == "checked write" then
+      check(management.persist_checked(b, saved) == true)
+    else
+      check(append(b).status == "committed_live")
+    end
+    local history = state.transcript_lines(b)
+    check(vim.deep_equal(vim.list_slice(history, 1, #original), original))
+    check((mode == "transaction" and #history > #original) or (mode == "checked write" and #history == #original))
+    check(bytes(path) == table.concat(history, "\n") .. "\n%%[straps:draft]%%\n" .. draft .. "\n")
+    b = reopen(b)
+    check(state.draft_text(b) == draft)
+  end)
+end
+
 it("never forces a readonly transcript and classifies attempted writes as ambiguous", function()
   local b = fixture(true)
   local path = vim.api.nvim_buf_get_name(b)
